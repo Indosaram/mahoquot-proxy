@@ -315,10 +315,15 @@ pub fn openai_to_anthropic(body: &Value) -> Result<Value, String> {
             })
         })
         .collect();
+    // Anthropic-style upstreams require max_tokens, but OpenAI-agent clients
+    // often omit it. A small default truncates reasoning models mid-response
+    // (thinking burns the output budget, so a tool_use block arrives cut off
+    // and the agent loop stalls), so default generously — billing follows
+    // actual output, not the cap.
     let mut result = json!({
         "model": model,
         "messages": out,
-        "max_tokens": body.get("max_tokens").and_then(Value::as_u64).unwrap_or(4096),
+        "max_tokens": body.get("max_tokens").and_then(Value::as_u64).unwrap_or(32_768),
         "stream": body.get("stream").and_then(Value::as_bool).unwrap_or(false),
     });
     if !system.is_empty() {
@@ -350,7 +355,7 @@ pub fn openai_to_anthropic(body: &Value) -> Result<Value, String> {
             let max_tokens = body
                 .get("max_tokens")
                 .and_then(Value::as_u64)
-                .unwrap_or(4096);
+                .unwrap_or(32_768);
             let needed = budget + 4096;
             if max_tokens <= budget {
                 result["max_tokens"] = json!(needed);
@@ -814,6 +819,28 @@ impl AnthropicStreamRenderer {
 #[cfg(test)]
 mod contract_tests {
     use super::*;
+
+    #[test]
+    fn omitted_max_tokens_defaults_generously() {
+        // Agent clients omit max_tokens; a small default truncates reasoning
+        // models mid tool_use and stalls the agent loop (gateway.log showed
+        // output pinned at exactly 4096 with 200 KB requests).
+        let translated = openai_to_anthropic(&json!({
+            "model":"claude-sonnet-4-6",
+            "messages":[{"role":"user","content":"Hello"}]
+        }))
+        .expect("translation");
+        assert_eq!(translated["max_tokens"], 32_768);
+
+        // Explicit client values still win.
+        let explicit = openai_to_anthropic(&json!({
+            "model":"claude-sonnet-4-6",
+            "max_tokens": 128,
+            "messages":[{"role":"user","content":"Hello"}]
+        }))
+        .expect("translation");
+        assert_eq!(explicit["max_tokens"], 128);
+    }
 
     #[test]
     fn system_content_parts_are_preserved() {
