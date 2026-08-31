@@ -152,7 +152,13 @@ pub fn create_app(state: Arc<AppState>) -> Router {
         )
         .route("/v1beta/interactions", post(cp_routes::v1beta_interactions))
         .route("/interactions", post(cp_routes::v1beta_interactions))
-        .layer(from_fn_with_state(state.api_keys.clone(), require_api_key));
+        .layer(from_fn_with_state(
+            Arc::new(crate::inbound::ApiKeys::with_live_settings(
+                Arc::clone(&state.settings),
+                crate::inbound::ApiKeys::new(state.api_keys.values().to_vec()),
+            )),
+            require_api_key,
+        ));
 
     // Public surface: Prometheus scrapers and liveness probes never send credentials,
     // and CLIProxyAPI exposes its metrics endpoint unauthenticated too.

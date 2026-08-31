@@ -84,13 +84,16 @@ impl AppState {
         let router = Router::new(config.strategy);
         let metrics = Arc::new(GatewayMetrics::default());
         let monitor = Arc::new(MonitorState::default());
-        let api_keys = Arc::new(config.api_keys.clone());
         let refresh_url = config.refresh_url.clone();
         let auth_refresh_enabled = config.auth_refresh_enabled;
         let settings = Arc::new(SettingsStore::load_or(
             config.config_path.clone(),
             config.as_settings(),
         )?);
+        let api_keys = Arc::new(ApiKeys::with_live_settings(
+            Arc::clone(&settings),
+            config.api_keys.clone(),
+        ));
         let telemetry = Arc::new(TelemetryStore::load(
             config.config_path.with_file_name("telemetry.json"),
         ));

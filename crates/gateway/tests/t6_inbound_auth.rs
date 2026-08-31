@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::http::{header, Request, StatusCode};
+use axum::http::{header, Method, Request, StatusCode};
 use axum::middleware::from_fn_with_state;
 use axum::routing::get;
 use axum::Router;
@@ -11,6 +11,110 @@ use mahoquot_gateway::models_route::{model_ids_from_env, models_payload};
 use mahoquot_gateway::{config::GatewayConfig, routes::create_app, state::AppState};
 use mahoquot_types::Strategy;
 use tower::ServiceExt;
+
+mod common;
+
+fn gateway_config(auth_dir: &std::path::Path) -> GatewayConfig {
+    GatewayConfig {
+        port: 0,
+        auth_dir: auth_dir.to_path_buf(),
+        strategy: Strategy::StrictRoundRobin,
+        max_failover: 3,
+        log_level: "info".to_string(),
+        api_keys: ApiKeys::default(),
+        models_env: None,
+        refresh_url: mahoquot_providers::refresh::REFRESH_TOKEN_URL.to_string(),
+        auth_refresh_enabled: false,
+        usage_poll_secs: 120,
+        config_path: auth_dir.join("config.yaml"),
+    }
+}
+
+async fn models_status(app: &Router, bearer: Option<&str>) -> StatusCode {
+    let mut request = Request::builder().uri("/v1/models");
+    if let Some(key) = bearer {
+        request = request.header(header::AUTHORIZATION, format!("Bearer {key}"));
+    }
+    app.clone()
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+        .status()
+}
+
+#[tokio::test]
+async fn config_yaml_api_keys_are_enforced() {
+    let auth_dir = common::unique_temp_dir("mahoquot-config-api-key");
+    std::fs::write(
+        auth_dir.join("config.yaml"),
+        "api-keys:\n  - config-only-key\n",
+    )
+    .expect("config.yaml");
+    let app = create_app(Arc::new(
+        AppState::new(&gateway_config(&auth_dir)).expect("state"),
+    ));
+
+    assert_eq!(models_status(&app, None).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        models_status(&app, Some("wrong-key")).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        models_status(&app, Some("config-only-key")).await,
+        StatusCode::OK
+    );
+
+    std::fs::remove_dir_all(auth_dir).ok();
+}
+
+#[tokio::test]
+async fn runtime_api_key_replacement_is_enforced_immediately() {
+    let auth_dir = common::unique_temp_dir("mahoquot-runtime-api-key");
+    std::fs::write(auth_dir.join("config.yaml"), "api-keys:\n  - old-key\n")
+        .expect("config.yaml");
+    let app = create_app(Arc::new(
+        AppState::new(&gateway_config(&auth_dir)).expect("state"),
+    ));
+
+    assert_eq!(models_status(&app, Some("old-key")).await, StatusCode::OK);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/v0/management/api-keys")
+                .header(header::AUTHORIZATION, "Bearer old-key")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"["new-key"]"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    assert_eq!(
+        models_status(&app, Some("old-key")).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        models_status(&app, Some("new-key")).await,
+        StatusCode::OK
+    );
+
+    std::fs::remove_dir_all(auth_dir).ok();
+}
+
+#[tokio::test]
+async fn empty_effective_api_key_set_keeps_local_default_open() {
+    let auth_dir = common::unique_temp_dir("mahoquot-empty-api-key");
+    let app = create_app(Arc::new(
+        AppState::new(&gateway_config(&auth_dir)).expect("state"),
+    ));
+
+    assert_eq!(models_status(&app, None).await, StatusCode::OK);
+
+    std::fs::remove_dir_all(auth_dir).ok();
+}
 
 #[tokio::test]
 async fn management_uses_the_same_api_key_as_proxy_routes() {

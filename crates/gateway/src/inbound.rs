@@ -5,12 +5,20 @@ use axum::http::{header, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
+use crate::management::store::SettingsStore;
+
 #[derive(Debug, Clone, Default)]
-pub struct ApiKeys(Vec<String>);
+pub struct ApiKeys {
+    overrides: Vec<String>,
+    settings: Option<Arc<SettingsStore>>,
+}
 
 impl ApiKeys {
     pub fn new(keys: Vec<String>) -> Self {
-        Self(keys)
+        Self {
+            overrides: keys,
+            settings: None,
+        }
     }
 
     pub fn from_env_value(raw: &str) -> Self {
@@ -20,15 +28,55 @@ impl ApiKeys {
             .filter(|s| !s.is_empty())
             .map(ToString::to_string)
             .collect();
-        Self(keys)
+        Self::new(keys)
+    }
+
+    pub fn with_live_settings(settings: Arc<SettingsStore>, overrides: Self) -> Self {
+        Self {
+            overrides: overrides.overrides,
+            settings: Some(settings),
+        }
+    }
+
+    pub fn values(&self) -> &[String] {
+        &self.overrides
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.overrides.is_empty()
+            && self
+                .settings
+                .as_ref()
+                .map(|settings| settings.current().api_keys.is_empty())
+                .unwrap_or(true)
     }
 
     pub fn accepts(&self, presented: &str) -> bool {
-        self.0.iter().any(|k| k == presented)
+        self.overrides.iter().any(|key| key == presented)
+            || self
+                .settings
+                .as_ref()
+                .map(|settings| settings.current().api_keys.iter().any(|key| key == presented))
+                .unwrap_or(false)
+    }
+
+    fn authorizes(&self, presented: Option<&str>) -> bool {
+        let settings = self.settings.as_ref().map(|settings| settings.current());
+        let live_keys = settings
+            .as_ref()
+            .map(|settings| settings.api_keys.as_slice())
+            .unwrap_or_default();
+
+        if self.overrides.is_empty() && live_keys.is_empty() {
+            return true;
+        }
+
+        presented
+            .map(|key| {
+                self.overrides.iter().any(|accepted| accepted == key)
+                    || live_keys.iter().any(|accepted| accepted == key)
+            })
+            .unwrap_or(false)
     }
 }
 
@@ -37,15 +85,8 @@ pub async fn require_api_key(
     req: Request,
     next: Next,
 ) -> Response {
-    if keys.is_empty() {
+    if keys.authorizes(extract_presented_key(&req)) {
         return next.run(req).await;
-    }
-
-    let presented = extract_presented_key(&req);
-    if let Some(key) = presented {
-        if keys.accepts(key) {
-            return next.run(req).await;
-        }
     }
 
     (

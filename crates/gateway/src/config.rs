@@ -98,6 +98,7 @@ impl GatewayConfig {
                 secret_key: String::new(),
                 ..RemoteManagement::default()
             },
+            api_keys: self.api_keys.values().to_vec(),
             ..Settings::default()
         }
     }
