@@ -265,6 +265,7 @@ pub fn observability_routes() -> Router<Arc<AppState>> {
                 let value = state.settings.current().logs_max_total_size_mb;
                 json_status(StatusCode::OK, json!({ "logs-max-total-size-mb": value }))
             })
+            .post(write_logs_cap)
             .put(write_logs_cap)
             .patch(write_logs_cap),
         )

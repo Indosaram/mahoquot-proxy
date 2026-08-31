@@ -136,6 +136,11 @@ pub fn scalars_routes() -> Router<Arc<AppState>> {
         let mut method = get(move |State(state): State<Arc<AppState>>| async move {
             read_scalar(state, find(path).expect("registered")).await
         })
+        .post(
+            move |State(state): State<Arc<AppState>>, body: bytes::Bytes| async move {
+                write_scalar(state, find(path).expect("registered"), body).await
+            },
+        )
         .put(
             move |State(state): State<Arc<AppState>>, body: bytes::Bytes| async move {
                 write_scalar(state, find(path).expect("registered"), body).await

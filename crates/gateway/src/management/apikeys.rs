@@ -142,6 +142,11 @@ pub fn apikeys_routes() -> Router<Arc<AppState>> {
                 get(move |State(state): State<Arc<AppState>>| async move {
                     read(state, entry(path)).await
                 })
+                .post(
+                    move |State(state): State<Arc<AppState>>, body: bytes::Bytes| async move {
+                        replace(state, entry(path), body).await
+                    },
+                )
                 .put(
                     move |State(state): State<Arc<AppState>>, body: bytes::Bytes| async move {
                         replace(state, entry(path), body).await
