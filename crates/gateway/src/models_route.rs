@@ -123,8 +123,13 @@ pub fn generic_model_entries(members: &[std::sync::Arc<AccountMember>]) -> Vec<M
 }
 
 pub fn models_payload(entries: &[ModelEntry], created_unix: i64) -> Value {
+    // Static per-provider entries and per-account entries overlap by design
+    // (several accounts may own the same model), and OpenAI clients treat a
+    // repeated id as a catalog bug — first owner wins.
+    let mut seen = std::collections::BTreeSet::new();
     let data: Vec<Value> = entries
         .iter()
+        .filter(|entry| seen.insert(entry.id.as_str()))
         .map(|entry| {
             json!({
                 "id": entry.id,
@@ -144,6 +149,32 @@ pub fn models_payload(entries: &[ModelEntry], created_unix: i64) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn payload_dedupes_ids_across_owners() {
+        let entries = vec![
+            ModelEntry {
+                id: "claude-sonnet-4-6".to_string(),
+                owned_by: "claude".to_string(),
+            },
+            ModelEntry {
+                id: "gpt-5.6-sol".to_string(),
+                owned_by: "openai".to_string(),
+            },
+            ModelEntry {
+                id: "claude-sonnet-4-6".to_string(),
+                owned_by: "antigravity".to_string(),
+            },
+        ];
+        let payload = models_payload(&entries, 0);
+        let ids: Vec<&str> = payload["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["claude-sonnet-4-6", "gpt-5.6-sol"]);
+    }
 
     #[test]
     fn entries_track_loaded_providers() {
