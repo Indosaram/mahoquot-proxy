@@ -459,13 +459,11 @@ impl GeminiDecoder {
                         .get("thoughtSignature")
                         .and_then(Value::as_str)
                         .map(str::to_string)
-                        .take()
                         .or_else(|| self.pending_signature.take());
                     let call_id = match signature.as_deref() {
-                        Some(sig) => embed_signature_in_call_id(
-                            &format!("call_{name}_{output_index}"),
-                            sig,
-                        ),
+                        Some(sig) => {
+                            embed_signature_in_call_id(&format!("call_{name}_{output_index}"), sig)
+                        }
                         None => format!("call_{name}_{output_index}"),
                     };
                     out.push(CodexEvent::ToolCallBegin {

@@ -298,7 +298,9 @@ async fn test_mount_difference_aliases() {
             .uri(*uri)
             .header(header::AUTHORIZATION, format!("Bearer {TEST_KEY}"))
             .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(r#"{"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]}"#))
+            .body(Body::from(
+                r#"{"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]}"#,
+            ))
             .expect("request");
         let resp = app.clone().oneshot(req).await.expect("response");
         // With empty pool, all return 503 auth_not_found / no healthy account
@@ -351,7 +353,10 @@ async fn test_auth_urls_endpoint_family() {
             .expect("body");
         let body: Value = serde_json::from_slice(&bytes).expect("json");
         assert!(
-            body.get("url").is_some() || body.get("verification_uri").is_some() || body.get("login_url").is_some() || body.get("auth_url").is_some(),
+            body.get("url").is_some()
+                || body.get("verification_uri").is_some()
+                || body.get("login_url").is_some()
+                || body.get("auth_url").is_some(),
             "Expected auth url field in response: {body:?}"
         );
     }
@@ -369,7 +374,11 @@ async fn test_auth_files_crud_and_status() {
         "email": "user@example.com",
         "disabled": false
     });
-    std::fs::write(&auth_file_path, serde_json::to_string_pretty(&initial_content).unwrap()).unwrap();
+    std::fs::write(
+        &auth_file_path,
+        serde_json::to_string_pretty(&initial_content).unwrap(),
+    )
+    .unwrap();
 
     let app = setup_app(&temp_dir);
 
@@ -382,9 +391,15 @@ async fn test_auth_files_crud_and_status() {
         .expect("request");
     let resp = app.clone().oneshot(req).await.expect("response");
     assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.expect("body");
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("body");
     let list_body: Value = serde_json::from_slice(&bytes).expect("json");
-    assert!(list_body["files"].as_array().expect("array").iter().any(|item| item["name"] == "test-acc.json"));
+    assert!(list_body["files"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .any(|item| item["name"] == "test-acc.json"));
 
     // 2. PATCH /v0/management/auth-files/status (disable)
     let patch_payload = json!({
@@ -401,7 +416,8 @@ async fn test_auth_files_crud_and_status() {
     let resp = app.clone().oneshot(req).await.expect("response");
     assert_eq!(resp.status(), StatusCode::OK);
 
-    let updated_content: Value = serde_json::from_str(&std::fs::read_to_string(&auth_file_path).unwrap()).unwrap();
+    let updated_content: Value =
+        serde_json::from_str(&std::fs::read_to_string(&auth_file_path).unwrap()).unwrap();
     assert_eq!(updated_content["disabled"], true);
 
     std::fs::remove_dir_all(temp_dir).ok();
@@ -423,9 +439,16 @@ async fn test_existing_live_and_realtime_calls_regression() {
         .expect("request");
     let resp = app.clone().oneshot(req).await.expect("response");
     assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.expect("body");
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("body");
     let secret_body: Value = serde_json::from_slice(&bytes).expect("json");
-    assert!(secret_body.get("value").is_some() || secret_body.get("client_secret").is_some() || secret_body.get("key").is_some() || secret_body.get("secret").is_some());
+    assert!(
+        secret_body.get("value").is_some()
+            || secret_body.get("client_secret").is_some()
+            || secret_body.get("key").is_some()
+            || secret_body.get("secret").is_some()
+    );
 
     // 2. /v1/realtime/sessions
     let req = Request::builder()
@@ -444,7 +467,9 @@ async fn test_existing_live_and_realtime_calls_regression() {
         .uri("/v1/realtime/calls")
         .header(header::AUTHORIZATION, format!("Bearer {TEST_KEY}"))
         .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(r#"{"sdp": "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n", "session": {}}"#))
+        .body(Body::from(
+            r#"{"sdp": "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n", "session": {}}"#,
+        ))
         .expect("request");
     let resp = app.clone().oneshot(req).await.expect("response");
     assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
@@ -455,7 +480,9 @@ async fn test_existing_live_and_realtime_calls_regression() {
         .uri("/v1/live")
         .header(header::AUTHORIZATION, format!("Bearer {TEST_KEY}"))
         .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(r#"{"sdp": "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n", "session": {}}"#))
+        .body(Body::from(
+            r#"{"sdp": "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n", "session": {}}"#,
+        ))
         .expect("request");
     let resp = app.clone().oneshot(req).await.expect("response");
     assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);

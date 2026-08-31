@@ -557,7 +557,8 @@ pub fn extract_zcode_balances(text: &str) -> Option<Vec<ZcodeBalanceEntry>> {
         from += pos + marker.len();
     }
     let (start, end) = found?;
-    let parsed: serde_json::Value = serde_json::from_str(&format!("[{}]", &text[start..end])).ok()?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(&format!("[{}]", &text[start..end])).ok()?;
     let entries = parsed.as_array()?;
     let balances: Vec<ZcodeBalanceEntry> = entries
         .iter()
@@ -568,8 +569,12 @@ pub fn extract_zcode_balances(text: &str) -> Option<Vec<ZcodeBalanceEntry>> {
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("GLM")
                     .to_string(),
-                used_units: entry.get("used_units").and_then(serde_json::Value::as_f64)?,
-                total_units: entry.get("total_units").and_then(serde_json::Value::as_f64)?,
+                used_units: entry
+                    .get("used_units")
+                    .and_then(serde_json::Value::as_f64)?,
+                total_units: entry
+                    .get("total_units")
+                    .and_then(serde_json::Value::as_f64)?,
                 period_end_unix: entry
                     .get("period_end")
                     .and_then(serde_json::Value::as_i64)

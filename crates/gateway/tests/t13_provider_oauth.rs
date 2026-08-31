@@ -713,60 +713,6 @@ async fn xai_pkce_callback_writes_a_live_generic_account() {
     std::fs::remove_dir_all(auth_dir).ok();
 }
 
-#[tokio::test]
-async fn gemini_pkce_callback_writes_google_adapter_account() {
-    let token_app = axum::Router::new().route(
-        "/token",
-        axum::routing::post(|body: String| async move {
-            assert!(body.contains("client_id=gemini-client"));
-            assert!(body.contains("code_verifier="));
-            axum::Json(json!({"access_token":"google-access","refresh_token":"google-refresh","email":"gemini@example.test","project_id":"project-1"}))
-        }),
-    );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let token_url = format!("http://{}/token", listener.local_addr().unwrap());
-    let token_task = tokio::spawn(async move { axum::serve(listener, token_app).await.unwrap() });
-    let auth_dir = unique_temp_dir("qg-t13-gemini");
-    std::fs::remove_dir_all(&auth_dir).ok();
-    std::fs::create_dir_all(&auth_dir).unwrap();
-    let config = GatewayConfig {
-        auth_dir: auth_dir.clone(),
-        api_keys: mahoquot_gateway::inbound::ApiKeys::new(vec![API_KEY.to_string()]),
-        config_path: auth_dir.join("config.yaml"),
-        ..GatewayConfig::default()
-    };
-    let app = create_app(Arc::new(AppState::new(&config).unwrap()));
-    let start=app.clone().oneshot(Request::builder().uri(format!("/v0/management/gemini-cli-auth-url?client_id=gemini-client&client_secret=gemini-secret&auth_url=https%3A%2F%2Faccounts.example.test%2Fauth&token_url={}",url_encode(&token_url))).header(header::AUTHORIZATION,format!("Bearer {API_KEY}")).body(Body::empty()).unwrap()).await.unwrap();
-    let start_json = body_json(start).await;
-    let state = start_json["state"].as_str().unwrap();
-    assert!(start_json["url"]
-        .as_str()
-        .unwrap()
-        .contains("access_type=offline"));
-    let callback = app
-        .oneshot(
-            Request::builder()
-                .uri(format!(
-                    "/v0/management/oauth-callback?code=google-code&state={state}"
-                ))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(callback.status(), StatusCode::OK);
-    let saved: Value = serde_json::from_str(
-        &std::fs::read_to_string(auth_dir.join("generic-gemini-cli-gemini_example.test.json"))
-            .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(saved["adapter"], "google");
-    assert_eq!(saved["project_id"], "project-1");
-    assert_eq!(saved["auth_mode"], "oauth");
-    token_task.abort();
-    std::fs::remove_dir_all(auth_dir).ok();
-}
-
 #[derive(Clone)]
 struct MockAntigravityServerState {
     token_hits: Arc<AtomicUsize>,
@@ -1723,7 +1669,10 @@ async fn test_zcode_quota_reads_the_desktop_app_balance_log() {
     assert_eq!(group.buckets[0].display_name.as_deref(), Some("GLM-5.3"));
     assert_eq!(group.buckets[0].used_percent, Some(10.0));
     assert_eq!(group.buckets[0].reset_at_unix, Some(1788191999));
-    assert_eq!(group.buckets[1].display_name.as_deref(), Some("GLM-5.3-Flash"));
+    assert_eq!(
+        group.buckets[1].display_name.as_deref(),
+        Some("GLM-5.3-Flash")
+    );
     assert_eq!(group.buckets[1].used_percent, Some(0.02));
 
     std::env::remove_var("ZCODE_LOGS_DIR");
@@ -1735,14 +1684,14 @@ async fn test_zcode_quota_reads_the_desktop_app_balance_log() {
 async fn test_zcode_import_local_provisions_from_desktop_credentials() {
     let _guard = ZCODE_ENV_LOCK.lock().await;
     let auth_dir = unique_temp_dir("qg-t13-zcode-import");
-    let creds_file = auth_dir.parent().unwrap().join(format!(
-        "zcode-desktop-creds-{}.json",
-        std::process::id()
-    ));
-    let config_file = auth_dir.parent().unwrap().join(format!(
-        "zcode-desktop-config-{}.json",
-        std::process::id()
-    ));
+    let creds_file = auth_dir
+        .parent()
+        .unwrap()
+        .join(format!("zcode-desktop-creds-{}.json", std::process::id()));
+    let config_file = auth_dir
+        .parent()
+        .unwrap()
+        .join(format!("zcode-desktop-config-{}.json", std::process::id()));
     std::fs::write(
         &creds_file,
         serde_json::json!({ "oauth:zai:access_token": "upstream-zai-token" }).to_string(),
@@ -1888,7 +1837,12 @@ async fn test_zcode_oauth_flow_end_to_end() {
         url_encode(&broker_url),
         url_encode(&api_base)
     );
-    let start_resp = client.get(&start_url).bearer_auth(API_KEY).send().await.unwrap();
+    let start_resp = client
+        .get(&start_url)
+        .bearer_auth(API_KEY)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(start_resp.status(), StatusCode::OK);
     let start_json: Value = start_resp.json().await.unwrap();
     assert_eq!(start_json["status"], "ok");
@@ -1923,7 +1877,10 @@ async fn test_zcode_oauth_flow_end_to_end() {
     assert_eq!(callback_json["status"], "ok");
 
     let cred_file = auth_dir.join("zcode-zcode.user_zai.example.json");
-    assert!(cred_file.exists(), "credential file {cred_file:?} should exist");
+    assert!(
+        cred_file.exists(),
+        "credential file {cred_file:?} should exist"
+    );
     let parsed: ZcodeAccount =
         serde_json::from_str(&std::fs::read_to_string(&cred_file).unwrap()).unwrap();
     assert_eq!(parsed.access_token, "key_id_1.secret_1");

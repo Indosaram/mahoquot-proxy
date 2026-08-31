@@ -33,13 +33,7 @@ pub const ZCODE_API_BASE: &str = "https://api.z.ai";
 pub const ZCODE_ANTHROPIC_BASE: &str = "https://api.z.ai/api/anthropic";
 pub const ZCODE_MESSAGES_PATH: &str = "/v1/messages";
 
-pub const ZCODE_MODELS: &[&str] = &[
-    "glm-5.3",
-    "glm-5.3-flash",
-    "glm-5.2",
-    "glm-5.1",
-    "glm-4.6",
-];
+pub const ZCODE_MODELS: &[&str] = &["glm-5.3", "glm-5.3-flash", "glm-5.2", "glm-5.1", "glm-4.6"];
 
 use serde_json::Value;
 
@@ -111,17 +105,33 @@ pub fn extract_callback_code(callback_url: &str, expected_state: &str) -> Result
             continue;
         };
         match key {
-            "code" if value.is_empty() => return Err("GLM ZCode callback URL must contain exactly one non-empty code and state".to_string()),
+            "code" if value.is_empty() => {
+                return Err(
+                    "GLM ZCode callback URL must contain exactly one non-empty code and state"
+                        .to_string(),
+                )
+            }
             "code" => {
                 if code.is_some() {
-                    return Err("GLM ZCode callback URL must contain exactly one non-empty code and state".to_string());
+                    return Err(
+                        "GLM ZCode callback URL must contain exactly one non-empty code and state"
+                            .to_string(),
+                    );
                 }
                 code = Some(value.to_string());
             }
-            "state" if value.is_empty() => return Err("GLM ZCode callback URL must contain exactly one non-empty code and state".to_string()),
+            "state" if value.is_empty() => {
+                return Err(
+                    "GLM ZCode callback URL must contain exactly one non-empty code and state"
+                        .to_string(),
+                )
+            }
             "state" => {
                 if state.is_some() {
-                    return Err("GLM ZCode callback URL must contain exactly one non-empty code and state".to_string());
+                    return Err(
+                        "GLM ZCode callback URL must contain exactly one non-empty code and state"
+                            .to_string(),
+                    );
                 }
                 state = Some(value.to_string());
             }
@@ -129,10 +139,14 @@ pub fn extract_callback_code(callback_url: &str, expected_state: &str) -> Result
         }
     }
     let Some(code) = code else {
-        return Err("GLM ZCode callback URL must contain exactly one non-empty code and state".to_string());
+        return Err(
+            "GLM ZCode callback URL must contain exactly one non-empty code and state".to_string(),
+        );
     };
     let Some(state) = state else {
-        return Err("GLM ZCode callback URL must contain exactly one non-empty code and state".to_string());
+        return Err(
+            "GLM ZCode callback URL must contain exactly one non-empty code and state".to_string(),
+        );
     };
     if state != expected_state {
         return Err("GLM ZCode callback state did not match".to_string());
@@ -158,10 +172,7 @@ fn required_str<'a>(body: &'a Value, keys: &[&str]) -> Result<&'a str, String> {
             }
         }
     }
-    Err(format!(
-        "GLM ZCode response missing {}",
-        keys.join(" or ")
-    ))
+    Err(format!("GLM ZCode response missing {}", keys.join(" or ")))
 }
 
 /// `data.zai.access_token` from the broker token exchange.
@@ -203,31 +214,43 @@ pub fn parse_customer_info(body: &Value) -> Result<ZcodeCustomerInfo, String> {
     let organizations = customer
         .get("organizations")
         .and_then(Value::as_array)
-        .ok_or_else(|| "GLM ZCode getCustomerInfo response missing default organization/project".to_string())?;
+        .ok_or_else(|| {
+            "GLM ZCode getCustomerInfo response missing default organization/project".to_string()
+        })?;
     let organization = organizations
         .iter()
         .find(|entry| entry.get("isDefault").and_then(Value::as_bool) == Some(true))
         .or_else(|| organizations.first())
-        .ok_or_else(|| "GLM ZCode getCustomerInfo response missing default organization/project".to_string())?;
+        .ok_or_else(|| {
+            "GLM ZCode getCustomerInfo response missing default organization/project".to_string()
+        })?;
     let projects = organization
         .get("projects")
         .and_then(Value::as_array)
-        .ok_or_else(|| "GLM ZCode getCustomerInfo response missing default organization/project".to_string())?;
+        .ok_or_else(|| {
+            "GLM ZCode getCustomerInfo response missing default organization/project".to_string()
+        })?;
     let project = projects
         .iter()
         .find(|entry| entry.get("isDefault").and_then(Value::as_bool) == Some(true))
         .or_else(|| projects.first())
-        .ok_or_else(|| "GLM ZCode getCustomerInfo response missing default organization/project".to_string())?;
+        .ok_or_else(|| {
+            "GLM ZCode getCustomerInfo response missing default organization/project".to_string()
+        })?;
     let organization_id = organization
         .get("organizationId")
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| "GLM ZCode getCustomerInfo response missing default organization/project".to_string())?;
+        .ok_or_else(|| {
+            "GLM ZCode getCustomerInfo response missing default organization/project".to_string()
+        })?;
     let project_id = project
         .get("projectId")
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| "GLM ZCode getCustomerInfo response missing default organization/project".to_string())?;
+        .ok_or_else(|| {
+            "GLM ZCode getCustomerInfo response missing default organization/project".to_string()
+        })?;
     Ok(ZcodeCustomerInfo {
         organization_id: organization_id.to_string(),
         project_id: project_id.to_string(),
@@ -411,11 +434,7 @@ mod tests {
     #[test]
     fn callback_code_accepts_the_canonical_redirect() {
         assert_eq!(
-            extract_callback_code(
-                "zcode://oauth/callback?code=zc_1&state=st-1",
-                "st-1"
-            )
-            .unwrap(),
+            extract_callback_code("zcode://oauth/callback?code=zc_1&state=st-1", "st-1").unwrap(),
             "zc_1"
         );
     }
@@ -436,7 +455,10 @@ mod tests {
             "zcode://oauth/callback?code=c",
         ];
         for url in invalid {
-            assert!(extract_callback_code(url, "st-1").is_err(), "accepted {url}");
+            assert!(
+                extract_callback_code(url, "st-1").is_err(),
+                "accepted {url}"
+            );
         }
         assert_eq!(
             extract_callback_code("zcode://oauth/callback?code=c&state=other", "st-1").unwrap_err(),
@@ -455,7 +477,8 @@ mod tests {
         );
         assert!(parse_broker_token(&serde_json::json!({ "data": {} })).is_err());
         assert_eq!(
-            parse_business_token(&serde_json::json!({ "data": { "access_token": "biz" } })).unwrap(),
+            parse_business_token(&serde_json::json!({ "data": { "access_token": "biz" } }))
+                .unwrap(),
             "biz"
         );
     }
@@ -491,7 +514,10 @@ mod tests {
             ]
         });
         assert_eq!(find_existing_api_key(&listed).as_deref(), Some("k1"));
-        assert_eq!(find_existing_api_key(&serde_json::json!({"data": []})), None);
+        assert_eq!(
+            find_existing_api_key(&serde_json::json!({"data": []})),
+            None
+        );
         assert_eq!(
             parse_created_api_key(&serde_json::json!({"data": {"apiKey": "k2"}})).unwrap(),
             "k2"
