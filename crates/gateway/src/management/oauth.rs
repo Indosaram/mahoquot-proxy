@@ -2199,7 +2199,14 @@ async fn provision_zcode_account(
         .json()
         .await
         .map_err(|err| format!("GLM ZCode z/login response was not valid JSON: {err}"))?;
-    let business_token = mahoquot_providers::zcode::parse_business_token(&login_response)?;
+    let business_token = mahoquot_providers::zcode::parse_business_token(&login_response).map_err(
+        |detail| {
+            format!(
+                "{detail}; the saved ZCode session was rejected by Z.AI - open the ZCode desktop app once to refresh it, then import again"
+            )
+        },
+    );
+    let business_token = business_token?;
 
     let customer_response: Value = state
         .http_client
@@ -2299,22 +2306,27 @@ async fn provision_zcode_account(
 /// browser round-trip. `ZCODE_DESKTOP_CREDENTIALS_FILE` relocates the file for
 /// tests.
 async fn import_local_zcode(State(app_state): State<Arc<AppState>>) -> Response {
-    let path = std::env::var("ZCODE_DESKTOP_CREDENTIALS_FILE").unwrap_or_else(|_| {
-        format!(
-            "{}/.zcode/v2/credentials.json",
-            std::env::var("HOME").unwrap_or_default()
-        )
-    });
-    let read = tokio::task::spawn_blocking(move || std::fs::read_to_string(path)).await;
-    let document = match read {
-        Ok(Ok(document)) => document,
+    let home = std::env::var("HOME").unwrap_or_default();
+    let credentials_path = std::env::var("ZCODE_DESKTOP_CREDENTIALS_FILE")
+        .unwrap_or_else(|_| format!("{home}/.zcode/v2/credentials.json"));
+    let config_path = std::env::var("ZCODE_DESKTOP_CONFIG_FILE")
+        .unwrap_or_else(|_| format!("{home}/.zcode/v2/config.json"));
+    let auth_dir = std::path::PathBuf::from(app_state.settings.current().auth_dir.clone());
+
+    let read = tokio::task::spawn_blocking(move || -> Result<(String, String), String> {
+        let credentials = std::fs::read_to_string(&credentials_path)
+            .map_err(|err| format!("ZCode desktop credentials not readable: {err}"))?;
+        let config = std::fs::read_to_string(&config_path)
+            .map_err(|err| format!("ZCode desktop config not readable: {err}"))?;
+        Ok((credentials, config))
+    })
+    .await;
+    let (credentials, config) = match read {
+        Ok(Ok(pair)) => pair,
         Ok(Err(error)) => {
             return json_status(
                 StatusCode::BAD_REQUEST,
-                json!({
-                    "error": format!("ZCode desktop credentials not readable: {error}"),
-                    "status": "error"
-                }),
+                json!({ "error": error, "status": "error" }),
             );
         }
         Err(error) => {
@@ -2324,45 +2336,80 @@ async fn import_local_zcode(State(app_state): State<Arc<AppState>>) -> Response 
             );
         }
     };
-    let parsed: Value = match serde_json::from_str(&document) {
+
+    let credentials: Value = match serde_json::from_str(&credentials) {
         Ok(parsed) => parsed,
         Err(error) => {
             return json_status(
                 StatusCode::BAD_REQUEST,
-                json!({
-                    "error": format!("ZCode desktop credentials are not valid JSON: {error}"),
-                    "status": "error"
-                }),
+                json!({ "error": format!("ZCode desktop credentials are not valid JSON: {error}"), "status": "error" }),
             );
         }
     };
-    let Some(upstream_token) = parsed
+    let config: Value = match serde_json::from_str(&config) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return json_status(
+                StatusCode::BAD_REQUEST,
+                json!({ "error": format!("ZCode desktop config is not valid JSON: {error}"), "status": "error" }),
+            );
+        }
+    };
+
+    // The desktop app already holds a provisioned GLM API key; no upstream
+    // login needed. The saved upstream token (if any) rides along as
+    // refresh_token for parity with the OAuth flow.
+    let upstream_token = credentials
         .get("oauth:zai:access_token")
         .and_then(Value::as_str)
-        .filter(|token| !token.trim().is_empty())
-    else {
+        .unwrap_or("")
+        .to_string();
+    let Some(api_key) = mahoquot_providers::zcode::pick_desktop_api_key(&config) else {
         return json_status(
             StatusCode::BAD_REQUEST,
             json!({
-                "error": "ZCode desktop credentials carry no oauth:zai:access_token; sign in inside the ZCode app first",
+                "error": "No provisioned ZCode API key found on this Mac - open the ZCode desktop app while signed in, then import again",
                 "status": "error"
             }),
         );
     };
 
-    let api_base =
-        std::env::var("ZCODE_API_BASE").unwrap_or_else(|_| mahoquot_providers::zcode::ZCODE_API_BASE.to_string());
-    match provision_zcode_account(&app_state, &api_base, upstream_token).await {
-        Ok(email) => json_status(
-            StatusCode::OK,
-            json!({
-                "status": "ok",
-                "provider": "zcode",
-                "name": format!("zcode-{email}.json"),
-            }),
-        ),
-        Err(error) => json_status(StatusCode::BAD_REQUEST, json!({ "error": error, "status": "error" })),
+    let credential = json!({
+        "identity_slug": "",
+        "access_token": api_key,
+        "refresh_token": upstream_token,
+        "email": "",
+        "expired": "2099-12-31T00:00:00Z",
+        "type": "zcode",
+        "disabled": false,
+    });
+    let filename = "zcode-desktop.json";
+    let rendered = serde_json::to_string_pretty(&credential)
+        .map_err(|error| format!("failed formatting credential json: {error}"));
+    let rendered = match rendered {
+        Ok(rendered) => rendered,
+        Err(error) => {
+            return json_status(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({ "error": error, "status": "error" }),
+            );
+        }
+    };
+    if let Err(error) = write_atomically(&auth_dir.join(filename), &rendered) {
+        return json_status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({ "error": error.to_string(), "status": "error" }),
+        );
     }
+
+    if let Err(error) = app_state.rescan_pool() {
+        eprintln!("pool rescan failed after ZCode onboarding: {error}");
+    }
+
+    json_status(
+        StatusCode::OK,
+        json!({ "status": "ok", "provider": "zcode", "name": filename }),
+    )
 }
 
 async fn zcode_auth_url_handler(Query(params): Query<HashMap<String, String>>) -> Response {

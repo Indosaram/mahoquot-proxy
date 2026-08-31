@@ -1,9 +1,7 @@
-use mahoquot_gateway::usage::{
-    parse_cursor_usage_summary, parse_kiro_usage_summary, parse_zcode_usage_summary,
-};
+use mahoquot_gateway::usage::{parse_cursor_usage_summary, parse_kiro_usage_summary};
 
 #[test]
-fn cursor_kiro_and_zcode_quota_payloads_normalize_to_account_usage() {
+fn cursor_and_kiro_quota_payloads_normalize_to_account_usage() {
     let cursor = parse_cursor_usage_summary(
         &serde_json::json!({
             "membershipType": "pro",
@@ -29,16 +27,4 @@ fn cursor_kiro_and_zcode_quota_payloads_normalize_to_account_usage() {
     );
     assert_eq!(kiro.groups[0].buckets[0].used_percent, Some(30.0));
     assert_eq!(kiro.groups[0].buckets[0].reset_at_unix, Some(1_900_000_000));
-
-    let zcode = parse_zcode_usage_summary(
-        &serde_json::json!({
-            "data": { "limits": [
-                { "type": "TOKENS_LIMIT", "percentage": 41, "nextResetTime": 1900000000 },
-                { "type": "TIME_LIMIT", "percentage": 12, "nextResetTime": 1900000100 }
-            ]}
-        }),
-        1_800_000_000,
-    );
-    assert_eq!(zcode.groups[0].buckets[0].used_percent, Some(41.0));
-    assert_eq!(zcode.groups[1].buckets[0].used_percent, Some(12.0));
 }

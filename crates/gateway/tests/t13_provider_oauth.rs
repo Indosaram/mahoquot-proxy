@@ -1655,14 +1655,92 @@ async fn test_command_code_oauth_reports_unavailable_default_callback_port() {
     std::fs::remove_dir_all(auth_dir).ok();
 }
 
-static ZCODE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static ZCODE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[tokio::test]
+async fn test_zcode_quota_reads_the_desktop_app_balance_log() {
+    use mahoquot_gateway::quota::refresh_account_usage;
+
+    let auth_dir = unique_temp_dir("qg-t13-zcode-quota");
+    let logs_dir = auth_dir
+        .parent()
+        .unwrap()
+        .join(format!("zcode-logs-{}", std::process::id()));
+    std::fs::create_dir_all(&logs_dir).unwrap();
+    // An older day log must lose to the newest one.
+    std::fs::write(
+        logs_dir.join("2026-08-30.log"),
+        r#"{"balances":[{"show_name":"STALE","used_units":9,"total_units":10,"period_end":1000}]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        logs_dir.join("2026-08-31.log"),
+        r#"host poll ok {"success":true,"data":{"balances":[{"show_name":"GLM-5.3","used_units":300000,"total_units":3000000,"period_end":1788191999},{"show_name":"GLM-5.3-Flash","used_units":1000,"total_units":5000000,"period_end":1788191999}]}}"#,
+    )
+    .unwrap();
+    std::env::set_var("ZCODE_LOGS_DIR", &logs_dir);
+
+    std::fs::write(
+        auth_dir.join("zcode-desktop.json"),
+        serde_json::json!({
+            "identity_slug": "",
+            "access_token": "key_id_9.secret_9",
+            "refresh_token": "upstream-zai-token",
+            "email": "",
+            "expired": "2099-12-31T00:00:00Z",
+            "type": "zcode",
+            "disabled": false
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let config = GatewayConfig {
+        auth_dir: auth_dir.clone(),
+        api_keys: mahoquot_gateway::inbound::ApiKeys::new(vec![API_KEY.to_string()]),
+        ..GatewayConfig::default()
+    };
+    let state = Arc::new(AppState::new(&config).unwrap());
+    let snapshot = state.pool.load();
+    let member = snapshot
+        .members
+        .iter()
+        .find(|m| m.kind() == mahoquot_gateway::account::ProviderKind::Zcode)
+        .expect("zcode member")
+        .clone();
+
+    refresh_account_usage(&state, &member)
+        .await
+        .expect("quota poll from desktop logs");
+
+    let usage = member.usage_snapshot();
+    let group = usage
+        .groups
+        .iter()
+        .find(|group| group.display_name.as_deref() == Some("GLM Coding Plan"))
+        .expect("coding plan group");
+    assert_eq!(group.buckets.len(), 2);
+    assert_eq!(group.buckets[0].display_name.as_deref(), Some("GLM-5.3"));
+    assert_eq!(group.buckets[0].used_percent, Some(10.0));
+    assert_eq!(group.buckets[0].reset_at_unix, Some(1788191999));
+    assert_eq!(group.buckets[1].display_name.as_deref(), Some("GLM-5.3-Flash"));
+    assert_eq!(group.buckets[1].used_percent, Some(0.02));
+
+    std::env::remove_var("ZCODE_LOGS_DIR");
+    std::fs::remove_dir_all(auth_dir).ok();
+    std::fs::remove_dir_all(logs_dir).ok();
+}
 
 #[tokio::test]
 async fn test_zcode_import_local_provisions_from_desktop_credentials() {
-    let _guard = ZCODE_ENV_LOCK.lock().unwrap();
+    let _guard = ZCODE_ENV_LOCK.lock().await;
     let auth_dir = unique_temp_dir("qg-t13-zcode-import");
     let creds_file = auth_dir.parent().unwrap().join(format!(
         "zcode-desktop-creds-{}.json",
+        std::process::id()
+    ));
+    let config_file = auth_dir.parent().unwrap().join(format!(
+        "zcode-desktop-config-{}.json",
         std::process::id()
     ));
     std::fs::write(
@@ -1670,47 +1748,21 @@ async fn test_zcode_import_local_provisions_from_desktop_credentials() {
         serde_json::json!({ "oauth:zai:access_token": "upstream-zai-token" }).to_string(),
     )
     .unwrap();
-
-    let zcode_api = Router::new()
-        .route(
-            "/api/auth/z/login",
-            post(|| async { Json(json!({ "data": { "access_token": "business-token" } })) }),
-        )
-        .route(
-            "/api/biz/customer/getCustomerInfo",
-            get(|| async {
-                Json(json!({
-                    "data": {
-                        "email": "zcode.user@zai.example",
-                        "id": "cust-1",
-                        "organizations": [
-                            {"organizationId": "org-1", "isDefault": true,
-                             "projects": [{"projectId": "proj-1", "isDefault": true}]}
-                        ]
-                    }
-                }))
-            }),
-        )
-        .route(
-            "/api/biz/v1/organization/org-1/projects/proj-1/api_keys",
-            get(|| async { Json(json!({ "data": [] })) })
-                .post(|| async { Json(json!({ "data": { "apiKey": "key_id_9" } })) }),
-        )
-        .route(
-            "/api/biz/v1/organization/org-1/projects/proj-1/api_keys/copy/key_id_9",
-            get(|| async { Json(json!({ "data": { "secretKey": "secret_9" } })) }),
-        );
-    let zcode_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let zcode_port = zcode_listener.local_addr().unwrap().port();
-    tokio::spawn(async move {
-        axum::serve(zcode_listener, zcode_api).await.unwrap();
-    });
+    std::fs::write(
+        &config_file,
+        serde_json::json!({
+            "provider": {
+                "builtin:zai": { "options": { "apiKey": "" } },
+                "builtin:zai-start-plan": { "options": { "apiKey": "otherplan_half1.otherplan_half2" } },
+                "builtin:zai-coding-plan": { "options": { "apiKey": "key_id_9.secret_9" } }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
 
     std::env::set_var("ZCODE_DESKTOP_CREDENTIALS_FILE", &creds_file);
-    std::env::set_var(
-        "ZCODE_API_BASE",
-        format!("http://127.0.0.1:{zcode_port}"),
-    );
+    std::env::set_var("ZCODE_DESKTOP_CONFIG_FILE", &config_file);
 
     let config = GatewayConfig {
         auth_dir: auth_dir.clone(),
@@ -1742,10 +1794,10 @@ async fn test_zcode_import_local_provisions_from_desktop_credentials() {
     let import_json: Value = import_resp.json().await.unwrap();
     assert_eq!(import_json["status"], "ok");
     assert_eq!(import_json["provider"], "zcode");
-    assert_eq!(import_json["name"], "zcode-zcode.user_zai.example.json");
+    assert_eq!(import_json["name"], "zcode-desktop.json");
 
     let parsed: mahoquot_providers::zcode::ZcodeAccount = serde_json::from_str(
-        &std::fs::read_to_string(auth_dir.join("zcode-zcode.user_zai.example.json")).unwrap(),
+        &std::fs::read_to_string(auth_dir.join("zcode-desktop.json")).unwrap(),
     )
     .unwrap();
     assert_eq!(parsed.access_token, "key_id_9.secret_9");
@@ -1753,8 +1805,9 @@ async fn test_zcode_import_local_provisions_from_desktop_credentials() {
     assert_eq!(parsed.r#type, "zcode");
 
     std::env::remove_var("ZCODE_DESKTOP_CREDENTIALS_FILE");
-    std::env::remove_var("ZCODE_API_BASE");
+    std::env::remove_var("ZCODE_DESKTOP_CONFIG_FILE");
     std::fs::remove_file(&creds_file).ok();
+    std::fs::remove_file(&config_file).ok();
     std::fs::remove_dir_all(auth_dir).ok();
 }
 

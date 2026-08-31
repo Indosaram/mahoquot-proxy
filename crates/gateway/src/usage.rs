@@ -531,43 +531,118 @@ pub fn parse_kiro_usage_summary(body: &serde_json::Value, now_unix: i64) -> Acco
     }
 }
 
-pub fn parse_zcode_usage_summary(body: &serde_json::Value, now_unix: i64) -> AccountUsage {
-    let mut groups = Vec::new();
-    for limit in body
-        .get("data")
-        .and_then(|v| v.get("limits"))
-        .and_then(|v| v.as_array())
-        .into_iter()
-        .flatten()
-    {
-        let Some(label) = limit
-            .get("type")
-            .and_then(|v| v.as_str())
-            .and_then(|kind| match kind {
-                "TOKENS_LIMIT" => Some("Tokens"),
-                "TIME_LIMIT" => Some("MCP Usage"),
-                _ => None,
-            })
-        else {
-            continue;
-        };
-        let bucket = usage_bucket(
-            label,
-            limit
-                .get("percentage")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0),
-            limit.get("nextResetTime").and_then(|v| v.as_i64()),
-            now_unix,
-        );
-        groups.push(QuotaGroup {
-            display_name: Some(label.to_string()),
-            buckets: vec![bucket],
-            models: None,
-        });
+/// One `balances[]` entry lifted out of a ZCode desktop log line.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ZcodeBalanceEntry {
+    pub show_name: String,
+    pub used_units: f64,
+    pub total_units: f64,
+    /// Seconds until the period resets.
+    pub period_end_unix: i64,
+}
+
+/// Find the most recent `"balances":[...]` array in ZCode desktop log text and
+/// pull out one entry per entitlement. The app logs the full balance JSON on
+/// every poll, so scanning backwards for the last occurrence gives the
+/// freshest snapshot without any network access.
+pub fn extract_zcode_balances(text: &str) -> Option<Vec<ZcodeBalanceEntry>> {
+    let marker = "\"balances\":[";
+    let mut found = None;
+    let mut from = 0;
+    while let Some(pos) = text[from..].find(marker) {
+        let absolute = from + pos + marker.len();
+        if let Some(end) = balanced_array_end(&text.as_bytes()[absolute..]) {
+            found = Some((absolute, absolute + end));
+        }
+        from += pos + marker.len();
     }
+    let (start, end) = found?;
+    let parsed: serde_json::Value = serde_json::from_str(&format!("[{}]", &text[start..end])).ok()?;
+    let entries = parsed.as_array()?;
+    let balances: Vec<ZcodeBalanceEntry> = entries
+        .iter()
+        .filter_map(|entry| {
+            Some(ZcodeBalanceEntry {
+                show_name: entry
+                    .get("show_name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("GLM")
+                    .to_string(),
+                used_units: entry.get("used_units").and_then(serde_json::Value::as_f64)?,
+                total_units: entry.get("total_units").and_then(serde_json::Value::as_f64)?,
+                period_end_unix: entry
+                    .get("period_end")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0),
+            })
+        })
+        .collect();
+    (!balances.is_empty()).then_some(balances)
+}
+
+/// Length of the balanced `[...]` array whose opening bracket was already
+/// consumed — `bytes` start just inside it.
+fn balanced_array_end(bytes: &[u8]) -> Option<usize> {
+    let mut depth = 1usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (index, byte) in bytes.iter().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if *byte == b'\\' {
+                escaped = true;
+            } else if *byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Convert balance entries into the account usage snapshot the console shows:
+/// one bucket per plan entitlement, consumed percentage against the period
+/// grant, resetting at the period end.
+pub fn zcode_balances_usage(balances: &[ZcodeBalanceEntry], now_unix: i64) -> AccountUsage {
+    let buckets = balances
+        .iter()
+        .map(|entry| {
+            let used_percent = if entry.total_units > 0.0 {
+                (entry.used_units / entry.total_units * 100.0).clamp(0.0, 100.0)
+            } else {
+                0.0
+            };
+            usage_bucket(
+                &entry.show_name,
+                used_percent,
+                Some(entry.period_end_unix),
+                now_unix,
+            )
+        })
+        .collect::<Vec<_>>();
     AccountUsage {
-        groups,
+        groups: if buckets.is_empty() {
+            Vec::new()
+        } else {
+            vec![QuotaGroup {
+                display_name: Some("GLM Coding Plan".to_string()),
+                buckets,
+                models: None,
+            }]
+        },
+        observed_at_unix: Some(now_unix),
         ..AccountUsage::default()
     }
 }
