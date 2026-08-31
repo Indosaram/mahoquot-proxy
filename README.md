@@ -78,6 +78,19 @@ If running alongside the Mahoquot desktop monitor app, you can point the app to 
 export MAHOQUOT_GATEWAY_BIN="/path/to/mahoquot-proxy/target/release/mahoquot-gateway"
 ```
 
+## Console UI
+
+The gateway serves the operations console embedded from `ui/index.html` (via `include_str!("../../../ui/index.html")` in `crates/gateway/src/static_pages.rs`).
+
+After changing the frontend in `quotio-rs/crates/monitor-ui/frontend`:
+1. Build the frontend and sync the artifact:
+   ```bash
+   cd /path/to/quotio-rs/crates/monitor-ui/frontend
+   bun run build
+   bun run sync:proxy
+   ```
+2. Rebuild and restart the gateway binary (`cargo build` / `cargo run`), because `ui/index.html` is embedded at compile time via `include_str!`. Running `sync:proxy` updates the repository copy in `ui/index.html`, but a gateway rebuild is required for the served UI to reflect the updated bundle.
+
 ## Testing & Benchmarks
 
 ```bash
