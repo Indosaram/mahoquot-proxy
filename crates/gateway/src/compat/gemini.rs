@@ -1,6 +1,29 @@
+use base64::Engine as _;
 use serde_json::{json, Map, Value};
 
 use super::events::{CodexEvent, Usage};
+
+const SIGNATURE_ID_SEPARATOR: char = '#';
+
+fn embed_signature_in_call_id(id: &str, signature: &str) -> String {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    format!(
+        "{id}{SIGNATURE_ID_SEPARATOR}{}",
+        URL_SAFE_NO_PAD.encode(signature.as_bytes())
+    )
+}
+
+fn split_signature_from_call_id(id: &str) -> (String, Option<String>) {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let Some((plain, encoded)) = id.split_once(SIGNATURE_ID_SEPARATOR) else {
+        return (id.to_string(), None);
+    };
+    let decoded = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok());
+    (plain.to_string(), decoded)
+}
 
 pub fn openai_to_gemini(body: &Value) -> Result<Value, String> {
     let model = body
@@ -46,7 +69,17 @@ pub fn openai_to_gemini(body: &Value) -> Result<Value, String> {
                         .and_then(Value::as_str)
                         .and_then(|s| serde_json::from_str::<Value>(s).ok())
                         .unwrap_or_else(|| json!({}));
-                    parts.push(json!({ "functionCall": { "name": name, "args": args } }));
+                    let raw_id = call.get("id").and_then(Value::as_str).unwrap_or("");
+                    let (_, signature) = split_signature_from_call_id(raw_id);
+                    let mut part_value = json!({ "functionCall": { "name": name, "args": args } });
+                    if let Some(signature) = signature.or_else(|| {
+                        call.get("thought_signature")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    }) {
+                        part_value["thoughtSignature"] = Value::String(signature);
+                    }
+                    parts.push(part_value);
                 }
                 if !parts.is_empty() {
                     contents.push(json!({ "role": "model", "parts": parts }));
@@ -203,8 +236,12 @@ pub fn gemini_json_to_openai(body: &Value, model: &str, created: i64) -> Value {
                     .get("args")
                     .map(|a| a.to_string())
                     .unwrap_or_else(|| "{}".to_string());
+                let mut id = format!("call_{name}_{idx}");
+                if let Some(sig) = part.get("thoughtSignature").and_then(Value::as_str) {
+                    id = embed_signature_in_call_id(&id, sig);
+                }
                 tool_calls.push(json!({
-                    "id": format!("call_{name}_{idx}"),
+                    "id": id,
                     "type": "function",
                     "function": {
                         "name": name,
@@ -327,6 +364,7 @@ pub struct GeminiDecoder {
     tool_index: u64,
     usage: Option<Usage>,
     completed: bool,
+    pending_signature: Option<String>,
 }
 
 impl GeminiDecoder {
@@ -417,9 +455,22 @@ impl GeminiDecoder {
                         .unwrap_or_else(|| "{}".to_string());
                     let output_index = self.tool_index;
                     self.tool_index += 1;
+                    let signature = part
+                        .get("thoughtSignature")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .take()
+                        .or_else(|| self.pending_signature.take());
+                    let call_id = match signature.as_deref() {
+                        Some(sig) => embed_signature_in_call_id(
+                            &format!("call_{name}_{output_index}"),
+                            sig,
+                        ),
+                        None => format!("call_{name}_{output_index}"),
+                    };
                     out.push(CodexEvent::ToolCallBegin {
                         output_index,
-                        call_id: format!("call_{name}_{output_index}"),
+                        call_id,
                         name: name.to_string(),
                     });
                     out.push(CodexEvent::ToolArgsDelta {
@@ -431,6 +482,7 @@ impl GeminiDecoder {
                 if let Some(sig) = part.get("thoughtSignature").and_then(Value::as_str) {
                     out.push(CodexEvent::ReasoningSignature(sig.to_string()));
                     if part.get("text").is_none() {
+                        self.pending_signature = Some(sig.to_string());
                         continue;
                     }
                 }
@@ -553,5 +605,119 @@ mod tests {
         let request = openai_to_gemini(&body).expect("translate");
         let text = request["contents"][0]["parts"][0]["text"].as_str().unwrap();
         assert!(text.contains("payload text stays"));
+    }
+}
+
+#[cfg(test)]
+mod signature_tests {
+    use super::*;
+
+    #[test]
+    fn thought_signature_round_trips_through_call_ids() {
+        let sig = "GgVSIGWq3bct77QK0b5EwQ==";
+        let id = embed_signature_in_call_id("call_todo_4", sig);
+        assert!(id.starts_with("call_todo_4#"));
+        let (plain, decoded) = split_signature_from_call_id(&id);
+        assert_eq!(plain, "call_todo_4");
+        assert_eq!(decoded.as_deref(), Some(sig));
+    }
+
+    #[test]
+    fn plain_call_ids_decode_without_signature() {
+        let (plain, decoded) = split_signature_from_call_id("call_todo_4");
+        assert_eq!(plain, "call_todo_4");
+        assert_eq!(decoded, None);
+    }
+
+    #[test]
+    fn request_history_attaches_signature_from_tool_call_id() {
+        let id = embed_signature_in_call_id("call_todo_4", "SIG");
+        let body = json!({
+            "model": "gemini-3.7-flash-high",
+            "messages": [
+                { "role": "user", "content": "plan" },
+                { "role": "assistant", "tool_calls": [
+                    { "id": id, "type": "function",
+                      "function": { "name": "todo", "arguments": "{}" } }
+                ]},
+                { "role": "tool", "tool_call_id": id, "name": "todo", "content": "{}" }
+            ]
+        });
+
+        let request = openai_to_gemini(&body).expect("translate");
+        let parts = &request["contents"][1]["parts"];
+        assert_eq!(parts[0]["functionCall"]["name"], "todo");
+        assert_eq!(parts[0]["thoughtSignature"], "SIG");
+    }
+
+    #[test]
+    fn request_history_stays_signature_free_for_plain_ids() {
+        let body = json!({
+            "model": "gemini-3.7-flash-high",
+            "messages": [
+                { "role": "user", "content": "plan" },
+                { "role": "assistant", "tool_calls": [
+                    { "id": "call_todo_4", "type": "function",
+                      "function": { "name": "todo", "arguments": "{}" } }
+                ]},
+                { "role": "tool", "tool_call_id": "call_todo_4", "name": "todo", "content": "{}" }
+            ]
+        });
+
+        let request = openai_to_gemini(&body).expect("translate");
+        let parts = &request["contents"][1]["parts"];
+        assert!(parts[0]["functionCall"].get("thoughtSignature").is_none());
+    }
+
+    #[test]
+    fn gemini_json_to_openai_embeds_signature_from_function_call() {
+        let response = json!({
+            "candidates": [{ "content": { "parts": [
+                { "functionCall": { "name": "todo", "args": {} },
+                  "thoughtSignature": "SIGJSON" }
+            ]}}]
+        });
+
+        let out = gemini_json_to_openai(&response, "gemini-3.7-flash-high", 0);
+        let id = out["choices"][0]["message"]["tool_calls"][0]["id"]
+            .as_str()
+            .expect("tool call id");
+        let (_, decoded) = split_signature_from_call_id(id);
+        assert_eq!(decoded.as_deref(), Some("SIGJSON"));
+    }
+
+    #[test]
+    fn decoder_embeds_signature_from_the_function_call_part() {
+        let mut decoder = GeminiDecoder::new();
+        let mut out = Vec::new();
+        decoder.decode(
+            br#"{"candidates":[{"content":{"parts":[{"functionCall":{"name":"todo","args":{}},"thoughtSignature":"SIGSTREAM"}]}}]}"#,
+            &mut out,
+        );
+        let begin = out.iter().find_map(|event| match event {
+            CodexEvent::ToolCallBegin { call_id, .. } => Some(call_id.clone()),
+            _ => None,
+        });
+        let (_, decoded) = split_signature_from_call_id(begin.expect("tool call begin").as_str());
+        assert_eq!(decoded.as_deref(), Some("SIGSTREAM"));
+    }
+
+    #[test]
+    fn decoder_carries_a_standalone_signature_part_into_the_next_call_id() {
+        let mut decoder = GeminiDecoder::new();
+        let mut out = Vec::new();
+        decoder.decode(
+            br#"{"candidates":[{"content":{"parts":[
+                {"thoughtSignature":"SIGPENDING"},
+                {"functionCall":{"name":"todo","args":{}}}
+            ]}}]}"#,
+            &mut out,
+        );
+        let begin = out.iter().find_map(|event| match event {
+            CodexEvent::ToolCallBegin { call_id, .. } => Some(call_id.clone()),
+            _ => None,
+        });
+        let (_, decoded) = split_signature_from_call_id(begin.expect("tool call begin").as_str());
+        assert_eq!(decoded.as_deref(), Some("SIGPENDING"));
     }
 }
