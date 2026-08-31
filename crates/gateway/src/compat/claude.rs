@@ -332,6 +332,32 @@ pub fn openai_to_anthropic(body: &Value) -> Result<Value, String> {
             result[key] = value.clone();
         }
     }
+    // Reasoning effort maps to the Anthropic thinking budget both upstreams
+    // (api.anthropic.com and z.ai's /api/anthropic) accept. The thinking block
+    // must fit inside max_tokens (budget < max_tokens, plus room for the
+    // answer), so a too-small client max_tokens is raised to make room.
+    if let Some(effort) = body.get("reasoning_effort").and_then(Value::as_str) {
+        let budget: u64 = match effort {
+            "minimal" => 1024,
+            "low" => 2048,
+            "medium" => 8192,
+            "high" => 16384,
+            "xhigh" => 49152,
+            "max" => 32768,
+            _ => 0,
+        };
+        if budget > 0 {
+            let max_tokens = body
+                .get("max_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(4096);
+            let needed = budget + 4096;
+            if max_tokens <= budget {
+                result["max_tokens"] = json!(needed);
+            }
+            result["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
+        }
+    }
     Ok(result)
 }
 
@@ -877,5 +903,64 @@ mod contract_tests {
         .expect("translation");
         assert_eq!(translated["tools"][0]["name"], "web_search");
         assert_eq!(translated["tools"][1]["name"], "custom_editor");
+    }
+
+    #[test]
+    fn reasoning_effort_maps_to_the_upstream_thinking_budget() {
+        let body = json!({
+            "model": "glm-5.3-flash",
+            "reasoning_effort": "low",
+            "max_tokens": 4096,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let out = openai_to_anthropic(&body).unwrap();
+        assert_eq!(
+            out["thinking"],
+            json!({"type": "enabled", "budget_tokens": 2048})
+        );
+        // low already fits under the client max_tokens; only max needs the raise
+        assert_eq!(out["max_tokens"], json!(4096));
+
+        let body = json!({
+            "model": "glm-5.3-flash",
+            "reasoning_effort": "max",
+            "max_tokens": 4096,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let out = openai_to_anthropic(&body).unwrap();
+        assert_eq!(
+            out["thinking"],
+            json!({"type": "enabled", "budget_tokens": 32768})
+        );
+        assert_eq!(out["max_tokens"], json!(36864));
+    }
+
+    #[test]
+    fn a_tiny_max_tokens_is_raised_to_make_room_for_thinking() {
+        let body = json!({
+            "model": "glm-5.3-flash",
+            "reasoning_effort": "high",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let out = openai_to_anthropic(&body).unwrap();
+        assert_eq!(
+            out["thinking"],
+            json!({"type": "enabled", "budget_tokens": 16384})
+        );
+        assert_eq!(out["max_tokens"], json!(20480));
+    }
+
+    #[test]
+    fn unknown_efforts_are_ignored() {
+        let body = json!({
+            "model": "glm-5.3-flash",
+            "reasoning_effort": "turbo",
+            "max_tokens": 4096,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let out = openai_to_anthropic(&body).unwrap();
+        assert!(out.get("thinking").is_none());
+        assert_eq!(out["max_tokens"], json!(4096));
     }
 }
