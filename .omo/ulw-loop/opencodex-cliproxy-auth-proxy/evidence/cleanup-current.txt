@@ -1,0 +1,11 @@
+Final current-tree QA cleanup:
+
+- Codex mock upstream on TCP 18881 terminated.
+- OpenAI QA gateway on TCP 18880 terminated.
+- Anthropic mock upstream on TCP 18883 terminated.
+- Anthropic QA gateway on TCP 18882 terminated.
+- Temporary credentials under `.tmp/ulw-final/auth` deleted.
+- Earlier `.tmp/ulw-qa` files, `crates/gateway/logs/gateway.log`,
+  `.tmp-capture.mjs`, and `.tmp-v4.mjs` deleted.
+- Final listener check covers 18801, 18880-18883, and 35959.
+- Gateway-generated `generated.yaml`, telemetry, and gateway log files deleted.

@@ -1,0 +1,5 @@
+$ bun run test -- src/__tests__/provider-catalog.test.ts
+
+PASS src/__tests__/provider-catalog.test.ts
+Test Files 1 passed
+Tests 12 passed

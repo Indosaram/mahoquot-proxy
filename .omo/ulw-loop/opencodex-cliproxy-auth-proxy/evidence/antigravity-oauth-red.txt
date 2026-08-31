@@ -1,0 +1,27 @@
+   Compiling mahoquot-gateway v0.1.0 (/Users/indo/code/project/quotio-rs/crates/gateway)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.61s
+     Running tests/t13_provider_oauth.rs (target/debug/deps/t13_provider_oauth-7f8e5e7fe1f2e602)
+
+running 3 tests
+
+thread 'test_antigravity_oauth_malformed_token_response_fails_cleanly' (53677536) panicked at crates/gateway/tests/t13_provider_oauth.rs:1003:5:
+assertion `left == right` failed
+  left: 200
+ right: 400
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test test_antigravity_oauth_callback_state_edge ... ok
+test test_antigravity_oauth_malformed_token_response_fails_cleanly ... FAILED
+
+thread 'test_antigravity_oauth_flow_end_to_end' (53677535) panicked at crates/gateway/tests/t13_provider_oauth.rs:837:5:
+assertion failed: auth_url.contains(&format!("client_id={}", url_encode(ANTIGRAVITY_CLIENT_ID)))
+test test_antigravity_oauth_flow_end_to_end ... FAILED
+
+failures:
+
+failures:
+    test_antigravity_oauth_flow_end_to_end
+    test_antigravity_oauth_malformed_token_response_fails_cleanly
+
+test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `-p mahoquot-gateway --test t13_provider_oauth`

@@ -1,0 +1,63 @@
+$ vitest run src/__tests__/provider-catalog.test.ts
+
+ RUN  v3.2.7 /Users/indo/code/project/quotio-rs/crates/monitor-ui/frontend
+
+ ❯ src/__tests__/provider-catalog.test.ts (11 tests | 2 failed) 13ms
+   ✓ provider-catalog > provides a brand icon for every catalog and dedicated onboarding provider 1ms
+   ✓ provider-catalog > exports exactly 83 unique production provider IDs 1ms
+   ✓ provider-catalog > ensures every catalog row has strict required fields and valid authKind 6ms
+   ✓ provider-catalog > contains major production providers with exact metadata 0ms
+   ✓ provider-catalog > normalized alias helpers > normalizes OpenCodex IDs to Quotio IDs via normalizeToQuotioProviderId / normalizeProviderAlias 0ms
+   ✓ provider-catalog > normalized alias helpers > normalizes Quotio IDs back to OpenCodex IDs via normalizeToOpenCodexProviderId 0ms
+   ✓ provider-catalog > normalized alias helpers > resolves catalog entries via getProviderCatalogEntry / getProviderPreset 0ms
+   ✓ provider-catalog > normalized alias helpers > checks provider existence via isKnownProviderId 0ms
+   ✓ provider-catalog > normalized alias helpers > exports alias maps with frozen records 0ms
+   × provider-catalog > OAuth catalog and onboarding alignment > does not classify command-code as OAuth when its onboarding path is API key import 3ms
+     → expected 'oauth' to be 'key' // Object.is equality
+   × provider-catalog > OAuth catalog and onboarding alignment > ensures every catalog entry marked as oauth corresponds to a dedicated working onboarding route 1ms
+     → expected true to be false // Object.is equality
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/__tests__/provider-catalog.test.ts > provider-catalog > OAuth catalog and onboarding alignment > does not classify command-code as OAuth when its onboarding path is API key import
+AssertionError: expected 'oauth' to be 'key' // Object.is equality
+
+Expected: [32m"key"[39m
+Received: [31m"oauth"[39m
+
+ ❯ src/__tests__/provider-catalog.test.ts:234:24
+    232|       // Then: it must be classified as key import, not oauth
+    233|       expect(entry).toBeDefined();
+    234|       expect(authKind).toBe("key");
+       |                        ^
+    235|       expect(authKind).not.toBe("oauth");
+    236|     });
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
+
+ FAIL  src/__tests__/provider-catalog.test.ts > provider-catalog > OAuth catalog and onboarding alignment > ensures every catalog entry marked as oauth corresponds to a dedicated working onboarding route
+AssertionError: expected true to be false // Object.is equality
+
+[32m- Expected[39m
+[31m+ Received[39m
+
+[32m- false[39m
+[31m+ true[39m
+
+ ❯ src/__tests__/provider-catalog.test.ts:261:73
+    259| 
+    260|       // Then: all oauth catalog entries have an onboarding route and …
+    261|       expect(oauthEntries.some((entry) => entry.id === "command-code")…
+       |                                                                         ^
+    262|       for (const entry of oauthEntries) {
+    263|         const canonicalId = entry.id;
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/2]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  2 failed | 9 passed (11)
+   Start at  17:30:24
+   Duration  715ms (transform 62ms, setup 86ms, collect 134ms, tests 13ms, environment 229ms, prepare 39ms)
+
+error: script "test" exited with code 1

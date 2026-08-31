@@ -1,0 +1,9 @@
+{
+  "bad_key_401": true,
+  "openai_stream_200": true,
+  "openai_nonstream_200": true,
+  "compact_200": true,
+  "anthropic_200": true,
+  "no_client_secret": true,
+  "no_upstream_secrets": true
+}

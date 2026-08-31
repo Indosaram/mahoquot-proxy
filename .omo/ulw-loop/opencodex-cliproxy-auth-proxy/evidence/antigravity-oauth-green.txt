@@ -1,0 +1,9 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.24s
+     Running tests/t13_provider_oauth.rs (target/debug/deps/t13_provider_oauth-7f8e5e7fe1f2e602)
+
+running 3 tests
+test test_antigravity_oauth_malformed_token_response_fails_cleanly ... ok
+test test_antigravity_oauth_flow_end_to_end ... ok
+test test_antigravity_oauth_callback_state_edge ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.02s

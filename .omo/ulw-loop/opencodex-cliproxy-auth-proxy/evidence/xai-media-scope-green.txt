@@ -1,0 +1,21 @@
+   Compiling mahoquot-gateway v0.1.0 (/Users/indo/code/project/quotio-rs/crates/gateway)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.37s
+     Running unittests src/lib.rs (target/debug/deps/mahoquot_gateway-4f7cab86b90cbb98)
+
+running 5 tests
+test capability::tests::reference_backed_image_models_pass_surface_gate ... ok
+test capability::tests::unimplemented_media_models_are_not_advertised_as_routable ... ok
+test capability::tests::unknown_provider_carries_code_and_param ... ok
+test capability::tests::video_error_matches_captured_upstream_text ... ok
+test capability::tests::image_error_matches_captured_upstream_text ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 129 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.09s
+     Running tests/t8_openai_compat.rs (target/debug/deps/t8_openai_compat-ee1e36263de1c750)
+
+running 1 test
+test test_t8_unimplemented_xai_media_models_fail_closed ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.01s
+

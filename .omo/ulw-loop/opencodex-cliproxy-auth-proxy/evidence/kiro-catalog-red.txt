@@ -1,0 +1,7 @@
+$ bun run test -- src/__tests__/provider-catalog.test.ts
+
+FAIL provider-catalog > OAuth catalog and onboarding alignment > does not advertise Kiro browser OAuth when onboarding is credential import
+AssertionError: expected 'oauth' to be 'key'
+
+Test Files 1 failed
+Tests 1 failed | 11 passed

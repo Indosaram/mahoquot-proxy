@@ -1,0 +1,42 @@
+   Compiling mahoquot-gateway v0.1.0 (/Users/indo/code/project/quotio-rs/crates/gateway)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.49s
+     Running tests/t12_provider_relay.rs (target/debug/deps/t12_provider_relay-681cea13dfc24fe9)
+
+running 1 test
+
+thread 'google_ai_studio_uses_generativelanguage_wire_and_api_key_header' (54225623) panicked at crates/gateway/tests/t12_provider_relay.rs:246:5:
+assertion `left == right` failed
+  left: Null
+ right: "google-ok"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test google_ai_studio_uses_generativelanguage_wire_and_api_key_header ... FAILED
+
+failures:
+
+failures:
+    google_ai_studio_uses_generativelanguage_wire_and_api_key_header
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.04s
+
+error: test failed, to rerun pass `-p mahoquot-gateway --test t12_provider_relay`
+   Compiling mahoquot-gateway v0.1.0 (/Users/indo/code/project/quotio-rs/crates/gateway)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.77s
+     Running tests/t14_management_route_parity.rs (target/debug/deps/t14_management_route_parity-e9055e02710c8329)
+
+running 1 test
+
+thread 'unimplemented_pluginhost_routes_are_not_advertised_as_handlers' (54226126) panicked at crates/gateway/tests/t14_management_route_parity.rs:162:9:
+assertion `left == right` failed: GET /v0/management/plugins
+  left: 200
+ right: 404
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test unimplemented_pluginhost_routes_are_not_advertised_as_handlers ... FAILED
+
+failures:
+
+failures:
+    unimplemented_pluginhost_routes_are_not_advertised_as_handlers
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `-p mahoquot-gateway --test t14_management_route_parity`

@@ -1,0 +1,11 @@
+$ vitest run src/__tests__/provider-catalog.test.ts
+
+ RUN  v3.2.7 /Users/indo/code/project/quotio-rs/crates/monitor-ui/frontend
+
+ ✓ src/__tests__/provider-catalog.test.ts (11 tests) 13ms
+
+ Test Files  1 passed (1)
+      Tests  11 passed (11)
+   Start at  17:30:43
+   Duration  653ms (transform 60ms, setup 82ms, collect 130ms, tests 13ms, environment 207ms, prepare 31ms)
+

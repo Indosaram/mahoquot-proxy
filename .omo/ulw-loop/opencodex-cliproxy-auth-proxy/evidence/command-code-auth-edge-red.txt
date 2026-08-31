@@ -1,0 +1,32 @@
+   Compiling mahoquot-gateway v0.1.0 (/Users/indo/code/project/quotio-rs/crates/gateway)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 7.79s
+     Running tests/t13_provider_oauth.rs (target/debug/deps/t13_provider_oauth-11a50f1be634fdfb)
+
+running 6 tests
+
+thread 'test_command_code_oauth_reports_unavailable_default_callback_port' (54143294) panicked at crates/gateway/tests/t13_provider_oauth.rs:1633:5:
+assertion `left == right` failed
+  left: 200
+ right: 409
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test test_command_code_oauth_reports_unavailable_default_callback_port ... FAILED
+test test_command_code_oauth_mismatched_state_fails_without_persistence ... ok
+test test_command_code_oauth_malformed_callback_fails_without_persistence ... ok
+
+thread 'test_command_code_oauth_rejects_whoami_without_identity' (54143293) panicked at crates/gateway/tests/t13_provider_oauth.rs:1595:5:
+assertion `left == right` failed
+  left: 200
+ right: 400
+test test_command_code_oauth_rejects_whoami_without_identity ... FAILED
+test test_command_code_oauth_flow_end_to_end ... ok
+test test_command_code_oauth_whoami_failure_fails_without_persistence ... ok
+
+failures:
+
+failures:
+    test_command_code_oauth_rejects_whoami_without_identity
+    test_command_code_oauth_reports_unavailable_default_callback_port
+
+test result: FAILED. 4 passed; 2 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.07s
+
+error: test failed, to rerun pass `-p mahoquot-gateway --test t13_provider_oauth`

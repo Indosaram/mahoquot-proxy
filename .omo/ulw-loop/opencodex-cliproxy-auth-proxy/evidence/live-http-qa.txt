@@ -1,0 +1,46 @@
+=== openai-nonstream exit=0 ===
+HTTP/1.1 503 Service Unavailable
+content-type: application/json
+access-control-allow-origin: *
+access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
+access-control-allow-headers: Authorization, Content-Type
+content-length: 91
+date: Sun, 30 Aug 2026 08:45:00 GMT
+
+{"error":{"message":"no available accounts for this model","type":"invalid_request_error"}}
+STDERR:
+
+=== openai-stream exit=0 ===
+HTTP/1.1 503 Service Unavailable
+content-type: application/json
+access-control-allow-origin: *
+access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
+access-control-allow-headers: Authorization, Content-Type
+content-length: 91
+date: Sun, 30 Aug 2026 08:45:00 GMT
+
+{"error":{"message":"no available accounts for this model","type":"invalid_request_error"}}
+STDERR:
+
+=== responses-compact exit=0 ===
+HTTP/1.1 400 Bad Request
+content-type: application/json
+access-control-allow-origin: *
+access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
+access-control-allow-headers: Authorization, Content-Type
+content-length: 134
+date: Sun, 30 Aug 2026 08:45:00 GMT
+
+{"error":{"code":"model_not_found","message":"unknown provider for model gpt-5.6-sol","param":"model","type":"invalid_request_error"}}
+STDERR:
+
+=== anthropic-stream exit=0 ===
+HTTP/1.1 404 Not Found
+access-control-allow-origin: *
+access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
+access-control-allow-headers: Authorization, Content-Type
+content-length: 0
+date: Sun, 30 Aug 2026 08:45:00 GMT
+
+
+STDERR:

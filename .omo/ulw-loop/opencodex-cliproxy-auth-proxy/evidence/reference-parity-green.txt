@@ -1,0 +1,6 @@
+$ cargo test -p mahoquot-gateway --test t20_reference_parity -- --nocapture
+
+running 1 test
+test every_reference_backed_flow_maps_to_an_owner_green_test_and_evidence ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out

@@ -1,0 +1,48 @@
+Current-tree manual QA on 2026-08-30.
+
+Real processes:
+- `cargo run -q -p bench -- mock --port 18881 --ttft-ms 1 --chunks 2 --protocol codex`
+- `AUTH_DIR=$PWD/.tmp/ulw-final/auth GATEWAY_PORT=18880 API_KEYS=qa-client-key MODELS=gpt-5.6-sol CONFIG_PATH=$PWD/.tmp/ulw-final/generated.yaml USAGE_POLL_SECS=3600 RUST_LOG=info cargo run -q -p mahoquot-gateway`
+
+Literal curl results:
+
+```text
+=== BAD KEY ===
+HTTP/1.1 401 Unauthorized
+{"error":{"message":"invalid api key","type":"invalid_request_error"}}
+
+=== NONSTREAM ===
+HTTP/1.1 200 OK
+content-type: application/json
+{"choices":[{"finish_reason":"stop","index":0,"message":{"content":"xx","role":"assistant"}}],"model":"gpt-5.6-sol","object":"chat.completion"}
+
+=== STREAM ===
+HTTP/1.1 200 OK
+content-type: text/event-stream
+data: {"choices":[{"delta":{"content":"","role":"assistant"}}],"model":"gpt-5.6-sol","object":"chat.completion.chunk"}
+data: {"choices":[{"delta":{"content":"x"}}],"model":"gpt-5.6-sol","object":"chat.completion.chunk"}
+data: {"choices":[{"delta":{"content":"x"}}],"model":"gpt-5.6-sol","object":"chat.completion.chunk"}
+data: {"choices":[{"delta":{},"finish_reason":"stop"}],"model":"gpt-5.6-sol","object":"chat.completion.chunk"}
+data: [DONE]
+
+=== ANTHROPIC NONSTREAM ===
+HTTP/1.1 200 OK
+content-type: application/json
+{"content":[{"text":"anthropic-current","type":"text"}],"id":"msg_live","model":"claude-sonnet-4-5-20250929","role":"assistant","stop_reason":"end_turn","type":"message","usage":{"input_tokens":3,"output_tokens":2}}
+
+=== ANTHROPIC STREAM ===
+HTTP/1.1 200 OK
+content-type: text/event-stream
+event: message_start
+event: content_block_start
+event: content_block_delta
+data: {"delta":{"text":"anthropic-current","type":"text_delta"},"index":0,"type":"content_block_delta"}
+event: content_block_stop
+event: message_delta
+event: message_stop
+```
+
+No client API key, upstream bearer token, refresh token, or account ID appeared in
+gateway output during the requests. The first attempted run lacked the credential
+`upstream_override` and correctly failed rather than being counted as QA evidence;
+the recorded results are from the corrected run against port 18881.

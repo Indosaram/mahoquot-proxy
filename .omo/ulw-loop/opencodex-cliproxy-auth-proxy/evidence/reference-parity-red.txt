@@ -1,0 +1,8 @@
+$ cargo test -p mahoquot-gateway --test t20_reference_parity -- --nocapture
+
+running 1 test
+test every_reference_backed_flow_maps_to_an_owner_green_test_and_evidence ... FAILED
+
+/Users/indo/code/project/quotio-rs/.omo/ulw-loop/opencodex-cliproxy-auth-proxy/evidence/reference-parity.json: No such file or directory (os error 2)
+
+test result: FAILED. 0 passed; 1 failed

@@ -1,0 +1,84 @@
+=== import ===
+HTTP/1.1 200 OK
+content-type: application/json
+x-cpa-version: 7.2.140
+x-cpa-commit: a7e3596b
+x-cpa-build-date: 2026-08-22T14:51:09Z
+x-cpa-support-plugin: 1
+access-control-expose-headers: X-CPA-TRACE-ID, X-CPA-VERSION, X-CPA-COMMIT, X-CPA-BUILD-DATE, X-CPA-SUPPORT-PLUGIN, X-CPA-HOME-VERSION, X-CPA-HOME-BUILD-DATE, X-SERVER-VERSION, X-SERVER-BUILD-DATE, Location, Retry-After, X-Request-Id, OpenAI-Request-Id
+access-control-allow-origin: *
+access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
+access-control-allow-headers: Authorization, Content-Type
+content-length: 43
+date: Sun, 30 Aug 2026 08:53:30 GMT
+
+{"name":"codex-qa-plus.json","status":"ok"}
+=== models exit=0 ===
+HTTP/1.1 200 OK
+content-type: application/json
+access-control-allow-origin: *
+access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
+access-control-allow-headers: Authorization, Content-Type
+content-length: 583
+date: Sun, 30 Aug 2026 08:53:30 GMT
+
+{"data":[{"created":1788080010,"id":"gpt-5.6-sol","object":"model","owned_by":"openai"},{"created":1788080010,"id":"gpt-5.6-luna","object":"model","owned_by":"openai"},{"created":1788080010,"id":"gpt-5.6-terra","object":"model","owned_by":"openai"},{"created":1788080010,"id":"gpt-5.5","object":"model","owned_by":"openai"},{"created":1788080010,"id":"gpt-5.4","object":"model","owned_by":"openai"},{"created":1788080010,"id":"gpt-5.4-mini","object":"model","owned_by":"openai"},{"created":1788080010,"id":"gpt-5.3-codex-spark","object":"model","owned_by":"openai"}],"object":"list"}
+STDERR:
+
+=== bad-key exit=0 ===
+HTTP/1.1 401 Unauthorized
+content-type: application/json
+access-control-allow-origin: *
+access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
+access-control-allow-headers: Authorization, Content-Type
+content-length: 70
+date: Sun, 30 Aug 2026 08:53:30 GMT
+
+{"error":{"message":"invalid api key","type":"invalid_request_error"}}
+STDERR:
+
+=== openai-stream exit=0 ===
+HTTP/1.1 200 OK
+content-type: text/event-stream
+cache-control: no-cache
+access-control-allow-origin: *
+access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
+access-control-allow-headers: Authorization, Content-Type
+transfer-encoding: chunked
+date: Sun, 30 Aug 2026 08:53:30 GMT
+
+data: {"choices":[{"delta":{"content":"","role":"assistant"},"finish_reason":null,"index":0}],"created":1788080010,"id":"chatcmpl-resp_bench","model":"gpt-5.6-sol","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"x"},"finish_reason":null,"index":0}],"created":1788080010,"id":"chatcmpl-resp_bench","model":"gpt-5.6-sol","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"x"},"finish_reason":null,"index":0}],"created":1788080010,"id":"chatcmpl-resp_bench","model":"gpt-5.6-sol","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{},"finish_reason":"stop","index":0}],"created":1788080010,"id":"chatcmpl-resp_bench","model":"gpt-5.6-sol","object":"chat.completion.chunk"}
+
+data: [DONE]
+
+
+STDERR:
+
+=== openai-nonstream exit=0 ===
+HTTP/1.1 200 OK
+content-type: application/json
+access-control-allow-origin: *
+access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
+access-control-allow-headers: Authorization, Content-Type
+content-length: 356
+date: Sun, 30 Aug 2026 08:53:30 GMT
+
+{"choices":[{"finish_reason":"stop","index":0,"message":{"content":"xx","role":"assistant"}}],"created":1788080010,"id":"chatcmpl-resp_bench","model":"gpt-5.6-sol","object":"chat.completion","usage":{"completion_tokens":20,"completion_tokens_details":{"reasoning_tokens":0},"prompt_tokens":16,"prompt_tokens_details":{"cached_tokens":0},"total_tokens":36}}
+STDERR:
+
+=== compact exit=0 ===
+HTTP/1.1 404 Not Found
+access-control-allow-origin: *
+access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
+access-control-allow-headers: Authorization, Content-Type
+content-length: 0
+date: Sun, 30 Aug 2026 08:53:30 GMT
+
+
+STDERR:

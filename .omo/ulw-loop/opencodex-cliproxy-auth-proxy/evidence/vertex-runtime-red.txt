@@ -1,0 +1,22 @@
+    Blocking waiting for file lock on build directory
+   Compiling mahoquot-gateway v0.1.0 (/Users/indo/code/project/quotio-rs/crates/gateway)
+error[E0599]: no variant or associated item named `Vertex` found for enum `ProviderKind` in the current scope
+   --> crates/gateway/tests/t19_vertex_runtime.rs:193:70
+    |
+193 |         if member.kind() == mahoquot_gateway::account::ProviderKind::Vertex
+    |                                                                      ^^^^^^ variant or associated item not found in `ProviderKind`
+
+error[E0599]: no variant or associated item named `Vertex` found for enum `ProviderKind` in the current scope
+   --> crates/gateway/tests/t19_vertex_runtime.rs:305:70
+    |
+305 |         if member.kind() == mahoquot_gateway::account::ProviderKind::Vertex
+    |                                                                      ^^^^^^ variant or associated item not found in `ProviderKind`
+
+error[E0599]: no variant or associated item named `Vertex` found for enum `ProviderKind` in the current scope
+   --> crates/gateway/tests/t19_vertex_runtime.rs:358:72
+    |
+358 |         .find(|m| m.kind() == mahoquot_gateway::account::ProviderKind::Vertex || m.provider_name() == "google-vertex")
+    |                                                                        ^^^^^^ variant or associated item not found in `ProviderKind`
+
+For more information about this error, try `rustc --explain E0599`.
+error: could not compile `mahoquot-gateway` (test "t19_vertex_runtime") due to 3 previous errors

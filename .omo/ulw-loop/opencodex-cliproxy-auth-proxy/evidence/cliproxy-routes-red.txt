@@ -1,0 +1,21 @@
+   Compiling mahoquot-gateway v0.1.0 (/Users/indo/code/project/quotio-rs/crates/gateway)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 22.04s
+     Running tests/t8_openai_compat.rs (target/debug/deps/t8_openai_compat-e7df48ffea0983f1)
+
+running 1 test
+
+thread 'test_t8_responses_compact_relays_to_codex_upstream' (53726740) panicked at crates/gateway/tests/t8_openai_compat.rs:147:5:
+assertion `left == right` failed
+  left: 404
+ right: 200
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test test_t8_responses_compact_relays_to_codex_upstream ... FAILED
+
+failures:
+
+failures:
+    test_t8_responses_compact_relays_to_codex_upstream
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p mahoquot-gateway --test t8_openai_compat`

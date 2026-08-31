@@ -1,0 +1,11 @@
+   Compiling mahoquot-gateway v0.1.0 (/Users/indo/code/project/quotio-rs/crates/gateway)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.91s
+     Running tests/t14_management_route_parity.rs (target/debug/deps/t14_management_route_parity-e9055e02710c8329)
+
+running 3 tests
+test unimplemented_pluginhost_routes_are_not_advertised_as_handlers ... ok
+test an_unimplemented_management_path_answers_the_bare_fallback ... ok
+test every_manifest_management_route_answers_from_a_registered_handler ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.47s
+

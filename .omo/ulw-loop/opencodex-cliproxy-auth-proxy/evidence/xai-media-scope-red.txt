@@ -1,0 +1,19 @@
+   Compiling mahoquot-gateway v0.1.0 (/Users/indo/code/project/quotio-rs/crates/gateway)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2m 48s
+     Running unittests src/lib.rs (target/debug/deps/mahoquot_gateway-26810a16ef49d99b)
+
+running 1 test
+
+thread 'capability::tests::unimplemented_media_models_are_not_advertised_as_routable' (54078874) panicked at crates/gateway/src/capability.rs:123:9:
+assertion failed: check_image("grok-imagine-image").is_some()
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test capability::tests::unimplemented_media_models_are_not_advertised_as_routable ... FAILED
+
+failures:
+
+failures:
+    capability::tests::unimplemented_media_models_are_not_advertised_as_routable
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 132 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p mahoquot-gateway --lib`
