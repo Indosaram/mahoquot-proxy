@@ -38,6 +38,7 @@ uuid.workspace = true
 jsonwebtoken.workspace = true
 prost.workspace = true
 prost-types.workspace = true
+clap.workspace = true
 
 [dev-dependencies]
 tower.workspace = true

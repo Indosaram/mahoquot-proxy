@@ -890,6 +890,7 @@ dependencies = [
  "axum",
  "base64",
  "bytes",
+ "clap",
  "futures",
  "http-body",
  "http-body-util",
