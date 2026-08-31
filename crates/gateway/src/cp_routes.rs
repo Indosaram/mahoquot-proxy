@@ -199,6 +199,27 @@ pub async fn realtime_hangup() -> Response {
     json_status(StatusCode::NOT_FOUND, realtime::call_not_found())
 }
 
+pub async fn realtime_sip_accept() -> Response {
+    json_status(
+        StatusCode::NOT_IMPLEMENTED,
+        realtime::capability_not_supported("Realtime SIP accept"),
+    )
+}
+
+pub async fn realtime_sip_reject() -> Response {
+    json_status(
+        StatusCode::NOT_IMPLEMENTED,
+        realtime::capability_not_supported("Realtime SIP reject"),
+    )
+}
+
+pub async fn realtime_sip_refer() -> Response {
+    json_status(
+        StatusCode::NOT_IMPLEMENTED,
+        realtime::capability_not_supported("Realtime SIP refer"),
+    )
+}
+
 pub async fn realtime_sip(Path((_call_id, action)): Path<(String, String)>) -> Response {
     json_status(
         StatusCode::NOT_IMPLEMENTED,

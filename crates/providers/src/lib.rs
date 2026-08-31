@@ -57,10 +57,13 @@ pub use vertex::{
     is_vertex_model, list_vertex_auth_files, load_vertex_account, VertexAccount, VERTEX_MODELS,
 };
 pub use zcode::{
-    is_provisioned_api_key, is_zcode_model, list_zcode_auth_files, zcode_messages_url,
-    ZcodeAccount, ZCODE_ANTHROPIC_BASE, ZCODE_API_BASE, ZCODE_LOGIN_URL, ZCODE_MESSAGES_PATH,
-    ZCODE_MODELS, ZCODE_OAUTH_AUTHORIZE_URL, ZCODE_OAUTH_BROKER_TOKEN_URL, ZCODE_OAUTH_CLIENT_ID,
-    ZCODE_OAUTH_REDIRECT_URI, ZCODE_USERINFO_URL,
+    extract_callback_code, find_existing_api_key, is_provisioned_api_key, is_zcode_model,
+    list_zcode_auth_files, parse_broker_token, parse_business_token, parse_copied_secret,
+    parse_created_api_key, parse_customer_info, zcode_authorize_url, zcode_messages_url,
+    ZcodeAccount, ZcodeCustomerInfo, ZCODE_ANTHROPIC_BASE, ZCODE_API_BASE, ZCODE_API_KEY_NAME,
+    ZCODE_LOGIN_URL, ZCODE_MESSAGES_PATH, ZCODE_MODELS, ZCODE_OAUTH_AUTHORIZE_URL,
+    ZCODE_OAUTH_BROKER_TOKEN_URL, ZCODE_OAUTH_CLIENT_ID, ZCODE_OAUTH_REDIRECT_URI,
+    ZCODE_USERINFO_URL,
 };
 
 #[cfg(test)]

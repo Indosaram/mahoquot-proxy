@@ -1654,3 +1654,241 @@ async fn test_command_code_oauth_reports_unavailable_default_callback_port() {
     drop(occupied);
     std::fs::remove_dir_all(auth_dir).ok();
 }
+
+static ZCODE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[tokio::test]
+async fn test_zcode_import_local_provisions_from_desktop_credentials() {
+    let _guard = ZCODE_ENV_LOCK.lock().unwrap();
+    let auth_dir = unique_temp_dir("qg-t13-zcode-import");
+    let creds_file = auth_dir.parent().unwrap().join(format!(
+        "zcode-desktop-creds-{}.json",
+        std::process::id()
+    ));
+    std::fs::write(
+        &creds_file,
+        serde_json::json!({ "oauth:zai:access_token": "upstream-zai-token" }).to_string(),
+    )
+    .unwrap();
+
+    let zcode_api = Router::new()
+        .route(
+            "/api/auth/z/login",
+            post(|| async { Json(json!({ "data": { "access_token": "business-token" } })) }),
+        )
+        .route(
+            "/api/biz/customer/getCustomerInfo",
+            get(|| async {
+                Json(json!({
+                    "data": {
+                        "email": "zcode.user@zai.example",
+                        "id": "cust-1",
+                        "organizations": [
+                            {"organizationId": "org-1", "isDefault": true,
+                             "projects": [{"projectId": "proj-1", "isDefault": true}]}
+                        ]
+                    }
+                }))
+            }),
+        )
+        .route(
+            "/api/biz/v1/organization/org-1/projects/proj-1/api_keys",
+            get(|| async { Json(json!({ "data": [] })) })
+                .post(|| async { Json(json!({ "data": { "apiKey": "key_id_9" } })) }),
+        )
+        .route(
+            "/api/biz/v1/organization/org-1/projects/proj-1/api_keys/copy/key_id_9",
+            get(|| async { Json(json!({ "data": { "secretKey": "secret_9" } })) }),
+        );
+    let zcode_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let zcode_port = zcode_listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(zcode_listener, zcode_api).await.unwrap();
+    });
+
+    std::env::set_var("ZCODE_DESKTOP_CREDENTIALS_FILE", &creds_file);
+    std::env::set_var(
+        "ZCODE_API_BASE",
+        format!("http://127.0.0.1:{zcode_port}"),
+    );
+
+    let config = GatewayConfig {
+        auth_dir: auth_dir.clone(),
+        api_keys: mahoquot_gateway::inbound::ApiKeys::new(vec![API_KEY.to_string()]),
+        ..GatewayConfig::default()
+    };
+    let gateway_app = create_app(Arc::new(AppState::new(&config).unwrap()));
+    let gateway_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gateway_port = gateway_listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(
+            gateway_listener,
+            gateway_app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    let client = reqwest::Client::new();
+
+    let import_resp = client
+        .post(format!(
+            "http://127.0.0.1:{gateway_port}/v0/management/zcode/import-local"
+        ))
+        .bearer_auth(API_KEY)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(import_resp.status(), StatusCode::OK);
+    let import_json: Value = import_resp.json().await.unwrap();
+    assert_eq!(import_json["status"], "ok");
+    assert_eq!(import_json["provider"], "zcode");
+    assert_eq!(import_json["name"], "zcode-zcode.user_zai.example.json");
+
+    let parsed: mahoquot_providers::zcode::ZcodeAccount = serde_json::from_str(
+        &std::fs::read_to_string(auth_dir.join("zcode-zcode.user_zai.example.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(parsed.access_token, "key_id_9.secret_9");
+    assert_eq!(parsed.refresh_token, "upstream-zai-token");
+    assert_eq!(parsed.r#type, "zcode");
+
+    std::env::remove_var("ZCODE_DESKTOP_CREDENTIALS_FILE");
+    std::env::remove_var("ZCODE_API_BASE");
+    std::fs::remove_file(&creds_file).ok();
+    std::fs::remove_dir_all(auth_dir).ok();
+}
+
+#[tokio::test]
+async fn test_zcode_oauth_flow_end_to_end() {
+    use mahoquot_providers::zcode::{extract_callback_code, zcode_authorize_url, ZcodeAccount};
+
+    let auth_dir = unique_temp_dir("qg-t13-zcode");
+
+    let zcode_api = Router::new()
+        .route(
+            "/api/v1/oauth/token",
+            post(|| async {
+                Json(json!({ "data": { "zai": { "access_token": "upstream-zai-token" } } }))
+            }),
+        )
+        .route(
+            "/api/auth/z/login",
+            post(|| async { Json(json!({ "data": { "access_token": "business-token" } })) }),
+        )
+        .route(
+            "/api/biz/customer/getCustomerInfo",
+            get(|| async {
+                Json(json!({
+                    "data": {
+                        "email": "zcode.user@zai.example",
+                        "id": "cust-1",
+                        "organizations": [
+                            {"organizationId": "org-other", "projects": []},
+                            {"organizationId": "org-1", "isDefault": true,
+                             "projects": [
+                                 {"projectId": "proj-other"},
+                                 {"projectId": "proj-1", "isDefault": true}
+                             ]}
+                        ]
+                    }
+                }))
+            }),
+        )
+        .route(
+            "/api/biz/v1/organization/org-1/projects/proj-1/api_keys",
+            get(|| async { Json(json!({ "data": [{"name": "other-key", "apiKey": "k0"}] })) })
+                .post(|| async { Json(json!({ "data": { "apiKey": "key_id_1" } })) }),
+        )
+        .route(
+            "/api/biz/v1/organization/org-1/projects/proj-1/api_keys/copy/key_id_1",
+            get(|| async { Json(json!({ "data": { "secretKey": "secret_1" } })) }),
+        );
+    let zcode_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let zcode_port = zcode_listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(zcode_listener, zcode_api).await.unwrap();
+    });
+    let api_base = format!("http://127.0.0.1:{zcode_port}");
+    let broker_url = format!("{api_base}/api/v1/oauth/token");
+
+    let config = GatewayConfig {
+        auth_dir: auth_dir.clone(),
+        api_keys: mahoquot_gateway::inbound::ApiKeys::new(vec![API_KEY.to_string()]),
+        ..GatewayConfig::default()
+    };
+    let app_state = Arc::new(AppState::new(&config).unwrap());
+    let gateway_app = create_app(app_state);
+    let gateway_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gateway_port = gateway_listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(
+            gateway_listener,
+            gateway_app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    let client = reqwest::Client::new();
+
+    let start_url = format!(
+        "http://127.0.0.1:{gateway_port}/v0/management/zcode-auth-url?broker_url={}&api_base={}",
+        url_encode(&broker_url),
+        url_encode(&api_base)
+    );
+    let start_resp = client.get(&start_url).bearer_auth(API_KEY).send().await.unwrap();
+    assert_eq!(start_resp.status(), StatusCode::OK);
+    let start_json: Value = start_resp.json().await.unwrap();
+    assert_eq!(start_json["status"], "ok");
+    assert_eq!(start_json["provider"], "zcode");
+    let auth_url = start_json["url"].as_str().unwrap();
+    let state_token = start_json["state"].as_str().unwrap();
+
+    let authorize = zcode_authorize_url(state_token);
+    assert_eq!(auth_url, authorize);
+    assert!(auth_url.starts_with("https://chat.z.ai/api/oauth/authorize?"));
+    assert!(auth_url.contains("response_type=code"));
+    assert!(auth_url.contains("client_id=client_P8X5CMWmlaRO9gyO-KSqtg"));
+    assert!(auth_url.contains(&format!("state={state_token}")));
+
+    let callback = format!("zcode://oauth/callback?code=zc_code_1&state={state_token}");
+    assert_eq!(
+        extract_callback_code(&callback, state_token).unwrap(),
+        "zc_code_1"
+    );
+
+    let callback_resp = client
+        .post(format!(
+            "http://127.0.0.1:{gateway_port}/v0/management/zcode-callback"
+        ))
+        .bearer_auth(API_KEY)
+        .json(&json!({ "state": state_token, "callback_url": callback }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(callback_resp.status(), StatusCode::OK);
+    let callback_json: Value = callback_resp.json().await.unwrap();
+    assert_eq!(callback_json["status"], "ok");
+
+    let cred_file = auth_dir.join("zcode-zcode.user_zai.example.json");
+    assert!(cred_file.exists(), "credential file {cred_file:?} should exist");
+    let parsed: ZcodeAccount =
+        serde_json::from_str(&std::fs::read_to_string(&cred_file).unwrap()).unwrap();
+    assert_eq!(parsed.access_token, "key_id_1.secret_1");
+    assert_eq!(parsed.refresh_token, "upstream-zai-token");
+    assert_eq!(parsed.email, "zcode.user@zai.example");
+    assert_eq!(parsed.r#type, "zcode");
+
+    let status_resp = client
+        .get(format!(
+            "http://127.0.0.1:{gateway_port}/v0/management/get-auth-status?state={state_token}"
+        ))
+        .bearer_auth(API_KEY)
+        .send()
+        .await
+        .unwrap();
+    let status_json: Value = status_resp.json().await.unwrap();
+    assert_eq!(status_json["status"], "ok");
+    assert_eq!(status_json["provider"], "zcode");
+
+    std::fs::remove_dir_all(auth_dir).ok();
+}

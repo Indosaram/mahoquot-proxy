@@ -22,6 +22,16 @@ pub fn create_app(state: Arc<AppState>) -> Router {
     // /admin/stats stays behind the key: it exposes account emails and reset times.
     let authed_routes = Router::new()
         .route("/v1/models", get(models_handler))
+        .route("/models", get(models_handler))
+        .route("/v1beta/models", get(cp_routes::v1beta_models))
+        .route(
+            "/v1beta/models/{*action}",
+            get(cp_routes::v1beta_action).post(cp_routes::v1beta_action),
+        )
+        .route(
+            "/models/{*action}",
+            get(cp_routes::v1beta_action).post(cp_routes::v1beta_action),
+        )
         .route("/admin/stats", get(admin_stats_handler))
         .route("/admin/usage", get(admin_usage_handler))
         .route("/admin/warmup", post(admin_warmup_handler))
@@ -32,9 +42,13 @@ pub fn create_app(state: Arc<AppState>) -> Router {
         .route("/admin/usage/refresh", post(admin_usage_refresh_handler))
         .route("/admin/accounts/{id}/reset", post(admin_reset_handler))
         .route("/v1/chat/completions", post(chat_completions_handler))
+        .route("/chat/completions", post(chat_completions_handler))
         .route("/v1/completions", post(completions_handler))
+        .route("/completions", post(completions_handler))
         .route("/v1/messages", post(messages_handler))
+        .route("/messages", post(messages_handler))
         .route("/v1/messages/count_tokens", post(count_tokens_handler))
+        .route("/messages/count_tokens", post(count_tokens_handler))
         .route(
             "/backend-api/codex/responses",
             get(cp_routes::ws_upgrade).post(codex_responses_handler),
@@ -51,18 +65,31 @@ pub fn create_app(state: Arc<AppState>) -> Router {
             "/v1/responses",
             get(cp_routes::ws_upgrade).post(cp_routes::responses),
         )
+        .route(
+            "/responses",
+            get(cp_routes::ws_upgrade).post(cp_routes::responses),
+        )
         .route("/v1/responses/compact", post(cp_routes::responses_compact))
+        .route("/responses/compact", post(cp_routes::responses_compact))
         .route("/v1/alpha/search", post(cp_routes::alpha_search))
+        .route("/alpha/search", post(cp_routes::alpha_search))
         .route(
             "/v1/images/generations",
             post(cp_routes::images_generations),
         )
+        .route("/images/generations", post(cp_routes::images_generations))
         .route("/v1/images/edits", post(cp_routes::images_edits))
+        .route("/images/edits", post(cp_routes::images_edits))
         .route("/v1/videos", post(cp_routes::videos))
+        .route("/videos", post(cp_routes::videos))
         .route("/v1/videos/generations", post(cp_routes::videos))
+        .route("/videos/generations", post(cp_routes::videos))
         .route("/v1/videos/edits", post(cp_routes::videos))
+        .route("/videos/edits", post(cp_routes::videos))
         .route("/v1/videos/extensions", post(cp_routes::videos))
+        .route("/videos/extensions", post(cp_routes::videos))
         .route("/v1/videos/{request_id}", get(cp_routes::videos_by_id))
+        .route("/videos/{request_id}", get(cp_routes::videos_by_id))
         .route("/openai/v1/videos", post(cp_routes::openai_videos))
         .route(
             "/openai/v1/videos/{video_id}",
@@ -72,8 +99,11 @@ pub fn create_app(state: Arc<AppState>) -> Router {
             "/openai/v1/videos/{video_id}/content",
             get(cp_routes::openai_videos),
         )
+        .route("/videos/{video_id}/content", get(cp_routes::openai_videos))
         .route("/v1/live", post(cp_routes::realtime_offer))
+        .route("/live", post(cp_routes::realtime_offer))
         .route("/v1/live/{call_id}", get(cp_routes::live_sideband))
+        .route("/live/{call_id}", get(cp_routes::live_sideband))
         .route(
             "/v1/realtime",
             get(cp_routes::ws_upgrade).post(cp_routes::realtime_offer),
@@ -86,6 +116,18 @@ pub fn create_app(state: Arc<AppState>) -> Router {
         .route(
             "/v1/realtime/calls/{call_id}/hangup",
             post(cp_routes::realtime_hangup),
+        )
+        .route(
+            "/v1/realtime/calls/{call_id}/accept",
+            post(cp_routes::realtime_sip_accept),
+        )
+        .route(
+            "/v1/realtime/calls/{call_id}/reject",
+            post(cp_routes::realtime_sip_reject),
+        )
+        .route(
+            "/v1/realtime/calls/{call_id}/refer",
+            post(cp_routes::realtime_sip_refer),
         )
         .route(
             "/v1/realtime/calls/{call_id}/{action}",
@@ -108,24 +150,26 @@ pub fn create_app(state: Arc<AppState>) -> Router {
             "/v1/realtime/translations/client_secrets",
             post(cp_routes::realtime_translations),
         )
-        .route("/v1beta/models", get(cp_routes::v1beta_models))
-        .route(
-            "/v1beta/models/{*action}",
-            get(cp_routes::v1beta_action).post(cp_routes::v1beta_action),
-        )
         .route("/v1beta/interactions", post(cp_routes::v1beta_interactions))
+        .route("/interactions", post(cp_routes::v1beta_interactions))
         .layer(from_fn_with_state(state.api_keys.clone(), require_api_key));
 
     // Public surface: Prometheus scrapers and liveness probes never send credentials,
     // and CLIProxyAPI exposes its metrics endpoint unauthenticated too.
     Router::new()
         .route("/healthz", get(healthz_handler))
+        .route("/keep-alive", get(keep_alive_handler))
         .route("/metrics", get(metrics_handler))
         .route("/", get(cp_routes::root))
         .route("/management.html", get(cp_routes::management_html))
         .route("/anthropic/callback", get(cp_routes::oauth_callback))
         .route("/codex/callback", get(cp_routes::oauth_callback))
         .route("/antigravity/callback", get(cp_routes::oauth_callback))
+        .route(
+            "/oauth-callback",
+            get(crate::management::oauth::oauth_callback)
+                .post(crate::management::oauth::oauth_callback),
+        )
         .route(
             "/v0/management/oauth-callback",
             get(crate::management::oauth::oauth_callback)
@@ -167,6 +211,10 @@ async fn cors(method: Method, req: axum::extract::Request, next: Next) -> Respon
 }
 
 async fn healthz_handler() -> impl IntoResponse {
+    Json(serde_json::json!({"status": "ok"}))
+}
+
+async fn keep_alive_handler() -> impl IntoResponse {
     Json(serde_json::json!({"status": "ok"}))
 }
 

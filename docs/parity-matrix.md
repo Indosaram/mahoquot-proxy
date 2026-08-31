@@ -12,10 +12,10 @@
 
 | Classification | Count | Description |
 | --- | ---: | --- |
-| `same-path` | **66** | Implemented on the identical path with matching request/response semantics. |
+| `same-path` | **71** | Implemented on the identical path with matching request/response semantics. |
 | `different-path` | **22** | Implemented in `mahoquot-proxy`, mounted under standard provider/API subpaths (compatibility aliases tracked in Section 4). |
-| `partial` | **11** | Management CRUD / routing skeleton in place; full downstream engine wiring or multi-field updates targeted for completion. |
-| `missing→ported` | **1** | Missing functionality to be implemented in downstream todos (P0/P1). |
+| `partial` | **7** | Management CRUD / routing skeleton in place; full downstream engine wiring or multi-field updates targeted for completion. |
+| `missing→ported` | **0** | Missing functionality to be implemented in downstream todos (P0/P1). |
 | `deferred` | **14** | Subsystem explicitly deferred (plugin runtime host, TUI, Redis queue, test harness fixtures). |
 | **Total Reconciled** | **114** | **100% of the 114 raw upstream endpoints accounted for.** |
 
@@ -24,19 +24,19 @@
 | Cluster | Endpoints | same-path | different-path | partial | missing→ported | deferred |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | API Key Management | 3 | 3 | 0 | 0 | 0 | 0 |
-| Auth & Identity | 19 | 17 | 1 | 1 | 0 | 0 |
+| Auth & Identity | 19 | 18 | 1 | 0 | 0 | 0 |
 | Config & Settings | 17 | 17 | 0 | 0 | 0 | 0 |
-| Core / Meta & Health | 5 | 4 | 0 | 0 | 1 | 0 |
+| Core / Meta & Health | 5 | 5 | 0 | 0 | 0 | 0 |
 | Core Inference & Chat | 8 | 1 | 7 | 0 | 0 | 0 |
 | Media / Images & Video | 9 | 0 | 9 | 0 | 0 | 0 |
 | Observability & Debug | 6 | 6 | 0 | 0 | 0 | 0 |
 | Plugins & Extensions | 6 | 0 | 0 | 0 | 0 | 6 |
 | Provider Key Config Lists | 7 | 0 | 0 | 7 | 0 | 0 |
-| Realtime & Live | 16 | 11 | 2 | 3 | 0 | 0 |
+| Realtime & Live | 16 | 14 | 2 | 0 | 0 | 0 |
 | Responses & Search | 7 | 3 | 3 | 0 | 0 | 1 |
 | Routing & Quota | 4 | 4 | 0 | 0 | 0 | 0 |
 | Test Harness & Diagnostics | 7 | 0 | 0 | 0 | 0 | 7 |
-| **Total** | **114** | **66** | **22** | **11** | **1** | **14** |
+| **Total** | **114** | **71** | **22** | **7** | **0** | **14** |
 
 ---
 
@@ -56,7 +56,7 @@
 | 10 | `/api-keys` | API Key Management | `same-path` | — | `mgmt.GET/PUT/PATCH/DELETE s.mgmt.*APIKeys` (`server_management.go:79-82`) | `apikeys::KEY_LISTS (CRUD)` (`crates/gateway/src/management/apikeys.rs:25`) | CRUD management for global inbound proxy API access keys list. |
 | 11 | `/auth-files` | Auth & Identity | `same-path` | — | `mgmt.GET/POST/DELETE s.mgmt.*AuthFile` (`server_management.go:166,170,171`) | `creds::list_auth_files / create / delete` (`crates/gateway/src/management/creds.rs:915`) | Account auth files CRUD (lists active accounts, uploads new credential JSONs, removes accounts). |
 | 12 | `/auth-files/download` | Auth & Identity | `same-path` | — | `mgmt.GET s.mgmt.DownloadAuthFile` (`server_management.go:169`) | `creds::download_auth_file` (`crates/gateway/src/management/creds.rs:924`) | Exports and downloads credential JSON file for a specified account. |
-| 13 | `/auth-files/fields` | Auth & Identity | `partial` | P1 | `mgmt.PATCH s.mgmt.PatchAuthFileFields` (`server_management.go:173`) | `creds::patch_unsupported (stub)` (`crates/gateway/src/management/creds.rs:929`) | Patch metadata fields (notes, proxy URL, tags); currently stubbed, full multi-field mutation targeted in Todo 4. |
+| 13 | `/auth-files/fields` | Auth & Identity | `same-path` | — | `mgmt.PATCH s.mgmt.PatchAuthFileFields` (`server_management.go:173`) | `creds::patch_auth_file_fields` (`crates/gateway/src/management/creds.rs:930`) | Selective multi-field JSON patching over auth file documents on disk with pool rescan. |
 | 14 | `/auth-files/models` | Auth & Identity | `same-path` | — | `mgmt.GET s.mgmt.GetAuthFileModels` (`server_management.go:167`) | `creds::auth_file_models` (`crates/gateway/src/management/creds.rs:923`) | Returns active model catalogs and custom model mappings for each registered auth file. |
 | 15 | `/auth-files/status` | Auth & Identity | `same-path` | — | `mgmt.PATCH s.mgmt.PatchAuthFileStatus` (`server_management.go:172`) | `creds::patch_auth_file_status` (`crates/gateway/src/management/creds.rs:925`) | Toggles enabled/disabled/quota status flag for an individual account auth file. |
 | 16 | `/backend-api/codex/responses` | Responses & Search | `same-path` | — | `codexDirect.GET/POST responses` (`server_routes.go:114-115`) | `cp_routes::ws_upgrade / codex_responses_handler` (`crates/gateway/src/routes.rs:38`) | ChatGPT Codex CLI direct responses route (Websocket streaming upgrade + HTTP POST response). |
@@ -79,7 +79,7 @@
 | 33 | `/images/generations` | Media / Images & Video | `different-path` | — | `v1.POST openaiHandlers.ImagesGenerations` (`server_routes.go:68`) | `cp_routes::images_generations` (`crates/gateway/src/routes.rs:56`) | Upstream mounts on `/v1/images/generations`; mahoquot mounts at `/v1/images/generations`. Image generation inference proxy. |
 | 34 | `/interactions-api-key` | Provider Key Config Lists | `partial` | P0 | `mgmt.GET/PUT/PATCH/DELETE InteractionsKeys` (`server_management.go:91-94`) | `apikeys::KEY_LISTS` (`crates/gateway/src/management/apikeys.rs:55`) | Management CRUD in `apikeys.rs`; wiring stored keys into relay credential pool resolution completed in Todo 2. |
 | 35 | `/interactions` | Core Inference & Chat | `different-path` | — | `v1beta.POST geminiHandlers.Interactions` (`server_routes.go:125`) | `cp_routes::v1beta_interactions` (`crates/gateway/src/routes.rs:116`) | Upstream mounts on `/v1beta/interactions`; mahoquot mounts at `/v1beta/interactions`. Unprefixed `/interactions` alias candidate. |
-| 36 | `/keep-alive` | Core / Meta & Health | `missing→ported` | P1 | `s.engine.GET s.handleKeepAlive` (`server_keepalive.go:24`) | `—` (`Not implemented`) | Connection keepalive/heartbeat ping endpoint; target for porting in Todo 4. |
+| 36 | `/keep-alive` | Core / Meta & Health | `same-path` | — | `s.engine.GET s.handleKeepAlive` (`server_keepalive.go:24`) | `routes::keep_alive_handler` (`crates/gateway/src/routes.rs:223`) | Public connection keepalive/heartbeat ping endpoint returning 200 `{"status":"ok"}`. |
 | 37 | `/kimi-auth-url` | Auth & Identity | `same-path` | — | `mgmt.GET s.mgmt.RequestKimiToken` (`server_management.go:179`) | `device_auth_url("kimi")` (`crates/gateway/src/management/oauth.rs:2400`) | Generates Kimi/Moonshot device authorization URL and tracking session. |
 | 38 | `/latest-version` | Core / Meta & Health | `same-path` | — | `mgmt.GET s.mgmt.GetLatestVersion` (`server_management.go:33`) | `core::get_latest_version` (`crates/gateway/src/management/core.rs:175`) | Checks upstream repository release tags and returns latest version metadata. |
 | 39 | `/live` | Realtime & Live | `different-path` | — | `v1.POST s.codexLiveHandler.Handle` (`server_routes.go:81`) | `cp_routes::realtime_offer` (`crates/gateway/src/routes.rs:75`) | Upstream mounts on `/v1/live`; mahoquot mounts at `/v1/live`. Realtime WebRTC session negotiation. |
@@ -133,10 +133,10 @@
 | 87 | `/v1/realtime` | Realtime & Live | `same-path` | — | `s.engine.GET/POST("/v1/realtime")` (`server_routes.go:87-88`) | `cp_routes::ws_upgrade / realtime_offer` (`crates/gateway/src/routes.rs:77`) | OpenAI Realtime API websocket upgrade and session initiation. |
 | 88 | `/v1/realtime/calls` | Realtime & Live | `same-path` | — | `s.engine.POST("/v1/realtime/calls")` (`server_routes.go:89`) | `cp_routes::realtime_offer` (`crates/gateway/src/routes.rs:81`) | Realtime WebRTC call negotiation endpoint. |
 | 89 | `/v1/realtime/calls/:call_id` | Realtime & Live | `same-path` | — | `s.engine.GET("/v1/realtime/calls/:call_id")` (`server_routes.go:90`) | `cp_routes::realtime_call_get` (`crates/gateway/src/routes.rs:82`) | Retrieve status and metadata for active realtime call. |
-| 90 | `/v1/realtime/calls/:call_id/accept` | Realtime & Live | `partial` | P1 | `s.engine.POST HandleSIPControl` (`server_routes.go:98`) | `cp_routes::realtime_sip (`{action}` wildcard)` (`crates/gateway/src/routes.rs:90`) | SIP call accept handler; currently routed through `{action}` wildcard in `routes.rs`, explicit accept scenario tests in Todo 4. |
+| 90 | `/v1/realtime/calls/:call_id/accept` | Realtime & Live | `same-path` | — | `s.engine.POST HandleSIPControl` (`server_routes.go:98`) | `cp_routes::realtime_sip_accept` (`crates/gateway/src/routes.rs:136`) | Explicit SIP call accept handler returning 501 capability_not_supported. |
 | 91 | `/v1/realtime/calls/:call_id/hangup` | Realtime & Live | `same-path` | — | `s.engine.POST HandleHangup` (`server_routes.go:97`) | `cp_routes::realtime_hangup` (`crates/gateway/src/routes.rs:86`) | Terminates active realtime audio/WebRTC call. |
-| 92 | `/v1/realtime/calls/:call_id/refer` | Realtime & Live | `partial` | P1 | `s.engine.POST HandleSIPControl` (`server_routes.go:100`) | `cp_routes::realtime_sip (`{action}` wildcard)` (`crates/gateway/src/routes.rs:90`) | SIP call transfer/refer handler; currently routed through `{action}` wildcard, explicit refer scenario tests in Todo 4. |
-| 93 | `/v1/realtime/calls/:call_id/reject` | Realtime & Live | `partial` | P1 | `s.engine.POST HandleSIPControl` (`server_routes.go:99`) | `cp_routes::realtime_sip (`{action}` wildcard)` (`crates/gateway/src/routes.rs:90`) | SIP call reject handler; currently routed through `{action}` wildcard, explicit reject scenario tests in Todo 4. |
+| 92 | `/v1/realtime/calls/:call_id/refer` | Realtime & Live | `same-path` | — | `s.engine.POST HandleSIPControl` (`server_routes.go:100`) | `cp_routes::realtime_sip_refer` (`crates/gateway/src/routes.rs:144`) | Explicit SIP call transfer/refer handler returning 501 capability_not_supported. |
+| 93 | `/v1/realtime/calls/:call_id/reject` | Realtime & Live | `same-path` | — | `s.engine.POST HandleSIPControl` (`server_routes.go:99`) | `cp_routes::realtime_sip_reject` (`crates/gateway/src/routes.rs:140`) | Explicit SIP call reject handler returning 501 capability_not_supported. |
 | 94 | `/v1/realtime/client_secrets` | Realtime & Live | `same-path` | — | `s.engine.POST CreateClientSecret` (`server_routes.go:91`) | `cp_routes::realtime_client_secrets` (`crates/gateway/src/routes.rs:94`) | Generates ephemeral client credentials for browser Realtime WebRTC connections. |
 | 95 | `/v1/realtime/sessions` | Realtime & Live | `same-path` | — | `s.engine.POST CreateLegacySession` (`server_routes.go:92`) | `cp_routes::realtime_sessions` (`crates/gateway/src/routes.rs:98`) | Creates Realtime session tokens and configuration. |
 | 96 | `/v1/realtime/transcription_sessions` | Realtime & Live | `same-path` | — | `s.engine.POST HandleTranscriptionSession` (`server_routes.go:93`) | `cp_routes::realtime_transcription` (`crates/gateway/src/routes.rs:99`) | Initializes realtime speech transcription session. |

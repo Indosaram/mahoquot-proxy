@@ -2106,6 +2106,326 @@ async fn command_code_auth_url_handler(
     )
 }
 
+fn create_zcode_auth_url(params: &HashMap<String, String>) -> (String, String, OAuthSession) {
+    let state = new_state();
+    let broker_url = params
+        .get("broker_url")
+        .cloned()
+        .or_else(|| std::env::var("ZCODE_BROKER_TOKEN_URL").ok())
+        .unwrap_or_else(|| mahoquot_providers::zcode::ZCODE_OAUTH_BROKER_TOKEN_URL.to_string());
+    let api_base = params
+        .get("api_base")
+        .cloned()
+        .or_else(|| std::env::var("ZCODE_API_BASE").ok())
+        .unwrap_or_else(|| mahoquot_providers::zcode::ZCODE_API_BASE.to_string());
+
+    let url = mahoquot_providers::zcode::zcode_authorize_url(&state);
+    let session = OAuthSession {
+        state: state.clone(),
+        provider: "zcode".to_string(),
+        verifier: String::new(),
+        challenge: String::new(),
+        redirect_uri: mahoquot_providers::zcode::ZCODE_OAUTH_REDIRECT_URI.to_string(),
+        token_url: broker_url,
+        poll_url: api_base,
+        uuid: String::new(),
+        status: SessionStatus::Pending,
+        created_at: Instant::now(),
+        saved_account_email: None,
+    };
+
+    (url, state, session)
+}
+
+async fn exchange_zcode_callback(
+    state: &AppState,
+    session: &mut OAuthSession,
+    callback_url: &str,
+) -> Result<(), String> {
+    let code = mahoquot_providers::zcode::extract_callback_code(callback_url, &session.state)?;
+
+    let broker_url = if session.token_url.is_empty() {
+        mahoquot_providers::zcode::ZCODE_OAUTH_BROKER_TOKEN_URL.to_string()
+    } else {
+        session.token_url.clone()
+    };
+    let broker_response: Value = state
+        .http_client
+        .post(&broker_url)
+        .json(&json!({
+            "provider": "zai",
+            "code": code,
+            "redirect_uri": session.redirect_uri,
+            "state": session.state,
+        }))
+        .send()
+        .await
+        .map_err(|err| format!("GLM ZCode broker request failed: {err}"))?
+        .error_for_status()
+        .map_err(|err| format!("GLM ZCode broker request failed: {err}"))?
+        .json()
+        .await
+        .map_err(|err| format!("GLM ZCode broker response was not valid JSON: {err}"))?;
+    let upstream_token = mahoquot_providers::zcode::parse_broker_token(&broker_response)?;
+    let api_base = if session.poll_url.is_empty() {
+        mahoquot_providers::zcode::ZCODE_API_BASE.to_string()
+    } else {
+        session.poll_url.clone()
+    };
+    let email = provision_zcode_account(state, &api_base, &upstream_token).await?;
+
+    session.saved_account_email = Some(email);
+    session.status = SessionStatus::Completed;
+    Ok(())
+}
+
+/// Turn an upstream Z.AI OAuth token into a provisioned `{id}.{secret}` API
+/// key credential file: business login, default org/project lookup, find or
+/// create `zcode-api-key`, copy its secret, write `zcode-<email>.json`.
+async fn provision_zcode_account(
+    state: &AppState,
+    api_base: &str,
+    upstream_token: &str,
+) -> Result<String, String> {
+    let login_response: Value = state
+        .http_client
+        .post(format!("{api_base}/api/auth/z/login"))
+        .json(&json!({ "token": upstream_token }))
+        .send()
+        .await
+        .map_err(|err| format!("GLM ZCode z/login request failed: {err}"))?
+        .error_for_status()
+        .map_err(|err| format!("GLM ZCode z/login request failed: {err}"))?
+        .json()
+        .await
+        .map_err(|err| format!("GLM ZCode z/login response was not valid JSON: {err}"))?;
+    let business_token = mahoquot_providers::zcode::parse_business_token(&login_response)?;
+
+    let customer_response: Value = state
+        .http_client
+        .get(format!("{api_base}/api/biz/customer/getCustomerInfo"))
+        .bearer_auth(&business_token)
+        .send()
+        .await
+        .map_err(|err| format!("GLM ZCode getCustomerInfo request failed: {err}"))?
+        .error_for_status()
+        .map_err(|err| format!("GLM ZCode getCustomerInfo request failed: {err}"))?
+        .json()
+        .await
+        .map_err(|err| format!("GLM ZCode getCustomerInfo response was not valid JSON: {err}"))?;
+    let customer = mahoquot_providers::zcode::parse_customer_info(&customer_response)?;
+
+    let keys_url = format!(
+        "{api_base}/api/biz/v1/organization/{}/projects/{}/api_keys",
+        customer.organization_id, customer.project_id
+    );
+    let listed: Value = state
+        .http_client
+        .get(&keys_url)
+        .bearer_auth(&business_token)
+        .send()
+        .await
+        .map_err(|err| format!("GLM ZCode api_keys list request failed: {err}"))?
+        .error_for_status()
+        .map_err(|err| format!("GLM ZCode api_keys list request failed: {err}"))?
+        .json()
+        .await
+        .map_err(|err| format!("GLM ZCode api_keys list response was not valid JSON: {err}"))?;
+    let key_id = match mahoquot_providers::zcode::find_existing_api_key(&listed) {
+        Some(key_id) => key_id,
+        None => {
+            let created: Value = state
+                .http_client
+                .post(&keys_url)
+                .bearer_auth(&business_token)
+                .json(&json!({ "name": mahoquot_providers::zcode::ZCODE_API_KEY_NAME }))
+                .send()
+                .await
+                .map_err(|err| format!("GLM ZCode api_keys create request failed: {err}"))?
+                .error_for_status()
+                .map_err(|err| format!("GLM ZCode api_keys create request failed: {err}"))?
+                .json()
+                .await
+                .map_err(|err| format!("GLM ZCode api_keys create response was not valid JSON: {err}"))?;
+            mahoquot_providers::zcode::parse_created_api_key(&created)?
+        }
+    };
+
+    let copied: Value = state
+        .http_client
+        .get(format!(
+            "{keys_url}/copy/{}",
+            url_encode(&key_id)
+        ))
+        .bearer_auth(&business_token)
+        .send()
+        .await
+        .map_err(|err| format!("GLM ZCode api_keys copy request failed: {err}"))?
+        .error_for_status()
+        .map_err(|err| format!("GLM ZCode api_keys copy request failed: {err}"))?
+        .json()
+        .await
+        .map_err(|err| format!("GLM ZCode api_keys copy response was not valid JSON: {err}"))?;
+    let secret_key = mahoquot_providers::zcode::parse_copied_secret(&copied)?;
+
+    let email = if customer.email.is_empty() {
+        "zcode-user@local".to_string()
+    } else {
+        customer.email.clone()
+    };
+    let credential = json!({
+        "identity_slug": "",
+        "access_token": format!("{key_id}.{secret_key}"),
+        "refresh_token": upstream_token,
+        "email": email,
+        "expired": "2099-12-31T00:00:00Z",
+        "type": "zcode",
+        "disabled": false,
+    });
+    let filename = format!("zcode-{}.json", sanitize_filename(&email));
+    let auth_dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
+    let rendered = serde_json::to_string_pretty(&credential).map_err(|e| e.to_string())?;
+    write_atomically(&auth_dir.join(filename), &rendered).map_err(|e| e.to_string())?;
+
+    if let Err(error) = state.rescan_pool() {
+        eprintln!("pool rescan failed after ZCode onboarding: {error}");
+    }
+
+    Ok(email)
+}
+
+/// Import the upstream token the ZCode desktop app already saved on this Mac
+/// (`~/.zcode/v2/credentials.json`) and provision from it, skipping the whole
+/// browser round-trip. `ZCODE_DESKTOP_CREDENTIALS_FILE` relocates the file for
+/// tests.
+async fn import_local_zcode(State(app_state): State<Arc<AppState>>) -> Response {
+    let path = std::env::var("ZCODE_DESKTOP_CREDENTIALS_FILE").unwrap_or_else(|_| {
+        format!(
+            "{}/.zcode/v2/credentials.json",
+            std::env::var("HOME").unwrap_or_default()
+        )
+    });
+    let read = tokio::task::spawn_blocking(move || std::fs::read_to_string(path)).await;
+    let document = match read {
+        Ok(Ok(document)) => document,
+        Ok(Err(error)) => {
+            return json_status(
+                StatusCode::BAD_REQUEST,
+                json!({
+                    "error": format!("ZCode desktop credentials not readable: {error}"),
+                    "status": "error"
+                }),
+            );
+        }
+        Err(error) => {
+            return json_status(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({ "error": error.to_string(), "status": "error" }),
+            );
+        }
+    };
+    let parsed: Value = match serde_json::from_str(&document) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return json_status(
+                StatusCode::BAD_REQUEST,
+                json!({
+                    "error": format!("ZCode desktop credentials are not valid JSON: {error}"),
+                    "status": "error"
+                }),
+            );
+        }
+    };
+    let Some(upstream_token) = parsed
+        .get("oauth:zai:access_token")
+        .and_then(Value::as_str)
+        .filter(|token| !token.trim().is_empty())
+    else {
+        return json_status(
+            StatusCode::BAD_REQUEST,
+            json!({
+                "error": "ZCode desktop credentials carry no oauth:zai:access_token; sign in inside the ZCode app first",
+                "status": "error"
+            }),
+        );
+    };
+
+    let api_base =
+        std::env::var("ZCODE_API_BASE").unwrap_or_else(|_| mahoquot_providers::zcode::ZCODE_API_BASE.to_string());
+    match provision_zcode_account(&app_state, &api_base, upstream_token).await {
+        Ok(email) => json_status(
+            StatusCode::OK,
+            json!({
+                "status": "ok",
+                "provider": "zcode",
+                "name": format!("zcode-{email}.json"),
+            }),
+        ),
+        Err(error) => json_status(StatusCode::BAD_REQUEST, json!({ "error": error, "status": "error" })),
+    }
+}
+
+async fn zcode_auth_url_handler(Query(params): Query<HashMap<String, String>>) -> Response {
+    let (url, state, session) = create_zcode_auth_url(&params);
+    register_session(session);
+    json_status(
+        StatusCode::OK,
+        json!({ "url": url, "state": state, "provider": "zcode", "status": "ok" }),
+    )
+}
+
+async fn zcode_callback_handler(
+    State(app_state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Response {
+    let session_state = body
+        .get("state")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let callback_url = body
+        .get("callback_url")
+        .or_else(|| body.get("callback"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    if session_state.is_empty() || callback_url.trim().is_empty() {
+        return json_status(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "ZCode callback requires state and callback_url", "status": "error" }),
+        );
+    }
+
+    let Some(mut session) = SESSIONS.read().unwrap().get(&session_state).cloned() else {
+        return json_status(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "ZCode OAuth state mismatch", "status": "error" }),
+        );
+    };
+    if session.provider != "zcode" {
+        return json_status(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "OAuth session provider mismatch", "status": "error" }),
+        );
+    }
+
+    match exchange_zcode_callback(&app_state, &mut session, &callback_url).await {
+        Ok(()) => {
+            register_session(session);
+            json_status(
+                StatusCode::OK,
+                json!({ "status": "ok", "success": true, "provider": "zcode" }),
+            )
+        }
+        Err(error) => {
+            session.status = SessionStatus::Failed(error.clone());
+            register_session(session);
+            json_status(StatusCode::BAD_REQUEST, json!({ "error": error, "status": "error" }))
+        }
+    }
+}
+
 async fn xai_auth_url_handler(Query(params): Query<HashMap<String, String>>) -> Response {
     let (url, state, session) = create_xai_auth_url(&params);
     register_session(session);
@@ -2154,6 +2474,9 @@ pub fn oauth_routes() -> Router<Arc<AppState>> {
         .route("/xai-auth-url", get(xai_auth_url_handler))
         .route("/gemini-cli-auth-url", get(gemini_auth_url_handler))
         .route("/command-code-auth-url", get(command_code_auth_url_handler))
+        .route("/zcode-auth-url", get(zcode_auth_url_handler))
+        .route("/zcode-callback", post(zcode_callback_handler))
+        .route("/zcode/import-local", post(import_local_zcode))
         .route(
             "/kimi-auth-url",
             get(|state, params| device_auth_url(state, params, "kimi")),

@@ -607,8 +607,132 @@ async fn patch_auth_file_status(
     )
 }
 
-async fn patch_unsupported() -> Response {
-    json_status(StatusCode::BAD_REQUEST, json!({ "error": "invalid body" }))
+async fn patch_auth_file_fields(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Response {
+    let Some(obj) = body.as_object() else {
+        return json_status(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "invalid request body" }),
+        );
+    };
+    let Some(name) = obj.get("name").and_then(Value::as_str) else {
+        return json_status(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "name is required" }),
+        );
+    };
+    let name = name.trim();
+    if name.is_empty() || name.contains('/') || name.contains("..") {
+        return json_status(StatusCode::BAD_REQUEST, json!({ "error": "invalid name" }));
+    }
+    let dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
+    let path = dir.join(name);
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return json_status(StatusCode::NOT_FOUND, json!({ "error": "auth not found" }))
+        }
+        Err(error) => {
+            return json_status(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({ "error": error.to_string() }),
+            )
+        }
+    };
+    let mut file_value: Value = match serde_json::from_str(&raw) {
+        Ok(val) => val,
+        Err(error) => {
+            return json_status(
+                StatusCode::BAD_REQUEST,
+                json!({ "error": error.to_string() }),
+            )
+        }
+    };
+    let Some(target_map) = file_value.as_object_mut() else {
+        return json_status(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "auth file is not a json object" }),
+        );
+    };
+
+    for (key, val) in obj {
+        if key == "name" {
+            continue;
+        }
+        let key = key.trim();
+        if key.is_empty() {
+            continue;
+        }
+        if key.contains('.') {
+            let parts: Vec<&str> = key
+                .split('.')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            if parts.is_empty() {
+                continue;
+            }
+            let mut curr = &mut *target_map;
+            for p in parts.iter().take(parts.len().saturating_sub(1)) {
+                if !curr.contains_key(*p) || !curr[*p].is_object() {
+                    curr.insert((*p).to_string(), json!({}));
+                }
+                curr = curr.get_mut(*p).unwrap().as_object_mut().unwrap();
+            }
+            let last = parts[parts.len() - 1];
+            if val.is_null() {
+                curr.remove(last);
+            } else {
+                curr.insert(last.to_string(), val.clone());
+            }
+        } else if val.is_null() {
+            target_map.remove(key);
+        } else if let Some(sub_obj) = val.as_object() {
+            let entry = target_map
+                .entry(key.to_string())
+                .or_insert_with(|| json!({}));
+            if let Some(entry_map) = entry.as_object_mut() {
+                for (sub_k, sub_v) in sub_obj {
+                    if sub_v.is_null()
+                        || (sub_v.is_string() && sub_v.as_str().unwrap().trim().is_empty())
+                    {
+                        entry_map.remove(sub_k);
+                    } else {
+                        entry_map.insert(sub_k.clone(), sub_v.clone());
+                    }
+                }
+            } else {
+                target_map.insert(key.to_string(), val.clone());
+            }
+        } else {
+            target_map.insert(key.to_string(), val.clone());
+        }
+    }
+
+    let rendered = match serde_json::to_string_pretty(&file_value) {
+        Ok(rendered) => rendered,
+        Err(error) => {
+            return json_status(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({ "error": error.to_string() }),
+            )
+        }
+    };
+    if let Err(error) = write_atomically(&path, &rendered) {
+        return json_status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({ "error": error.to_string() }),
+        );
+    }
+    if let Err(error) = state.rescan_pool() {
+        return json_status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({ "error": error.to_string() }),
+        );
+    }
+    json_status(StatusCode::OK, json!({ "status": "ok" }))
 }
 
 #[derive(serde::Serialize)]
@@ -928,7 +1052,7 @@ pub fn creds_routes() -> Router<Arc<AppState>> {
         )
         .route(
             "/auth-files/fields",
-            axum::routing::patch(patch_unsupported),
+            axum::routing::patch(patch_auth_file_fields),
         )
         .route("/model-definitions/{channel}", get(model_definitions))
         .route("/vertex/import", post(vertex_import))
