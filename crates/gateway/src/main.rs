@@ -4,7 +4,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Parser, Subcommand};
 use mahoquot_gateway::account::load_account_members;
-use mahoquot_gateway::config::GatewayConfig;
+use mahoquot_gateway::config::{
+    resolve_bind_addr, should_warn_for_unauthenticated_bind, GatewayConfig,
+};
 use mahoquot_gateway::inbound::ApiKeys;
 use mahoquot_gateway::management::settings::Settings;
 use mahoquot_gateway::routes::create_app;
@@ -12,7 +14,7 @@ use mahoquot_gateway::server::run_server;
 use mahoquot_gateway::state::AppState;
 use mahoquot_types::Strategy;
 use tokio::net::TcpListener;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
@@ -57,6 +59,10 @@ pub struct ServeArgs {
     /// TCP port the gateway listens on
     #[arg(long, env = "GATEWAY_PORT", default_value_t = 18801)]
     pub port: u16,
+
+    /// Address the gateway listens on (BIND_ADDR takes precedence)
+    #[arg(long)]
+    pub bind: Option<String>,
 
     /// Directory storing provider credential JSON files
     #[arg(long, env = "AUTH_DIR")]
@@ -265,6 +271,7 @@ async fn main() -> anyhow::Result<()> {
         None => cli.serve_args,
     };
 
+    let bind_addr = resolve_bind_addr(serve_args.bind.clone(), std::env::var("BIND_ADDR").ok());
     let config = serve_args.build_config()?;
 
     tracing_subscriber::fmt()
@@ -282,6 +289,12 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let state = Arc::new(AppState::new(&config)?);
+    if should_warn_for_unauthenticated_bind(&bind_addr, state.api_keys.is_empty()) {
+        warn!(
+            bind_addr = %bind_addr,
+            "SECURITY WARNING: gateway is listening on a non-loopback address without any API keys configured"
+        );
+    }
     state
         .telemetry
         .spawn_flush_worker(std::time::Duration::from_secs(10));
@@ -291,9 +304,8 @@ async fn main() -> anyhow::Result<()> {
     );
     let app = create_app(state);
 
-    let addr = format!("0.0.0.0:{}", config.port);
-    let listener = TcpListener::bind(&addr).await?;
-    info!("listening on {}", addr);
+    let listener = TcpListener::bind((bind_addr.as_str(), config.port)).await?;
+    info!(bind_addr = %bind_addr, port = config.port, "listening");
 
     run_server(listener, app).await
 }
