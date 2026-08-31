@@ -994,8 +994,6 @@ pub fn parse_relay_usage(payload: &serde_json::Value) -> Option<RelayUsageTotals
     })
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1381,10 +1379,26 @@ mod tests {
         // given samples spread across a day: counters at t0, t+2h, t+5h, t+20h
         let now = 1_800_000;
         let samples = vec![
-            UsageSample { unix: now - 30 * 3600, requests: 100, tokens: 1_000 },
-            UsageSample { unix: now - 5 * 3600, requests: 300, tokens: 3_000 },
-            UsageSample { unix: now - 2 * 3600, requests: 500, tokens: 5_000 },
-            UsageSample { unix: now - 60, requests: 650, tokens: 6_000 },
+            UsageSample {
+                unix: now - 30 * 3600,
+                requests: 100,
+                tokens: 1_000,
+            },
+            UsageSample {
+                unix: now - 5 * 3600,
+                requests: 300,
+                tokens: 3_000,
+            },
+            UsageSample {
+                unix: now - 2 * 3600,
+                requests: 500,
+                tokens: 5_000,
+            },
+            UsageSample {
+                unix: now - 60,
+                requests: 650,
+                tokens: 6_000,
+            },
         ];
         // when the rolling deltas are computed
         let deltas = window_deltas(&samples, now);
@@ -1403,8 +1417,16 @@ mod tests {
         // given counters that collapsed (relay restarted)
         let now = 1_800_000;
         let samples = vec![
-            UsageSample { unix: now - 5 * 3600, requests: 7_000, tokens: 900_000 },
-            UsageSample { unix: now - 60, requests: 5, tokens: 800 },
+            UsageSample {
+                unix: now - 5 * 3600,
+                requests: 7_000,
+                tokens: 900_000,
+            },
+            UsageSample {
+                unix: now - 60,
+                requests: 5,
+                tokens: 800,
+            },
         ];
         // when deltas are computed
         let deltas = window_deltas(&samples, now);
@@ -1439,15 +1461,25 @@ mod tests {
             let store = UsageSampleStore::load(path.clone());
             store.push(
                 "claude-relay",
-                UsageSample { unix: 1_800_000, requests: 7005, tokens: 1_184_368_836 },
+                UsageSample {
+                    unix: 1_800_000,
+                    requests: 7005,
+                    tokens: 1_184_368_836,
+                },
             );
         }
         // when a fresh store loads the same file
         let store = UsageSampleStore::load(path.clone());
-        let sample = store.push("claude-relay", UsageSample { unix: 1_800_060, requests: 7010, tokens: 1_184_400_000 });
+        let sample = store.push(
+            "claude-relay",
+            UsageSample {
+                unix: 1_800_060,
+                requests: 7010,
+                tokens: 1_184_400_000,
+            },
+        );
         // then the pre-restart sample survives inside the window
         assert_eq!(sample.first().map(|s| s.requests), Some(7005));
         std::fs::remove_dir_all(dir).ok();
     }
 }
-

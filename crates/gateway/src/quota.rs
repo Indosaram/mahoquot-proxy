@@ -172,7 +172,9 @@ async fn try_claude_usage(state: &AppState, member: &Arc<AccountMember>) -> Resu
             .unwrap_or_default()
             .trim_end_matches('/');
         if base.is_empty() {
-            return Err(QuotaError::Upstream("relay account has no upstream_override".into()));
+            return Err(QuotaError::Upstream(
+                "relay account has no upstream_override".into(),
+            ));
         }
         let resp = state
             .http_client
@@ -201,7 +203,11 @@ async fn try_claude_usage(state: &AppState, member: &Arc<AccountMember>) -> Resu
         let now = now_unix();
         let samples = state.usage_samples.push(
             &member.id,
-            crate::usage::UsageSample { unix: now, requests: totals.requests, tokens: totals.tokens },
+            crate::usage::UsageSample {
+                unix: now,
+                requests: totals.requests,
+                tokens: totals.tokens,
+            },
         );
         member.set_usage(crate::usage::AccountUsage {
             plan_type: Some("relay".into()),

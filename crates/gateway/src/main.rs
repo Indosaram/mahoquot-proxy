@@ -121,9 +121,7 @@ impl ServeArgs {
 
         let auth_refresh_enabled = !matches!(self.auth_refresh.as_str(), "false" | "0");
 
-        let config_path = self
-            .config
-            .unwrap_or_else(|| auth_dir.join("config.yaml"));
+        let config_path = self.config.unwrap_or_else(|| auth_dir.join("config.yaml"));
 
         let usage_poll_secs = if self.usage_poll_secs > 0 {
             self.usage_poll_secs
@@ -152,7 +150,10 @@ fn run_doctor(auth_dir: PathBuf, config: Option<PathBuf>) -> anyhow::Result<()> 
     println!("Auth directory: {}", auth_dir.display());
 
     if !auth_dir.is_dir() {
-        eprintln!("Error: auth directory '{}' does not exist or is not a directory", auth_dir.display());
+        eprintln!(
+            "Error: auth directory '{}' does not exist or is not a directory",
+            auth_dir.display()
+        );
         std::process::exit(1);
     }
 
@@ -164,7 +165,11 @@ fn run_doctor(auth_dir: PathBuf, config: Option<PathBuf>) -> anyhow::Result<()> 
     let members = match load_account_members(&auth_dir) {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("Error loading accounts from '{}': {}", auth_dir.display(), e);
+            eprintln!(
+                "Error loading accounts from '{}': {}",
+                auth_dir.display(),
+                e
+            );
             std::process::exit(1);
         }
     };
@@ -211,7 +216,10 @@ fn run_doctor(auth_dir: PathBuf, config: Option<PathBuf>) -> anyhow::Result<()> 
 
 fn run_accounts(auth_dir: PathBuf) -> anyhow::Result<()> {
     if !auth_dir.is_dir() {
-        eprintln!("Error: auth directory '{}' does not exist or is not a directory", auth_dir.display());
+        eprintln!(
+            "Error: auth directory '{}' does not exist or is not a directory",
+            auth_dir.display()
+        );
         std::process::exit(1);
     }
 
@@ -223,7 +231,10 @@ fn run_accounts(auth_dir: PathBuf) -> anyhow::Result<()> {
     let members = load_account_members(&auth_dir)?;
 
     println!("{:-<78}", "");
-    println!("{:<24} {:<14} {:<12} {:<10} {:<10}", "ID", "PROVIDER", "STATUS", "EXPIRED", "TOKENS");
+    println!(
+        "{:<24} {:<14} {:<12} {:<10} {:<10}",
+        "ID", "PROVIDER", "STATUS", "EXPIRED", "TOKENS"
+    );
     println!("{:-<78}", "");
     for member in &members {
         let has_tokens = !member.access_token().is_empty() || !member.refresh_token().is_empty();

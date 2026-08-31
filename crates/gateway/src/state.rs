@@ -100,9 +100,7 @@ impl AppState {
             telemetry,
             log_tail: LogTail::default(),
             usage_samples: crate::usage::UsageSampleStore::load(
-                config
-                    .config_path
-                    .with_file_name("usage-samples.json"),
+                config.config_path.with_file_name("usage-samples.json"),
             ),
             router,
             pool: arc_swap::ArcSwap::from_pointee(PoolSnapshot { members, models }),
