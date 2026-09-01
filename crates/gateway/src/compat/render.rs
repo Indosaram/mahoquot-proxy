@@ -223,9 +223,15 @@ impl ChunkRenderer {
                 self.role_prelude(&mut out);
                 out.push(self.chunk(json!({"content": text}), None));
             }
-            CodexEvent::ReasoningDelta(_) => {}
-            // OpenAI streaming chunks carry no field for a provider reasoning
-            // marker, so it is dropped rather than invented into the delta.
+            CodexEvent::ReasoningDelta(text) => {
+                // Forward reasoning as the de-facto `reasoning_content` delta
+                // field. Dropping it left the client byte-silent for the whole
+                // thinking phase (minutes on GLM-5.x), tripping idle timeouts —
+                // the "responds nothing and stalls" symptom. Parsers that
+                // don't know the field simply ignore it, but bytes still flow.
+                self.role_prelude(&mut out);
+                out.push(self.chunk(json!({"reasoning_content": text}), None));
+            }
             CodexEvent::ReasoningSignature(_) => {}
             CodexEvent::ToolCallBegin {
                 output_index,
@@ -461,6 +467,53 @@ impl Aggregator {
             payload["usage"] = usage_value(usage);
         }
         payload
+    }
+}
+
+#[cfg(test)]
+mod openai_stream_tests {
+    use super::*;
+
+    fn payloads(frames: Vec<Bytes>) -> Vec<Value> {
+        frames
+            .iter()
+            .filter_map(|f| {
+                let text = String::from_utf8_lossy(f);
+                let body = text.strip_prefix("data: ")?.trim();
+                serde_json::from_str(body).ok()
+            })
+            .collect()
+    }
+
+    // The thinking phase can run for minutes on GLM-5.x. Forwarding reasoning
+    // as `reasoning_content` keeps bytes flowing so client idle timeouts do not
+    // fire; clients that don't know the field ignore it.
+    #[test]
+    fn reasoning_deltas_forward_as_reasoning_content() {
+        let mut r = ChunkRenderer::new("glm-5.3".into(), 0, false);
+        let mut frames = r.render(CodexEvent::ReasoningDelta(" pondering".into()));
+        frames.extend(r.render(CodexEvent::TextDelta("answer".into())));
+        let out = payloads(frames);
+        let reasoning: Vec<&Value> = out
+            .iter()
+            .filter(|frame| {
+                frame["choices"][0]["delta"]
+                    .get("reasoning_content")
+                    .is_some()
+            })
+            .collect();
+        assert_eq!(reasoning.len(), 1);
+        assert_eq!(
+            reasoning[0]["choices"][0]["delta"]["reasoning_content"],
+            " pondering"
+        );
+        let text = out
+            .iter()
+            .find(|frame| frame["choices"][0]["delta"]["content"] == "answer")
+            .expect("text delta");
+        assert_eq!(text["choices"][0]["delta"]["content"], "answer");
+        // The role prelude must precede both.
+        assert_eq!(out[0]["choices"][0]["delta"]["role"], "assistant");
     }
 }
 
