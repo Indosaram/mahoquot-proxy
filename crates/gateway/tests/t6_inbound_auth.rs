@@ -70,8 +70,7 @@ async fn config_yaml_api_keys_are_enforced() {
 #[tokio::test]
 async fn runtime_api_key_replacement_is_enforced_immediately() {
     let auth_dir = common::unique_temp_dir("mahoquot-runtime-api-key");
-    std::fs::write(auth_dir.join("config.yaml"), "api-keys:\n  - old-key\n")
-        .expect("config.yaml");
+    std::fs::write(auth_dir.join("config.yaml"), "api-keys:\n  - old-key\n").expect("config.yaml");
     let app = create_app(Arc::new(
         AppState::new(&gateway_config(&auth_dir)).expect("state"),
     ));
@@ -96,10 +95,7 @@ async fn runtime_api_key_replacement_is_enforced_immediately() {
         models_status(&app, Some("old-key")).await,
         StatusCode::UNAUTHORIZED
     );
-    assert_eq!(
-        models_status(&app, Some("new-key")).await,
-        StatusCode::OK
-    );
+    assert_eq!(models_status(&app, Some("new-key")).await, StatusCode::OK);
 
     std::fs::remove_dir_all(auth_dir).ok();
 }

@@ -56,7 +56,13 @@ impl ApiKeys {
             || self
                 .settings
                 .as_ref()
-                .map(|settings| settings.current().api_keys.iter().any(|key| key == presented))
+                .map(|settings| {
+                    settings
+                        .current()
+                        .api_keys
+                        .iter()
+                        .any(|key| key == presented)
+                })
                 .unwrap_or(false)
     }
 
