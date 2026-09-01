@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use mahoquot_providers::credential_file::write_credential_atomically;
 use mahoquot_providers::refresh_exec::{apply_refresh_to_file, execute_refresh_spec, RefreshError};
 use mahoquot_providers::{
     derive_identity_slug, is_antigravity_model, load_antigravity_account, AntigravityAccount,
@@ -698,7 +699,7 @@ impl AccountMember {
                 "client_id".to_string(),
                 serde_json::Value::String(fresh.clone()),
             );
-        std::fs::write(&self.file_path, root.to_string())?;
+        write_credential_atomically(&self.file_path, root.to_string().as_bytes())?;
         self.reload_from_file()
             .map_err(|e| RefreshError::Parse(e.to_string()))?;
         Ok((bootstrap_url, fresh))

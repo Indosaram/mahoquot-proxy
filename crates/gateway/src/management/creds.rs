@@ -6,6 +6,7 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
+use mahoquot_providers::credential_file::write_credential_atomically;
 use serde_json::{json, Value};
 
 use crate::state::AppState;
@@ -184,7 +185,7 @@ async fn save_auth_file_order(State(state): State<Arc<AppState>>, raw: bytes::By
             return json_status(StatusCode::BAD_REQUEST, json!({ "error": err.to_string() }))
         }
     };
-    match write_atomically(&dir.join(ACCOUNT_ORDER_FILE), &rendered) {
+    match write_credential_atomically(&dir.join(ACCOUNT_ORDER_FILE), rendered.as_bytes()) {
         Ok(()) => json_status(StatusCode::OK, json!({ "status": "ok", "names": names })),
         Err(err) => json_status(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -286,7 +287,7 @@ async fn import_local_claude(State(state): State<Arc<AppState>>) -> Response {
         );
     }
     let rendered = serde_json::to_string_pretty(&stored).unwrap_or_default();
-    match write_atomically(&dir.join("claude-local.json"), &rendered) {
+    match write_credential_atomically(&dir.join("claude-local.json"), rendered.as_bytes()) {
         Ok(()) => {
             if let Err(error) = state.rescan_pool() {
                 eprintln!("pool rescan failed after claude import: {error}");
@@ -336,7 +337,7 @@ async fn create_auth_file(State(state): State<Arc<AppState>>, raw: bytes::Bytes)
             )
         }
     };
-    match write_atomically(&dir.join(name), &rendered) {
+    match write_credential_atomically(&dir.join(name), rendered.as_bytes()) {
         Ok(()) => {
             if let Err(error) = state.rescan_pool() {
                 eprintln!("pool rescan failed after credential write: {error}");
@@ -434,17 +435,6 @@ pub fn resolve_auth_index(state: &AppState, wanted: &str) -> Option<String> {
         }
     }
     None
-}
-
-/// A credential must never be observed half-written by the loader, which scans
-/// this directory continuously; render to a temp file and rename into place.
-fn write_atomically(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
-    use std::io::Write;
-    let temp = path.with_extension(format!("tmp{}", std::process::id()));
-    let mut file = std::fs::File::create(&temp)?;
-    file.write_all(contents.as_bytes())?;
-    file.sync_all()?;
-    std::fs::rename(&temp, path)
 }
 
 async fn delete_auth_file(
@@ -589,7 +579,7 @@ async fn patch_auth_file_status(
             )
         }
     };
-    if let Err(error) = write_atomically(&path, &rendered) {
+    if let Err(error) = write_credential_atomically(&path, rendered.as_bytes()) {
         return json_status(
             StatusCode::INTERNAL_SERVER_ERROR,
             json!({ "error": error.to_string() }),
@@ -720,7 +710,7 @@ async fn patch_auth_file_fields(
             )
         }
     };
-    if let Err(error) = write_atomically(&path, &rendered) {
+    if let Err(error) = write_credential_atomically(&path, rendered.as_bytes()) {
         return json_status(
             StatusCode::INTERNAL_SERVER_ERROR,
             json!({ "error": error.to_string() }),
@@ -895,7 +885,7 @@ async fn vertex_import(State(state): State<Arc<AppState>>, raw: bytes::Bytes) ->
             )
         }
     };
-    if let Err(error) = write_atomically(&path, &rendered) {
+    if let Err(error) = write_credential_atomically(&path, rendered.as_bytes()) {
         return json_status(
             StatusCode::INTERNAL_SERVER_ERROR,
             json!({ "error": error.to_string() }),
@@ -944,7 +934,7 @@ async fn command_code_import(
             )
         }
     };
-    if let Err(error) = write_atomically(&path, &rendered) {
+    if let Err(error) = write_credential_atomically(&path, rendered.as_bytes()) {
         return json_status(
             StatusCode::INTERNAL_SERVER_ERROR,
             json!({"error":error.to_string()}),
@@ -1022,7 +1012,7 @@ async fn trae_import(State(state): State<Arc<AppState>>, Json(body): Json<Value>
     let dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
     let target = dir.join("monitor-trae.json");
     let rendered = serde_json::to_string_pretty(&credential).unwrap_or_default();
-    if let Err(error) = write_atomically(&target, &rendered) {
+    if let Err(error) = write_credential_atomically(&target, rendered.as_bytes()) {
         return json_status(
             StatusCode::INTERNAL_SERVER_ERROR,
             json!({"error":error.to_string()}),
@@ -1129,7 +1119,7 @@ mod tests {
         // given a credential written atomically
         let dir = std::env::temp_dir().join(format!("mahoquot-creds-w-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
-        write_atomically(&dir.join("x.json"), "{}").expect("writes");
+        write_credential_atomically(&dir.join("x.json"), b"{}").expect("writes");
         // when the directory is listed
         let names: Vec<_> = std::fs::read_dir(&dir)
             .expect("readable")

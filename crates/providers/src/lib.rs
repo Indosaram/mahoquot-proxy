@@ -8,6 +8,7 @@
 pub mod account;
 pub mod antigravity;
 pub mod claude;
+pub mod credential_file;
 pub mod cursor;
 pub mod kiro;
 pub mod mimo;

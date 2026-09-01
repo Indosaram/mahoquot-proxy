@@ -1,12 +1,10 @@
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::Value;
 
+use crate::credential_file::write_credential_atomically;
 use crate::refresh::Tokens;
-
-static TEMP_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 pub fn format_expired_rfc3339(unix: i64) -> String {
     DateTime::<Utc>::from_timestamp(unix, 0)
@@ -237,23 +235,7 @@ pub fn apply_refresh_to_file(
 
     let serialized =
         serde_json::to_string(&root).map_err(|e| RefreshError::Parse(e.to_string()))?;
-
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("auth");
-    let seq = TEMP_FILE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let temp_path = parent.join(format!(".{file_name}.tmp.{}.{seq}", std::process::id()));
-
-    if let Err(e) = std::fs::write(&temp_path, serialized.as_bytes()) {
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(RefreshError::Io(e));
-    }
-
-    if let Err(e) = std::fs::rename(&temp_path, path) {
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(RefreshError::Io(e));
-    }
-
-    Ok(())
+    write_credential_atomically(path, serialized.as_bytes()).map_err(RefreshError::Io)
 }
 
 #[cfg(test)]

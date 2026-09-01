@@ -228,12 +228,12 @@
         "needle": "atomicWriteFile"
       },
       "owner": {
-        "path": "crates/gateway/src/management/creds.rs",
-        "needle": "fn write_atomically"
+        "path": "crates/providers/src/credential_file.rs",
+        "needle": "fn write_credential_atomically"
       },
       "green_test": {
-        "path": "crates/gateway/src/management/creds.rs",
-        "needle": "writing_a_credential_leaves_no_temp_file"
+        "path": "crates/providers/src/credential_file.rs",
+        "needle": "resulting_file_mode_is_owner_read_write_only"
       },
       "evidence": ".omo/ulw-loop/opencodex-cliproxy-auth-proxy/evidence/command-code-auth-green.txt"
     },
@@ -723,8 +723,8 @@
       "auth_kind": "key",
       "coverage": "dedicated",
       "green_test": {
-        "path": "crates/gateway/tests/t13_provider_oauth.rs",
-        "needle": "gemini_pkce_callback_writes_google_adapter_account"
+        "path": "crates/gateway/tests/t12_provider_relay.rs",
+        "needle": "google_ai_studio_uses_generativelanguage_wire_and_api_key_header"
       }
     },
     {
