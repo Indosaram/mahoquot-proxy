@@ -56,6 +56,26 @@ pub struct TelemetryStore {
     flush_requested: tokio::sync::Notify,
 }
 
+/// Index of the bucket for `minute_unix`, inserted (keeping the vector
+/// ordered) when missing. Keyed lookup instead of a last-bucket check: an
+/// event arriving out of order across a minute boundary must reuse its
+/// bucket, not fragment the history with a duplicate minute.
+fn bucket_index_for(buckets: &mut Vec<TelemetryBucket>, minute_unix: i64) -> usize {
+    match buckets.binary_search_by_key(&minute_unix, |b| b.minute_unix) {
+        Ok(index) => index,
+        Err(position) => {
+            buckets.insert(
+                position,
+                TelemetryBucket {
+                    minute_unix,
+                    ..TelemetryBucket::default()
+                },
+            );
+            position
+        }
+    }
+}
+
 impl TelemetryStore {
     pub fn load(path: PathBuf) -> Self {
         let buckets = load_buckets(&path);
@@ -83,16 +103,7 @@ impl TelemetryStore {
             .buckets
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let bucket_index = match buckets.last() {
-            Some(bucket) if bucket.minute_unix == minute_unix => buckets.len() - 1,
-            _ => {
-                buckets.push(TelemetryBucket {
-                    minute_unix,
-                    ..TelemetryBucket::default()
-                });
-                buckets.len() - 1
-            }
-        };
+        let bucket_index = bucket_index_for(&mut buckets, minute_unix);
         let bucket = &mut buckets[bucket_index];
         bucket.requests += 1;
         if success {
@@ -169,16 +180,7 @@ impl TelemetryStore {
             .buckets
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let bucket_index = match buckets.last() {
-            Some(bucket) if bucket.minute_unix == minute_unix => buckets.len() - 1,
-            _ => {
-                buckets.push(TelemetryBucket {
-                    minute_unix,
-                    ..TelemetryBucket::default()
-                });
-                buckets.len() - 1
-            }
-        };
+        let bucket_index = bucket_index_for(&mut buckets, minute_unix);
         let bucket = &mut buckets[bucket_index];
         bucket.input_tokens = bucket.input_tokens.saturating_add(input_tokens);
         bucket.output_tokens = bucket.output_tokens.saturating_add(output_tokens);

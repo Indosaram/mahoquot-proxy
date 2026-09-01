@@ -1056,7 +1056,12 @@ impl UsageSampleStore {
         window.truncate(600);
         let retained = window.clone();
         if let Ok(raw) = serde_json::to_string_pretty(&*entries) {
-            let _ = std::fs::write(&self.path, raw);
+            // Atomic rename: a crash mid-write must not wipe the 24h rolling
+            // baseline this file exists to preserve.
+            let _ = mahoquot_providers::credential_file::write_credential_atomically(
+                &self.path,
+                raw.as_bytes(),
+            );
         }
         retained
     }

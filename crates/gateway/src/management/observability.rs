@@ -87,11 +87,23 @@ pub fn append_log_line(settings: &Settings, line: &str) {
     }
 }
 
+/// Size of the file right after the last trim, so the append path stays a
+/// pure append instead of a full read+rewrite on every line once the cap is
+/// reached (QUOTA-4: 100 MB x per-line rewrites pegged the disk).
+static LAST_TRIM_SIZE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn trim_log_file(path: &std::path::Path, max_bytes: u64) {
+    use std::sync::atomic::Ordering;
     let Ok(metadata) = std::fs::metadata(path) else {
         return;
     };
-    if metadata.len() <= max_bytes {
+    let size = metadata.len();
+    let margin = (max_bytes / 10).max(1024 * 1024);
+    let last = LAST_TRIM_SIZE.load(Ordering::Relaxed);
+    if last != 0 && size <= last.saturating_add(margin) {
+        return;
+    }
+    if size <= max_bytes {
         return;
     }
     let Ok(body) = std::fs::read(path) else {
@@ -105,6 +117,7 @@ fn trim_log_file(path: &std::path::Path, max_bytes: u64) {
         .map(|offset| start + offset + 1)
         .unwrap_or(start);
     let _ = std::fs::write(path, &body[boundary..]);
+    LAST_TRIM_SIZE.store((body.len() - boundary) as u64, Ordering::Relaxed);
 }
 
 fn read_log_lines(dir: &std::path::Path) -> Vec<String> {

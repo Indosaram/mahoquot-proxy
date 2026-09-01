@@ -15,6 +15,9 @@ use super::settings::{Settings, SettingsError};
 pub struct SettingsStore {
     current: ArcSwap<Settings>,
     path: PathBuf,
+    /// Serializes read-modify-write cycles so concurrent setting changes
+    /// cannot silently drop each other's edits.
+    mutate_lock: std::sync::Mutex<()>,
 }
 
 impl SettingsStore {
@@ -22,6 +25,7 @@ impl SettingsStore {
         Self {
             current: ArcSwap::from_pointee(settings),
             path,
+            mutate_lock: std::sync::Mutex::new(()),
         }
     }
 
@@ -73,6 +77,10 @@ impl SettingsStore {
     where
         F: FnOnce(&mut Settings),
     {
+        let _write = self
+            .mutate_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut next = Settings::clone(&self.current());
         edit(&mut next);
         next.persist(&self.path)?;
