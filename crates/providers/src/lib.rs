@@ -22,11 +22,11 @@ pub use account::{
     load_codex_account, parse_expired_unix, CodexAccount, LoadError, UPSTREAM_BASE, USER_AGENT,
 };
 pub use antigravity::{
-    antigravity_count_tokens_url, antigravity_quota_summary_url, antigravity_stream_url,
-    derive_antigravity_slug_from_filename, is_antigravity_model, list_antigravity_auth_files,
-    load_antigravity_account, AntigravityAccount, ANTIGRAVITY_API_VERSION, ANTIGRAVITY_CLIENT_ID,
-    ANTIGRAVITY_CLIENT_SECRET, ANTIGRAVITY_LOAD_BASE, ANTIGRAVITY_MODELS, ANTIGRAVITY_TOKEN_URL,
-    ANTIGRAVITY_UPSTREAM_BASE, ANTIGRAVITY_USER_AGENT,
+    antigravity_client_id, antigravity_client_secret, antigravity_count_tokens_url,
+    antigravity_quota_summary_url, antigravity_stream_url, derive_antigravity_slug_from_filename,
+    is_antigravity_model, list_antigravity_auth_files, load_antigravity_account,
+    AntigravityAccount, ANTIGRAVITY_API_VERSION, ANTIGRAVITY_LOAD_BASE, ANTIGRAVITY_MODELS,
+    ANTIGRAVITY_TOKEN_URL, ANTIGRAVITY_UPSTREAM_BASE, ANTIGRAVITY_USER_AGENT,
 };
 pub use claude::{
     claude_messages_url, is_claude_model, list_claude_auth_files, ClaudeAccount,

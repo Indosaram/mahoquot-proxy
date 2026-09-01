@@ -59,11 +59,11 @@ pub fn build_antigravity_refresh_request(refresh_token: &str) -> RefreshRequest 
         form_fields: vec![
             (
                 "client_id".to_string(),
-                crate::antigravity::ANTIGRAVITY_CLIENT_ID.to_string(),
+                crate::antigravity::antigravity_client_id().to_string(),
             ),
             (
                 "client_secret".to_string(),
-                crate::antigravity::ANTIGRAVITY_CLIENT_SECRET.to_string(),
+                crate::antigravity::antigravity_client_secret().to_string(),
             ),
             ("grant_type".to_string(), "refresh_token".to_string()),
             ("refresh_token".to_string(), refresh_token.to_string()),

@@ -548,7 +548,10 @@ mod gemini_stream_tests {
         let immediate = payloads(r.render(CodexEvent::TextDelta("OK".into())));
         assert_eq!(immediate.len(), 1);
         assert!(immediate[0].get("usageMetadata").is_none());
-        assert_eq!(immediate[0]["candidates"][0]["content"]["parts"][0]["text"], "OK");
+        assert_eq!(
+            immediate[0]["candidates"][0]["content"]["parts"][0]["text"],
+            "OK"
+        );
 
         let out = payloads(r.render(CodexEvent::Completed {
             usage: Some(usage()),

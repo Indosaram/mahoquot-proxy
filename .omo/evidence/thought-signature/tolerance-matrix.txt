@@ -1,0 +1,15 @@
+=== UNSIGNED HISTORY TOLERANCE MATRIX (live, gateway 18801, gemini-3.7-flash-high via antigravity) ===
+Variant A: plain unsigned multi-turn (2 tool pairs, no signatures)        -> HTTP 200 (tolerated)
+Variant B: same with thought_signature:"" on each tool_call              -> HTTP 200 (tolerated)
+Variant C: same with fabricated thought_signature:"x"                    -> HTTP 400 (signature validation rejects fakes)
+Variant D: tool pairs dropped, assistant turn summarized as text         -> HTTP 200
+Variant E: mixed — one real signed call + one unsigned call              -> HTTP 200 (tolerated)
+
+CONCLUSION: the upstream tolerates unsigned history as-is; it only hard-rejects
+fabricated non-empty signatures. Winning strategy = pass-through unchanged (no
+fabrication, no dropping). Regression pins:
+- compat::gemini::signature_tests::request_history_stays_signature_free_for_plain_ids
+- compat::gemini::signature_tests::request_history_attaches_signature_from_tool_call_id
+The user's recurring 400 originated from the quotio path (Quotio app :8317 ->
+CLIProxyAPI :18317) which mangles signatures in its Go binary; routing now
+prefers mahoquot (agent omo.json categories rewired 2026-08-31).

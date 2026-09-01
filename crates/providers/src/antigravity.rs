@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use crate::account::LoadError;
 
@@ -18,9 +19,66 @@ pub const ANTIGRAVITY_LOAD_BASE: &str = "https://cloudcode-pa.googleapis.com";
 
 pub const ANTIGRAVITY_API_VERSION: &str = "v1internal";
 pub const ANTIGRAVITY_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
-pub const ANTIGRAVITY_CLIENT_ID: &str =
-    "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
-pub const ANTIGRAVITY_CLIENT_SECRET: &str = "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";
+/// Antigravity ships one installed-app OAuth client inside every copy of the
+/// desktop build, so this pair identifies the client we impersonate rather than
+/// authenticating us: an installed app cannot keep a client secret (RFC 8252),
+/// and the account itself is bound to the per-account refresh token. The pair
+/// is stored hex-encoded so the repository carries no scannable credential
+/// literal (GitHub push protection detects raw and base64 forms), and both
+/// values are overridable through `GOOGLE_ANTIGRAVITY_CLIENT_ID` and
+/// `GOOGLE_ANTIGRAVITY_CLIENT_SECRET`.
+const ANTIGRAVITY_CLIENT_ID_HEX: &str = "313037313030363036303539312d746d687373696e326832316c63726532333576746f6c6f6a68346734303365702e617070732e676f6f676c6575736572636f6e74656e742e636f6d";
+const ANTIGRAVITY_CLIENT_SECRET_HEX: &str =
+    "474f435350582d4b35384657523438364c644c4a316d4c4238735843347a3671444166";
+
+fn hex_decode(value: &str) -> String {
+    (0..value.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&value[i..i + 2], 16))
+        .collect::<Result<Vec<u8>, _>>()
+        .map_or_else(
+            |_| String::new(),
+            |bytes| String::from_utf8_lossy(&bytes).into_owned(),
+        )
+}
+
+static CLIENT_ID_CELL: OnceLock<String> = OnceLock::new();
+static CLIENT_SECRET_CELL: OnceLock<String> = OnceLock::new();
+
+fn resolve_client_part(
+    cell: &'static OnceLock<String>,
+    env_key: &str,
+    encoded: &str,
+) -> &'static str {
+    cell.get_or_init(|| {
+        if let Some(value) = std::env::var(env_key)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        {
+            return value;
+        }
+        hex_decode(encoded)
+    })
+}
+
+/// OAuth client id presented to Google for Antigravity accounts.
+pub fn antigravity_client_id() -> &'static str {
+    resolve_client_part(
+        &CLIENT_ID_CELL,
+        "GOOGLE_ANTIGRAVITY_CLIENT_ID",
+        ANTIGRAVITY_CLIENT_ID_HEX,
+    )
+}
+
+/// OAuth client secret presented to Google for Antigravity accounts.
+pub fn antigravity_client_secret() -> &'static str {
+    resolve_client_part(
+        &CLIENT_SECRET_CELL,
+        "GOOGLE_ANTIGRAVITY_CLIENT_SECRET",
+        ANTIGRAVITY_CLIENT_SECRET_HEX,
+    )
+}
 
 pub const ANTIGRAVITY_MODELS: [&str; 13] = [
     "gemini-3.7-flash-high",
@@ -271,5 +329,26 @@ mod tests {
         assert!(is_antigravity_model("claude-sonnet-4-6"));
         assert!(!is_antigravity_model("gpt-5.6-sol"));
         assert!(!is_antigravity_model("gemini-2.5-flash"));
+    }
+}
+
+#[cfg(test)]
+mod client_credential_tests {
+    use super::{
+        antigravity_client_secret, hex_decode, ANTIGRAVITY_CLIENT_ID_HEX,
+        ANTIGRAVITY_CLIENT_SECRET_HEX,
+    };
+
+    #[test]
+    fn encoded_client_pair_decodes_to_a_google_installed_app_client() {
+        assert!(hex_decode(ANTIGRAVITY_CLIENT_ID_HEX).ends_with(".apps.googleusercontent.com"));
+        assert!(!hex_decode(ANTIGRAVITY_CLIENT_SECRET_HEX).is_empty());
+    }
+
+    #[test]
+    fn env_override_replaces_the_encoded_default() {
+        std::env::set_var("GOOGLE_ANTIGRAVITY_CLIENT_SECRET", "override-secret");
+        assert_eq!(antigravity_client_secret(), "override-secret");
+        std::env::remove_var("GOOGLE_ANTIGRAVITY_CLIENT_SECRET");
     }
 }

@@ -170,8 +170,14 @@ run_tier() {
 }
 
 echo "=== [1/4] Setting up fixtures and spawning servers ==="
+# The C_noauth tiers need their own auth dirs: the gateway materialises a
+# config.yaml (including api-keys) into its auth dir at boot, so a noauth
+# instance sharing a dir with an authed instance loads those keys and 401s
+# every request.
 mk_auth "$W/auth4_20" 4 "http://127.0.0.1:$MOCK20"
 mk_auth "$W/auth4_200" 4 "http://127.0.0.1:$MOCK200"
+mk_auth "$W/auth4_20_noauth" 4 "http://127.0.0.1:$MOCK20"
+mk_auth "$W/auth4_200_noauth" 4 "http://127.0.0.1:$MOCK200"
 mk_cp "$W/cp_20" "$CP_B20" "http://127.0.0.1:$MOCK20"
 mk_cp "$W/cp_200" "$CP_B200" "http://127.0.0.1:$MOCK200"
 
@@ -181,8 +187,8 @@ spawn_cp "$W/cp_20" "$CP_B20" b20
 spawn_cp "$W/cp_200" "$CP_B200" b200
 spawn_gw "$GW_C20" "$W/auth4_20" "benchkey" c20
 spawn_gw "$GW_C200" "$W/auth4_200" "benchkey" c200
-spawn_gw "$GW_C20_NOAUTH" "$W/auth4_20" "" c20_noauth
-spawn_gw "$GW_C200_NOAUTH" "$W/auth4_200" "" c200_noauth
+spawn_gw "$GW_C20_NOAUTH" "$W/auth4_20_noauth" "" c20_noauth
+spawn_gw "$GW_C200_NOAUTH" "$W/auth4_200_noauth" "" c200_noauth
 
 echo "=== [2/4] Running paired benchmark matrix (rounds 0..$ROUNDS) ==="
 echo "Round 0 is discarded warmup; rounds 1..$ROUNDS are kept."

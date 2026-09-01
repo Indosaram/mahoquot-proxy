@@ -9,6 +9,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::prelude::*;
 use mahoquot_providers::credential_file::write_credential_atomically;
+use mahoquot_providers::{antigravity_client_id, antigravity_client_secret};
 use serde_json::{json, Value};
 use tokio::sync::Notify;
 
@@ -33,9 +34,6 @@ const COMMAND_CODE_DEFAULT_CALLBACK_URL: &str = "http://127.0.0.1:5959/callback"
 const CURSOR_DEFAULT_LOGIN_URL: &str = "https://cursor.com/loginDeepControl";
 const CURSOR_DEFAULT_POLL_URL: &str = "https://api2.cursor.sh/auth/poll";
 
-const ANTIGRAVITY_CLIENT_ID: &str =
-    "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
-const ANTIGRAVITY_CLIENT_SECRET: &str = "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";
 const ANTIGRAVITY_DEFAULT_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const ANTIGRAVITY_DEFAULT_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const ANTIGRAVITY_DEFAULT_USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v2/userinfo";
@@ -58,13 +56,13 @@ pub fn create_antigravity_auth_url(
         .get("client_id")
         .cloned()
         .or_else(|| std::env::var("GOOGLE_ANTIGRAVITY_CLIENT_ID").ok())
-        .unwrap_or_else(|| ANTIGRAVITY_CLIENT_ID.to_string());
+        .unwrap_or_else(|| antigravity_client_id().to_string());
 
     let client_secret = params
         .get("client_secret")
         .cloned()
         .or_else(|| std::env::var("GOOGLE_ANTIGRAVITY_CLIENT_SECRET").ok())
-        .unwrap_or_else(|| ANTIGRAVITY_CLIENT_SECRET.to_string());
+        .unwrap_or_else(|| antigravity_client_secret().to_string());
 
     let auth_url = params
         .get("auth_url")
@@ -163,11 +161,11 @@ async fn exchange_antigravity_code(
     let client_id = extra_meta
         .get("client_id")
         .and_then(Value::as_str)
-        .unwrap_or(ANTIGRAVITY_CLIENT_ID);
+        .unwrap_or(antigravity_client_id());
     let client_secret = extra_meta
         .get("client_secret")
         .and_then(Value::as_str)
-        .unwrap_or(ANTIGRAVITY_CLIENT_SECRET);
+        .unwrap_or(antigravity_client_secret());
     let userinfo_url = extra_meta
         .get("userinfo_url")
         .and_then(Value::as_str)

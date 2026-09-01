@@ -813,8 +813,7 @@ fn select_index(
         if exclude.contains(&index) {
             continue;
         }
-        if model_owned_by_dedicated_provider
-            && member.kind() == crate::account::ProviderKind::Codex
+        if model_owned_by_dedicated_provider && member.kind() == crate::account::ProviderKind::Codex
         {
             continue;
         }

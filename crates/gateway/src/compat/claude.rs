@@ -991,10 +991,7 @@ mod contract_tests {
         for frame in joined.split("\n\n") {
             let mut lines = frame.lines();
             let event = lines.next().unwrap_or_default().strip_prefix("event: ");
-            let payload: Value = match lines
-                .next()
-                .and_then(|line| line.strip_prefix("data: "))
-            {
+            let payload: Value = match lines.next().and_then(|line| line.strip_prefix("data: ")) {
                 Some(body) => serde_json::from_str(body).expect("valid frame payload"),
                 None => continue,
             };
@@ -1004,19 +1001,27 @@ mod contract_tests {
                     let kind = payload["content_block"]["type"]
                         .as_str()
                         .expect("block type");
-                    assert!(open.insert(index, kind.to_string()).is_none(),
-                        "index {index} started while already open ({kind})");
+                    assert!(
+                        open.insert(index, kind.to_string()).is_none(),
+                        "index {index} started while already open ({kind})"
+                    );
                     if let Some(name) = payload["content_block"]["name"].as_str() {
                         started_names.push(name.to_string());
                     }
                 }
                 Some("content_block_delta") => {
                     let index = payload["index"].as_u64().expect("block index");
-                    assert!(open.contains_key(&index), "delta for unopened index {index}");
+                    assert!(
+                        open.contains_key(&index),
+                        "delta for unopened index {index}"
+                    );
                 }
                 Some("content_block_stop") => {
                     let index = payload["index"].as_u64().expect("block index");
-                    assert!(open.remove(&index).is_some(), "stop for unopened index {index}");
+                    assert!(
+                        open.remove(&index).is_some(),
+                        "stop for unopened index {index}"
+                    );
                 }
                 Some("message_delta") => {
                     stop_reason = payload["delta"]["stop_reason"]

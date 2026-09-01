@@ -17,7 +17,7 @@ use mahoquot_gateway::config::GatewayConfig;
 use mahoquot_gateway::routes::create_app;
 use mahoquot_gateway::state::AppState;
 use mahoquot_providers::antigravity::{
-    AntigravityAccount, ANTIGRAVITY_CLIENT_ID, ANTIGRAVITY_CLIENT_SECRET,
+    antigravity_client_id, antigravity_client_secret, AntigravityAccount,
 };
 use mahoquot_providers::claude::ClaudeAccount;
 use mahoquot_providers::cursor::CursorAccount;
@@ -842,7 +842,10 @@ async fn test_antigravity_oauth_flow_end_to_end() {
     let state = start_json["state"].as_str().unwrap();
 
     // Assert auth URL query params
-    assert!(auth_url.contains(&format!("client_id={}", url_encode(ANTIGRAVITY_CLIENT_ID))));
+    assert!(auth_url.contains(&format!(
+        "client_id={}",
+        url_encode(antigravity_client_id())
+    )));
     assert!(auth_url.contains("redirect_uri="));
     assert!(auth_url.contains("scope="));
     assert!(auth_url.contains("code_challenge="));
@@ -873,10 +876,13 @@ async fn test_antigravity_oauth_flow_end_to_end() {
 
     let raw_token_body = server_state.last_token_body.lock().await.clone().unwrap();
     assert!(raw_token_body.contains("grant_type=authorization_code"));
-    assert!(raw_token_body.contains(&format!("client_id={}", url_encode(ANTIGRAVITY_CLIENT_ID))));
+    assert!(raw_token_body.contains(&format!(
+        "client_id={}",
+        url_encode(antigravity_client_id())
+    )));
     assert!(raw_token_body.contains(&format!(
         "client_secret={}",
-        url_encode(ANTIGRAVITY_CLIENT_SECRET)
+        url_encode(antigravity_client_secret())
     )));
     assert!(raw_token_body.contains("code=antigravity-code-777"));
     assert!(raw_token_body.contains("redirect_uri="));
