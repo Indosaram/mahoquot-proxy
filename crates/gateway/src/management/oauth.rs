@@ -8,6 +8,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::prelude::*;
+use mahoquot_providers::credential_file::write_credential_atomically;
 use serde_json::{json, Value};
 use tokio::sync::Notify;
 
@@ -343,7 +344,8 @@ async fn exchange_antigravity_code(
     let filename = format!("antigravity-{}.json", sanitize_filename(&email));
     let auth_dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
     let rendered = serde_json::to_string_pretty(&credential).map_err(|error| error.to_string())?;
-    write_atomically(&auth_dir.join(filename), &rendered).map_err(|error| error.to_string())?;
+    write_credential_atomically(&auth_dir.join(filename), rendered.as_bytes())
+        .map_err(|error| error.to_string())?;
 
     session.saved_account_email = Some(email);
     session.status = SessionStatus::Completed;
@@ -426,98 +428,6 @@ fn create_xai_auth_url(params: &HashMap<String, String>) -> (String, String, OAu
     (url, state, session)
 }
 
-fn create_gemini_auth_url(
-    params: &HashMap<String, String>,
-) -> Result<(String, String, OAuthSession), String> {
-    let client_id = params
-        .get("client_id")
-        .cloned()
-        .or_else(|| std::env::var("QUOTIO_GEMINI_CLIENT_ID").ok())
-        .ok_or_else(|| "Gemini OAuth requires QUOTIO_GEMINI_CLIENT_ID or client_id".to_string())?;
-    let state = new_state();
-    let (verifier, challenge) = generate_pkce();
-    let auth_url = params
-        .get("auth_url")
-        .cloned()
-        .unwrap_or_else(|| "https://accounts.google.com/o/oauth2/v2/auth".to_string());
-    let token_url = params
-        .get("token_url")
-        .cloned()
-        .unwrap_or_else(|| "https://oauth2.googleapis.com/token".to_string());
-    let redirect_uri = params
-        .get("redirect_uri")
-        .cloned()
-        .unwrap_or_else(|| "http://127.0.0.1:51122/oauth2callback".to_string());
-    let scope = "openid https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile";
-    let url = format!("{auth_url}?client_id={}&response_type=code&redirect_uri={}&scope={}&access_type=offline&prompt=consent&code_challenge={}&code_challenge_method=S256&state={}",
-        url_encode(&client_id), url_encode(&redirect_uri), url_encode(scope), url_encode(&challenge), state);
-    let session = OAuthSession {
-        state: state.clone(),
-        provider: "gemini-cli".to_string(),
-        verifier,
-        challenge: client_id,
-        redirect_uri,
-        token_url,
-        poll_url: params.get("client_secret").cloned().unwrap_or_default(),
-        uuid: "gemini-2.5-pro,gemini-2.5-flash,gemini-1.5-pro,gemini-1.5-flash".to_string(),
-        status: SessionStatus::Pending,
-        created_at: Instant::now(),
-        saved_account_email: None,
-    };
-    Ok((url, state, session))
-}
-
-async fn exchange_gemini_code(
-    state: &AppState,
-    session: &mut OAuthSession,
-    code: &str,
-) -> Result<(), String> {
-    let response = state
-        .http_client
-        .post(&session.token_url)
-        .form(&[
-            ("grant_type", "authorization_code"),
-            ("client_id", session.challenge.as_str()),
-            ("client_secret", session.poll_url.as_str()),
-            ("code", code),
-            ("redirect_uri", session.redirect_uri.as_str()),
-            ("code_verifier", session.verifier.as_str()),
-        ])
-        .send()
-        .await
-        .map_err(|error| error.to_string())?;
-    let status = response.status();
-    let body: Value = response.json().await.map_err(|error| error.to_string())?;
-    if !status.is_success() {
-        return Err(format!("Gemini token exchange failed ({status}): {body}"));
-    }
-    let access_token = body
-        .get("access_token")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "Gemini token response missing access_token".to_string())?;
-    let email = body
-        .get("email")
-        .and_then(Value::as_str)
-        .unwrap_or("gemini-account");
-    let project_id = body.get("project_id").and_then(Value::as_str).unwrap_or("");
-    let credential = json!({"type":"generic","provider":"gemini-cli","label":email,"adapter":"google",
-        "auth_mode":"oauth","project_id":project_id,"base_url":"https://cloudcode-pa.googleapis.com",
-        "api_key":access_token,"refresh_token":body.get("refresh_token"),"models":session.uuid.split(',').collect::<Vec<_>>(),"disabled":false});
-    let auth_dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
-    let rendered = serde_json::to_string_pretty(&credential).map_err(|error| error.to_string())?;
-    write_atomically(
-        &auth_dir.join(format!(
-            "generic-gemini-cli-{}.json",
-            sanitize_filename(email)
-        )),
-        &rendered,
-    )
-    .map_err(|error| error.to_string())?;
-    session.saved_account_email = Some(email.to_string());
-    session.status = SessionStatus::Completed;
-    Ok(())
-}
-
 async fn exchange_xai_code(
     state: &AppState,
     session: &mut OAuthSession,
@@ -558,9 +468,9 @@ async fn exchange_xai_code(
     });
     let auth_dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
     let rendered = serde_json::to_string_pretty(&credential).map_err(|error| error.to_string())?;
-    write_atomically(
+    write_credential_atomically(
         &auth_dir.join(format!("generic-xai-{}.json", sanitize_filename(email))),
-        &rendered,
+        rendered.as_bytes(),
     )
     .map_err(|error| error.to_string())?;
     session.saved_account_email = Some(email.to_string());
@@ -780,15 +690,6 @@ mod hex {
         }
         s
     }
-}
-
-fn write_atomically(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let temp = path.with_extension(format!("tmp{}", std::process::id()));
-    std::fs::write(&temp, contents)?;
-    std::fs::rename(&temp, path)
 }
 
 pub fn format_rfc3339(secs_since_epoch: u64) -> String {
@@ -1124,7 +1025,8 @@ async fn poll_device_session(
         sanitize_filename(email)
     );
     let rendered = serde_json::to_string_pretty(&credential).map_err(|error| error.to_string())?;
-    write_atomically(&auth_dir.join(filename), &rendered).map_err(|error| error.to_string())?;
+    write_credential_atomically(&auth_dir.join(filename), rendered.as_bytes())
+        .map_err(|error| error.to_string())?;
     session.saved_account_email = Some(email.to_string());
     session.status = SessionStatus::Completed;
     Ok(Some(credential))
@@ -1235,7 +1137,7 @@ pub async fn exchange_anthropic_code(
     let file_path = auth_dir.join(&filename);
     let rendered = serde_json::to_string_pretty(&cred_json)
         .map_err(|e| format!("failed to format json: {e}"))?;
-    write_atomically(&file_path, &rendered)
+    write_credential_atomically(&file_path, rendered.as_bytes())
         .map_err(|e| format!("failed writing credential file: {e}"))?;
 
     session.saved_account_email = Some(email.to_string());
@@ -1334,7 +1236,8 @@ async fn exchange_codex_code(
     let filename = format!("codex-{}{}.json", sanitize_filename(email), suffix);
     let rendered = serde_json::to_string_pretty(&credential).map_err(|error| error.to_string())?;
     let auth_dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
-    write_atomically(&auth_dir.join(filename), &rendered).map_err(|error| error.to_string())?;
+    write_credential_atomically(&auth_dir.join(filename), rendered.as_bytes())
+        .map_err(|error| error.to_string())?;
     session.saved_account_email = Some(email.to_string());
     session.status = SessionStatus::Completed;
     Ok(())
@@ -1446,7 +1349,7 @@ pub async fn poll_cursor_session(
     let file_path = auth_dir.join(&filename);
     let rendered = serde_json::to_string_pretty(&cred_json)
         .map_err(|e| format!("failed formatting json: {e}"))?;
-    write_atomically(&file_path, &rendered)
+    write_credential_atomically(&file_path, rendered.as_bytes())
         .map_err(|e| format!("failed writing credential file: {e}"))?;
 
     session.saved_account_email = Some(email.to_string());
@@ -1714,7 +1617,8 @@ async fn exchange_command_code_callback(
     );
     let auth_dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
     let rendered = serde_json::to_string_pretty(&credential).map_err(|e| e.to_string())?;
-    write_atomically(&auth_dir.join(filename), &rendered).map_err(|e| e.to_string())?;
+    write_credential_atomically(&auth_dir.join(filename), rendered.as_bytes())
+        .map_err(|e| e.to_string())?;
 
     if let Err(error) = state.rescan_pool() {
         eprintln!("pool rescan failed after Command Code onboarding: {error}");
@@ -1881,19 +1785,6 @@ pub async fn oauth_callback(
                     Ok(()) => {
                         if let Err(error) = state.rescan_pool() {
                             eprintln!("pool rescan failed after xAI onboarding: {error}");
-                        }
-                    }
-                    Err(error) => session.status = SessionStatus::Failed(error),
-                }
-                SESSIONS
-                    .write()
-                    .unwrap()
-                    .insert(session.state.clone(), session);
-            } else if session.provider == "gemini-cli" && session.status == SessionStatus::Pending {
-                match exchange_gemini_code(&state, &mut session, code).await {
-                    Ok(()) => {
-                        if let Err(error) = state.rescan_pool() {
-                            eprintln!("pool rescan failed after Gemini onboarding: {error}");
                         }
                     }
                     Err(error) => session.status = SessionStatus::Failed(error),
@@ -2253,17 +2144,16 @@ async fn provision_zcode_account(
                 .map_err(|err| format!("GLM ZCode api_keys create request failed: {err}"))?
                 .json()
                 .await
-                .map_err(|err| format!("GLM ZCode api_keys create response was not valid JSON: {err}"))?;
+                .map_err(|err| {
+                    format!("GLM ZCode api_keys create response was not valid JSON: {err}")
+                })?;
             mahoquot_providers::zcode::parse_created_api_key(&created)?
         }
     };
 
     let copied: Value = state
         .http_client
-        .get(format!(
-            "{keys_url}/copy/{}",
-            url_encode(&key_id)
-        ))
+        .get(format!("{keys_url}/copy/{}", url_encode(&key_id)))
         .bearer_auth(&business_token)
         .send()
         .await
@@ -2292,7 +2182,8 @@ async fn provision_zcode_account(
     let filename = format!("zcode-{}.json", sanitize_filename(&email));
     let auth_dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
     let rendered = serde_json::to_string_pretty(&credential).map_err(|e| e.to_string())?;
-    write_atomically(&auth_dir.join(filename), &rendered).map_err(|e| e.to_string())?;
+    write_credential_atomically(&auth_dir.join(filename), rendered.as_bytes())
+        .map_err(|e| e.to_string())?;
 
     if let Err(error) = state.rescan_pool() {
         eprintln!("pool rescan failed after ZCode onboarding: {error}");
@@ -2395,7 +2286,7 @@ async fn import_local_zcode(State(app_state): State<Arc<AppState>>) -> Response 
             );
         }
     };
-    if let Err(error) = write_atomically(&auth_dir.join(filename), &rendered) {
+    if let Err(error) = write_credential_atomically(&auth_dir.join(filename), rendered.as_bytes()) {
         return json_status(
             StatusCode::INTERNAL_SERVER_ERROR,
             json!({ "error": error.to_string(), "status": "error" }),
@@ -2468,7 +2359,10 @@ async fn zcode_callback_handler(
         Err(error) => {
             session.status = SessionStatus::Failed(error.clone());
             register_session(session);
-            json_status(StatusCode::BAD_REQUEST, json!({ "error": error, "status": "error" }))
+            json_status(
+                StatusCode::BAD_REQUEST,
+                json!({ "error": error, "status": "error" }),
+            )
         }
     }
 }
@@ -2480,22 +2374,6 @@ async fn xai_auth_url_handler(Query(params): Query<HashMap<String, String>>) -> 
         StatusCode::OK,
         json!({ "url":url, "state":state, "provider":"xai", "status":"ok" }),
     )
-}
-
-async fn gemini_auth_url_handler(Query(params): Query<HashMap<String, String>>) -> Response {
-    match create_gemini_auth_url(&params) {
-        Ok((url, state, session)) => {
-            register_session(session);
-            json_status(
-                StatusCode::OK,
-                json!({"url":url,"state":state,"provider":"gemini-cli","status":"ok"}),
-            )
-        }
-        Err(error) => json_status(
-            StatusCode::BAD_REQUEST,
-            json!({"status":"error","error":error}),
-        ),
-    }
 }
 
 async fn device_auth_url(
@@ -2519,7 +2397,6 @@ pub fn oauth_routes() -> Router<Arc<AppState>> {
         .route("/cursor-auth-url", get(cursor_auth_url_handler))
         .route("/antigravity-auth-url", get(antigravity_auth_url_handler))
         .route("/xai-auth-url", get(xai_auth_url_handler))
-        .route("/gemini-cli-auth-url", get(gemini_auth_url_handler))
         .route("/command-code-auth-url", get(command_code_auth_url_handler))
         .route("/zcode-auth-url", get(zcode_auth_url_handler))
         .route("/zcode-callback", post(zcode_callback_handler))
@@ -2575,7 +2452,6 @@ mod tests {
             "codex",
             "cursor",
             "xai",
-            "gemini-cli",
             "antigravity",
             "kimi",
             "qwen",
