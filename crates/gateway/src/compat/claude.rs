@@ -2,6 +2,13 @@ use serde_json::{json, Map, Value};
 
 use super::events::{CodexEvent, Usage};
 
+/// Kiro-style upstreams mark imported tools with a single `custom_` prefix.
+/// Strip at most one occurrence: `trim_start_matches` removes the substring
+/// repeatedly, so a genuine `custom_custom_y` would be corrupted to `custom_y`.
+fn strip_custom_prefix(name: &str) -> &str {
+    name.strip_prefix("custom_").unwrap_or(name)
+}
+
 #[derive(Default)]
 pub struct AnthropicDecoder {
     started: bool,
@@ -41,8 +48,8 @@ impl AnthropicDecoder {
                         .to_string(),
                     name: value["content_block"]["name"]
                         .as_str()
+                        .map(strip_custom_prefix)
                         .unwrap_or("tool")
-                        .trim_start_matches("custom_")
                         .to_string(),
                 });
                 self.next_tool_index += 1;
@@ -429,7 +436,7 @@ pub fn anthropic_json_to_openai(body: &Value, model: &str, created: i64) -> Valu
                 "id": block["id"],
                 "type": "function",
                 "function": {
-                    "name": block["name"].as_str().unwrap_or("tool").trim_start_matches("custom_"),
+                    "name": block["name"].as_str().map(strip_custom_prefix).unwrap_or("tool"),
                     "arguments": block["input"].to_string(),
                 }
             })
@@ -699,6 +706,24 @@ impl AnthropicStreamRenderer {
         }
     }
 
+    fn close_thinking(&mut self, out: &mut Vec<bytes::Bytes>) {
+        if let Some(index) = self.thinking_index.take() {
+            out.push(Self::frame(
+                "content_block_stop",
+                json!({"type":"content_block_stop","index":index}),
+            ));
+        }
+    }
+
+    fn close_open_tool(&mut self, out: &mut Vec<bytes::Bytes>) {
+        if let Some(index) = self.current_tool_index.take() {
+            out.push(Self::frame(
+                "content_block_stop",
+                json!({"type":"content_block_stop","index":index}),
+            ));
+        }
+    }
+
     pub fn render(&mut self, event: CodexEvent) -> Vec<bytes::Bytes> {
         let mut out = Vec::new();
         self.ensure_started(&mut out);
@@ -709,6 +734,8 @@ impl AnthropicStreamRenderer {
                 }
             }
             CodexEvent::TextDelta(text) => {
+                self.close_thinking(&mut out);
+                self.close_open_tool(&mut out);
                 if !self.text_open {
                     self.text_open = true;
                     out.push(Self::frame(
@@ -736,7 +763,9 @@ impl AnthropicStreamRenderer {
                 ));
             }
             CodexEvent::ToolCallBegin { call_id, name, .. } => {
+                self.close_thinking(&mut out);
                 self.close_text(&mut out);
+                self.close_open_tool(&mut out);
                 let index = self.next_content_index;
                 self.next_content_index += 1;
                 self.tool_index += 1;
@@ -754,19 +783,9 @@ impl AnthropicStreamRenderer {
                 ));
             }
             CodexEvent::Completed { usage } => {
-                if let Some(index) = self.thinking_index.take() {
-                    out.push(Self::frame(
-                        "content_block_stop",
-                        json!({"type":"content_block_stop","index":index}),
-                    ));
-                }
+                self.close_thinking(&mut out);
                 self.close_text(&mut out);
-                if let Some(index) = self.current_tool_index.take() {
-                    out.push(Self::frame(
-                        "content_block_stop",
-                        json!({"type":"content_block_stop","index":index}),
-                    ));
-                }
+                self.close_open_tool(&mut out);
                 let stop = if self.tool_index > 0 {
                     "tool_use"
                 } else {
@@ -794,6 +813,8 @@ impl AnthropicStreamRenderer {
         if let Some(index) = self.thinking_index {
             return index;
         }
+        self.close_open_tool(out);
+        self.close_text(out);
         let index = self.next_content_index;
         self.next_content_index += 1;
         self.thinking_index = Some(index);
@@ -915,6 +936,103 @@ mod contract_tests {
             .collect::<String>();
         assert!(joined.contains("\"type\":\"thinking\""), "{joined}");
         assert!(joined.contains("\"type\":\"signature_delta\""), "{joined}");
+    }
+
+    #[test]
+    fn custom_prefix_is_stripped_exactly_once() {
+        assert_eq!(strip_custom_prefix("custom_search"), "search");
+        assert_eq!(strip_custom_prefix("custom_custom_y"), "custom_y");
+        assert_eq!(strip_custom_prefix("customer_search"), "customer_search");
+        assert_eq!(strip_custom_prefix("mcp_tool"), "mcp_tool");
+        assert_eq!(strip_custom_prefix("web_search"), "web_search");
+    }
+
+    #[test]
+    fn stream_blocks_pair_start_and_stop_across_transitions() {
+        // End-to-end: an upstream Anthropic SSE stream (with a kiro-style
+        // double-prefixed tool name) is decoded and re-rendered; the downstream
+        // stream must stay well-paired and preserve the tool names.
+        let mut decoder = AnthropicDecoder::default();
+        let mut events: Vec<CodexEvent> = Vec::new();
+        for frame in [
+            json!({"type":"message_start","message":{"id":"msg_up","usage":{"input_tokens":3}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"pondering"}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig"}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"hello"}}),
+            json!({"type":"content_block_stop","index":1}),
+            json!({"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"call_1","name":"custom_custom_y","input":{}}}),
+            json!({"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{}"}}),
+            json!({"type":"content_block_stop","index":2}),
+            json!({"type":"content_block_start","index":3,"content_block":{"type":"tool_use","id":"call_2","name":"customer_search","input":{}}}),
+            json!({"type":"content_block_delta","index":3,"delta":{"type":"input_json_delta","partial_json":"{}"}}),
+            json!({"type":"message_delta","usage":{"output_tokens":2}}),
+            json!({"type":"message_stop"}),
+        ] {
+            decoder.decode(frame.to_string().as_bytes(), &mut events);
+        }
+        assert!(matches!(events.last(), Some(CodexEvent::Completed { .. })));
+
+        let mut renderer = AnthropicStreamRenderer::new("claude-sonnet-4-6".into(), 1);
+        let mut joined = String::new();
+        for event in events {
+            for frame in renderer.render(event) {
+                joined.push_str(&String::from_utf8_lossy(&frame));
+            }
+        }
+        for frame in renderer.close_unterminated() {
+            joined.push_str(&String::from_utf8_lossy(&frame));
+        }
+
+        // Walk the SSE stream and assert every content block is opened once,
+        // written only while open, and stopped before the next start.
+        let mut open: std::collections::BTreeMap<u64, String> = std::collections::BTreeMap::new();
+        let mut started_names: Vec<String> = Vec::new();
+        let mut stop_reason = String::new();
+        for frame in joined.split("\n\n") {
+            let mut lines = frame.lines();
+            let event = lines.next().unwrap_or_default().strip_prefix("event: ");
+            let payload: Value = match lines
+                .next()
+                .and_then(|line| line.strip_prefix("data: "))
+            {
+                Some(body) => serde_json::from_str(body).expect("valid frame payload"),
+                None => continue,
+            };
+            match event {
+                Some("content_block_start") => {
+                    let index = payload["index"].as_u64().expect("block index");
+                    let kind = payload["content_block"]["type"]
+                        .as_str()
+                        .expect("block type");
+                    assert!(open.insert(index, kind.to_string()).is_none(),
+                        "index {index} started while already open ({kind})");
+                    if let Some(name) = payload["content_block"]["name"].as_str() {
+                        started_names.push(name.to_string());
+                    }
+                }
+                Some("content_block_delta") => {
+                    let index = payload["index"].as_u64().expect("block index");
+                    assert!(open.contains_key(&index), "delta for unopened index {index}");
+                }
+                Some("content_block_stop") => {
+                    let index = payload["index"].as_u64().expect("block index");
+                    assert!(open.remove(&index).is_some(), "stop for unopened index {index}");
+                }
+                Some("message_delta") => {
+                    stop_reason = payload["delta"]["stop_reason"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string();
+                }
+                _ => {}
+            }
+        }
+        assert!(open.is_empty(), "blocks never stopped: {open:?}");
+        assert_eq!(stop_reason, "tool_use");
+        assert_eq!(started_names, vec!["custom_y", "customer_search"]);
     }
 
     #[test]
