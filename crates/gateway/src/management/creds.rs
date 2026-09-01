@@ -920,8 +920,33 @@ async fn command_code_import(
         .or_else(|| body.get("userName"))
         .and_then(Value::as_str)
         .unwrap_or("Command Code");
+    let base_url = std::env::var("MAHOQUOT_COMMAND_CODE_BASE_URL")
+        .unwrap_or_else(|_| "https://api.commandcode.ai/provider/v1".to_string());
+    // Plan D9 (AUTH-7): verify the key against the upstream once before it
+    // can become a stored account file.
+    let verification = state
+        .http_client
+        .get(format!("{base_url}/models"))
+        .header(header::AUTHORIZATION, format!("Bearer {api_key}"))
+        .send()
+        .await;
+    match verification {
+        Ok(response) if response.status().is_success() => {}
+        Ok(response) => {
+            return json_status(
+                StatusCode::UNAUTHORIZED,
+                json!({"error": format!("credential rejected by upstream: {}", response.status()), "status": "error"}),
+            )
+        }
+        Err(error) => {
+            return json_status(
+                StatusCode::BAD_GATEWAY,
+                json!({"error": format!("credential verification unreachable: {error}"), "status": "error"}),
+            )
+        }
+    }
     let credential = json!({"type":"generic","provider":"command-code","label":label,"adapter":"openai-chat",
-        "base_url":"https://api.commandcode.ai/provider/v1","api_key":api_key,
+        "base_url":base_url,"api_key":api_key,
         "models":["deepseek/deepseek-v4-flash"],"disabled":false});
     let dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
     let path = dir.join(format!("generic-command-code-{}.json", std::process::id()));
