@@ -43,8 +43,7 @@ pub fn openai_to_gemini(body: &Value) -> Result<Value, String> {
     // OpenAI tool messages carry `tool_call_id`, not `name`; Gemini's
     // functionResponse needs the originating function name, so index every
     // assistant tool_call by id up front.
-    let mut call_names: std::collections::HashMap<&str, &str> =
-        std::collections::HashMap::new();
+    let mut call_names: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
     for msg in messages {
         if msg.get("role").and_then(Value::as_str) == Some("assistant") {
             for call in msg
@@ -108,12 +107,28 @@ pub fn openai_to_gemini(body: &Value) -> Result<Value, String> {
                 }
             }
             "tool" => {
-                let call_id = msg.get("tool_call_id").and_then(Value::as_str).unwrap_or("");
-                let name = call_names.get(call_id).copied().ok_or_else(|| {
-                    format!(
-                        "tool response references unknown tool_call_id {call_id:?}; Gemini functionResponse needs the originating function name"
-                    )
-                })?;
+                let call_id = msg
+                    .get("tool_call_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let explicit_name = msg
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.is_empty());
+                let name = match explicit_name {
+                    // Legacy OpenAI clients carry the function name on the
+                    // tool message itself; it outranks the id lookup.
+                    Some(name) => name.to_string(),
+                    None => call_names
+                        .get(call_id)
+                        .copied()
+                        .ok_or_else(|| {
+                            format!(
+                                "tool response references unknown tool_call_id {call_id:?}; Gemini functionResponse needs the originating function name"
+                            )
+                        })?
+                        .to_string(),
+                };
                 let raw = content_to_text(msg.get("content")).unwrap_or_default();
                 let response = serde_json::from_str::<Value>(&raw)
                     .unwrap_or_else(|_| json!({ "result": raw }));
@@ -123,7 +138,10 @@ pub fn openai_to_gemini(body: &Value) -> Result<Value, String> {
                 }));
             }
             "function" => {
-                let name = msg.get("name").and_then(Value::as_str).unwrap_or("function");
+                let name = msg
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("function");
                 let raw = content_to_text(msg.get("content")).unwrap_or_default();
                 let response = serde_json::from_str::<Value>(&raw)
                     .unwrap_or_else(|_| json!({ "result": raw }));
@@ -405,7 +423,8 @@ fn openai_content_to_gemini_parts(content: Option<&Value>) -> Vec<Value> {
         Some(Value::String(s)) => vec![json!({ "text": s })],
         Some(Value::Array(items)) => items
             .iter()
-            .filter_map(|item| match item.get("type").and_then(Value::as_str) {
+            .filter_map(|item| {
+                match item.get("type").and_then(Value::as_str) {
                 Some("text") => item
                     .get("text")
                     .and_then(Value::as_str)
@@ -418,6 +437,7 @@ fn openai_content_to_gemini_parts(content: Option<&Value>) -> Vec<Value> {
                         json!({ "inlineData": { "mimeType": media_type, "data": data } })
                     }),
                 _ => None,
+            }
             })
             .collect(),
         _ => Vec::new(),
