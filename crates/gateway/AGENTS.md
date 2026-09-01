@@ -44,7 +44,7 @@ crates/gateway/
 
 ## COMMANDS
 ```bash
-cargo test -p quotio-gateway                  # Run gateway integration & unit tests
-cargo run -p quotio-gateway                   # Start local gateway server on :18801
-cargo check -p quotio-gateway                 # Validate syntax & type safety
+cargo test -p mahoquot-gateway                  # Run gateway integration & unit tests
+cargo run -p mahoquot-gateway                   # Start local gateway server on :18801
+cargo check -p mahoquot-gateway                 # Validate syntax & type safety
 ```
