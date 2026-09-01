@@ -217,7 +217,11 @@ async fn cors(method: Method, req: axum::extract::Request, next: Next) -> Respon
 }
 
 async fn healthz_handler() -> impl IntoResponse {
-    Json(serde_json::json!({"status": "ok"}))
+    Json(serde_json::json!({
+        "status": "ok",
+        "version": env!("CARGO_PKG_VERSION"),
+        "api_schema": 1,
+    }))
 }
 
 async fn keep_alive_handler() -> impl IntoResponse {
