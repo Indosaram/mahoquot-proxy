@@ -52,7 +52,9 @@ pub fn openai_to_cursor_connect(body: &Value) -> Result<Vec<u8>, String> {
             id: "optimization".to_string(),
             value: level.to_string(),
         });
-    let messages = body["messages"].as_array().expect("parsed messages");
+    let messages = body["messages"]
+        .as_array()
+        .ok_or_else(|| "Cursor requires a messages array".to_string())?;
     let root_prompt_messages_json = messages
         .iter()
         .filter(|message| matches!(message["role"].as_str(), Some("system" | "developer")))
@@ -385,6 +387,13 @@ impl CursorDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_request_without_messages_is_a_translation_error_not_a_panic() {
+        let body = serde_json::json!({"model":"cursor/auto-cost"});
+        let error = openai_to_cursor_connect(&body).expect_err("no messages must fail");
+        assert!(error.contains("Cursor requires"), "{error}");
+    }
 
     #[test]
     fn request_is_wrapped_in_agent_client_message() {
