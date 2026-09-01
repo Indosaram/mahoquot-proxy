@@ -792,22 +792,33 @@ fn eligible_indices(
         .collect()
 }
 
-fn select_index(state: &AppState, hint: &SessionHint, model: Option<&str>) -> Option<usize> {
+fn select_index(
+    state: &AppState,
+    hint: &SessionHint,
+    model: Option<&str>,
+    exclude: &[usize],
+) -> Option<usize> {
     let pool = state.pool.load();
-    let as_dyn = |members: &[Arc<AccountMember>]| {
-        members
-            .iter()
-            .map(|m| m.clone() as Arc<dyn PoolMember>)
-            .collect::<Vec<_>>()
-    };
-    let Some(model) = model else {
-        return state.router.select(&as_dyn(&pool.members), hint);
-    };
-
+    // A model served by its dedicated provider must not be intercepted by a
+    // generic Codex account, mirroring eligible_indices.
+    let model_owned_by_dedicated_provider = model.is_some_and(|model| {
+        pool.members.iter().any(|member| {
+            member.kind() != crate::account::ProviderKind::Codex
+                && member.kind().serves_model(model)
+        })
+    });
     let mut candidates: Vec<Arc<dyn PoolMember>> = Vec::with_capacity(pool.members.len());
     let mut origin: Vec<usize> = Vec::with_capacity(pool.members.len());
     for (index, member) in pool.members.iter().enumerate() {
-        if member.supports_model(model) {
+        if exclude.contains(&index) {
+            continue;
+        }
+        if model_owned_by_dedicated_provider
+            && member.kind() == crate::account::ProviderKind::Codex
+        {
+            continue;
+        }
+        if model.is_none_or(|model| member.supports_model(model)) {
             candidates.push(member.clone());
             origin.push(index);
         }
@@ -1112,9 +1123,14 @@ pub async fn handle_relay(
     let hint = SessionHint {
         affinity_key: affinity_key(headers),
     };
+    // Accounts already tried in this request. 5xx and transport failures leave
+    // health untouched (per contract), so exclusion is what forces the next
+    // attempt onto a distinct account even when session affinity binds the
+    // router to the failing one.
+    let mut attempted: Vec<usize> = Vec::new();
 
     for _ in 0..max_attempts {
-        let chosen_idx = match select_index(&state, &hint, plan.model.as_deref()) {
+        let chosen_idx = match select_index(&state, &hint, plan.model.as_deref(), &attempted) {
             Some(idx) => idx,
             None => break,
         };
@@ -1122,6 +1138,7 @@ pub async fn handle_relay(
             Some(m) => m.clone(),
             None => break,
         };
+        attempted.push(chosen_idx);
 
         let mut refreshed_this_account = false;
         let now_unix = SystemTime::now()
@@ -1335,8 +1352,21 @@ pub async fn handle_relay(
             }
         }
 
-        if status_code == 429 || (500..=504).contains(&status_code) {
+        if status_code == 429 {
             last_failure = Some(record_cooldown(resp, &member, status_code, &state).await);
+            continue;
+        }
+
+        if (500..=504).contains(&status_code) {
+            // Contract: ServerError leaves health unchanged. The account is
+            // excluded from this request's remaining attempts, but a transient
+            // upstream 5xx never benches it for other requests.
+            member.record_fail();
+            state.metrics.failed_over.fetch_add(1, Ordering::Relaxed);
+            state
+                .monitor
+                .record_error(member.id(), status_code, "upstream server error");
+            last_failure = Some(extract_failure(resp, status_code).await);
             continue;
         }
 
@@ -1482,7 +1512,7 @@ mod routing_tests {
             "kiro/claude-haiku-4-5-20251001",
             "cursor/auto",
         ] {
-            let selected = select_index(&state, &hint, Some(model)).expect("selection");
+            let selected = select_index(&state, &hint, Some(model), &[]).expect("selection");
             assert!(
                 state.pool.load().members[selected].supports_model(model),
                 "model {model} was routed to {}",

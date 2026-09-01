@@ -127,3 +127,102 @@ async fn test_t3_failover() {
 
     std::fs::remove_dir_all(&temp_dir).ok();
 }
+
+#[tokio::test]
+async fn server_error_failover_keeps_health_and_moves_to_the_next_account() {
+    // Given: Account A (FillFirst order) always answers 500, Account B 200 SSE
+    let listener_a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port_a = listener_a.local_addr().unwrap().port();
+    let app_a = Router::new().route(
+        common::CODEX_PATH,
+        post(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "{\"error\":\"boom\"}") }),
+    );
+    tokio::spawn(async move {
+        axum::serve(listener_a, app_a).await.unwrap();
+    });
+
+    let listener_b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port_b = listener_b.local_addr().unwrap().port();
+    let app_b = Router::new().route(
+        common::CODEX_PATH,
+        post(|| async {
+            (
+                StatusCode::OK,
+                [("Content-Type", "text/event-stream")],
+                common::codex_sse("hello"),
+            )
+        }),
+    );
+    tokio::spawn(async move {
+        axum::serve(listener_b, app_b).await.unwrap();
+    });
+
+    let temp_dir = unique_temp_dir("qgw-test-t3-server-error");
+    let json_a = create_auth_file_json(
+        "a",
+        "acc_a",
+        "token_a",
+        Some(&format!("http://127.0.0.1:{port_a}")),
+    );
+    std::fs::write(temp_dir.join("codex-a-plus.json"), json_a).unwrap();
+
+    let json_b = create_auth_file_json(
+        "b",
+        "acc_b",
+        "token_b",
+        Some(&format!("http://127.0.0.1:{port_b}")),
+    );
+    std::fs::write(temp_dir.join("codex-b-plus.json"), json_b).unwrap();
+
+    let config = GatewayConfig {
+        usage_poll_secs: 120,
+        port: 0,
+        auth_dir: temp_dir.clone(),
+        strategy: Strategy::FillFirst,
+        max_failover: 3,
+        log_level: "info".to_string(),
+        api_keys: mahoquot_gateway::inbound::ApiKeys::default(),
+        models_env: None,
+        refresh_url: mahoquot_providers::refresh::REFRESH_TOKEN_URL.to_string(),
+        auth_refresh_enabled: true,
+        ..Default::default()
+    };
+
+    let state = Arc::new(AppState::new(&config).unwrap());
+    let app = create_app(state.clone());
+    let gw_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gw_port = gw_listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(gw_listener, app).await.unwrap();
+    });
+
+    let client = reqwest::Client::new();
+    let gw_url = format!("http://127.0.0.1:{gw_port}/v1/chat/completions");
+
+    // When: one request bound to the affinity session (A is first in FillFirst
+    // order, so without exclusion the bound account would be retried forever)
+    let res = client
+        .post(&gw_url)
+        .header("Content-Type", "application/json")
+        .header("x-session-id", "conv-server-error")
+        .body(common::OPENAI_REQUEST)
+        .send()
+        .await
+        .unwrap();
+
+    // Then: the client still gets a 200 SSE from account B
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    let body = res.text().await.unwrap();
+    assert!(body.contains("data: [DONE]"));
+
+    // And: a transient upstream 5xx never benches account A
+    let acct_a = state.find_member("a").expect("member a exists");
+    assert_eq!(
+        acct_a.health(),
+        Health::Available,
+        "5xx must leave health unchanged, was {:?}",
+        acct_a.health()
+    );
+
+    std::fs::remove_dir_all(&temp_dir).ok();
+}
