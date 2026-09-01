@@ -24,7 +24,7 @@ crates/providers/
 | Refresh request construction | `crates/providers/src/refresh.rs` | Pure builders for token grant payloads |
 
 ## CONVENTIONS
-- **File System Discovery**: Discover provider accounts from `~/.cli-proxy-api/codex-*.json` and Antigravity directory structures.
+- **File System Discovery**: Discover provider accounts from `~/.mahoquot/auth/codex-*.json` and Antigravity directory structures.
 - **Split Construction & Execution**: Keep OAuth request payload creation pure in `refresh.rs`, delegating I/O execution to `refresh_exec.rs`.
 
 ## ANTI-PATTERNS (THIS SUBTREE)

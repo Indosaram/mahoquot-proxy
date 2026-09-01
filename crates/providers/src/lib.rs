@@ -1,7 +1,7 @@
 //! Provider adapters. Lane owns: Codex account loading from CLIProxyAPI-format
 //! auth JSON files, header decoration, (stretch) token refresh.
 //!
-//! Schema of ~/.cli-proxy-api/codex-*.json (verified 2026-08-27):
+//! Schema of ~/.mahoquot/auth/codex-*.json (verified 2026-08-27):
 //! access_token:string, account_id:string, email:string, expired:string(ISO),
 //! id_token:string, last_refresh:string, refresh_token:string, type:string
 
