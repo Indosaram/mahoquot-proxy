@@ -156,8 +156,10 @@ pub fn parse_antigravity_quota_summary(body: &serde_json::Value, now_unix: i64) 
     };
 
     AccountUsage {
-        primary: worst("weekly"),
-        secondary: worst("5h"),
+        // Window convention shared with the codex and claude parsers: primary
+        // is the short (5h session) window, secondary the weekly one.
+        primary: worst("5h"),
+        secondary: worst("weekly"),
         groups,
         observed_at_unix: Some(now_unix),
         ..Default::default()
@@ -1079,6 +1081,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn primary_is_always_the_short_window_across_providers() {
+        let now = 1_800_000_000;
+
+        // Antigravity quota summary: 5h session bucket plus a weekly one.
+        let body = serde_json::json!({
+            "groups": [{
+                "displayName": "glm-5.3",
+                "buckets": [
+                    {"bucketId": "week", "window": "weekly", "remainingFraction": 0.5,
+                     "resetTime": "2026-09-07T00:00:00Z"},
+                    {"bucketId": "session", "window": "5h", "remainingFraction": 0.9,
+                     "resetTime": "2026-09-01T05:00:00Z"}
+                ]
+            }]
+        });
+        let antigravity = parse_antigravity_quota_summary(&body, now);
+        assert_eq!(antigravity.primary.window_minutes, Some(300));
+        assert_eq!(antigravity.primary.limit_name.as_deref(), Some("session"));
+        assert_eq!(antigravity.secondary.window_minutes, Some(10_080));
+
+        // Codex headers: the plain family labels the windows positionally;
+        // classification must still put the short window in primary.
+        let headers: HashMap<String, String> = [
+            ("x-codex-primary-used-percent", "10"),
+            ("x-codex-primary-window-minutes", "10080"),
+            ("x-codex-secondary-used-percent", "40"),
+            ("x-codex-secondary-window-minutes", "300"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let codex = parse_codex_headers(&headers, now);
+        assert_eq!(codex.primary.window_minutes, Some(300));
+        assert_eq!(codex.secondary.window_minutes, Some(10_080));
+
+        // Claude unified headers: 5h session + 7d weekly.
+        let claude_headers: HashMap<String, String> = [
+            ("anthropic-ratelimit-unified-5h-utilization", "0.4"),
+            ("anthropic-ratelimit-unified-7d-utilization", "0.1"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let claude = parse_claude_headers(&claude_headers, now);
+        assert_eq!(claude.primary.window_minutes, Some(300));
+        assert_eq!(claude.secondary.window_minutes, Some(10_080));
+    }
+
+    #[test]
     fn extract_reads_openai_usage_from_tail_json() {
         let body = br#"{"id":"x","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#;
         assert_eq!(extract_total_tokens(body, body), Some(15));
@@ -1379,12 +1430,12 @@ mod tests {
     #[test]
     fn antigravity_flat_windows_take_worst_bucket() {
         let u = parse_antigravity_quota_summary(&antigravity_fixture(), 1_700_000_000);
-        // weekly: gemini ~0% vs 3p 75% -> worst is 75%
-        assert!((u.primary.used_percent.unwrap() - 75.0).abs() < 1e-6);
-        assert_eq!(u.primary.window_minutes, Some(10_080));
-        // 5h: gemini 50% vs 3p 0% -> worst is 50%
-        assert!((u.secondary.used_percent.unwrap() - 50.0).abs() < 1e-6);
-        assert_eq!(u.secondary.window_minutes, Some(300));
+        // primary is the 5h session window: gemini 50% vs 3p 0% -> worst is 50%
+        assert!((u.primary.used_percent.unwrap() - 50.0).abs() < 1e-6);
+        assert_eq!(u.primary.window_minutes, Some(300));
+        // secondary is the weekly window: gemini ~0% vs 3p 75% -> worst is 75%
+        assert!((u.secondary.used_percent.unwrap() - 75.0).abs() < 1e-6);
+        assert_eq!(u.secondary.window_minutes, Some(10_080));
     }
 
     #[test]
