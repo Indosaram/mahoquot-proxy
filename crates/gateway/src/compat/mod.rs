@@ -92,6 +92,13 @@ pub const CODEX_PATH: &str = "/backend-api/codex/responses";
 
 pub type UpstreamStream = Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>>;
 
+/// Split an OpenAI `data:` URL into its MIME type and base64 payload.
+pub fn split_data_url(url: &str) -> Option<(&str, &str)> {
+    let data_url = url.strip_prefix("data:")?;
+    let (media_type, data) = data_url.split_once(";base64,")?;
+    Some((media_type, data))
+}
+
 pub fn looks_like_sse(bytes: &[u8]) -> bool {
     let start = bytes
         .iter()

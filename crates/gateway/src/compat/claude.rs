@@ -395,10 +395,7 @@ fn openai_content_to_anthropic(part: &Value) -> Value {
     let Some(url) = part["image_url"]["url"].as_str() else {
         return part.clone();
     };
-    let Some(data_url) = url.strip_prefix("data:") else {
-        return part.clone();
-    };
-    let Some((media_type, data)) = data_url.split_once(";base64,") else {
+    let Some((media_type, data)) = super::split_data_url(url) else {
         return part.clone();
     };
     json!({

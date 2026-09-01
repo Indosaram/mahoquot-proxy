@@ -40,6 +40,28 @@ pub fn openai_to_gemini(body: &Value) -> Result<Value, String> {
     let mut system_parts: Vec<Value> = Vec::new();
     let empty: Vec<Value> = Vec::new();
 
+    // OpenAI tool messages carry `tool_call_id`, not `name`; Gemini's
+    // functionResponse needs the originating function name, so index every
+    // assistant tool_call by id up front.
+    let mut call_names: std::collections::HashMap<&str, &str> =
+        std::collections::HashMap::new();
+    for msg in messages {
+        if msg.get("role").and_then(Value::as_str) == Some("assistant") {
+            for call in msg
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .unwrap_or(&empty)
+            {
+                if let (Some(id), Some(name)) = (
+                    call.get("id").and_then(Value::as_str),
+                    call.pointer("/function/name").and_then(Value::as_str),
+                ) {
+                    call_names.insert(id, name);
+                }
+            }
+        }
+    }
+
     for msg in messages {
         let role = msg.get("role").and_then(Value::as_str).unwrap_or("user");
         match role {
@@ -85,8 +107,23 @@ pub fn openai_to_gemini(body: &Value) -> Result<Value, String> {
                     contents.push(json!({ "role": "model", "parts": parts }));
                 }
             }
-            "tool" | "function" => {
-                let name = msg.get("name").and_then(Value::as_str).unwrap_or("tool");
+            "tool" => {
+                let call_id = msg.get("tool_call_id").and_then(Value::as_str).unwrap_or("");
+                let name = call_names.get(call_id).copied().ok_or_else(|| {
+                    format!(
+                        "tool response references unknown tool_call_id {call_id:?}; Gemini functionResponse needs the originating function name"
+                    )
+                })?;
+                let raw = content_to_text(msg.get("content")).unwrap_or_default();
+                let response = serde_json::from_str::<Value>(&raw)
+                    .unwrap_or_else(|_| json!({ "result": raw }));
+                contents.push(json!({
+                    "role": "user",
+                    "parts": [{ "functionResponse": { "name": name, "response": response } }]
+                }));
+            }
+            "function" => {
+                let name = msg.get("name").and_then(Value::as_str).unwrap_or("function");
                 let raw = content_to_text(msg.get("content")).unwrap_or_default();
                 let response = serde_json::from_str::<Value>(&raw)
                     .unwrap_or_else(|_| json!({ "result": raw }));
@@ -96,8 +133,9 @@ pub fn openai_to_gemini(body: &Value) -> Result<Value, String> {
                 }));
             }
             _ => {
-                if let Some(text) = content_to_text(msg.get("content")) {
-                    contents.push(json!({ "role": "user", "parts": [{ "text": text }] }));
+                let parts = openai_content_to_gemini_parts(msg.get("content"));
+                if !parts.is_empty() {
+                    contents.push(json!({ "role": "user", "parts": parts }));
                 }
             }
         }
@@ -359,6 +397,33 @@ fn content_to_text(content: Option<&Value>) -> Option<String> {
     }
 }
 
+/// OpenAI multimodal content to Gemini parts: text maps to `text`, data-URL
+/// `image_url` parts map to `inlineData`. The Gemini path used to collect only
+/// text, silently dropping images that the claude adapter handled.
+fn openai_content_to_gemini_parts(content: Option<&Value>) -> Vec<Value> {
+    match content {
+        Some(Value::String(s)) => vec![json!({ "text": s })],
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| match item.get("type").and_then(Value::as_str) {
+                Some("text") => item
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(|t| json!({ "text": t })),
+                Some("image_url") => item
+                    .pointer("/image_url/url")
+                    .and_then(Value::as_str)
+                    .and_then(super::split_data_url)
+                    .map(|(media_type, data)| {
+                        json!({ "inlineData": { "mimeType": media_type, "data": data } })
+                    }),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 #[derive(Default)]
 pub struct GeminiDecoder {
     tool_index: u64,
@@ -609,6 +674,49 @@ mod tests {
 #[cfg(test)]
 mod signature_tests {
     use super::*;
+
+    #[test]
+    fn image_data_urls_become_inline_data_parts() {
+        let body = json!({
+            "model":"gemini-3-flash",
+            "messages":[{"role":"user","content":[
+                {"type":"text","text":"what is this?"},
+                {"type":"image_url","image_url":{"url":"data:image/png;base64,aGVsbG8="}}
+            ]}]
+        });
+        let request = openai_to_gemini(&body).expect("translate");
+        let parts = &request["contents"][0]["parts"];
+        assert_eq!(parts[0]["text"], "what is this?");
+        assert_eq!(parts[1]["inlineData"]["mimeType"], "image/png");
+        assert_eq!(parts[1]["inlineData"]["data"], "aGVsbG8=");
+    }
+
+    #[test]
+    fn tool_responses_resolve_the_function_name_from_tool_call_id() {
+        let body = json!({
+            "model":"gemini-3-flash",
+            "messages":[
+                {"role":"assistant","content":null,"tool_calls":[
+                    {"id":"call_9","type":"function","function":{"name":"lookup","arguments":"{}"}}
+                ]},
+                {"role":"tool","tool_call_id":"call_9","content":"{\"temp\":21}"}
+            ]
+        });
+        let request = openai_to_gemini(&body).expect("translate");
+        let parts = &request["contents"][1]["parts"];
+        assert_eq!(parts[0]["functionResponse"]["name"], "lookup");
+        assert_eq!(parts[0]["functionResponse"]["response"]["temp"], 21);
+    }
+
+    #[test]
+    fn tool_responses_without_a_known_call_id_fail_explicitly() {
+        let body = json!({
+            "model":"gemini-3-flash",
+            "messages":[{"role":"tool","tool_call_id":"ghost","content":"x"}]
+        });
+        let error = openai_to_gemini(&body).expect_err("unknown call id must fail");
+        assert!(error.contains("ghost"), "{error}");
+    }
 
     #[test]
     fn thought_signature_round_trips_through_call_ids() {
