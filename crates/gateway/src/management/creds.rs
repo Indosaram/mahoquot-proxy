@@ -952,7 +952,20 @@ async fn command_code_import(
     )
 }
 
-async fn trae_import(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
+async fn trae_import(State(state): State<Arc<AppState>>, raw: bytes::Bytes) -> Response {
+    // The desktop app posts this endpoint without a body or content-type;
+    // a JSON body only ever carried an optional storage-path override, so
+    // parse it leniently instead of letting the extractor 415 the request.
+    let body: Value = if raw.is_empty() {
+        Value::Null
+    } else {
+        match serde_json::from_slice(&raw) {
+            Ok(value) => value,
+            Err(error) => {
+                return json_status(StatusCode::BAD_REQUEST, json!({"error": error.to_string()}))
+            }
+        }
+    };
     let path = body
         .get("path")
         .and_then(Value::as_str)

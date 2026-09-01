@@ -182,3 +182,43 @@ async fn unimplemented_pluginhost_routes_are_not_advertised_as_handlers() {
     }
     std::fs::remove_dir_all(auth_dir).ok();
 }
+
+#[tokio::test]
+async fn trae_import_local_accepts_the_desktop_apps_bodyless_post() {
+    // The desktop app POSTs /trae/import-local with no body and no
+    // content-type; the old Json extractor rejected it with 415 before the
+    // handler could read the local Trae storage.
+    let auth_dir = std::env::temp_dir().join(format!("mahoquot-trae-415-{}", std::process::id()));
+    std::fs::create_dir_all(&auth_dir).expect("auth dir");
+    let config = GatewayConfig {
+        auth_dir: auth_dir.clone(),
+        api_keys: ApiKeys::new(vec![PROBE_KEY.to_string()]),
+        config_path: auth_dir.join("config.yaml"),
+        ..GatewayConfig::default()
+    };
+    let app = create_app(Arc::new(AppState::new(&config).expect("state")));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v0/management/trae/import-local")
+                .header(header::AUTHORIZATION, format!("Bearer {PROBE_KEY}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    let status = response.status();
+    assert_ne!(
+        status,
+        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        "bodyless trae import must reach the handler"
+    );
+    assert!(
+        status.is_client_error() || status.is_success(),
+        "unexpected status {status}"
+    );
+    std::fs::remove_dir_all(auth_dir).ok();
+}
