@@ -65,6 +65,7 @@ async fn test_t3_failover() {
         usage_poll_secs: 120,
         port: 0,
         auth_dir: temp_dir.clone(),
+        config_path: temp_dir.join("config.yaml"),
         strategy: Strategy::FillFirst, // FillFirst will always try 'a' first
         max_failover: 3,
         log_level: "info".to_string(),
@@ -129,6 +130,173 @@ async fn test_t3_failover() {
 }
 
 #[tokio::test]
+async fn test_t3b_final_failure_records_the_attempted_account() {
+    // Given: the only available account's upstream always answers 429
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = Router::new().route(
+        common::CODEX_PATH,
+        post(|| async {
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                [("Retry-After", "300")],
+                "{\"error\":\"rate limited\"}",
+            )
+        }),
+    );
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let temp_dir = unique_temp_dir("qgw-test-t3b");
+    let json = create_auth_file_json(
+        "a",
+        "acc_a",
+        "token_a",
+        Some(&format!("http://127.0.0.1:{port}")),
+    );
+    std::fs::write(temp_dir.join("codex-a-plus.json"), json).unwrap();
+
+    let config = GatewayConfig {
+        usage_poll_secs: 120,
+        port: 0,
+        auth_dir: temp_dir.clone(),
+        config_path: temp_dir.join("config.yaml"),
+        strategy: Strategy::FillFirst,
+        max_failover: 3,
+        log_level: "info".to_string(),
+        api_keys: mahoquot_gateway::inbound::ApiKeys::default(),
+        models_env: None,
+        refresh_url: mahoquot_providers::refresh::REFRESH_TOKEN_URL.to_string(),
+        auth_refresh_enabled: true,
+        ..Default::default()
+    };
+
+    let state = Arc::new(AppState::new(&config).unwrap());
+    let app = create_app(state.clone());
+    let gw_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gw_port = gw_listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(gw_listener, app).await.unwrap();
+    });
+
+    let client = reqwest::Client::new();
+    let gw_url = format!("http://127.0.0.1:{gw_port}/v1/chat/completions");
+
+    // When: the single attempt fails with 429 and no failover target remains
+    let res = client
+        .post(&gw_url)
+        .header("Content-Type", "application/json")
+        .body(common::OPENAI_REQUEST)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+
+    // Then: the recorded usage event names the attempted account, not "unknown"
+    state.history.flush().unwrap();
+    let rows = state
+        .history
+        .store()
+        .unwrap()
+        .export(&mahoquot_gateway::request_history::HistoryQuery::default())
+        .unwrap();
+    assert_eq!(rows.len(), 1, "exactly one usage event is recorded");
+    assert_eq!(rows[0].status_code, 429);
+    assert_eq!(
+        rows[0].account_identifier, "a",
+        "failed request must keep the attempted account id"
+    );
+    assert_eq!(rows[0].provider, "codex");
+
+    std::fs::remove_dir_all(&temp_dir).ok();
+}
+
+#[tokio::test]
+async fn test_t3c_final_failure_attribution_names_the_last_attempted_account() {
+    // Given: account A answers HTTP 500, account B refuses connections
+    let listener_a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port_a = listener_a.local_addr().unwrap().port();
+    let app_a = Router::new().route(
+        common::CODEX_PATH,
+        post(|| async {
+            (StatusCode::INTERNAL_SERVER_ERROR, "{\"error\":\"boom\"}")
+        }),
+    );
+    tokio::spawn(async move {
+        axum::serve(listener_a, app_a).await.unwrap();
+    });
+
+    // A dead port: bind, read the port, drop — connection refused afterwards.
+    let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead_port = dead.local_addr().unwrap().port();
+    drop(dead);
+
+    let temp_dir = unique_temp_dir("qgw-test-t3c");
+    for (id, upstream) in [
+        ("a", format!("http://127.0.0.1:{port_a}")),
+        ("b", format!("http://127.0.0.1:{dead_port}")),
+    ] {
+        let json = create_auth_file_json(id, &format!("acc_{id}"), &format!("token_{id}"), Some(&upstream));
+        std::fs::write(temp_dir.join(format!("codex-{id}-plus.json")), json).unwrap();
+    }
+
+    let config = GatewayConfig {
+        usage_poll_secs: 120,
+        port: 0,
+        auth_dir: temp_dir.clone(),
+        config_path: temp_dir.join("config.yaml"),
+        strategy: Strategy::FillFirst,
+        max_failover: 3,
+        log_level: "info".to_string(),
+        api_keys: mahoquot_gateway::inbound::ApiKeys::default(),
+        models_env: None,
+        refresh_url: mahoquot_providers::refresh::REFRESH_TOKEN_URL.to_string(),
+        auth_refresh_enabled: true,
+        ..Default::default()
+    };
+
+    let state = Arc::new(AppState::new(&config).unwrap());
+    let app = create_app(state.clone());
+    let gw_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gw_port = gw_listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(gw_listener, app).await.unwrap();
+    });
+
+    let client = reqwest::Client::new();
+    let gw_url = format!("http://127.0.0.1:{gw_port}/v1/chat/completions");
+
+    // When: A fails with HTTP 500, then B fails during transport
+    let res = client
+        .post(&gw_url)
+        .header("Content-Type", "application/json")
+        .body(common::OPENAI_REQUEST)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+
+    // Then: the usage event names B — the last ATTEMPTED account — not A,
+    // whose HTTP failure merely produced the final response body.
+    state.history.flush().unwrap();
+    let rows = state
+        .history
+        .store()
+        .unwrap()
+        .export(&mahoquot_gateway::request_history::HistoryQuery::default())
+        .unwrap();
+    assert_eq!(rows.len(), 1, "exactly one usage event is recorded");
+    assert_eq!(
+        rows[0].account_identifier, "b",
+        "attribution must follow the last attempted account, not the last HTTP failure"
+    );
+    assert_eq!(rows[0].provider, "codex");
+
+    std::fs::remove_dir_all(&temp_dir).ok();
+}
+
+#[tokio::test]
 async fn server_error_failover_keeps_health_and_moves_to_the_next_account() {
     // Given: Account A (FillFirst order) always answers 500, Account B 200 SSE
     let listener_a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -178,6 +346,7 @@ async fn server_error_failover_keeps_health_and_moves_to_the_next_account() {
         usage_poll_secs: 120,
         port: 0,
         auth_dir: temp_dir.clone(),
+        config_path: temp_dir.join("config.yaml"),
         strategy: Strategy::FillFirst,
         max_failover: 3,
         log_level: "info".to_string(),

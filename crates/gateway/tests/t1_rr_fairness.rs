@@ -68,6 +68,7 @@ async fn test_t1_rr_fairness() {
         usage_poll_secs: 120,
         port: 0,
         auth_dir: temp_dir.clone(),
+        config_path: temp_dir.join("config.yaml"),
         strategy: Strategy::StrictRoundRobin,
         max_failover: 3,
         log_level: "info".to_string(),
@@ -110,6 +111,103 @@ async fn test_t1_rr_fairness() {
             ids[i]
         );
     }
+
+    std::fs::remove_dir_all(&temp_dir).ok();
+}
+
+#[tokio::test]
+async fn test_t1b_body_prefix_affinity_keeps_large_conversations_on_one_account() {
+    // Given: 2 upstream mocks under StrictRoundRobin, requests without any
+    // session header, but with a cacheable (> 4 KiB) stable body prefix
+    let counts: Vec<Arc<AtomicUsize>> = (0..2).map(|_| Arc::new(AtomicUsize::new(0))).collect();
+    let mut upstream_uris = Vec::new();
+
+    for count in &counts {
+        let count_clone = count.clone();
+        let mock_app = Router::new().route(
+            "/backend-api/codex/responses",
+            post(move || {
+                let c = count_clone.clone();
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::OK,
+                        [("Content-Type", "text/event-stream")],
+                        CODEX_SSE,
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        upstream_uris.push(format!("http://127.0.0.1:{port}"));
+        tokio::spawn(async move {
+            axum::serve(listener, mock_app).await.unwrap();
+        });
+    }
+
+    let temp_dir = unique_temp_dir("qgw-test-t1b");
+    let ids = ["a", "b"];
+    for (i, id) in ids.iter().enumerate() {
+        let file_path = temp_dir.join(format!("codex-{id}-plus.json"));
+        let json_content = create_auth_file_json(
+            id,
+            &format!("acc_{id}"),
+            &format!("token_{id}"),
+            Some(&upstream_uris[i]),
+        );
+        std::fs::write(file_path, json_content).unwrap();
+    }
+
+    let config = GatewayConfig {
+        usage_poll_secs: 120,
+        port: 0,
+        auth_dir: temp_dir.clone(),
+        config_path: temp_dir.join("config.yaml"),
+        strategy: Strategy::StrictRoundRobin,
+        max_failover: 3,
+        log_level: "info".to_string(),
+        api_keys: mahoquot_gateway::inbound::ApiKeys::default(),
+        models_env: None,
+        refresh_url: mahoquot_providers::refresh::REFRESH_TOKEN_URL.to_string(),
+        auth_refresh_enabled: true,
+        ..Default::default()
+    };
+
+    let app = create_app(Arc::new(AppState::new(&config).unwrap()));
+    let gw_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gw_port = gw_listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(gw_listener, app).await.unwrap();
+    });
+
+    let client = reqwest::Client::new();
+    let gw_url = format!("http://127.0.0.1:{gw_port}/v1/chat/completions");
+    let big_body = format!(
+        r#"{{"model":"codex","stream":true,"messages":[{{"role":"system","content":"{}"}}]}}"#,
+        "x".repeat(6144)
+    );
+
+    // When: 4 sequential identical large POSTs with no session header
+    for _ in 0..4 {
+        let res = client
+            .post(&gw_url)
+            .header("Content-Type", "application/json")
+            .body(big_body.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), reqwest::StatusCode::OK);
+    }
+
+    // Then: body-prefix affinity keeps the whole conversation on ONE account
+    let served: Vec<usize> = counts.iter().map(|c| c.load(Ordering::SeqCst)).collect();
+    assert_eq!(served.iter().sum::<usize>(), 4);
+    assert_eq!(
+        served.iter().filter(|&&n| n > 0).count(),
+        1,
+        "all turns of one header-less conversation must land on one account, got {served:?}"
+    );
 
     std::fs::remove_dir_all(&temp_dir).ok();
 }

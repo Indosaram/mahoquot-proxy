@@ -808,8 +808,10 @@ impl HeadTailCapture {
 }
 
 /// Extract a total token count from the captured head/tail windows of a
-/// response body. Handles the three wire shapes the gateway relays:
-/// OpenAI-style `"usage":{...}` (JSON or SSE frame), Gemini
+/// response body. Handles the four wire shapes the gateway relays:
+/// OpenAI-style `"usage":{...}` in both the chat-completions
+/// (`prompt_tokens`) and Responses API (`input_tokens` +
+/// `input_tokens_details`) variants (JSON or SSE frame), Gemini
 /// `"usageMetadata":{...}`, and Claude SSE where `input_tokens` appears in
 /// `message_start` (stream head) and `output_tokens` in `message_delta`
 /// (stream tail). Returns `None` when nothing usable is present.
@@ -841,6 +843,25 @@ pub fn extract_response_token_usage(head: &[u8], tail: &[u8]) -> Option<Response
                     "cached_tokens",
                 )
                 .unwrap_or(0),
+                reasoning_tokens: nested_object_number(
+                    &usage,
+                    "output_tokens_details",
+                    "reasoning_tokens",
+                )
+                .unwrap_or(0),
+            });
+        }
+        // OpenAI Responses API usage: `input_tokens` plus
+        // `input_tokens_details.cached_tokens` instead of the chat-completions
+        // `prompt_tokens` family. Gated on the details object because Anthropic
+        // message_delta usage objects also carry input/output tokens, and this
+        // branch must never swallow Claude's head-side `cache_read_input_tokens`.
+        if let Some(cached) = nested_object_number(&usage, "input_tokens_details", "cached_tokens")
+        {
+            return Some(ResponseTokenUsage {
+                input_tokens: object_number(&usage, &["input_tokens"]).unwrap_or(0),
+                output_tokens: object_number(&usage, &["output_tokens"]).unwrap_or(0),
+                cached_input_tokens: cached,
                 reasoning_tokens: nested_object_number(
                     &usage,
                     "output_tokens_details",
@@ -1263,6 +1284,39 @@ mod tests {
         assert_eq!(usage.output_tokens, 5);
         assert_eq!(usage.cached_input_tokens, 4);
         assert_eq!(usage.reasoning_tokens, 2);
+    }
+
+    #[test]
+    fn extract_reads_responses_api_cached_tokens_from_buffered_json() {
+        let body = br#"{"id":"resp_1","usage":{"input_tokens":146418,"input_tokens_details":{"cached_tokens":143744},"output_tokens":512,"output_tokens_details":{"reasoning_tokens":96},"total_tokens":146930}}"#;
+        let usage = extract_response_token_usage(body, body).expect("responses usage");
+        assert_eq!(usage.input_tokens, 146418);
+        assert_eq!(usage.output_tokens, 512);
+        assert_eq!(usage.cached_input_tokens, 143744);
+        assert_eq!(usage.reasoning_tokens, 96);
+    }
+
+    #[test]
+    fn extract_reads_responses_api_usage_from_sse_completed_frame() {
+        let head =
+            b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n";
+        let tail = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{\"input_tokens\":700,\"input_tokens_details\":{\"cached_tokens\":640},\"output_tokens\":60,\"output_tokens_details\":{\"reasoning_tokens\":16},\"total_tokens\":760}}}\n\n";
+        let usage = extract_response_token_usage(head, tail).expect("responses stream usage");
+        assert_eq!(usage.input_tokens, 700);
+        assert_eq!(usage.output_tokens, 60);
+        assert_eq!(usage.cached_input_tokens, 640);
+        assert_eq!(usage.reasoning_tokens, 16);
+    }
+
+    #[test]
+    fn extract_keeps_claude_cache_reads_when_delta_usage_has_no_details_object() {
+        let head = b"event: message_start\ndata: {\"message\":{\"usage\":{\"input_tokens\":21,\"cache_read_input_tokens\":19}}}\n\n";
+        let tail =
+            b"event: message_delta\ndata: {\"usage\":{\"output_tokens\":9,\"input_tokens\":21}}\n\n";
+        let usage = extract_response_token_usage(head, tail).expect("claude usage");
+        assert_eq!(usage.input_tokens, 21);
+        assert_eq!(usage.output_tokens, 9);
+        assert_eq!(usage.cached_input_tokens, 19);
     }
 
     #[test]

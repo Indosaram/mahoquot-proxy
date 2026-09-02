@@ -1,5 +1,6 @@
 // allow: SIZE_OK — single-loop failover relay state machine with auth refresh, retry, and in-flight tracking
 
+use std::hash::Hasher;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1164,6 +1165,27 @@ fn affinity_key(headers: &HeaderMap) -> Option<String> {
     None
 }
 
+/// Bodies smaller than this get no body-derived affinity: prompts below the
+/// roughly 1Ki-token prompt-cache floor gain nothing from prefix stickiness,
+/// and leaving tiny probes on strict round-robin preserves load fairness.
+const BODY_AFFINITY_MIN_BYTES: usize = 4096;
+
+/// How much of the request body head feeds the affinity hash.
+const BODY_AFFINITY_HEAD_BYTES: usize = 2048;
+
+/// Fallback affinity for clients that send no session header: hash the stable
+/// head of the request body, so successive turns of one conversation keep
+/// landing on the account that already holds their provider-side prompt cache.
+fn body_prefix_affinity_key(body: &[u8]) -> Option<String> {
+    if body.len() < BODY_AFFINITY_MIN_BYTES {
+        return None;
+    }
+    let head = &body[..body.len().min(BODY_AFFINITY_HEAD_BYTES)];
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hasher.write(head);
+    Some(format!("body-prefix-{:016x}", hasher.finish()))
+}
+
 pub async fn handle_relay(
     state: Arc<AppState>,
     mode: RelayMode,
@@ -1208,8 +1230,13 @@ pub async fn handle_relay(
     }
 
     let mut last_failure: Option<FinalFailure> = None;
+    // Attribution follows the last account we ATTEMPTED, not the last one that
+    // happened to answer with a buffered HTTP failure: transport and
+    // proactive-refresh failures end an attempt without an HTTP response.
+    let mut last_attempted: Option<(&'static str, String)> = None;
     let hint = SessionHint {
-        affinity_key: affinity_key(headers),
+        affinity_key: affinity_key(headers)
+            .or_else(|| body_prefix_affinity_key(plan.original_body.as_ref())),
     };
     // Accounts already tried in this request. 5xx and transport failures leave
     // health untouched (per contract), so exclusion is what forces the next
@@ -1233,6 +1260,7 @@ pub async fn handle_relay(
             None => break,
         };
         attempted.push(chosen_idx);
+        last_attempted = Some((member.kind().as_str(), member.id().to_string()));
 
         let mut refreshed_this_account = false;
         let now_unix = SystemTime::now()
@@ -1548,6 +1576,10 @@ pub async fn handle_relay(
 
     state.metrics.exposed_errors.fetch_add(1, Ordering::Relaxed);
 
+    let (failure_provider, failure_account) = last_attempted
+        .map(|(provider, account)| (Some(provider), Some(account)))
+        .unwrap_or((None, None));
+
     let response = match last_failure {
         Some(final_fail) => body_response(
             final_fail.status,
@@ -1569,8 +1601,8 @@ pub async fn handle_relay(
         OutcomeRecord {
             event_id: &event_id,
             occurred_at_ms,
-            provider: "unknown",
-            account: None,
+            provider: failure_provider.unwrap_or("unknown"),
+            account: failure_account.as_deref(),
             model: plan.model.as_deref(),
             key_identifier: key_identifier.as_deref(),
             status: response.status().as_u16(),
@@ -1590,6 +1622,35 @@ pub async fn handle_relay(
 mod routing_tests {
     use super::*;
     use crate::config::GatewayConfig;
+
+    #[test]
+    fn body_prefix_affinity_skips_bodies_below_the_cacheable_threshold() {
+        let small = br#"{"model":"codex","messages":[{"role":"user","content":"hi"}]}"#;
+        assert_eq!(body_prefix_affinity_key(small), None);
+    }
+
+    #[test]
+    fn body_prefix_affinity_is_decided_by_the_stable_head_alone() {
+        let mut base = vec![b'x'; 6144];
+        base[..8].copy_from_slice(b"{\"model\"");
+        let head_key = body_prefix_affinity_key(&base).expect("large body gets a key");
+
+        let mut tail_changed = base.clone();
+        tail_changed[3000] = b'!';
+        assert_eq!(
+            body_prefix_affinity_key(&tail_changed).as_deref(),
+            Some(head_key.as_str()),
+            "changes beyond the hashed head must not rebind the account"
+        );
+
+        let mut head_changed = base;
+        head_changed[0] = b'y';
+        assert_ne!(
+            body_prefix_affinity_key(&head_changed).as_deref(),
+            Some(head_key.as_str()),
+            "different heads may bind different accounts"
+        );
+    }
 
     fn credential(kind: &str) -> String {
         let extra = match kind {
