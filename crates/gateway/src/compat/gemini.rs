@@ -25,6 +25,18 @@ fn split_signature_from_call_id(id: &str) -> (String, Option<String>) {
     (plain.to_string(), decoded)
 }
 
+/// Gemini's functionResponse.response is a google.protobuf.Struct, which
+/// only accepts a JSON object. Tool payloads that parse to a bare scalar or
+/// array must be wrapped, or the upstream rejects the whole request with
+/// INVALID_ARGUMENT.
+fn struct_response(raw: &str) -> Value {
+    match serde_json::from_str::<Value>(raw) {
+        Ok(Value::Object(map)) => Value::Object(map),
+        Ok(value) => json!({ "result": value }),
+        Err(_) => json!({ "result": raw }),
+    }
+}
+
 pub fn openai_to_gemini(body: &Value) -> Result<Value, String> {
     let model = body
         .get("model")
@@ -130,8 +142,7 @@ pub fn openai_to_gemini(body: &Value) -> Result<Value, String> {
                         .to_string(),
                 };
                 let raw = content_to_text(msg.get("content")).unwrap_or_default();
-                let response = serde_json::from_str::<Value>(&raw)
-                    .unwrap_or_else(|_| json!({ "result": raw }));
+                let response = struct_response(&raw);
                 contents.push(json!({
                     "role": "user",
                     "parts": [{ "functionResponse": { "name": name, "response": response } }]
@@ -143,8 +154,7 @@ pub fn openai_to_gemini(body: &Value) -> Result<Value, String> {
                     .and_then(Value::as_str)
                     .unwrap_or("function");
                 let raw = content_to_text(msg.get("content")).unwrap_or_default();
-                let response = serde_json::from_str::<Value>(&raw)
-                    .unwrap_or_else(|_| json!({ "result": raw }));
+                let response = struct_response(&raw);
                 contents.push(json!({
                     "role": "user",
                     "parts": [{ "functionResponse": { "name": name, "response": response } }]
@@ -726,6 +736,47 @@ mod signature_tests {
         let parts = &request["contents"][1]["parts"];
         assert_eq!(parts[0]["functionResponse"]["name"], "lookup");
         assert_eq!(parts[0]["functionResponse"]["response"]["temp"], 21);
+    }
+
+    #[test]
+    fn scalar_tool_responses_wrap_into_a_struct() {
+        // Gemini functionResponse.response is a protobuf Struct: a bare
+        // scalar (e.g. a tool that answers just `0`) is INVALID_ARGUMENT
+        // upstream, so scalars must be wrapped into an object.
+        for content in ["0", "42", "-7.5", "true", "false", "null", "", "\"done\"", "[1,2]", "1e10"] {
+            let body = json!({
+                "model":"gemini-3-flash",
+                "messages":[
+                    {"role":"assistant","content":null,"tool_calls":[
+                        {"id":"call_s","type":"function","function":{"name":"count","arguments":"{}"}}
+                    ]},
+                    {"role":"tool","tool_call_id":"call_s","content":content}
+                ]
+            });
+            let request = openai_to_gemini(&body).expect("translate");
+            let response = &request["contents"][1]["parts"][0]["functionResponse"]["response"];
+            assert!(
+                response.is_object(),
+                "content {content} must produce a Struct response, got {response}"
+            );
+            let expected: serde_json::Value =
+                serde_json::from_str(content).unwrap_or_else(|_| serde_json::json!(""));
+            assert_eq!(response["result"], expected);
+        }
+    }
+
+    #[test]
+    fn function_role_scalar_responses_wrap_into_a_struct() {
+        let body = json!({
+            "model":"gemini-3-flash",
+            "messages":[
+                {"role":"function","name":"count","content":"0"}
+            ]
+        });
+        let request = openai_to_gemini(&body).expect("translate");
+        let response = &request["contents"][0]["parts"][0]["functionResponse"]["response"];
+        assert!(response.is_object());
+        assert_eq!(response["result"], 0);
     }
 
     #[test]
