@@ -12,6 +12,81 @@ use mahoquot_gateway::{config::GatewayConfig, routes::create_app, state::AppStat
 use mahoquot_types::Strategy;
 use tower::ServiceExt;
 
+#[tokio::test]
+async fn authenticated_shutdown_drains_before_server_exit() {
+    let auth_dir = common::unique_temp_dir("qg-t6-shutdown");
+    let config = GatewayConfig {
+        auth_dir: auth_dir.clone(),
+        api_keys: mahoquot_gateway::inbound::ApiKeys::new(vec!["shutdown-key".to_string()]),
+        ..GatewayConfig::default()
+    };
+    let state = Arc::new(AppState::new(&config).unwrap());
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let app = create_app(state.clone()).route(
+        "/slow",
+        axum::routing::get({
+            let started = started.clone();
+            let release = release.clone();
+            move || {
+                let started = started.clone();
+                let release = release.clone();
+                async move {
+                    started.notify_one();
+                    release.notified().await;
+                    "completed"
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:18898")
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let shutdown = state.shutdown.clone();
+    let server =
+        tokio::spawn(async move {
+            mahoquot_gateway::server::run_server(listener, app, async move {
+                shutdown.notified().await
+            })
+            .await
+            .unwrap();
+        });
+    let client = reqwest::Client::new();
+    let slow_client = client.clone();
+    let slow = tokio::spawn(async move {
+        slow_client
+            .get(format!("http://{address}/slow"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap()
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(1), started.notified())
+        .await
+        .expect("slow request must start");
+    let shutdown = client
+        .post(format!("http://{address}/v0/management/shutdown"))
+        .bearer_auth("shutdown-key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(shutdown.status(), reqwest::StatusCode::OK);
+    assert!(
+        !server.is_finished(),
+        "server must wait for the in-flight request"
+    );
+    release.notify_one();
+    assert_eq!(slow.await.unwrap(), "completed");
+    tokio::time::timeout(std::time::Duration::from_secs(1), server)
+        .await
+        .expect("server must exit after draining")
+        .unwrap();
+    std::fs::remove_dir_all(auth_dir).ok();
+}
+
 mod common;
 
 fn gateway_config(auth_dir: &std::path::Path) -> GatewayConfig {
@@ -27,6 +102,8 @@ fn gateway_config(auth_dir: &std::path::Path) -> GatewayConfig {
         auth_refresh_enabled: false,
         usage_poll_secs: 120,
         config_path: auth_dir.join("config.yaml"),
+        history_queue_capacity: 1024,
+        history_batch_size: 64,
     }
 }
 
@@ -129,6 +206,8 @@ async fn management_uses_the_same_api_key_as_proxy_routes() {
         auth_refresh_enabled: false,
         usage_poll_secs: 120,
         config_path: auth_dir.join("config.yaml"),
+        history_queue_capacity: 1024,
+        history_batch_size: 64,
     };
     let app = create_app(Arc::new(AppState::new(&config).expect("state")));
 

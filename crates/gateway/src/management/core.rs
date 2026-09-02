@@ -137,12 +137,9 @@ async fn reset_quota(State(state): State<Arc<AppState>>, raw: bytes::Bytes) -> R
                 "models": member.usage_snapshot(),
             }),
         ),
-        // A provider without a resettable window is not a failure: upstream
-        // answers 200 with an empty model list, so the caller sees the same
-        // outcome whether or not this provider tracks a 5h quota.
-        Err(_) => json_status(
-            StatusCode::OK,
-            json!({ "status": "ok", "auth_index": auth_index, "models": Value::Array(vec![]) }),
+        Err(error) => json_status(
+            crate::quota::reset_error_status(&error),
+            json!({ "status": "error", "auth_index": auth_index, "error": error.to_string() }),
         ),
     }
 }
@@ -168,6 +165,11 @@ async fn api_call(raw: bytes::Bytes) -> Response {
     )
 }
 
+async fn shutdown(State(state): State<Arc<AppState>>) -> Response {
+    state.shutdown.notify_waiters();
+    json_status(StatusCode::OK, json!({ "status": "draining" }))
+}
+
 pub fn core_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/config", get(get_config))
@@ -175,6 +177,7 @@ pub fn core_routes() -> Router<Arc<AppState>> {
         .route("/latest-version", get(get_latest_version))
         .route("/api-call", post(api_call))
         .route("/reset-quota", post(reset_quota))
+        .route("/shutdown", post(shutdown))
 }
 
 #[cfg(test)]

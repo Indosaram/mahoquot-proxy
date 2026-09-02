@@ -75,6 +75,7 @@ pub mod request;
 
 use std::collections::VecDeque;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use axum::body::Body;
 use bytes::Bytes;
@@ -300,15 +301,28 @@ impl StreamRenderer {
     }
 }
 
-pub fn streaming_body(
-    first: Bytes,
-    upstream: UpstreamStream,
-    model: String,
-    created: i64,
-    include_usage: bool,
-    shape: ReplyShape,
-    session: ProtocolSession,
-) -> Body {
+pub struct StreamingBodyParams {
+    pub first: Bytes,
+    pub upstream: UpstreamStream,
+    pub model: String,
+    pub created: i64,
+    pub include_usage: bool,
+    pub shape: ReplyShape,
+    pub session: ProtocolSession,
+    pub upstream_capture: Option<Arc<std::sync::Mutex<Option<crate::usage::ResponseTokenUsage>>>>,
+}
+
+pub fn streaming_body(params: StreamingBodyParams) -> Body {
+    let StreamingBodyParams {
+        first,
+        upstream,
+        model,
+        created,
+        include_usage,
+        shape,
+        session,
+        upstream_capture,
+    } = params;
     let renderer = match shape {
         ReplyShape::Gemini => {
             StreamRenderer::Gemini(Box::new(GeminiChunkRenderer::new(model, created)))
@@ -328,60 +342,98 @@ pub fn streaming_body(
     let mut events = Vec::new();
     state.parser.push(&first, &mut events);
     for event in events {
+        capture_stream_usage(&event, upstream_capture.as_ref());
         state.pending.extend(state.renderer.render(event));
     }
 
-    Body::from_stream(futures::stream::unfold(state, |mut state| async move {
-        loop {
-            if let Some(frame) = state.pending.pop_front() {
-                return Some((Ok::<Bytes, std::io::Error>(frame), state));
-            }
-            if state.drained {
-                return None;
-            }
-            match state.upstream.next().await {
-                Some(Ok(chunk)) => {
-                    let mut events = Vec::new();
-                    state.parser.push(&chunk, &mut events);
-                    for event in events {
-                        state.pending.extend(state.renderer.render(event));
+    Body::from_stream(futures::stream::unfold(
+        (state, upstream_capture),
+        |(mut state, upstream_capture)| async move {
+            loop {
+                if let Some(frame) = state.pending.pop_front() {
+                    return Some((
+                        Ok::<Bytes, std::io::Error>(frame),
+                        (state, upstream_capture),
+                    ));
+                }
+                if state.drained {
+                    return None;
+                }
+                match state.upstream.next().await {
+                    Some(Ok(chunk)) => {
+                        let mut events = Vec::new();
+                        state.parser.push(&chunk, &mut events);
+                        for event in events {
+                            capture_stream_usage(&event, upstream_capture.as_ref());
+                            state.pending.extend(state.renderer.render(event));
+                        }
+                    }
+                    Some(Err(err)) => {
+                        state.drained = true;
+                        state
+                            .pending
+                            .extend(error_frames(&mut state.renderer, &err.to_string()));
+                    }
+                    None => {
+                        state.drained = true;
+                        let mut events = Vec::new();
+                        state.parser.finish(&mut events);
+                        for event in events {
+                            capture_stream_usage(&event, upstream_capture.as_ref());
+                            state.pending.extend(state.renderer.render(event));
+                        }
+                        state.pending.extend(state.renderer.close_unterminated());
                     }
                 }
-                Some(Err(err)) => {
-                    state.drained = true;
-                    state
-                        .pending
-                        .extend(error_frames(&mut state.renderer, &err.to_string()));
-                }
-                None => {
-                    state.drained = true;
-                    let mut events = Vec::new();
-                    state.parser.finish(&mut events);
-                    for event in events {
-                        state.pending.extend(state.renderer.render(event));
-                    }
-                    state.pending.extend(state.renderer.close_unterminated());
-                }
             }
-        }
-    }))
+        },
+    ))
+}
+
+fn capture_stream_usage(
+    event: &CodexEvent,
+    capture: Option<&Arc<std::sync::Mutex<Option<crate::usage::ResponseTokenUsage>>>>,
+) {
+    let (Some(capture), CodexEvent::Completed { usage: Some(usage) }) = (capture, event) else {
+        return;
+    };
+    *capture
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+        Some(crate::usage::ResponseTokenUsage {
+            input_tokens: usage.prompt_tokens,
+            output_tokens: usage.completion_tokens,
+            cached_input_tokens: usage.cached_tokens,
+            reasoning_tokens: usage.reasoning_tokens,
+        });
 }
 
 pub async fn collect_stream_with_replies(
     first: Bytes,
     mut stream: UpstreamStream,
     session: ProtocolSession,
-) -> Result<Vec<u8>, String> {
+) -> Result<(Vec<u8>, Option<crate::usage::ResponseTokenUsage>), String> {
     let mut parser = ProtocolParser::with_cursor_reply(session.protocol, session.cursor_reply);
     let mut raw = first.to_vec();
-    let mut ignored = Vec::new();
-    parser.push(&first, &mut ignored);
+    let mut events = Vec::new();
+    parser.push(&first, &mut events);
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| e.to_string())?;
-        parser.push(&chunk, &mut ignored);
+        parser.push(&chunk, &mut events);
         raw.extend_from_slice(&chunk);
     }
-    Ok(raw)
+    let usage = events.iter().rev().find_map(|event| match event {
+        CodexEvent::Completed {
+            usage: Some(completed),
+        } => Some(crate::usage::ResponseTokenUsage {
+            input_tokens: completed.prompt_tokens,
+            output_tokens: completed.completion_tokens,
+            cached_input_tokens: completed.cached_tokens,
+            reasoning_tokens: completed.reasoning_tokens,
+        }),
+        _ => None,
+    });
+    Ok((raw, usage))
 }
 
 fn error_frames(renderer: &mut StreamRenderer, message: &str) -> Vec<Bytes> {

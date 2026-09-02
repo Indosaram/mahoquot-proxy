@@ -36,6 +36,8 @@ fn gateway_config(auth_dir: &std::path::Path) -> GatewayConfig {
         auth_refresh_enabled: false,
         usage_poll_secs: 120,
         config_path: auth_dir.join("config.yaml"),
+        history_queue_capacity: 1024,
+        history_batch_size: 64,
     }
 }
 

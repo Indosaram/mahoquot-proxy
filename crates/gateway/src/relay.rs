@@ -45,9 +45,13 @@ fn now_unix_secs() -> i64 {
 /// body has been fully delivered (or abandoned by a client disconnect).
 struct StreamedOutcome {
     state: Arc<AppState>,
+    event_id: String,
+    occurred_at_ms: i64,
     provider: String,
     account: Option<String>,
     model: Option<String>,
+    key_identifier: Option<String>,
+    upstream_capture: Option<Arc<std::sync::Mutex<Option<crate::usage::ResponseTokenUsage>>>>,
     status: u16,
     started: std::time::Instant,
     bytes_in: usize,
@@ -73,18 +77,29 @@ impl StreamCapture {
         let Some(outcome) = self.outcome.take() else {
             return;
         };
-        let token_usage = {
-            let (head, tail) = self.head_tail.parts();
-            crate::usage::extract_response_token_usage(head, tail)
-        };
+        let token_usage = outcome
+            .upstream_capture
+            .as_ref()
+            .and_then(|capture| {
+                *capture
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+            })
+            .or_else(|| {
+                let (head, tail) = self.head_tail.parts();
+                crate::usage::extract_response_token_usage(head, tail)
+            });
         let tokens = token_usage.map(crate::usage::ResponseTokenUsage::total_tokens);
         let bytes_out = self.bytes_out;
         let state = outcome.state;
         tokio::spawn(async move {
             let record = OutcomeRecord {
+                event_id: &outcome.event_id,
+                occurred_at_ms: outcome.occurred_at_ms,
                 provider: &outcome.provider,
                 account: outcome.account.as_deref(),
                 model: outcome.model.as_deref(),
+                key_identifier: outcome.key_identifier.as_deref(),
                 status: outcome.status,
                 success: true,
                 elapsed_ms: outcome.started.elapsed().as_millis() as u64,
@@ -163,9 +178,12 @@ impl futures::Stream for CountedStream {
 /// Fields of one finalized request record, handed to `record_request_outcome`
 /// by the synchronous error paths and the streamed-success finalizer alike.
 struct OutcomeRecord<'a> {
+    event_id: &'a str,
+    occurred_at_ms: i64,
     provider: &'a str,
     account: Option<&'a str>,
     model: Option<&'a str>,
+    key_identifier: Option<&'a str>,
     status: u16,
     success: bool,
     elapsed_ms: u64,
@@ -177,6 +195,23 @@ struct OutcomeRecord<'a> {
 
 async fn record_request_outcome(state: &AppState, record: OutcomeRecord<'_>) {
     let timestamp = now_unix_secs();
+    let token_usage = record.token_usage.unwrap_or_default();
+    state.history.enqueue(crate::request_history::UsageEvent {
+        event_id: record.event_id.to_string(),
+        occurred_at_ms: record.occurred_at_ms,
+        account_identifier: record.account.unwrap_or("unknown").to_string(),
+        provider: record.provider.to_string(),
+        model: record.model.unwrap_or("unknown").to_string(),
+        key_identifier: record.key_identifier.map(ToString::to_string),
+        status_code: record.status,
+        succeeded: record.success,
+        input_tokens: token_usage.input_tokens,
+        output_tokens: token_usage.output_tokens,
+        cached_input_tokens: token_usage.cached_input_tokens,
+        reasoning_tokens: token_usage.reasoning_tokens,
+        total_tokens: token_usage.total_tokens(),
+        latency_ms: record.elapsed_ms,
+    });
     state
         .telemetry
         .record_with_account(timestamp, record.provider, record.account, record.success);
@@ -769,10 +804,28 @@ fn reply_shape(mode: RelayMode) -> compat::ReplyShape {
     }
 }
 
+fn member_matches_binding(
+    member: &AccountMember,
+    binding: Option<&crate::management::settings::ApiKeyBinding>,
+) -> bool {
+    let Some(binding) = binding else {
+        return true;
+    };
+    binding
+        .account
+        .as_deref()
+        .is_none_or(|account| member.id() == account)
+        && binding
+            .provider
+            .as_deref()
+            .is_none_or(|provider| member.provider_name() == provider)
+}
+
 fn eligible_indices(
     pool: &crate::state::PoolSnapshot,
     model: Option<&str>,
     now_ms: i64,
+    binding: Option<&crate::management::settings::ApiKeyBinding>,
 ) -> Vec<usize> {
     let model_owned_by_dedicated_provider = model.is_some_and(|model| {
         pool.members.iter().any(|member| {
@@ -788,6 +841,7 @@ fn eligible_indices(
             !(model_owned_by_dedicated_provider && m.kind() == crate::account::ProviderKind::Codex)
         })
         .filter(|(_, m)| model.is_none_or(|model| m.supports_model(model)))
+        .filter(|(_, m)| member_matches_binding(m, binding))
         .map(|(i, _)| i)
         .collect()
 }
@@ -797,6 +851,7 @@ fn select_index(
     hint: &SessionHint,
     model: Option<&str>,
     exclude: &[usize],
+    binding: Option<&crate::management::settings::ApiKeyBinding>,
 ) -> Option<usize> {
     let pool = state.pool.load();
     // A model served by its dedicated provider must not be intercepted by a
@@ -817,7 +872,10 @@ fn select_index(
         {
             continue;
         }
-        if model.is_none_or(|model| member.supports_model(model)) {
+        if model.is_none_or(|model| member.supports_model(model))
+            && (binding.is_some() || state.scheduler.permits(member.id()))
+            && member_matches_binding(member, binding)
+        {
             candidates.push(member.clone());
             origin.push(index);
         }
@@ -898,6 +956,9 @@ async fn finish_success(
     let protocol = session.protocol;
     let content_type = content_type_of(&resp);
     capture_usage(member, resp.headers());
+    state
+        .scheduler
+        .record_success(member.id(), &state.pool.load().members);
 
     // Generic accounts relay verbatim only when the upstream speaks the same
     // wire as the client. The google and anthropic adapters do not, so they
@@ -1000,23 +1061,27 @@ async fn finish_success(
         member.record_ok();
         state.metrics.served.fetch_add(1, Ordering::Relaxed);
         state.router.feedback(member.id(), Outcome::Success);
-        let body = compat::streaming_body(
+        let upstream_capture = Arc::new(std::sync::Mutex::new(None));
+        let body = compat::streaming_body(compat::StreamingBodyParams {
             first,
-            stream,
+            upstream: stream,
             model,
             created,
-            false,
-            compat::ReplyShape::Anthropic,
+            include_usage: false,
+            shape: compat::ReplyShape::Anthropic,
             session,
-        );
-        return Ok(Response::builder()
+            upstream_capture: Some(Arc::clone(&upstream_capture)),
+        });
+        let mut response = Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "text/event-stream")
             .header(header::CACHE_CONTROL, "no-cache")
             .body(body)
             .unwrap_or_else(|_| {
                 (StatusCode::INTERNAL_SERVER_ERROR, "failed to build body").into_response()
-            }));
+            });
+        response.extensions_mut().insert(upstream_capture);
+        return Ok(response);
     }
 
     if plan.mode == RelayMode::Anthropic {
@@ -1037,35 +1102,45 @@ async fn finish_success(
         member.record_ok();
         state.metrics.served.fetch_add(1, Ordering::Relaxed);
         state.router.feedback(member.id(), Outcome::Success);
-        let body = compat::streaming_body(
+        let upstream_capture = Arc::new(std::sync::Mutex::new(None));
+        let body = compat::streaming_body(compat::StreamingBodyParams {
             first,
-            stream,
+            upstream: stream,
             model,
             created,
-            plan.include_usage,
-            reply_shape(plan.mode),
+            include_usage: plan.include_usage,
+            shape: reply_shape(plan.mode),
             session,
-        );
-        return Ok(Response::builder()
+            upstream_capture: Some(Arc::clone(&upstream_capture)),
+        });
+        let mut response = Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "text/event-stream")
             .header(header::CACHE_CONTROL, "no-cache")
             .body(body)
             .unwrap_or_else(|_| {
                 (StatusCode::INTERNAL_SERVER_ERROR, "failed to build body").into_response()
-            }));
+            });
+        response.extensions_mut().insert(upstream_capture);
+        return Ok(response);
     }
 
-    let raw = compat::collect_stream_with_replies(first, stream, session).await?;
+    let (raw, upstream_usage) = compat::collect_stream_with_replies(first, stream, session).await?;
     let completion = compat::aggregate(&raw, model, created, protocol, reply_shape(plan.mode))?;
     member.record_ok();
     state.metrics.served.fetch_add(1, Ordering::Relaxed);
     state.router.feedback(member.id(), Outcome::Success);
-    Ok(body_response(
+    let mut response = body_response(
         StatusCode::OK,
         Some("application/json"),
         Bytes::from(completion.to_string()),
-    ))
+    );
+    if let Some(usage) = upstream_usage {
+        response
+            .extensions_mut()
+            .insert(Arc::new(std::sync::Mutex::new(Some(usage))));
+    }
+    Ok(response)
 }
 
 /// Identify the conversation a request belongs to, so successive turns keep
@@ -1097,6 +1172,14 @@ pub async fn handle_relay(
     body_bytes: Bytes,
 ) -> Response {
     let request_started = std::time::Instant::now();
+    let event_id = uuid::Uuid::new_v4().to_string();
+    let occurred_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or(0);
+    let presented_key = crate::inbound::presented_api_key(headers);
+    let key_identifier = presented_key.map(crate::request_history::stable_key_identifier);
+    let binding = crate::management::accounts::binding_for_key(&state, presented_key);
     let _in_flight = state.monitor.track_in_flight();
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1109,7 +1192,13 @@ pub async fn handle_relay(
         Err(message) => return json_error(StatusCode::BAD_REQUEST, &message),
     };
 
-    let available_count = eligible_indices(&state.pool.load(), plan.model.as_deref(), now_ms).len();
+    let available_count = eligible_indices(
+        &state.pool.load(),
+        plan.model.as_deref(),
+        now_ms,
+        binding.as_ref(),
+    )
+    .len();
     let max_attempts = std::cmp::min(available_count, state.max_failover);
     if max_attempts == 0 {
         return json_error(
@@ -1129,7 +1218,13 @@ pub async fn handle_relay(
     let mut attempted: Vec<usize> = Vec::new();
 
     for _ in 0..max_attempts {
-        let chosen_idx = match select_index(&state, &hint, plan.model.as_deref(), &attempted) {
+        let chosen_idx = match select_index(
+            &state,
+            &hint,
+            plan.model.as_deref(),
+            &attempted,
+            binding.as_ref(),
+        ) {
             Some(idx) => idx,
             None => break,
         };
@@ -1189,6 +1284,9 @@ pub async fn handle_relay(
             Ok(r) => r,
             Err(e) => {
                 member.record_fail();
+                state
+                    .scheduler
+                    .record_non_auth_failure(member.id(), &state.pool.load().members);
                 state.metrics.failed_over.fetch_add(1, Ordering::Relaxed);
                 state
                     .monitor
@@ -1266,7 +1364,11 @@ pub async fn handle_relay(
             )
             .await
             {
-                Ok(response) => {
+                Ok(mut response) => {
+                    let upstream_capture = response
+                        .extensions_mut()
+                        .remove::<Arc<std::sync::Mutex<Option<crate::usage::ResponseTokenUsage>>>>(
+                        );
                     let (parts, body) = response.into_parts();
                     let bytes_in = plan.original_body.len();
                     // A buffered body is already fully in memory: finalize the
@@ -1280,9 +1382,12 @@ pub async fn handle_relay(
                                 record_request_outcome(
                                     &state,
                                     OutcomeRecord {
+                                        event_id: &event_id,
+                                        occurred_at_ms,
                                         provider: member.kind().as_str(),
                                         account: Some(member.id()),
                                         model: plan.model.as_deref(),
+                                        key_identifier: key_identifier.as_deref(),
                                         status: StatusCode::BAD_GATEWAY.as_u16(),
                                         success: false,
                                         elapsed_ms: request_started.elapsed().as_millis() as u64,
@@ -1300,16 +1405,25 @@ pub async fn handle_relay(
                             }
                         };
                         let bytes = collected.to_bytes();
-                        let token_usage =
-                            crate::usage::extract_response_token_usage(&bytes, &bytes);
+                        let token_usage = upstream_capture
+                            .as_ref()
+                            .and_then(|capture| {
+                                *capture
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            })
+                            .or_else(|| crate::usage::extract_response_token_usage(&bytes, &bytes));
                         let tokens =
                             token_usage.map(crate::usage::ResponseTokenUsage::total_tokens);
                         record_request_outcome(
                             &state,
                             OutcomeRecord {
+                                event_id: &event_id,
+                                occurred_at_ms,
                                 provider: member.kind().as_str(),
                                 account: Some(member.id()),
                                 model: plan.model.as_deref(),
+                                key_identifier: key_identifier.as_deref(),
                                 status: status_code,
                                 success: true,
                                 elapsed_ms: request_started.elapsed().as_millis() as u64,
@@ -1324,9 +1438,13 @@ pub async fn handle_relay(
                     }
                     let outcome = StreamedOutcome {
                         state: Arc::clone(&state),
+                        event_id: event_id.clone(),
+                        occurred_at_ms,
                         provider: member.kind().as_str().to_string(),
                         account: Some(member.id().to_string()),
                         model: plan.model.clone(),
+                        key_identifier: key_identifier.clone(),
+                        upstream_capture,
                         status: status_code,
                         started: request_started,
                         bytes_in,
@@ -1361,6 +1479,9 @@ pub async fn handle_relay(
             // excluded from this request's remaining attempts, but a transient
             // upstream 5xx never benches it for other requests.
             member.record_fail();
+            state
+                .scheduler
+                .record_non_auth_failure(member.id(), &state.pool.load().members);
             state.metrics.failed_over.fetch_add(1, Ordering::Relaxed);
             state
                 .monitor
@@ -1402,9 +1523,12 @@ pub async fn handle_relay(
         record_request_outcome(
             &state,
             OutcomeRecord {
+                event_id: &event_id,
+                occurred_at_ms,
                 provider: member.kind().as_str(),
                 account: Some(member.id()),
                 model: plan.model.as_deref(),
+                key_identifier: key_identifier.as_deref(),
                 status: failure.status.as_u16(),
                 success: false,
                 elapsed_ms: request_started.elapsed().as_millis() as u64,
@@ -1443,9 +1567,12 @@ pub async fn handle_relay(
     record_request_outcome(
         &state,
         OutcomeRecord {
+            event_id: &event_id,
+            occurred_at_ms,
             provider: "unknown",
             account: None,
             model: plan.model.as_deref(),
+            key_identifier: key_identifier.as_deref(),
             status: response.status().as_u16(),
             success: false,
             elapsed_ms: request_started.elapsed().as_millis() as u64,
@@ -1511,7 +1638,7 @@ mod routing_tests {
             "kiro/claude-haiku-4-5-20251001",
             "cursor/auto",
         ] {
-            let selected = select_index(&state, &hint, Some(model), &[]).expect("selection");
+            let selected = select_index(&state, &hint, Some(model), &[], None).expect("selection");
             assert!(
                 state.pool.load().members[selected].supports_model(model),
                 "model {model} was routed to {}",

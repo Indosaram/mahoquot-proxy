@@ -34,10 +34,17 @@ pub struct AppState {
     pub max_failover: usize,
     pub model_restrictions: AtomicBool,
     pub settings: Arc<SettingsStore>,
+    pub scheduler: crate::scheduler::SchedulerRegistry,
+    pub history: crate::request_history::HistoryService,
     pub telemetry: Arc<TelemetryStore>,
     /// Live in-memory log tail, always fed regardless of `logging-to-file`.
     pub log_tail: LogTail,
     pub usage_samples: crate::usage::UsageSampleStore,
+    pub usage_state: crate::usage::UsageStateStore,
+    pub shutdown: Arc<tokio::sync::Notify>,
+    /// Per-account usage-poll backoff (unix secs). A 429 from a usage endpoint
+    /// parks the account here so the poller stops keeping the throttle hot.
+    pub usage_poll_backoff: std::sync::Mutex<std::collections::HashMap<String, i64>>,
 }
 
 fn adopt_runtime_state(target: &AccountMember, previous: &Arc<AccountMember>) {
@@ -94,17 +101,50 @@ impl AppState {
             Arc::clone(&settings),
             config.api_keys.clone(),
         ));
+        let scheduler = crate::scheduler::SchedulerRegistry::load(&config.config_path, &members);
+        let history = crate::request_history::HistoryService::open(
+            &config.config_path.with_file_name("request-history.sqlite"),
+            config.history_queue_capacity,
+            config.history_batch_size,
+            Arc::clone(&metrics),
+        );
+        if let Ok(store) = history.store() {
+            if let Err(error) = store.prune(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+                    .unwrap_or(0),
+            ) {
+                tracing::warn!(%error, "failed to prune request history on startup");
+            }
+        }
         let telemetry = Arc::new(TelemetryStore::load(
             config.config_path.with_file_name("telemetry.json"),
         ));
+        let usage_state = crate::usage::UsageStateStore::load(
+            config.config_path.with_file_name("usage-state.json"),
+        );
+        // Restore the last observed quota snapshots so the console shows real
+        // windows right after a restart instead of waiting for the first poll.
+        let restored_usage = usage_state.restore();
+        for member in &members {
+            if let Some(snapshot) = restored_usage.get(&member.id) {
+                member.set_usage(snapshot.clone());
+            }
+        }
 
         Ok(Self {
             settings,
+            scheduler,
+            history,
             telemetry,
             log_tail: LogTail::default(),
             usage_samples: crate::usage::UsageSampleStore::load(
                 config.config_path.with_file_name("usage-samples.json"),
             ),
+            usage_state,
+            shutdown: Arc::new(tokio::sync::Notify::new()),
+            usage_poll_backoff: std::sync::Mutex::default(),
             router,
             pool: arc_swap::ArcSwap::from_pointee(PoolSnapshot { members, models }),
             models_env: config.models_env.clone(),
@@ -160,6 +200,7 @@ impl AppState {
         models.extend(crate::models_route::generic_model_entries(&members));
         let count = members.len();
         self.pool.store(Arc::new(PoolSnapshot { members, models }));
+        self.scheduler.reconcile(&self.pool.load().members);
         Ok(count)
     }
 
@@ -204,6 +245,7 @@ impl AppState {
                 crate::metrics::AccountStats {
                     id: m.id.clone(),
                     provider: m.provider_name(),
+                    plan: m.relay_plan(),
                     health: health.into(),
                     ok: m.ok_count.load(Ordering::Relaxed),
                     fails: m.fail_count.load(Ordering::Relaxed),

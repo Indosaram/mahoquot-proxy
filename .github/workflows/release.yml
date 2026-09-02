@@ -22,6 +22,8 @@ jobs:
             target: x86_64-apple-darwin
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
 
     steps:
       - name: Checkout repository
@@ -42,7 +44,11 @@ jobs:
         shell: bash
         run: |
           BIN_PATH="target/${{ matrix.target }}/release/mahoquot-gateway"
-          if [ -f "$BIN_PATH" ]; then
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            BIN_PATH="${BIN_PATH}.exe"
+            7z a "mahoquot-gateway-${{ matrix.target }}.zip" "$BIN_PATH"
+            sha256sum "mahoquot-gateway-${{ matrix.target }}.zip" > "mahoquot-gateway-${{ matrix.target }}.zip.sha256"
+          elif [ -f "$BIN_PATH" ]; then
             strip "$BIN_PATH" || true
             tar -czf "mahoquot-gateway-${{ matrix.target }}.tar.gz" -C "$(dirname "$BIN_PATH")" mahoquot-gateway
           else
@@ -61,3 +67,5 @@ jobs:
           files: |
             mahoquot-gateway-${{ matrix.target }}.tar.gz
             mahoquot-gateway-${{ matrix.target }}.tar.gz.sha256
+            mahoquot-gateway-${{ matrix.target }}.zip
+            mahoquot-gateway-${{ matrix.target }}.zip.sha256

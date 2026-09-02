@@ -39,6 +39,7 @@ jsonwebtoken.workspace = true
 prost.workspace = true
 prost-types.workspace = true
 clap.workspace = true
+rusqlite = { version = "0.31", features = ["bundled"] }
 
 [dev-dependencies]
 tower.workspace = true

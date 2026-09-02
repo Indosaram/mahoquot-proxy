@@ -147,6 +147,8 @@ impl ServeArgs {
             auth_refresh_enabled,
             usage_poll_secs,
             config_path,
+            history_queue_capacity: 1024,
+            history_batch_size: 64,
         })
     }
 }
@@ -302,10 +304,11 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&state),
         std::time::Duration::from_secs(config.usage_poll_secs),
     );
-    let app = create_app(state);
+    let app = create_app(state.clone());
 
     let listener = TcpListener::bind((bind_addr.as_str(), config.port)).await?;
     info!(bind_addr = %bind_addr, port = config.port, "listening");
 
-    run_server(listener, app).await
+    let shutdown = state.shutdown.clone();
+    run_server(listener, app, async move { shutdown.notified().await }).await
 }

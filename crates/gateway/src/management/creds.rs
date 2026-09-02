@@ -22,6 +22,25 @@ fn is_credential_filename(name: &str) -> bool {
     lowered.ends_with(".json") && name != ACCOUNT_ORDER_FILE && lowered != "telemetry.json"
 }
 
+fn is_credential_document(value: &Value) -> bool {
+    matches!(
+        value.get("type").and_then(Value::as_str),
+        Some(
+            "codex"
+                | "antigravity"
+                | "claude"
+                | "anthropic"
+                | "cursor"
+                | "kiro"
+                | "zcode"
+                | "generic"
+                | "vertex"
+                | "google-vertex"
+                | "monitor"
+        )
+    )
+}
+
 fn ordered_names(dir: &std::path::Path) -> Vec<String> {
     std::fs::read_to_string(dir.join(ACCOUNT_ORDER_FILE))
         .ok()
@@ -141,8 +160,14 @@ async fn list_auth_files(
         {
             continue;
         }
-        if let Some(described) = describe(&dir, &name) {
-            files.push(described);
+        let is_credential = std::fs::read_to_string(dir.join(&name))
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .is_some_and(|value| is_credential_document(&value));
+        if is_credential {
+            if let Some(described) = describe(&dir, &name) {
+                files.push(described);
+            }
         }
     }
     sort_described_files(&mut files, &ordered_names(&dir));
@@ -187,116 +212,6 @@ async fn save_auth_file_order(State(state): State<Arc<AppState>>, raw: bytes::By
     };
     match write_credential_atomically(&dir.join(ACCOUNT_ORDER_FILE), rendered.as_bytes()) {
         Ok(()) => json_status(StatusCode::OK, json!({ "status": "ok", "names": names })),
-        Err(err) => json_status(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            json!({ "error": err.to_string() }),
-        ),
-    }
-}
-
-fn decode_claude_credentials(raw: &str) -> Result<Value, String> {
-    let trimmed = raw.trim();
-    let decoded = if trimmed.starts_with('{') {
-        trimmed.to_string()
-    } else {
-        let bytes = trimmed.as_bytes();
-        if !bytes.len().is_multiple_of(2) || !bytes.iter().all(u8::is_ascii_hexdigit) {
-            return Err("Claude Code credential has an unknown format".into());
-        }
-        let decoded: Result<Vec<u8>, _> = bytes
-            .chunks_exact(2)
-            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap_or_default(), 16))
-            .collect();
-        String::from_utf8(decoded.map_err(|_| "invalid Claude Code credential encoding")?)
-            .map_err(|_| "Claude Code credential is not UTF-8")?
-    };
-    serde_json::from_str(&decoded)
-        .map_err(|err| format!("invalid Claude Code credential JSON: {err}"))
-}
-
-fn claude_credential_from_store(value: &Value) -> Result<Value, String> {
-    let oauth = value
-        .get("claudeAiOauth")
-        .ok_or_else(|| "Claude Code OAuth credential is missing".to_string())?;
-    let access_token = required_string(oauth, "accessToken")?;
-    let refresh_token = required_string(oauth, "refreshToken")?;
-    let expires_at = oauth
-        .get("expiresAt")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| "credential field expiresAt is required".to_string())?;
-    Ok(json!({
-        "type": "claude",
-        "access_token": access_token,
-        "refresh_token": refresh_token,
-        "email": "Claude Code subscription",
-        "expired": super::oauth::format_rfc3339(expires_at / 1000),
-        "identity_slug": "claude-code",
-        "disabled": false
-    }))
-}
-
-async fn import_local_claude(State(state): State<Arc<AppState>>) -> Response {
-    let credential_bytes = tokio::task::spawn_blocking(|| {
-        #[cfg(target_os = "macos")]
-        {
-            let output = std::process::Command::new("security")
-                .args([
-                    "find-generic-password",
-                    "-s",
-                    "Claude Code-credentials",
-                    "-w",
-                ])
-                .output()
-                .map_err(|err| err.to_string())?;
-            if output.status.success() {
-                Ok(output.stdout)
-            } else {
-                Err(String::from_utf8_lossy(&output.stderr).to_string())
-            }
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let home = std::env::var("HOME").map_err(|err| err.to_string())?;
-            std::fs::read(std::path::PathBuf::from(home).join(".claude/.credentials.json"))
-                .map_err(|err| err.to_string())
-        }
-    })
-    .await;
-
-    let credential_bytes = match credential_bytes {
-        Ok(Ok(bytes)) => bytes,
-        _ => {
-            return json_status(
-                StatusCode::NOT_FOUND,
-                json!({ "error": "Claude Code OAuth credential not found" }),
-            )
-        }
-    };
-    let raw = String::from_utf8_lossy(&credential_bytes);
-    let stored = match decode_claude_credentials(&raw)
-        .and_then(|value| claude_credential_from_store(&value))
-    {
-        Ok(stored) => stored,
-        Err(error) => return json_status(StatusCode::BAD_REQUEST, json!({ "error": error })),
-    };
-    let dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
-    if let Err(err) = std::fs::create_dir_all(&dir) {
-        return json_status(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            json!({ "error": err.to_string() }),
-        );
-    }
-    let rendered = serde_json::to_string_pretty(&stored).unwrap_or_default();
-    match write_credential_atomically(&dir.join("claude-local.json"), rendered.as_bytes()) {
-        Ok(()) => {
-            if let Err(error) = state.rescan_pool() {
-                eprintln!("pool rescan failed after claude import: {error}");
-            }
-            json_status(
-                StatusCode::OK,
-                json!({ "status": "ok", "name": "claude-local.json" }),
-            )
-        }
         Err(err) => json_status(
             StatusCode::INTERNAL_SERVER_ERROR,
             json!({ "error": err.to_string() }),
@@ -360,10 +275,23 @@ fn required_string<'a>(content: &'a Value, field: &str) -> Result<&'a str, Strin
         .ok_or_else(|| format!("credential field {field} is required"))
 }
 
-fn validate_provider_credential(content: &Value) -> Result<(), String> {
+pub(crate) fn validate_provider_credential(content: &Value) -> Result<(), String> {
     let kind = required_string(content, "type")?;
     match kind {
-        "claude" | "anthropic" | "cursor" => {
+        // A claude static-key relay deployment (api_key + upstream_override)
+        // has inert refresh/expiry, so demanding the OAuth quartet would reject
+        // the only shape the add-screen can produce for relay targets.
+        "claude" | "anthropic" => {
+            required_string(content, "email")?;
+            if content.get("api_key").and_then(Value::as_str).is_some() {
+                required_string(content, "upstream_override")?;
+            } else {
+                required_string(content, "access_token")?;
+                required_string(content, "refresh_token")?;
+                required_string(content, "expired")?;
+            }
+        }
+        "cursor" => {
             required_string(content, "access_token")?;
             required_string(content, "refresh_token")?;
             required_string(content, "email")?;
@@ -405,6 +333,32 @@ fn validate_provider_credential(content: &Value) -> Result<(), String> {
         _ => return Err(format!("unsupported credential type {kind}")),
     }
     Ok(())
+}
+
+/// Stable duplicate-detection identity for imports. Provider plus email keeps
+/// separate providers distinct; account/project/identity ids cover credentials
+/// that do not carry an email. Secret token material is never part of the key.
+pub(crate) fn credential_identity(content: &Value) -> Option<String> {
+    let provider = content
+        .get("provider")
+        .or_else(|| content.get("type"))
+        .and_then(Value::as_str)?
+        .trim()
+        .to_ascii_lowercase();
+    if provider.is_empty() {
+        return None;
+    }
+    let identity = ["email", "account_id", "project_id", "identity_slug"]
+        .into_iter()
+        .find_map(|field| {
+            content
+                .get(field)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_ascii_lowercase)
+        })?;
+    Some(format!("{provider}|{identity}"))
 }
 
 /// Upstream addresses a credential by a stable opaque handle rather than its
@@ -498,8 +452,12 @@ async fn model_definitions(Path(channel): Path<String>) -> Response {
 
 async fn download_auth_file(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
+    if !super::accounts::export_authorized(&state, &headers) {
+        return super::accounts::export_refusal();
+    }
     let Some(name) = params.get("name").map(|v| v.trim()) else {
         return json_status(
             StatusCode::BAD_REQUEST,
@@ -1071,7 +1029,6 @@ pub fn creds_routes() -> Router<Arc<AppState>> {
                 .delete(delete_auth_file),
         )
         .route("/auth-files/order", put(save_auth_file_order))
-        .route("/claude/import-local", post(import_local_claude))
         .route("/auth-files/models", get(auth_file_models))
         .route("/auth-files/download", get(download_auth_file))
         .route(
@@ -1093,21 +1050,6 @@ pub fn creds_routes() -> Router<Arc<AppState>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn claude_code_hex_store_converts_without_exposing_tokens() {
-        let raw = r#"{"claudeAiOauth":{"accessToken":"access","refreshToken":"refresh","expiresAt":1893456000000}}"#;
-        let hex = raw
-            .as_bytes()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        let decoded = decode_claude_credentials(&hex).expect("decode");
-        let credential = claude_credential_from_store(&decoded).expect("convert");
-        assert_eq!(credential["type"], "claude");
-        assert_eq!(credential["identity_slug"], "claude-code");
-        assert_eq!(credential["expired"], "2030-01-01T00:00:00Z");
-    }
 
     #[test]
     fn explicit_account_order_precedes_unlisted_files() {
@@ -1195,6 +1137,43 @@ mod tests {
         assert_eq!(
             validate_provider_credential(&invalid_zcode),
             Err("zcode access_token must be a provisioned {id}.{secret} key".to_string())
+        );
+    }
+
+    #[test]
+    fn claude_relay_documents_skip_the_oauth_quartet_but_stay_pinned() {
+        // given the claude-type document the add-screen builds for relay targets
+        let relay_doc = json!({
+            "type": "claude",
+            "email": "claude-nekos",
+            "identity_slug": "claude-nekos",
+            "api_key": "sk-clb-secret",
+            "upstream_override": "https://claude.nekos.me",
+            "plan": "standard"
+        });
+        // then it is accepted without access_token/refresh_token/expired
+        assert_eq!(validate_provider_credential(&relay_doc), Ok(()));
+
+        // and a relay doc without a pinned target API is still rejected
+        let unpinned = json!({
+            "type": "claude",
+            "email": "claude-nekos",
+            "api_key": "sk-clb-secret"
+        });
+        assert_eq!(
+            validate_provider_credential(&unpinned),
+            Err("credential field upstream_override is required".to_string())
+        );
+
+        // and an oauth claude doc without tokens is still rejected as before
+        let oauth_missing_tokens = json!({
+            "type": "claude",
+            "email": "u@example.com",
+            "expired": "2099-01-01T00:00:00Z"
+        });
+        assert_eq!(
+            validate_provider_credential(&oauth_missing_tokens),
+            Err("credential field access_token is required".to_string())
         );
     }
 

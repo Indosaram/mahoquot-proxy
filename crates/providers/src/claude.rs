@@ -68,6 +68,11 @@ pub struct ClaudeAccount {
     pub api_key: Option<String>,
     #[serde(default)]
     pub upstream_override: Option<String>,
+    /// Usage-polling-only base: when a relay serves messages on one front door
+    /// and cumulative counters on another, chat keeps `upstream_override` while
+    /// /v1/usage/self is polled here.
+    #[serde(default)]
+    pub usage_override: Option<String>,
     #[serde(default)]
     pub email: String,
     #[serde(default)]
@@ -77,6 +82,10 @@ pub struct ClaudeAccount {
     pub account_id: String,
     #[serde(default)]
     pub disabled: bool,
+    /// Relay plan label chosen at registration (nekos/ccapi hidden feature);
+    /// purely informational, the relay itself never sees it.
+    #[serde(default)]
+    pub plan: Option<String>,
     #[serde(rename = "type")]
     pub r#type: String,
 }
@@ -182,5 +191,30 @@ mod tests {
         assert!(is_claude_model("claude-haiku-4-5-20251001"));
         assert!(!is_claude_model("gpt-5.6-sol"));
         assert!(!is_claude_model("glm-5.2"));
+    }
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+
+    #[test]
+    fn relay_documents_carry_an_optional_plan_label() {
+        let with_plan: ClaudeAccount = serde_json::from_str(
+            r#"{"type":"claude","email":"claude-nekos","identity_slug":"claude-nekos",
+                "api_key":"sk-clb-secret","upstream_override":"https://claude.nekos.me",
+                "plan":"opus-standard"}"#,
+        )
+        .expect("deserialize");
+        assert_eq!(with_plan.plan.as_deref(), Some("opus-standard"));
+
+        // the live claude-nekos.json shape predates plans and must keep parsing
+        let legacy: ClaudeAccount = serde_json::from_str(
+            r#"{"type":"claude","api_key":"sk-clb-secret",
+                "upstream_override":"https://claude.nekos.me","email":"claude-nekos",
+                "identity_slug":"claude-nekos","disabled":false}"#,
+        )
+        .expect("deserialize");
+        assert_eq!(legacy.plan, None);
     }
 }

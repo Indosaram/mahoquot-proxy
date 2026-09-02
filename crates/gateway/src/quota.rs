@@ -20,6 +20,36 @@ const KIRO_USAGE_URL: &str = "https://q.us-east-1.amazonaws.com/getUsageLimits?o
 /// header, and a new date means the payload can change without notice.
 const CLAUDE_OAUTH_BETA: &str = "oauth-2025-04-20";
 
+/// Hidden relay-usage feature: the /v1/usage/self cumulative-counter endpoint
+/// only exists on the nekos/ccapi relay targets, so the poller filters on the
+/// account's target API, not on the key material. Generic API-key accounts
+/// never enter this path (no settings, no UI trace), and static-key chat
+/// routing is unaffected.
+const RELAY_USAGE_HOST_MARKERS: [&str; 2] = ["nekos", "ccapi"];
+
+/// After a 429 from a usage endpoint, skip that account's usage polls for this
+/// long. Anthropic's OAuth usage endpoint throttles hard and sends no
+/// Retry-After, so re-polling every cycle keeps the throttle hot and an
+/// account that has never observed a snapshot would never get one.
+const USAGE_RATE_LIMIT_BACKOFF_SECS: i64 = 900;
+
+fn poll_allowed(now_unix: i64, backoff_until_unix: Option<i64>) -> bool {
+    backoff_until_unix.is_none_or(|until| now_unix >= until)
+}
+
+fn relay_usage_target(key: Option<String>, base: Option<&str>) -> Option<String> {
+    let key = key?;
+    let base = base?;
+    RELAY_USAGE_HOST_MARKERS
+        .iter()
+        .any(|marker| base.contains(marker))
+        .then_some(key)
+}
+
+fn relay_usage_key(member: &AccountMember) -> Option<String> {
+    relay_usage_target(member.relay_api_key(), member.upstream_override.as_deref())
+}
+
 fn now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -27,18 +57,97 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
+fn poll_backoff_until(state: &AppState, account: &str) -> Option<i64> {
+    state
+        .usage_poll_backoff
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(account)
+        .copied()
+}
+
+fn set_poll_backoff(state: &AppState, account: &str, until_unix: i64) {
+    state
+        .usage_poll_backoff
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(account.to_string(), until_unix);
+}
+
+fn clear_poll_backoff(state: &AppState, account: &str) {
+    state
+        .usage_poll_backoff
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(account);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetAttemptPolicy {
+    Success,
+    RefreshAndRetry,
+    Unauthorized,
+    NoCredit,
+    Upstream,
+}
+
+/// Classify one upstream reset response without coupling retry policy to I/O.
+pub fn reset_attempt_policy(
+    status: reqwest::StatusCode,
+    already_refreshed: bool,
+    body: &str,
+) -> ResetAttemptPolicy {
+    if status.is_success() {
+        return ResetAttemptPolicy::Success;
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return if already_refreshed {
+            ResetAttemptPolicy::Unauthorized
+        } else {
+            ResetAttemptPolicy::RefreshAndRetry
+        };
+    }
+    let detail = body.to_ascii_lowercase();
+    if detail.contains("credit")
+        && (detail.contains("no ")
+            || detail.contains("zero")
+            || detail.contains("exhaust")
+            || detail.contains("available_count\":0"))
+    {
+        return ResetAttemptPolicy::NoCredit;
+    }
+    ResetAttemptPolicy::Upstream
+}
+
+/// A reset retry must retain the first request id rather than minting another.
+pub fn retain_redeem_request_id(existing: &str, generated: &str) -> String {
+    if existing.is_empty() {
+        generated.to_string()
+    } else {
+        existing.to_string()
+    }
+}
+
 #[derive(Debug)]
 pub enum QuotaError {
     Unsupported,
     Unauthorized,
+    NoCredit,
+    Network(String),
+    /// The usage endpoint answered 429: a stale read, not a quota fact. The
+    /// caller backs off instead of surfacing it as a poll failure.
+    RateLimited,
     Upstream(String),
 }
 
 impl std::fmt::Display for QuotaError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            QuotaError::Unsupported => write!(f, "provider does not expose quota"),
-            QuotaError::Unauthorized => write!(f, "account rejected the credentials"),
+            QuotaError::Unsupported => write!(f, "provider does not support reset credits"),
+            QuotaError::Unauthorized => write!(f, "account rejected the credentials after refresh"),
+            QuotaError::NoCredit => write!(f, "no reset credits available"),
+            QuotaError::Network(m) => write!(f, "reset network error: {m}"),
+            QuotaError::RateLimited => write!(f, "usage endpoint rate limited"),
             QuotaError::Upstream(m) => write!(f, "{m}"),
         }
     }
@@ -58,6 +167,32 @@ fn codex_account_id(member: &AccountMember) -> String {
 /// Poll one account's quota and store it. Returns `Unsupported` only for
 /// providers that genuinely publish no quota API.
 pub async fn refresh_account_usage(
+    state: &AppState,
+    member: &Arc<AccountMember>,
+) -> Result<(), QuotaError> {
+    if !poll_allowed(now_unix(), poll_backoff_until(state, &member.id)) {
+        return Ok(());
+    }
+    let outcome = refresh_account_usage_inner(state, member).await;
+    match outcome {
+        Ok(()) => {
+            clear_poll_backoff(state, &member.id);
+            Ok(())
+        }
+        Err(QuotaError::RateLimited) => {
+            set_poll_backoff(
+                state,
+                &member.id,
+                now_unix() + USAGE_RATE_LIMIT_BACKOFF_SECS,
+            );
+            tracing::debug!(account = %member.id, "usage poll rate limited; backing off");
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn refresh_account_usage_inner(
     state: &AppState,
     member: &Arc<AccountMember>,
 ) -> Result<(), QuotaError> {
@@ -201,11 +336,15 @@ async fn refresh_claude_usage(
 
 async fn try_claude_usage(state: &AppState, member: &Arc<AccountMember>) -> Result<(), QuotaError> {
     // Relay deployments authenticate with a static key and publish cumulative
-    // counters from /v1/usage/self instead of subscription windows.
-    if let Some(key) = member.relay_api_key() {
+    // counters from /v1/usage/self instead of subscription windows. Gated on
+    // the account's target API so generic API keys stay untouched.
+    if let Some(key) = relay_usage_key(member) {
+        // Poll the usage front door when one is pinned; chat still uses the
+        // upstream_override target.
         let base = member
-            .upstream_override
+            .usage_override
             .as_deref()
+            .or(member.upstream_override.as_deref())
             .unwrap_or_default()
             .trim_end_matches('/');
         if base.is_empty() {
@@ -227,6 +366,9 @@ async fn try_claude_usage(state: &AppState, member: &Arc<AccountMember>) -> Resu
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
             return Err(QuotaError::Unauthorized);
         }
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(QuotaError::RateLimited);
+        }
         if !status.is_success() {
             return Err(QuotaError::Upstream(format!("usage http {status}")));
         }
@@ -244,6 +386,7 @@ async fn try_claude_usage(state: &AppState, member: &Arc<AccountMember>) -> Resu
                 unix: now,
                 requests: totals.requests,
                 tokens: totals.tokens,
+                cost_usd: totals.total_cost_usd,
             },
         );
         member.set_usage(crate::usage::AccountUsage {
@@ -280,7 +423,11 @@ async fn try_claude_usage(state: &AppState, member: &Arc<AccountMember>) -> Resu
         return Err(QuotaError::Unauthorized);
     }
     // Anthropic throttles this endpoint hard and gives no Retry-After. A 429 is
-    // a stale read, not a quota fact, so the previous snapshot is left alone.
+    // a stale read, not a quota fact, so the previous snapshot is left alone
+    // and the account backs off instead of keeping the throttle hot.
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Err(QuotaError::RateLimited);
+    }
     if !status.is_success() {
         return Err(QuotaError::Upstream(format!("usage http {status}")));
     }
@@ -406,9 +553,14 @@ async fn refresh_codex_usage(
     }
     let account_id = codex_account_id(member);
 
+    let usage_url = member
+        .upstream_override
+        .as_deref()
+        .map(|base| format!("{}/backend-api/wham/usage", base.trim_end_matches('/')))
+        .unwrap_or_else(|| CODEX_USAGE_URL.to_string());
     let mut req = state
         .http_client
-        .get(CODEX_USAGE_URL)
+        .get(usage_url)
         .header("Authorization", format!("Bearer {token}"))
         .header("Accept", "application/json")
         .header("User-Agent", CODEX_USER_AGENT)
@@ -436,6 +588,59 @@ async fn refresh_codex_usage(
     Ok(())
 }
 
+async fn try_consume_reset_credit(
+    state: &AppState,
+    member: &Arc<AccountMember>,
+    redeem_id: &str,
+) -> Result<(reqwest::StatusCode, String), QuotaError> {
+    let token = member.access_token();
+    if token.is_empty() {
+        return Err(QuotaError::Unauthorized);
+    }
+    let account_id = codex_account_id(member);
+    let reset_url = member
+        .upstream_override
+        .as_deref()
+        .map(|base| {
+            format!(
+                "{}/backend-api/wham/rate-limit-reset-credits/consume",
+                base.trim_end_matches('/')
+            )
+        })
+        .unwrap_or_else(|| CODEX_RESET_URL.to_string());
+    let mut req = state
+        .http_client
+        .post(reset_url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Content-Type", "application/json")
+        .header("User-Agent", CODEX_USER_AGENT)
+        .timeout(Duration::from_secs(20));
+    if !account_id.is_empty() {
+        req = req.header("Chatgpt-Account-Id", &account_id);
+    }
+    let resp = req
+        .json(&serde_json::json!({ "redeem_request_id": redeem_id }))
+        .send()
+        .await
+        .map_err(|e| QuotaError::Network(e.to_string()))?;
+    let status = resp.status();
+    let body = if status.is_success() {
+        String::new()
+    } else {
+        resp.text().await.unwrap_or_default()
+    };
+    Ok((status, body))
+}
+
+fn reset_upstream_error(status: reqwest::StatusCode, body: &str) -> QuotaError {
+    let snippet: String = body.trim().chars().take(200).collect();
+    QuotaError::Upstream(if snippet.is_empty() {
+        format!("reset http {status}")
+    } else {
+        format!("reset http {status}: {snippet}")
+    })
+}
+
 /// Spend one reset credit to force-clear the account's 5h window.
 pub async fn consume_reset_credit(
     state: &AppState,
@@ -444,46 +649,61 @@ pub async fn consume_reset_credit(
     if member.kind() != ProviderKind::Codex {
         return Err(QuotaError::Unsupported);
     }
-    let token = member.access_token();
-    if token.is_empty() {
+    if member.usage_snapshot().reset_credits_available == Some(0) {
+        return Err(QuotaError::NoCredit);
+    }
+    if member.access_token().is_empty() {
         return Err(QuotaError::Unauthorized);
     }
-    let account_id = codex_account_id(member);
+    if state.auth_refresh_enabled && member.is_expired(now_unix()) {
+        state
+            .refresh_member(member, None)
+            .await
+            .map_err(|e| QuotaError::Upstream(format!("reset token refresh failed: {e}")))?;
+    }
+
     let redeem_id = uuid_v4();
-
-    let mut req = state
-        .http_client
-        .post(CODEX_RESET_URL)
-        .header("Authorization", format!("Bearer {token}"))
-        .header("Content-Type", "application/json")
-        .header("User-Agent", CODEX_USER_AGENT)
-        .timeout(Duration::from_secs(20));
-    if !account_id.is_empty() {
-        req = req.header("Chatgpt-Account-Id", &account_id);
-    }
-
-    let resp = req
-        .json(&serde_json::json!({ "redeem_request_id": redeem_id }))
-        .send()
-        .await
-        .map_err(|e| QuotaError::Upstream(e.to_string()))?;
-    let status = resp.status();
-    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        return Err(QuotaError::Unauthorized);
-    }
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        // Surface the upstream reason (e.g. no credits left) instead of a
-        // generic failure, truncated on a char boundary so multibyte is safe.
-        let snippet: String = body.trim().chars().take(200).collect();
-        return Err(QuotaError::Upstream(if snippet.is_empty() {
-            format!("reset http {status}")
-        } else {
-            format!("reset http {status}: {snippet}")
-        }));
+    let used_token = member.access_token();
+    let (status, body) = try_consume_reset_credit(state, member, &redeem_id).await?;
+    match reset_attempt_policy(status, false, &body) {
+        ResetAttemptPolicy::Success => {}
+        ResetAttemptPolicy::RefreshAndRetry if state.auth_refresh_enabled => {
+            state
+                .refresh_member(member, Some(&used_token))
+                .await
+                .map_err(|e| QuotaError::Upstream(format!("reset token refresh failed: {e}")))?;
+            let retry_id = retain_redeem_request_id(&redeem_id, &uuid_v4());
+            let (retry_status, retry_body) =
+                try_consume_reset_credit(state, member, &retry_id).await?;
+            match reset_attempt_policy(retry_status, true, &retry_body) {
+                ResetAttemptPolicy::Success => {}
+                ResetAttemptPolicy::Unauthorized | ResetAttemptPolicy::RefreshAndRetry => {
+                    return Err(QuotaError::Unauthorized)
+                }
+                ResetAttemptPolicy::NoCredit => return Err(QuotaError::NoCredit),
+                ResetAttemptPolicy::Upstream => {
+                    return Err(reset_upstream_error(retry_status, &retry_body))
+                }
+            }
+        }
+        ResetAttemptPolicy::RefreshAndRetry | ResetAttemptPolicy::Unauthorized => {
+            return Err(QuotaError::Unauthorized)
+        }
+        ResetAttemptPolicy::NoCredit => return Err(QuotaError::NoCredit),
+        ResetAttemptPolicy::Upstream => return Err(reset_upstream_error(status, &body)),
     }
     let _ = refresh_account_usage(state, member).await;
     Ok(())
+}
+
+pub fn reset_error_status(error: &QuotaError) -> reqwest::StatusCode {
+    match error {
+        QuotaError::Unsupported => reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        QuotaError::Unauthorized => reqwest::StatusCode::UNAUTHORIZED,
+        QuotaError::NoCredit => reqwest::StatusCode::CONFLICT,
+        QuotaError::RateLimited => reqwest::StatusCode::TOO_MANY_REQUESTS,
+        QuotaError::Network(_) | QuotaError::Upstream(_) => reqwest::StatusCode::BAD_GATEWAY,
+    }
 }
 
 fn uuid_v4() -> String {
@@ -539,6 +759,13 @@ pub async fn refresh_all_usage(state: &Arc<AppState>) {
     for t in tasks {
         let _ = t.await;
     }
+    // Persist the settled snapshots so the next gateway restart restores the
+    // console cards immediately instead of waiting for the first poll cycle.
+    let mut snapshots = std::collections::BTreeMap::new();
+    for m in state.pool.load().members.iter() {
+        snapshots.insert(m.id.clone(), m.usage_snapshot());
+    }
+    state.usage_state.save(&snapshots, now_unix());
 }
 
 pub fn spawn_usage_poller(state: Arc<AppState>, every: Duration) {
@@ -564,5 +791,43 @@ mod tests {
         assert_eq!(a.as_bytes()[14], b'4');
         assert!(matches!(a.as_bytes()[19], b'8' | b'9' | b'a' | b'b'));
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn usage_poll_backoff_gates_by_unix_time() {
+        assert!(poll_allowed(100, None));
+        assert!(poll_allowed(900, Some(900)));
+        assert!(!poll_allowed(899, Some(900)));
+    }
+
+    #[test]
+    fn relay_usage_polling_filters_on_the_target_api_not_the_key() {
+        // then only nekos/ccapi relay targets unlock the usage/self path,
+        // regardless of what the key material looks like
+        assert_eq!(
+            relay_usage_target(
+                Some("sk-clb-anything".into()),
+                Some("https://claude.nekos.me")
+            )
+            .as_deref(),
+            Some("sk-clb-anything")
+        );
+        assert!(
+            relay_usage_target(Some("k1".into()), Some("https://api.ccapi.example.com")).is_some()
+        );
+        // a generic API target never unlocks, whatever the key prefix
+        assert_eq!(
+            relay_usage_target(
+                Some("nekos-prefixed-key".into()),
+                Some("https://api.anthropic.com")
+            ),
+            None
+        );
+        // no target API or no static key means no polling either
+        assert_eq!(relay_usage_target(Some("k".into()), None), None);
+        assert_eq!(
+            relay_usage_target(None, Some("https://claude.nekos.me")),
+            None
+        );
     }
 }

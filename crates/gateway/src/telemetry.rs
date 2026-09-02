@@ -167,6 +167,103 @@ impl TelemetryStore {
             .clone()
     }
 
+    pub fn remove_history_groups(&self, groups: &[crate::request_history::HistoryGroup]) -> usize {
+        let mut buckets = self
+            .buckets
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let before = buckets.len();
+        for group in groups {
+            let (Some(bucket_start_ms), Some(provider), Some(account)) = (
+                group.key.bucket_start_ms,
+                group.key.provider.as_deref(),
+                group.key.account.as_deref(),
+            ) else {
+                continue;
+            };
+            let minute_unix = bucket_start_ms.div_euclid(1_000);
+            let Some(bucket) = buckets
+                .iter_mut()
+                .find(|bucket| bucket.minute_unix == minute_unix)
+            else {
+                continue;
+            };
+            let totals = &group.totals;
+            bucket.requests = bucket.requests.saturating_sub(totals.requests);
+            bucket.successes = bucket.successes.saturating_sub(totals.successful_requests);
+            bucket.failures = bucket.failures.saturating_sub(totals.failed_requests);
+            bucket.input_tokens = bucket.input_tokens.saturating_sub(totals.input_tokens);
+            bucket.output_tokens = bucket.output_tokens.saturating_sub(totals.output_tokens);
+            if let Some(provider_bucket) = bucket
+                .providers
+                .iter_mut()
+                .find(|item| item.provider == provider)
+            {
+                provider_bucket.requests = provider_bucket.requests.saturating_sub(totals.requests);
+                provider_bucket.successes = provider_bucket
+                    .successes
+                    .saturating_sub(totals.successful_requests);
+                provider_bucket.failures = provider_bucket
+                    .failures
+                    .saturating_sub(totals.failed_requests);
+                provider_bucket.input_tokens = provider_bucket
+                    .input_tokens
+                    .saturating_sub(totals.input_tokens);
+                provider_bucket.output_tokens = provider_bucket
+                    .output_tokens
+                    .saturating_sub(totals.output_tokens);
+            }
+            if let Some(account_bucket) = bucket
+                .accounts
+                .iter_mut()
+                .find(|item| item.account == account)
+            {
+                account_bucket.requests = account_bucket.requests.saturating_sub(totals.requests);
+                account_bucket.successes = account_bucket
+                    .successes
+                    .saturating_sub(totals.successful_requests);
+                account_bucket.failures = account_bucket
+                    .failures
+                    .saturating_sub(totals.failed_requests);
+                account_bucket.input_tokens = account_bucket
+                    .input_tokens
+                    .saturating_sub(totals.input_tokens);
+                account_bucket.output_tokens = account_bucket
+                    .output_tokens
+                    .saturating_sub(totals.output_tokens);
+            }
+        }
+        for bucket in buckets.iter_mut() {
+            bucket.providers.retain(|item| {
+                item.requests != 0
+                    || item.successes != 0
+                    || item.failures != 0
+                    || item.input_tokens != 0
+                    || item.output_tokens != 0
+            });
+            bucket.accounts.retain(|item| {
+                item.requests != 0
+                    || item.successes != 0
+                    || item.failures != 0
+                    || item.input_tokens != 0
+                    || item.output_tokens != 0
+            });
+        }
+        buckets.retain(|bucket| {
+            bucket.requests != 0
+                || bucket.successes != 0
+                || bucket.failures != 0
+                || bucket.input_tokens != 0
+                || bucket.output_tokens != 0
+                || !bucket.providers.is_empty()
+                || !bucket.accounts.is_empty()
+        });
+        if !groups.is_empty() {
+            self.flush_requested.notify_one();
+        }
+        before.saturating_sub(buckets.len())
+    }
+
     pub fn record_tokens(
         &self,
         unix_secs: i64,

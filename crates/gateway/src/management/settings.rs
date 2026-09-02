@@ -35,6 +35,18 @@ pub struct RoutingSettings {
     pub strategy: String,
 }
 
+/// An inbound key route stores only the key's stable one-way identifier. Raw
+/// client keys remain in the canonical `api-keys` setting and are never copied
+/// into routing metadata.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApiKeyBinding {
+    pub key_identifier: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct QuotaExceededSettings {
     #[serde(rename = "switch-project", default = "yes")]
@@ -156,6 +168,8 @@ pub struct Settings {
     pub remote_management: RemoteManagement,
     #[serde(rename = "api-keys", default)]
     pub api_keys: Vec<String>,
+    #[serde(rename = "api-key-bindings", default)]
+    pub api_key_bindings: Vec<ApiKeyBinding>,
     #[serde(rename = "oauth-excluded-models", default)]
     pub oauth_excluded_models: std::collections::BTreeMap<String, Vec<String>>,
     #[serde(rename = "gemini-api-key", default)]
@@ -224,6 +238,7 @@ impl Default for Settings {
             quota_exceeded: QuotaExceededSettings::default(),
             remote_management: RemoteManagement::default(),
             api_keys: Vec::new(),
+            api_key_bindings: Vec::new(),
             oauth_excluded_models: std::collections::BTreeMap::new(),
             gemini_api_key: Vec::new(),
             claude_api_key: Vec::new(),

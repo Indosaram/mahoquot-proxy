@@ -1607,8 +1607,6 @@ async fn test_command_code_oauth_reports_unavailable_default_callback_port() {
     std::fs::remove_dir_all(auth_dir).ok();
 }
 
-static ZCODE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 #[tokio::test]
 async fn test_zcode_quota_reads_the_desktop_app_balance_log() {
     use mahoquot_gateway::quota::refresh_account_usage;
@@ -1684,86 +1682,6 @@ async fn test_zcode_quota_reads_the_desktop_app_balance_log() {
     std::env::remove_var("ZCODE_LOGS_DIR");
     std::fs::remove_dir_all(auth_dir).ok();
     std::fs::remove_dir_all(logs_dir).ok();
-}
-
-#[tokio::test]
-async fn test_zcode_import_local_provisions_from_desktop_credentials() {
-    let _guard = ZCODE_ENV_LOCK.lock().await;
-    let auth_dir = unique_temp_dir("qg-t13-zcode-import");
-    let creds_file = auth_dir
-        .parent()
-        .unwrap()
-        .join(format!("zcode-desktop-creds-{}.json", std::process::id()));
-    let config_file = auth_dir
-        .parent()
-        .unwrap()
-        .join(format!("zcode-desktop-config-{}.json", std::process::id()));
-    std::fs::write(
-        &creds_file,
-        serde_json::json!({ "oauth:zai:access_token": "upstream-zai-token" }).to_string(),
-    )
-    .unwrap();
-    std::fs::write(
-        &config_file,
-        serde_json::json!({
-            "provider": {
-                "builtin:zai": { "options": { "apiKey": "" } },
-                "builtin:zai-start-plan": { "options": { "apiKey": "otherplan_half1.otherplan_half2" } },
-                "builtin:zai-coding-plan": { "options": { "apiKey": "key_id_9.secret_9" } }
-            }
-        })
-        .to_string(),
-    )
-    .unwrap();
-
-    std::env::set_var("ZCODE_DESKTOP_CREDENTIALS_FILE", &creds_file);
-    std::env::set_var("ZCODE_DESKTOP_CONFIG_FILE", &config_file);
-
-    let config = GatewayConfig {
-        auth_dir: auth_dir.clone(),
-        api_keys: mahoquot_gateway::inbound::ApiKeys::new(vec![API_KEY.to_string()]),
-        ..GatewayConfig::default()
-    };
-    let gateway_app = create_app(Arc::new(AppState::new(&config).unwrap()));
-    let gateway_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let gateway_port = gateway_listener.local_addr().unwrap().port();
-    tokio::spawn(async move {
-        axum::serve(
-            gateway_listener,
-            gateway_app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await
-        .unwrap();
-    });
-    let client = reqwest::Client::new();
-
-    let import_resp = client
-        .post(format!(
-            "http://127.0.0.1:{gateway_port}/v0/management/zcode/import-local"
-        ))
-        .bearer_auth(API_KEY)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(import_resp.status(), StatusCode::OK);
-    let import_json: Value = import_resp.json().await.unwrap();
-    assert_eq!(import_json["status"], "ok");
-    assert_eq!(import_json["provider"], "zcode");
-    assert_eq!(import_json["name"], "zcode-desktop.json");
-
-    let parsed: mahoquot_providers::zcode::ZcodeAccount = serde_json::from_str(
-        &std::fs::read_to_string(auth_dir.join("zcode-desktop.json")).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(parsed.access_token, "key_id_9.secret_9");
-    assert_eq!(parsed.refresh_token, "upstream-zai-token");
-    assert_eq!(parsed.r#type, "zcode");
-
-    std::env::remove_var("ZCODE_DESKTOP_CREDENTIALS_FILE");
-    std::env::remove_var("ZCODE_DESKTOP_CONFIG_FILE");
-    std::fs::remove_file(&creds_file).ok();
-    std::fs::remove_file(&config_file).ok();
-    std::fs::remove_dir_all(auth_dir).ok();
 }
 
 #[tokio::test]

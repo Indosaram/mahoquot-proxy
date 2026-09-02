@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -816,6 +817,8 @@ impl HeadTailCapture {
 pub struct ResponseTokenUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub reasoning_tokens: u64,
 }
 
 impl ResponseTokenUsage {
@@ -832,6 +835,18 @@ pub fn extract_response_token_usage(head: &[u8], tail: &[u8]) -> Option<Response
             return Some(ResponseTokenUsage {
                 input_tokens: prompt.unwrap_or(0),
                 output_tokens: completion.unwrap_or(0),
+                cached_input_tokens: nested_object_number(
+                    &usage,
+                    "input_tokens_details",
+                    "cached_tokens",
+                )
+                .unwrap_or(0),
+                reasoning_tokens: nested_object_number(
+                    &usage,
+                    "output_tokens_details",
+                    "reasoning_tokens",
+                )
+                .unwrap_or(0),
             });
         }
     }
@@ -842,6 +857,9 @@ pub fn extract_response_token_usage(head: &[u8], tail: &[u8]) -> Option<Response
             return Some(ResponseTokenUsage {
                 input_tokens: prompt.unwrap_or(0),
                 output_tokens: completion.unwrap_or(0),
+                cached_input_tokens: object_number(&usage, &["cachedContentTokenCount"])
+                    .unwrap_or(0),
+                reasoning_tokens: object_number(&usage, &["thoughtsTokenCount"]).unwrap_or(0),
             });
         }
     }
@@ -851,6 +869,9 @@ pub fn extract_response_token_usage(head: &[u8], tail: &[u8]) -> Option<Response
         return Some(ResponseTokenUsage {
             input_tokens: input.unwrap_or(0),
             output_tokens: output.unwrap_or(0),
+            cached_input_tokens: last_number_after(head, b"\"cache_read_input_tokens\"")
+                .unwrap_or(0),
+            reasoning_tokens: 0,
         });
     }
     None
@@ -917,6 +938,14 @@ fn object_number(json: &str, keys: &[&str]) -> Option<u64> {
     keys.iter().find_map(|key| value.get(key)?.as_u64())
 }
 
+fn nested_object_number(json: &str, object: &str, key: &str) -> Option<u64> {
+    serde_json::from_str::<serde_json::Value>(json)
+        .ok()?
+        .get(object)?
+        .get(key)?
+        .as_u64()
+}
+
 fn last_number_after(haystack: &[u8], key: &[u8]) -> Option<u64> {
     let mut start = 0;
     let mut found = None;
@@ -964,13 +993,17 @@ pub struct RelayUsageTotals {
 }
 
 /// One point-in-time snapshot of the cumulative counters, kept so rolling
-/// window deltas (3h/24h) can be derived locally when the relay publishes no
+/// window deltas (3h/24h/7d) can be derived locally when the relay publishes no
 /// windows of its own.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct UsageSample {
     pub unix: i64,
     pub requests: u64,
     pub tokens: u64,
+    /// Relay-billed value (official-price USD); the unit the plan allowance is
+    /// measured in, so window deltas must carry it, not just tokens.
+    #[serde(default)]
+    pub cost_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -978,9 +1011,14 @@ pub struct UsageWindowDelta {
     pub label: String,
     pub requests: u64,
     pub tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
 }
 
-const WINDOW_LABELS: [(&str, i64); 2] = [("3h", 3 * 3600), ("24h", 24 * 3600)];
+/// 7d mirrors the relay's real quota horizon (weekly allowance; the daily cap
+/// is only a safety valve), which is why samples are retained beyond one day.
+const WINDOW_LABELS: [(&str, i64); 3] =
+    [("3h", 3 * 3600), ("24h", 24 * 3600), ("7d", 7 * 24 * 3600)];
 
 /// Deltas over rolling windows from monotone counter samples. Counter resets
 /// (relay restarts) treat the last sample as the new baseline.
@@ -1002,6 +1040,7 @@ pub fn window_deltas(samples: &[UsageSample], now_unix: i64) -> Vec<UsageWindowD
                     unix: cutoff,
                     requests: 0,
                     tokens: 0,
+                    cost_usd: None,
                 });
             // a collapsing counter means the relay restarted; the new counter
             // value is already the fresh usage, never a negative delta
@@ -1012,10 +1051,18 @@ pub fn window_deltas(samples: &[UsageSample], now_unix: i64) -> Vec<UsageWindowD
                     last
                 }
             };
+            let cost_delta = match (baseline.cost_usd, last.cost_usd) {
+                (Some(b), Some(l)) => {
+                    // f64 but monotone, so the same restart rule applies
+                    Some(if l >= b { l - b } else { l })
+                }
+                _ => None,
+            };
             UsageWindowDelta {
                 label: (*label).to_string(),
                 requests: delta(baseline.requests, last.requests),
                 tokens: delta(baseline.tokens, last.tokens),
+                cost_usd: cost_delta,
             }
         })
         .collect()
@@ -1027,6 +1074,63 @@ pub fn window_deltas(samples: &[UsageSample], now_unix: i64) -> Vec<UsageWindowD
 pub struct UsageSampleStore {
     path: std::path::PathBuf,
     entries: std::sync::Mutex<std::collections::BTreeMap<String, Vec<UsageSample>>>,
+}
+
+/// Last observed quota snapshot per account, persisted so the console restores
+/// account cards immediately after a gateway restart instead of showing empty
+/// windows until the first successful usage poll lands.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct UsageStateDocument {
+    saved_at_unix: i64,
+    accounts: std::collections::BTreeMap<String, AccountUsage>,
+}
+
+pub struct UsageStateStore {
+    path: std::path::PathBuf,
+}
+
+impl UsageStateStore {
+    /// The quota windows themselves span 7d; restoring anything older would
+    /// present long-expired observations as current state.
+    const MAX_AGE_SECS: i64 = 7 * 24 * 3600;
+
+    pub fn load(path: std::path::PathBuf) -> Self {
+        Self { path }
+    }
+
+    /// Restores the persisted snapshots, or an empty map when the file is
+    /// missing, unreadable, or older than the quota horizon.
+    pub fn restore(&self) -> std::collections::BTreeMap<String, AccountUsage> {
+        let raw = std::fs::read_to_string(&self.path).ok();
+        let document: UsageStateDocument = raw
+            .as_deref()
+            .and_then(|raw| serde_json::from_str(raw).ok())
+            .unwrap_or_default();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        if now.saturating_sub(document.saved_at_unix) > Self::MAX_AGE_SECS {
+            return Default::default();
+        }
+        document.accounts
+    }
+
+    pub fn save(&self, accounts: &std::collections::BTreeMap<String, AccountUsage>, now_unix: i64) {
+        let document = UsageStateDocument {
+            saved_at_unix: now_unix,
+            accounts: accounts.clone(),
+        };
+        let Ok(rendered) = serde_json::to_string_pretty(&document) else {
+            return;
+        };
+        // Atomic rename: a crash mid-write must not corrupt the snapshot the
+        // next restart will restore.
+        let _ = mahoquot_providers::credential_file::write_credential_atomically(
+            &self.path,
+            rendered.as_bytes(),
+        );
+    }
 }
 
 impl UsageSampleStore {
@@ -1041,10 +1145,13 @@ impl UsageSampleStore {
         }
     }
 
-    /// Appends a sample, prunes anything older than 25 hours, persists, and
-    /// returns the retained window for delta computation.
+    /// Appends a sample, prunes anything older than the 7d quota horizon plus
+    /// margin, persists, and returns the retained window for delta computation.
     pub fn push(&self, account_id: &str, sample: UsageSample) -> Vec<UsageSample> {
-        const SPAN_SECS: i64 = 25 * 3600;
+        const SPAN_SECS: i64 = 8 * 24 * 3600;
+        // ~2.6min observed cadence over 8d is ~4.4k samples; 5000 leaves slack
+        // while span pruning stays the real bound
+        const MAX_SAMPLES: usize = 5000;
         let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
         let window = entries.entry(account_id.to_string()).or_default();
         window.push(sample);
@@ -1053,7 +1160,7 @@ impl UsageSampleStore {
             .map(|last| last.unix - SPAN_SECS)
             .unwrap_or(i64::MIN);
         window.retain(|sample| sample.unix >= cutoff);
-        window.truncate(600);
+        window.truncate(MAX_SAMPLES);
         let retained = window.clone();
         if let Ok(raw) = serde_json::to_string_pretty(&*entries) {
             // Atomic rename: a crash mid-write must not wipe the 24h rolling
@@ -1146,6 +1253,16 @@ mod tests {
 
 "#;
         assert_eq!(extract_total_tokens(body, body), Some(10));
+    }
+
+    #[test]
+    fn extract_preserves_cached_and_reasoning_token_breakdowns() {
+        let body = br#"{"usage":{"prompt_tokens":10,"completion_tokens":5,"input_tokens_details":{"cached_tokens":4},"output_tokens_details":{"reasoning_tokens":2}}}"#;
+        let usage = extract_response_token_usage(body, body).expect("usage breakdown");
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 5);
+        assert_eq!(usage.cached_input_tokens, 4);
+        assert_eq!(usage.reasoning_tokens, 2);
     }
 
     #[test]
@@ -1511,41 +1628,78 @@ mod tests {
     }
 
     #[test]
-    fn window_deltas_cover_three_and_twenty_four_hour_spans() {
-        // given samples spread across a day: counters at t0, t+2h, t+5h, t+20h
+    fn window_deltas_cover_hourly_daily_and_weekly_spans_with_cost() {
+        // given samples spread across days: value deltas ride the same ring
         let now = 1_800_000;
         let samples = vec![
             UsageSample {
                 unix: now - 30 * 3600,
                 requests: 100,
                 tokens: 1_000,
+                cost_usd: Some(10.0),
             },
             UsageSample {
                 unix: now - 5 * 3600,
                 requests: 300,
                 tokens: 3_000,
+                cost_usd: Some(30.0),
             },
             UsageSample {
                 unix: now - 2 * 3600,
                 requests: 500,
                 tokens: 5_000,
+                cost_usd: Some(50.0),
             },
             UsageSample {
                 unix: now - 60,
                 requests: 650,
                 tokens: 6_000,
+                cost_usd: Some(60.0),
             },
         ];
         // when the rolling deltas are computed
         let deltas = window_deltas(&samples, now);
-        // then 3h counts everything after the 2h-old sample and 24h spans all
-        assert_eq!(deltas.len(), 2);
+        // then 3h counts everything after the 2h-old sample, 24h spans all,
+        // and 7d exists because the weekly allowance is the real quota unit
+        assert_eq!(deltas.len(), 3);
         assert_eq!(deltas[0].label, "3h");
         assert_eq!(deltas[0].requests, 350);
         assert_eq!(deltas[0].tokens, 3_000);
+        assert_eq!(deltas[0].cost_usd, Some(30.0));
         assert_eq!(deltas[1].label, "24h");
         assert_eq!(deltas[1].requests, 550);
         assert_eq!(deltas[1].tokens, 5_000);
+        assert_eq!(deltas[1].cost_usd, Some(50.0));
+        // 7d reaches past sample history: counters start from the zero
+        // sentinel and the value delta stays unset until real history exists
+        assert_eq!(deltas[2].label, "7d");
+        assert_eq!(deltas[2].requests, 650);
+        assert_eq!(deltas[2].tokens, 6_000);
+        assert_eq!(deltas[2].cost_usd, None);
+    }
+
+    #[test]
+    fn cost_deltas_stay_none_when_the_relay_reports_no_value() {
+        // given samples captured before the relay exposed total_cost_usd
+        let now = 1_800_000;
+        let samples = vec![
+            UsageSample {
+                unix: now - 5 * 3600,
+                requests: 100,
+                tokens: 1_000,
+                cost_usd: None,
+            },
+            UsageSample {
+                unix: now - 60,
+                requests: 150,
+                tokens: 2_000,
+                cost_usd: Some(5.0),
+            },
+        ];
+        // when deltas are computed
+        let deltas = window_deltas(&samples, now);
+        // then a half-observed baseline yields no value delta rather than a guess
+        assert_eq!(deltas[0].cost_usd, None);
     }
 
     #[test]
@@ -1557,11 +1711,13 @@ mod tests {
                 unix: now - 5 * 3600,
                 requests: 7_000,
                 tokens: 900_000,
+                cost_usd: None,
             },
             UsageSample {
                 unix: now - 60,
                 requests: 5,
                 tokens: 800,
+                cost_usd: None,
             },
         ];
         // when deltas are computed
@@ -1588,6 +1744,50 @@ mod tests {
     }
 
     #[test]
+    fn the_usage_state_store_round_trips_and_expires_stale_snapshots() {
+        let dir = std::env::temp_dir().join(format!("quotio-usage-state-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("usage-state.json");
+        let mut accounts = std::collections::BTreeMap::new();
+        accounts.insert(
+            "codex-1".to_string(),
+            AccountUsage {
+                plan_type: Some("plus".into()),
+                primary: QuotaWindow {
+                    used_percent: Some(74.0),
+                    ..QuotaWindow::default()
+                },
+                ..AccountUsage::default()
+            },
+        );
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        // given a snapshot saved inside the 7d quota horizon
+        {
+            let store = UsageStateStore::load(path.clone());
+            store.save(&accounts, now);
+        }
+        // when a fresh store loads it after a restart
+        let store = UsageStateStore::load(path.clone());
+        let restored = store.restore();
+        // then the snapshot survives the restart
+        assert_eq!(
+            restored.get("codex-1").and_then(|u| u.primary.used_percent),
+            Some(74.0)
+        );
+        // and a snapshot older than the horizon is not resurrected
+        {
+            let store = UsageStateStore::load(path.clone());
+            store.save(&accounts, now - 8 * 24 * 3600);
+        }
+        assert!(store.restore().is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn the_sample_store_round_trips_across_restart() {
         // given a store with one recorded sample
         let dir = std::env::temp_dir().join(format!("quotio-samples-{}", std::process::id()));
@@ -1601,6 +1801,7 @@ mod tests {
                     unix: 1_800_000,
                     requests: 7005,
                     tokens: 1_184_368_836,
+                    cost_usd: Some(3990.364061),
                 },
             );
         }
@@ -1612,6 +1813,7 @@ mod tests {
                 unix: 1_800_060,
                 requests: 7010,
                 tokens: 1_184_400_000,
+                cost_usd: Some(3990.5),
             },
         );
         // then the pre-restart sample survives inside the window

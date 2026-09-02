@@ -36,6 +36,8 @@ pub struct GatewayConfig {
     pub auth_refresh_enabled: bool,
     pub usage_poll_secs: u64,
     pub config_path: PathBuf,
+    pub history_queue_capacity: usize,
+    pub history_batch_size: usize,
 }
 
 impl GatewayConfig {
@@ -83,6 +85,16 @@ impl GatewayConfig {
             .and_then(|v| v.parse::<u64>().ok())
             .filter(|v| *v > 0)
             .unwrap_or(120);
+        let history_queue_capacity = std::env::var("HISTORY_QUEUE_CAPACITY")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(1024);
+        let history_batch_size = std::env::var("HISTORY_BATCH_SIZE")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(64);
 
         Ok(Self {
             config_path,
@@ -96,6 +108,8 @@ impl GatewayConfig {
             models_env,
             refresh_url,
             auth_refresh_enabled,
+            history_queue_capacity,
+            history_batch_size,
         })
     }
 

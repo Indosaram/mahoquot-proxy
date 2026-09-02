@@ -11,12 +11,17 @@ pub struct GatewayMetrics {
     pub failed_over: AtomicU64,
     pub exposed_errors: AtomicU64,
     pub exposed_client_errors: AtomicU64,
+    pub history_dropped: AtomicU64,
+    pub history_database_failures: AtomicU64,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AccountStats {
     pub id: String,
     pub provider: String,
+    /// Relay plan label; absent for every non-claude-relay account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
     #[serde(default)]
     pub usage: crate::usage::AccountUsage,
     pub health: HealthStats,

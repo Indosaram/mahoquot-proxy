@@ -194,6 +194,16 @@ impl ProviderAccount {
         }
     }
 
+    /// Relay plan labels are a hidden shared-relay feature. The caller must
+    /// first prove the account targets a known relay host; key prefixes are not
+    /// a provider signal and never unlock this field.
+    pub fn relay_plan(&self) -> Option<String> {
+        match self {
+            Self::Claude(a) => a.plan.clone(),
+            _ => None,
+        }
+    }
+
     fn refresh_token(&self) -> String {
         match self {
             Self::Codex(a) => a.refresh_token.clone(),
@@ -445,6 +455,8 @@ pub struct AccountMember {
     pub inner: RwLock<ProviderAccount>,
     pub health: RwLock<Health>,
     pub upstream_override: Option<String>,
+    /// Usage-polling-only base; falls back to `upstream_override` when unset.
+    pub usage_override: Option<String>,
     pub ok_count: AtomicU64,
     pub fail_count: AtomicU64,
     pub refresh_lock: tokio::sync::Mutex<()>,
@@ -485,6 +497,7 @@ impl AccountMember {
             inner: RwLock::new(inner),
             health: RwLock::new(Health::Available),
             upstream_override: None,
+            usage_override: None,
             ok_count: AtomicU64::new(0),
             fail_count: AtomicU64::new(0),
             refresh_lock: tokio::sync::Mutex::new(()),
@@ -507,6 +520,19 @@ impl AccountMember {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .relay_api_key()
+    }
+
+    /// The registered relay plan label, only when `upstream_override` identifies
+    /// the hidden nekos/ccapi shared-relay surface.
+    pub fn relay_plan(&self) -> Option<String> {
+        let target = self.upstream_override.as_deref()?.to_ascii_lowercase();
+        if !target.contains("nekos") && !target.contains("ccapi") {
+            return None;
+        }
+        self.inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .relay_plan()
     }
 
     pub fn set_usage(&self, usage: crate::usage::AccountUsage) {
@@ -1105,6 +1131,11 @@ pub fn load_account_members(auth_dir: &Path) -> anyhow::Result<Vec<Arc<AccountMe
             })
             .map(str::to_string);
 
+        let usage_override = value
+            .get("usage_override")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+
         let mut inner = match provider_account_from_value(kind, value) {
             Ok(inner) => inner,
             Err(e) => {
@@ -1149,6 +1180,7 @@ pub fn load_account_members(auth_dir: &Path) -> anyhow::Result<Vec<Arc<AccountMe
             inner: RwLock::new(inner),
             health: RwLock::new(Health::Available),
             upstream_override,
+            usage_override,
             ok_count: AtomicU64::new(0),
             fail_count: AtomicU64::new(0),
             refresh_lock: tokio::sync::Mutex::new(()),

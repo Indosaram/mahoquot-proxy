@@ -315,7 +315,7 @@ async fn admin_reset_handler(
         }))
         .into_response(),
         Err(e) => (
-            StatusCode::BAD_GATEWAY,
+            crate::quota::reset_error_status(&e),
             Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
         )
             .into_response(),

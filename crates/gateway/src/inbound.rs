@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use axum::extract::{Request, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
@@ -101,6 +101,23 @@ pub async fn require_api_key(
         r#"{"error":{"message":"invalid api key","type":"invalid_request_error"}}"#,
     )
         .into_response()
+}
+
+pub fn presented_api_key(headers: &HeaderMap) -> Option<&str> {
+    if let Some(auth_val) = headers.get(header::AUTHORIZATION) {
+        if let Ok(auth_str) = auth_val.to_str() {
+            if let Some(token) = auth_str
+                .strip_prefix("Bearer ")
+                .or_else(|| auth_str.strip_prefix("bearer "))
+            {
+                return Some(token.trim());
+            }
+        }
+    }
+    headers
+        .get("x-api-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
 }
 
 fn extract_presented_key(req: &Request) -> Option<&str> {

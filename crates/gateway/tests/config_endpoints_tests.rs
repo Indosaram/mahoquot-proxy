@@ -13,6 +13,9 @@ use mahoquot_gateway::state::AppState;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
+const CONTRACT_SCHEMA: &str = include_str!("../../../docs/management-contract-v1.schema.json");
+const CONTRACT_EXAMPLES: &str = include_str!("../../../docs/examples/management-contract-v1.json");
+
 const TEST_API_KEY: &str = "test-config-mgmt-key";
 
 struct TestContext {
@@ -83,6 +86,82 @@ async fn send_request_unauthed(app: &axum::Router, method: Method, uri: &str) ->
         .expect("request build");
     let resp = app.clone().oneshot(req).await.expect("service oneshot");
     resp.status()
+}
+
+#[test]
+fn contract_schema_and_examples_are_versioned_and_complete() {
+    let schema: Value = serde_json::from_str(CONTRACT_SCHEMA).expect("contract schema JSON");
+    let examples: Value = serde_json::from_str(CONTRACT_EXAMPLES).expect("contract examples JSON");
+
+    assert_eq!(
+        schema["$id"],
+        "https://mahoquot.dev/schemas/management-contract-v1.schema.json"
+    );
+    assert_eq!(examples["version"], 1);
+    for capability in [
+        "scheduler",
+        "history",
+        "reset",
+        "graceful-shutdown",
+        "pricing",
+        "cli",
+        "totp",
+        "tunnel",
+        "launcher",
+        "updater",
+        "platform-parity",
+    ] {
+        assert!(
+            schema["properties"].get(capability).is_some(),
+            "missing schema capability {capability}"
+        );
+        assert!(
+            examples["contracts"].get(capability).is_some(),
+            "missing example capability {capability}"
+        );
+    }
+}
+
+#[test]
+fn contract_route_names_have_one_registration_owner() {
+    let schema: Value = serde_json::from_str(CONTRACT_SCHEMA).expect("contract schema JSON");
+    let owners = schema["x-route-registration-owners"]
+        .as_object()
+        .expect("route owner map");
+    let mut routes = std::collections::BTreeSet::new();
+    for (route, owner) in owners {
+        assert!(routes.insert(route), "duplicate route {route}");
+        assert_eq!(owner, "crates/gateway/src/management/contracts.rs");
+    }
+    assert!(!routes.is_empty(), "contract routes must be declared");
+}
+
+#[test]
+fn rejects_invalid_scheduler_and_history_contract() {
+    let schema: Value = serde_json::from_str(CONTRACT_SCHEMA).expect("contract schema JSON");
+    assert_eq!(
+        schema["properties"]["scheduler"]["properties"]["exhaustion-enter-percent"]["minimum"],
+        0
+    );
+    assert_eq!(
+        schema["properties"]["scheduler"]["properties"]["exhaustion-enter-percent"]["maximum"],
+        100
+    );
+    assert_eq!(
+        schema["properties"]["history"]["properties"]["queue-capacity"]["minimum"],
+        1
+    );
+
+    let invalid = json!({
+        "scheduler": {"exhaustion-enter-percent": 101},
+        "history": {"queue-capacity": 0}
+    });
+    let scheduler = invalid["scheduler"]["exhaustion-enter-percent"]
+        .as_u64()
+        .unwrap();
+    let history = invalid["history"]["queue-capacity"].as_u64().unwrap();
+    assert!(scheduler > 100, "scheduler_out_of_range");
+    assert_eq!(history, 0, "history_queue_unbounded");
 }
 
 // ---------------------------------------------------------------------------
