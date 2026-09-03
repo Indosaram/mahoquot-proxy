@@ -52,33 +52,51 @@ impl Router {
             Err(_) => 0,
         };
 
-        match self.strategy {
-            Strategy::FillFirst => members
-                .iter()
-                .position(|m| m.health().is_available(now_unix_ms)),
-            Strategy::StrictRoundRobin => {
-                let mut state = self
-                    .state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-                // Stick to the account this conversation already used, as long as
-                // it is still healthy; only fall through to round-robin when it
-                // is not, so a session never hops accounts unnecessarily.
+        // Stick to the account this conversation already used, as long as
+        // it is still healthy; only fall through when it is not, so a session
+        // never hops accounts unnecessarily regardless of strategy.
+        if let Some(key) = hint.affinity_key.as_deref() {
+            if let Some((bound_id, _)) = state.affinity.get(key).cloned() {
+                if let Some(idx) = members.iter().position(|m| {
+                    m.id() == bound_id && m.health().is_available(now_unix_ms)
+                }) {
+                    let seq = state.seq.wrapping_add(1);
+                    state.seq = seq;
+                    state.last_served.insert(bound_id.clone(), seq);
+                    state.affinity.insert(key.to_string(), (bound_id, seq));
+                    return Some(idx);
+                }
+            }
+        }
+
+        match self.strategy {
+            Strategy::FillFirst => {
+                let chosen_idx = members
+                    .iter()
+                    .position(|m| m.health().is_available(now_unix_ms))?;
+                let seq = state.seq.wrapping_add(1);
+                state.seq = seq;
+                let chosen_id = members[chosen_idx].id().to_string();
+                state.last_served.insert(chosen_id.clone(), seq);
+
                 if let Some(key) = hint.affinity_key.as_deref() {
-                    if let Some((bound_id, _)) = state.affinity.get(key).cloned() {
-                        if let Some(idx) = members.iter().position(|m| {
-                            m.id() == bound_id && m.health().is_available(now_unix_ms)
-                        }) {
-                            let seq = state.seq.wrapping_add(1);
-                            state.seq = seq;
-                            state.last_served.insert(bound_id.clone(), seq);
-                            state.affinity.insert(key.to_string(), (bound_id, seq));
-                            return Some(idx);
-                        }
+                    state
+                        .affinity
+                        .insert(key.to_string(), (chosen_id, seq));
+                    if state.affinity.len() > 1024 {
+                        let cutoff = seq.saturating_sub(AFFINITY_MAX_IDLE);
+                        state.affinity.retain(|_, (_, s)| *s >= cutoff);
                     }
                 }
 
+                Some(chosen_idx)
+            }
+            Strategy::StrictRoundRobin => {
                 let mut best: Option<(usize, u64)> = None;
 
                 for (idx, member) in members.iter().enumerate() {
@@ -125,6 +143,15 @@ impl Router {
 
     pub fn strategy(&self) -> Strategy {
         self.strategy
+    }
+
+    /// Retrieve the member ID bound to an affinity key, if any.
+    pub fn bound_affinity_member(&self, key: &str) -> Option<String> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.affinity.get(key).map(|(id, _)| id.clone())
     }
 }
 
@@ -283,6 +310,31 @@ mod red_tests {
         for _ in 0..12 {
             assert_eq!(r.select(&p, &keyed("conv-1")), Some(first));
         }
+    }
+
+    #[test]
+    fn fill_first_session_sticks_to_bound_account_even_if_prior_account_recovers() {
+        let r = Router::new(Strategy::FillFirst);
+        // Initially 'a' is cooled down, 'b' is available.
+        let mut p = pool(&[
+            (
+                "a",
+                Health::Cooldown {
+                    until_unix_ms: i64::MAX,
+                },
+            ),
+            ("b", Health::Available),
+        ]);
+        let first = r.select(&p, &keyed("conv-fill")).expect("select b");
+        assert_eq!(p[first].id(), "b");
+
+        // Now 'a' recovers and becomes Available.
+        p[0] = M::new("a", Health::Available);
+
+        // Under FillFirst without affinity, it would jump to 'a'.
+        // BUT with affinity, it must stay on 'b' to keep prompt cache!
+        let second = r.select(&p, &keyed("conv-fill")).expect("still b");
+        assert_eq!(p[second].id(), "b");
     }
 
     #[test]

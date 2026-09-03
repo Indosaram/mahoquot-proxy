@@ -9,6 +9,7 @@ use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
+use mahoquot_registry::{ModelCapability, ProviderBinding, ProviderId};
 use mahoquot_types::{Health, Outcome, PoolMember, SessionHint};
 
 use crate::account::AccountMember;
@@ -27,6 +28,9 @@ pub enum RelayMode {
     /// Non-streaming Gemini token count; the upstream reply is passed through
     /// verbatim so its `promptTokensDetails` reach the client unmodified.
     GeminiCountTokens,
+    /// Image generation is relayed without chat translation after a binding
+    /// capability gate selects a provider-specific image binding.
+    Image,
 }
 
 struct FinalFailure {
@@ -197,6 +201,18 @@ struct OutcomeRecord<'a> {
 async fn record_request_outcome(state: &AppState, record: OutcomeRecord<'_>) {
     let timestamp = now_unix_secs();
     let token_usage = record.token_usage.unwrap_or_default();
+    let total_tokens = token_usage.total_tokens();
+    if total_tokens > 0 {
+        if let Some(charged) = state
+            .scoped_keys
+            .record_usage(record.key_identifier, total_tokens)
+        {
+            // The atomic is authoritative while the process lives; mirroring it
+            // into the settings document is what makes a restart resume from
+            // the spent balance instead of handing the allowance back.
+            persist_scoped_usage(state, record.key_identifier, charged).await;
+        }
+    }
     state.history.enqueue(crate::request_history::UsageEvent {
         event_id: record.event_id.to_string(),
         occurred_at_ms: record.occurred_at_ms,
@@ -252,9 +268,53 @@ async fn record_request_outcome(state: &AppState, record: OutcomeRecord<'_>) {
     .await;
 }
 
+/// Mirror a scoped key's live token counter into the settings document.
+///
+/// Skipped when the persisted value already covers the charge, so a burst of
+/// zero-token or already-recorded outcomes does not turn into a disk write.
+async fn persist_scoped_usage(state: &AppState, key_identifier: Option<&str>, charged: u64) {
+    let Some(identifier) = key_identifier else {
+        return;
+    };
+    let already_persisted = state
+        .settings
+        .current()
+        .scoped_api_keys
+        .iter()
+        .find(|key| key.key_identifier == identifier)
+        .map(|key| key.token_used);
+    match already_persisted {
+        Some(persisted) if persisted >= charged => return,
+        Some(_) => {}
+        None => return,
+    }
+
+    let identifier = identifier.to_string();
+    let settings = Arc::clone(&state.settings);
+    let result = tokio::task::spawn_blocking(move || {
+        settings.mutate(|document| {
+            if let Some(key) = document
+                .scoped_api_keys
+                .iter_mut()
+                .find(|key| key.key_identifier == identifier)
+            {
+                key.token_used = key.token_used.max(charged);
+            }
+        })
+    })
+    .await;
+    match result {
+        Ok(Err(err)) => tracing::warn!("failed to persist scoped key usage: {err}"),
+        Err(err) => tracing::warn!("scoped key usage persistence task failed: {err}"),
+        Ok(Ok(_)) => {}
+    }
+}
+
 struct RelayPlan {
     upstream_path: String,
     body: Bytes,
+    /// Client-requested model. This stays unchanged for external response
+    /// rewriting; routing and upstream translation use `ResolvedRoute`.
     model: Option<String>,
     mode: RelayMode,
     client_stream: bool,
@@ -274,7 +334,59 @@ struct UpstreamExchange {
     cursor_reply: Option<tokio::sync::mpsc::UnboundedSender<Bytes>>,
 }
 
-fn resolve_target(member: &AccountMember, plan: &RelayPlan) -> Result<UpstreamTarget, String> {
+#[derive(Clone, Debug)]
+struct ResolvedProviderClass {
+    binding: ProviderBinding,
+    upstream_model: String,
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedRoute {
+    canonical_model: String,
+    #[allow(dead_code)]
+    capabilities: std::collections::BTreeSet<ModelCapability>,
+    provider_classes: Vec<ResolvedProviderClass>,
+}
+
+fn body_with_model(body: &Bytes, model: &str) -> Bytes {
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return body.clone();
+    };
+    let Some(object) = value.as_object_mut() else {
+        return body.clone();
+    };
+    object.insert(
+        "model".to_string(),
+        serde_json::Value::String(model.to_string()),
+    );
+    Bytes::from(value.to_string())
+}
+
+fn openai_body_with_model(plan: &RelayPlan, model: &str) -> Option<serde_json::Value> {
+    let mut body = plan.openai_body.clone()?;
+    if let Some(object) = body.as_object_mut() {
+        object.insert(
+            "model".to_string(),
+            serde_json::Value::String(model.to_string()),
+        );
+    }
+    Some(body)
+}
+
+fn resolve_target(
+    member: &AccountMember,
+    plan: &RelayPlan,
+    upstream_model: &str,
+) -> Result<UpstreamTarget, String> {
+    if plan.mode == RelayMode::Image {
+        let base = member.upstream_override.as_deref().unwrap_or_default();
+        return Ok(UpstreamTarget {
+            url: crate::url::join_provider_path(base, &plan.upstream_path),
+            body: body_with_model(&plan.original_body, upstream_model),
+            protocol: compat::Protocol::Codex,
+        });
+    }
+
     if plan.mode == RelayMode::GeminiCountTokens {
         if member.kind() != crate::account::ProviderKind::Antigravity {
             return Err("gemini-native requests need an antigravity account".to_string());
@@ -309,11 +421,7 @@ fn resolve_target(member: &AccountMember, plan: &RelayPlan) -> Result<UpstreamTa
             .ok_or_else(|| "antigravity account missing project_id".to_string())?;
         let gemini: serde_json::Value = serde_json::from_slice(&plan.body)
             .map_err(|e| format!("invalid gemini request: {e}"))?;
-        let model = gemini
-            .get("model")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_string();
+        let model = upstream_model.to_string();
         let mut inner = gemini.clone();
         if let Some(obj) = inner.as_object_mut() {
             obj.remove("model");
@@ -329,14 +437,9 @@ fn resolve_target(member: &AccountMember, plan: &RelayPlan) -> Result<UpstreamTa
 
     if member.kind() != crate::account::ProviderKind::Antigravity {
         if member.kind() == crate::account::ProviderKind::Vertex {
-            let openai = plan
-                .openai_body
-                .as_ref()
+            let openai = openai_body_with_model(plan, upstream_model)
                 .ok_or_else(|| "Vertex requires an OpenAI-shaped request".to_string())?;
-            let model = openai
-                .get("model")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| "Vertex request missing model".to_string())?;
+            let model = upstream_model;
             let project = member
                 .project_id()
                 .ok_or_else(|| "Vertex account missing project_id".to_string())?;
@@ -357,7 +460,7 @@ fn resolve_target(member: &AccountMember, plan: &RelayPlan) -> Result<UpstreamTa
                     member.upstream_override.as_deref(),
                     &path,
                 ),
-                body: Bytes::from(compat::gemini::openai_to_gemini(openai)?.to_string()),
+                body: Bytes::from(compat::gemini::openai_to_gemini(&openai)?.to_string()),
                 protocol: compat::Protocol::Antigravity,
             });
         }
@@ -365,9 +468,7 @@ fn resolve_target(member: &AccountMember, plan: &RelayPlan) -> Result<UpstreamTa
             let adapter = member
                 .generic_adapter()
                 .unwrap_or_else(|| "openai-chat".to_string());
-            let openai_body = plan
-                .openai_body
-                .as_ref()
+            let openai_body = openai_body_with_model(plan, upstream_model)
                 .ok_or_else(|| "generic adapter requires OpenAI-compatible input".to_string())?;
             if adapter == "google" {
                 let model = openai_body
@@ -386,7 +487,7 @@ fn resolve_target(member: &AccountMember, plan: &RelayPlan) -> Result<UpstreamTa
                         member.upstream_override.as_deref(),
                         &path,
                     ),
-                    body: Bytes::from(compat::gemini::openai_to_gemini(openai_body)?.to_string()),
+                    body: Bytes::from(compat::gemini::openai_to_gemini(&openai_body)?.to_string()),
                     protocol: compat::Protocol::Antigravity,
                 });
             }
@@ -398,7 +499,7 @@ fn resolve_target(member: &AccountMember, plan: &RelayPlan) -> Result<UpstreamTa
                         "/v1/messages",
                     ),
                     body: Bytes::from(
-                        serde_json::to_vec(&compat::claude::openai_to_anthropic(openai_body)?)
+                        serde_json::to_vec(&compat::claude::openai_to_anthropic(&openai_body)?)
                             .map_err(|error| error.to_string())?,
                     ),
                     protocol: compat::Protocol::Anthropic,
@@ -446,14 +547,12 @@ fn resolve_target(member: &AccountMember, plan: &RelayPlan) -> Result<UpstreamTa
                     member.upstream_override.as_deref(),
                     "/v1/chat/completions",
                 ),
-                body: plan.original_body.clone(),
+                body: body_with_model(&plan.original_body, upstream_model),
                 protocol: compat::Protocol::Codex,
             });
         }
         if member.kind() == crate::account::ProviderKind::Cursor {
-            let openai = plan
-                .openai_body
-                .as_ref()
+            let openai = openai_body_with_model(plan, upstream_model)
                 .ok_or_else(|| "Cursor requires an OpenAI-shaped request".to_string())?;
             return Ok(UpstreamTarget {
                 url: crate::url::build_provider_url(
@@ -461,14 +560,12 @@ fn resolve_target(member: &AccountMember, plan: &RelayPlan) -> Result<UpstreamTa
                     member.upstream_override.as_deref(),
                     "/agent.v1.AgentService/Run",
                 ),
-                body: Bytes::from(compat::cursor::openai_to_cursor_connect(openai)?),
+                body: Bytes::from(compat::cursor::openai_to_cursor_connect(&openai)?),
                 protocol: compat::Protocol::Cursor,
             });
         }
         if member.kind() == crate::account::ProviderKind::Kiro {
-            let openai = plan
-                .openai_body
-                .as_ref()
+            let openai = openai_body_with_model(plan, upstream_model)
                 .ok_or_else(|| "Kiro requires an OpenAI-shaped request".to_string())?;
             return Ok(UpstreamTarget {
                 url: mahoquot_providers::kiro_generate_url(
@@ -480,7 +577,7 @@ fn resolve_target(member: &AccountMember, plan: &RelayPlan) -> Result<UpstreamTa
                 ),
                 body: Bytes::from(
                     serde_json::to_vec(&compat::kiro::openai_to_kiro_with_profile(
-                        openai,
+                        &openai,
                         member.kiro_profile_arn().as_deref(),
                     )?)
                     .map_err(|e| e.to_string())?,
@@ -493,13 +590,13 @@ fn resolve_target(member: &AccountMember, plan: &RelayPlan) -> Result<UpstreamTa
             crate::account::ProviderKind::Claude | crate::account::ProviderKind::Zcode
         ) {
             let body = if plan.mode == RelayMode::Anthropic {
-                plan.original_body.clone()
+                body_with_model(&plan.original_body, upstream_model)
             } else {
-                let openai = plan.openai_body.as_ref().ok_or_else(|| {
+                let openai = openai_body_with_model(plan, upstream_model).ok_or_else(|| {
                     "Anthropic provider requires an OpenAI-shaped request".to_string()
                 })?;
                 Bytes::from(
-                    serde_json::to_vec(&compat::claude::openai_to_anthropic(openai)?)
+                    serde_json::to_vec(&compat::claude::openai_to_anthropic(&openai)?)
                         .map_err(|e| e.to_string())?,
                 )
             };
@@ -519,19 +616,17 @@ fn resolve_target(member: &AccountMember, plan: &RelayPlan) -> Result<UpstreamTa
                 member.upstream_override.as_deref(),
                 &plan.upstream_path,
             ),
-            body: plan.body.clone(),
+            body: body_with_model(&plan.body, upstream_model),
             protocol: compat::Protocol::Codex,
         });
     }
 
-    let openai_body = plan
-        .openai_body
-        .as_ref()
+    let openai_body = openai_body_with_model(plan, upstream_model)
         .ok_or_else(|| "antigravity requires an openai-shaped request".to_string())?;
     let project = member
         .project_id()
         .ok_or_else(|| "antigravity account missing project_id".to_string())?;
-    let translated = compat::openai_to_antigravity(openai_body, &project)?;
+    let translated = compat::openai_to_antigravity(&openai_body, &project)?;
 
     Ok(UpstreamTarget {
         url: crate::url::build_antigravity_url(member.upstream_override.as_deref()),
@@ -550,7 +645,26 @@ async fn send_upstream(
     accept: Option<&str>,
 ) -> Result<UpstreamExchange, reqwest::Error> {
     let mut req_builder = state.http_client.post(target_url);
-    for (name, val) in member.build_upstream_headers() {
+    let mut member_headers = member.build_upstream_headers();
+
+    // If client provided anthropic-beta headers, merge them with member headers
+    // so client-requested beta features (e.g. prompt-caching, output-128k) are preserved.
+    if let Some(client_beta) = headers.get("anthropic-beta").and_then(|v| v.to_str().ok()) {
+        if let Some((_, val)) = member_headers.iter_mut().find(|(k, _)| k == "anthropic-beta") {
+            let mut betas: Vec<String> = val.split(',').map(|s| s.trim().to_string()).collect();
+            for part in client_beta.split(',') {
+                let p = part.trim();
+                if !p.is_empty() && !betas.iter().any(|b| b == p) {
+                    betas.push(p.to_string());
+                }
+            }
+            *val = betas.join(",");
+        } else if member.kind() == crate::account::ProviderKind::Claude {
+            member_headers.push(("anthropic-beta".to_string(), client_beta.to_string()));
+        }
+    }
+
+    for (name, val) in member_headers {
         req_builder = req_builder.header(name, val);
     }
     if let Some(accept) = accept {
@@ -734,7 +848,7 @@ fn build_plan(mode: RelayMode, req_path: &str, body_bytes: Bytes) -> Result<Rela
             openai_body: None,
             original_body: body_bytes.clone(),
         }),
-        RelayMode::GeminiCountTokens => Ok(RelayPlan {
+        RelayMode::GeminiCountTokens | RelayMode::Image => Ok(RelayPlan {
             upstream_path: req_path.to_string(),
             model: compat::extract_model(&body_bytes),
             body: body_bytes.clone(),
@@ -805,7 +919,7 @@ fn reply_shape(mode: RelayMode) -> compat::ReplyShape {
     }
 }
 
-fn member_matches_binding(
+fn member_matches_api_key_binding(
     member: &AccountMember,
     binding: Option<&crate::management::settings::ApiKeyBinding>,
 ) -> bool {
@@ -822,69 +936,194 @@ fn member_matches_binding(
             .is_none_or(|provider| member.provider_name() == provider)
 }
 
+fn member_provider_id(member: &AccountMember) -> Option<ProviderId> {
+    let id = match member.kind() {
+        crate::account::ProviderKind::Codex => ProviderId::codex(),
+        crate::account::ProviderKind::Antigravity => ProviderId::antigravity(),
+        crate::account::ProviderKind::Claude => ProviderId::claude(),
+        crate::account::ProviderKind::Cursor => ProviderId::cursor(),
+        crate::account::ProviderKind::Kiro => ProviderId::kiro(),
+        crate::account::ProviderKind::Zcode => ProviderId::zcode(),
+        crate::account::ProviderKind::Vertex => ProviderId::vertex(),
+        crate::account::ProviderKind::Generic => {
+            ProviderId::canonical(member.provider_name()).ok()?
+        }
+    };
+    Some(id)
+}
+
+fn account_declares_binding_model(
+    member: &AccountMember,
+    requested_model: &str,
+    canonical_model: &str,
+    provider: &ResolvedProviderClass,
+) -> bool {
+    let unsupported = member
+        .unsupported_models
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if unsupported.iter().any(|model| {
+        model == requested_model || model == canonical_model || model == &provider.upstream_model
+    }) {
+        return false;
+    }
+    drop(unsupported);
+
+    let Some((_, models)) = member.generic_models() else {
+        return true;
+    };
+    models.is_empty()
+        || models.iter().any(|model| {
+            model == requested_model
+                || model == canonical_model
+                || model == &provider.upstream_model
+        })
+}
+
+fn resolve_route(
+    pool: &crate::state::PoolSnapshot,
+    requested_model: Option<&str>,
+    required_capability: Option<ModelCapability>,
+) -> Result<Option<ResolvedRoute>, mahoquot_registry::RegistryError> {
+    let Some(requested_model) = requested_model else {
+        return Ok(None);
+    };
+    let resolved = pool.registry.resolve(requested_model)?;
+    let provider_classes = resolved
+        .eligible_bindings
+        .into_iter()
+        .filter(|binding| {
+            required_capability
+                .as_ref()
+                .is_none_or(|capability| binding.capabilities.contains(capability))
+        })
+        .filter_map(|binding| {
+            let loaded = pool
+                .members
+                .iter()
+                .any(|member| member_provider_id(member).as_ref() == Some(&binding.provider_id));
+            loaded.then(|| ResolvedProviderClass {
+                upstream_model: binding
+                    .effective_upstream_id(&resolved.canonical_id)
+                    .to_string(),
+                binding,
+            })
+        })
+        .collect();
+
+    Ok(Some(ResolvedRoute {
+        canonical_model: resolved.canonical_id.to_string(),
+        capabilities: resolved.effective_capabilities,
+        provider_classes,
+    }))
+}
+
 fn eligible_indices(
     pool: &crate::state::PoolSnapshot,
-    model: Option<&str>,
+    route: Option<&ResolvedRoute>,
+    requested_model: Option<&str>,
     now_ms: i64,
-    binding: Option<&crate::management::settings::ApiKeyBinding>,
+    api_key_binding: Option<&crate::management::settings::ApiKeyBinding>,
+    scoped_key: Option<&crate::management::settings::ScopedApiKey>,
+    state: &AppState,
 ) -> Vec<usize> {
-    let model_owned_by_dedicated_provider = model.is_some_and(|model| {
-        pool.members.iter().any(|member| {
-            member.kind() != crate::account::ProviderKind::Codex
-                && member.kind().serves_model(model)
-        })
-    });
-    pool.members
-        .iter()
-        .enumerate()
-        .filter(|(_, m)| m.health().is_available(now_ms))
-        .filter(|(_, m)| {
-            !(model_owned_by_dedicated_provider && m.kind() == crate::account::ProviderKind::Codex)
-        })
-        .filter(|(_, m)| model.is_none_or(|model| m.supports_model(model)))
-        .filter(|(_, m)| member_matches_binding(m, binding))
-        .map(|(i, _)| i)
-        .collect()
+    let Some(route) = route else {
+        return pool
+            .members
+            .iter()
+            .enumerate()
+            .filter(|(_, member)| member.health().is_available(now_ms))
+            .filter(|(_, member)| state.scheduler.permits(member.id()))
+            .filter(|(_, member)| member_matches_api_key_binding(member, api_key_binding))
+            .filter(|(_, member)| crate::models_route::member_matches_scope(member, scoped_key))
+            .map(|(index, _)| index)
+            .collect();
+    };
+    let requested_model = requested_model.unwrap_or(&route.canonical_model);
+    let mut eligible = Vec::new();
+    for provider in &route.provider_classes {
+        let indices: Vec<usize> = pool
+            .members
+            .iter()
+            .enumerate()
+            .filter(|(_, member)| member.health().is_available(now_ms))
+            .filter(|(_, member)| state.scheduler.permits(member.id()))
+            .filter(|(_, member)| member_matches_api_key_binding(member, api_key_binding))
+            .filter(|(_, member)| crate::models_route::member_matches_scope(member, scoped_key))
+            .filter(|(_, member)| {
+                member_provider_id(member).as_ref() == Some(&provider.binding.provider_id)
+            })
+            .filter(|(_, member)| {
+                account_declares_binding_model(
+                    member,
+                    requested_model,
+                    &route.canonical_model,
+                    provider,
+                )
+            })
+            .map(|(index, _)| index)
+            .collect();
+        eligible.extend(indices);
+    }
+    eligible
 }
 
 fn select_index(
     state: &AppState,
+    pool: &crate::state::PoolSnapshot,
     hint: &SessionHint,
-    model: Option<&str>,
+    eligible: &[usize],
     exclude: &[usize],
-    binding: Option<&crate::management::settings::ApiKeyBinding>,
 ) -> Option<usize> {
-    let pool = state.pool.load();
-    // A model served by its dedicated provider must not be intercepted by a
-    // generic Codex account, mirroring eligible_indices.
-    let model_owned_by_dedicated_provider = model.is_some_and(|model| {
-        pool.members.iter().any(|member| {
-            member.kind() != crate::account::ProviderKind::Codex
-                && member.kind().serves_model(model)
+    // If there is an active session affinity key pointing to an eligible, non-excluded
+    // member, select that member's provider group first so session affinity survives across turns.
+    let target_provider = hint
+        .affinity_key
+        .as_deref()
+        .and_then(|key| state.router.bound_affinity_member(key))
+        .and_then(|bound_id| {
+            eligible
+                .iter()
+                .copied()
+                .find(|&idx| !exclude.contains(&idx) && pool.members.get(idx).map(|m| m.id()) == Some(&bound_id))
+                .and_then(|idx| member_provider_id(pool.members.get(idx)?))
         })
-    });
-    let mut candidates: Vec<Arc<dyn PoolMember>> = Vec::with_capacity(pool.members.len());
-    let mut origin: Vec<usize> = Vec::with_capacity(pool.members.len());
-    for (index, member) in pool.members.iter().enumerate() {
+        .or_else(|| {
+            let first_index = eligible
+                .iter()
+                .copied()
+                .find(|index| !exclude.contains(index))?;
+            member_provider_id(pool.members.get(first_index)?)
+        })?;
+
+    let mut candidates: Vec<Arc<dyn PoolMember>> = Vec::with_capacity(eligible.len());
+    let mut origin: Vec<usize> = Vec::with_capacity(eligible.len());
+    for &index in eligible {
         if exclude.contains(&index) {
             continue;
         }
-        if model_owned_by_dedicated_provider && member.kind() == crate::account::ProviderKind::Codex
-        {
+        let member = pool.members.get(index)?;
+        if member_provider_id(member).as_ref() != Some(&target_provider) {
             continue;
         }
-        if model.is_none_or(|model| member.supports_model(model))
-            && (binding.is_some() || state.scheduler.permits(member.id()))
-            && member_matches_binding(member, binding)
-        {
-            candidates.push(member.clone());
-            origin.push(index);
-        }
+        candidates.push(member.clone());
+        origin.push(index);
     }
     state
         .router
         .select(&candidates, hint)
         .and_then(|idx| origin.get(idx).copied())
+}
+
+fn provider_for_member<'a>(
+    route: &'a ResolvedRoute,
+    member: &AccountMember,
+) -> Option<&'a ResolvedProviderClass> {
+    let provider_id = member_provider_id(member)?;
+    route
+        .provider_classes
+        .iter()
+        .find(|provider| provider.binding.provider_id == provider_id)
 }
 
 /// Codex and Claude both report quota state on every response, under different
@@ -982,7 +1221,10 @@ async fn finish_success(
         return Ok(stream_response(resp, status_code));
     }
 
-    if plan.mode == RelayMode::Native || plan.mode == RelayMode::GeminiCountTokens {
+    if matches!(
+        plan.mode,
+        RelayMode::Native | RelayMode::Image | RelayMode::GeminiCountTokens
+    ) {
         if content_type
             .as_deref()
             .is_some_and(|ct| ct.trim_start().starts_with("text/html"))
@@ -1149,6 +1391,7 @@ async fn finish_success(
 /// stable per-session id; without one the request routes by plain round-robin.
 fn affinity_key(headers: &HeaderMap) -> Option<String> {
     for name in [
+        "x-claude-code-session-id",
         "session_id",
         "x-session-id",
         "conversation_id",
@@ -1201,6 +1444,21 @@ pub async fn handle_relay(
         .unwrap_or(0);
     let presented_key = crate::inbound::presented_api_key(headers);
     let key_identifier = presented_key.map(crate::request_history::stable_key_identifier);
+    let scoped_entry = presented_key.and_then(|k| state.scoped_keys.lookup_raw(k));
+    let scoped_key = scoped_entry.as_ref().map(|e| e.key.clone());
+
+    // 1. Quota check: if token budget is exhausted, reject with 429.
+    if let Some(ref entry) = scoped_entry {
+        if entry.is_exhausted() {
+            let used = entry.token_used();
+            let limit = entry.token_limit();
+            return json_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                &format!("Token quota exceeded for this API key (used: {used}, limit: {limit})"),
+            );
+        }
+    }
+
     let binding = crate::management::accounts::binding_for_key(&state, presented_key);
     let _in_flight = state.monitor.track_in_flight();
     let now_ms = SystemTime::now()
@@ -1214,15 +1472,62 @@ pub async fn handle_relay(
         Err(message) => return json_error(StatusCode::BAD_REQUEST, &message),
     };
 
-    let available_count = eligible_indices(
-        &state.pool.load(),
+    // 2. Model check: if scoped key restricts allowed_models, enforce whitelist.
+    if let Some(ref scoped) = scoped_key {
+        let requested_model = plan.model.as_deref().unwrap_or_default();
+        if !crate::models_route::allow_list_admits(&scoped.allowed_models, requested_model) {
+            return json_error(
+                StatusCode::FORBIDDEN,
+                &format!("Model '{requested_model}' is not allowed for this API key"),
+            );
+        }
+    }
+
+    // One immutable generation governs resolution, eligibility, account
+    // selection, and upstream model rewriting for the whole request.
+    let pool = state.pool.load_full();
+    let required_capability = match plan.mode {
+        RelayMode::Image => Some(ModelCapability::Image),
+        RelayMode::GeminiCountTokens => Some(ModelCapability::CountTokens),
+        _ => None,
+    };
+    let route = match resolve_route(&pool, plan.model.as_deref(), required_capability) {
+        Ok(route) => route,
+        Err(_) => {
+            let model = plan.model.as_deref().unwrap_or_default();
+            return body_response(
+                StatusCode::BAD_REQUEST,
+                Some("application/json"),
+                Bytes::from(crate::capability::unknown_provider(model).to_string()),
+            );
+        }
+    };
+    let eligible = eligible_indices(
+        &pool,
+        route.as_ref(),
         plan.model.as_deref(),
         now_ms,
         binding.as_ref(),
-    )
-    .len();
-    let max_attempts = std::cmp::min(available_count, state.max_failover);
+        scoped_key.as_deref(),
+        &state,
+    );
+    if eligible.is_empty() && scoped_key.is_some() {
+        return json_error(
+            StatusCode::FORBIDDEN,
+            "no permitted accounts/providers available for this API key",
+        );
+    }
+    let max_attempts = std::cmp::min(eligible.len(), state.max_failover);
     if max_attempts == 0 {
+        let model = plan.model.as_deref().unwrap_or_default();
+        if !pool.members.is_empty() && route.is_some_and(|route| route.provider_classes.is_empty())
+        {
+            return body_response(
+                StatusCode::BAD_REQUEST,
+                Some("application/json"),
+                Bytes::from(crate::capability::unknown_provider(model).to_string()),
+            );
+        }
         return json_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "no available accounts for this model",
@@ -1245,17 +1550,11 @@ pub async fn handle_relay(
     let mut attempted: Vec<usize> = Vec::new();
 
     for _ in 0..max_attempts {
-        let chosen_idx = match select_index(
-            &state,
-            &hint,
-            plan.model.as_deref(),
-            &attempted,
-            binding.as_ref(),
-        ) {
+        let chosen_idx = match select_index(&state, &pool, &hint, &eligible, &attempted) {
             Some(idx) => idx,
             None => break,
         };
-        let member = match state.pool.load().members.get(chosen_idx) {
+        let member = match pool.members.get(chosen_idx) {
             Some(m) => m.clone(),
             None => break,
         };
@@ -1284,7 +1583,13 @@ pub async fn handle_relay(
             }
         }
 
-        let target = match resolve_target(&member, &plan) {
+        let upstream_model = route
+            .as_ref()
+            .and_then(|route| provider_for_member(route, &member))
+            .map(|provider| provider.upstream_model.as_str())
+            .or(plan.model.as_deref())
+            .unwrap_or_default();
+        let target = match resolve_target(&member, &plan, upstream_model) {
             Ok(t) => t,
             Err(message) => return json_error(StatusCode::BAD_REQUEST, &message),
         };
@@ -1658,6 +1963,7 @@ mod routing_tests {
                 r#""account_id":"acc","id_token":"id","last_refresh":"2026-01-01T00:00:00Z","#
             }
             "antigravity" => r#""project_id":"project","#,
+            "vertex" => r#""project_id":"project","location":"us-central1","#,
             "kiro" => r#""region":"us-east-1","#,
             _ => "",
         };
@@ -1673,7 +1979,15 @@ mod routing_tests {
             rand::random::<u64>()
         ));
         std::fs::create_dir_all(&auth_dir).expect("create auth dir");
-        for kind in ["codex", "antigravity", "claude", "cursor", "kiro", "zcode"] {
+        for kind in [
+            "codex",
+            "antigravity",
+            "claude",
+            "cursor",
+            "kiro",
+            "zcode",
+            "vertex",
+        ] {
             std::fs::write(auth_dir.join(format!("{kind}-test.json")), credential(kind))
                 .expect("write credential");
         }
@@ -1686,11 +2000,221 @@ mod routing_tests {
         (AppState::new(&config).expect("state"), auth_dir)
     }
 
+    fn state_with_credentials(
+        tag: &str,
+        credentials: &[(&str, String)],
+    ) -> (AppState, std::path::PathBuf) {
+        let auth_dir = std::env::temp_dir().join(format!(
+            "mahoquot-routing-{tag}-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&auth_dir).expect("create auth dir");
+        for (file, contents) in credentials {
+            std::fs::write(auth_dir.join(file), contents).expect("write credential");
+        }
+        let config = GatewayConfig {
+            auth_dir: auth_dir.clone(),
+            config_path: auth_dir.join("config.yaml"),
+            auth_refresh_enabled: false,
+            ..GatewayConfig::default()
+        };
+        (AppState::new(&config).expect("state"), auth_dir)
+    }
+
+    #[test]
+    fn resolved_routes_preserve_virtual_ids_and_provider_upstream_ids() {
+        let (state, auth_dir) = six_provider_state();
+        let pool = state.pool.load_full();
+
+        let kiro = resolve_route(&pool, Some("auto-kiro"), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(kiro.canonical_model, "kiro/auto");
+        assert_eq!(
+            kiro.provider_classes[0].binding.provider_id.as_str(),
+            "kiro"
+        );
+        assert_eq!(kiro.provider_classes[0].upstream_model, "auto");
+
+        let cursor = resolve_route(&pool, Some("cursor/auto-cost"), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cursor.canonical_model, "cursor/auto-cost");
+        assert_eq!(
+            cursor.provider_classes[0].binding.provider_id.as_str(),
+            "cursor"
+        );
+        assert_eq!(cursor.provider_classes[0].upstream_model, "auto-cost");
+
+        let vertex = resolve_route(&pool, Some("gemini-2.5-flash"), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            vertex.provider_classes[0].binding.provider_id.as_str(),
+            "vertex"
+        );
+
+        std::fs::remove_dir_all(auth_dir).ok();
+    }
+
+    #[test]
+    fn generic_account_models_become_exact_discovered_bindings() {
+        let generic = serde_json::json!({
+            "type": "generic",
+            "identity_slug": "deepseek-a",
+            "provider": "deepseek",
+            "label": "DeepSeek",
+            "adapter": "openai-chat",
+            "base_url": "http://127.0.0.1:9",
+            "api_key": "fixture",
+            "models": ["deepseek-chat"]
+        })
+        .to_string();
+        let (state, auth_dir) =
+            state_with_credentials("generic-discovered", &[("generic.json", generic)]);
+        let pool = state.pool.load_full();
+        let route = resolve_route(&pool, Some("deepseek-chat"), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            route.provider_classes[0].binding.provider_id.as_str(),
+            "deepseek"
+        );
+        assert_eq!(
+            route.provider_classes[0].binding.policy,
+            mahoquot_registry::ProviderPolicy::Discovered
+        );
+        let other = resolve_route(&pool, Some("other-deepseek-model"), None)
+            .unwrap()
+            .unwrap();
+        assert!(other.provider_classes.is_empty());
+        std::fs::remove_dir_all(auth_dir).ok();
+    }
+
+    #[test]
+    fn unknown_model_uses_codex_only_when_a_codex_account_is_loaded() {
+        let (with_codex, with_dir) =
+            state_with_credentials("unknown-codex", &[("codex.json", credential("codex"))]);
+        let route = resolve_route(&with_codex.pool.load_full(), Some("new-open-model"), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(route.provider_classes.len(), 1);
+        assert_eq!(
+            route.provider_classes[0].binding.provider_id.as_str(),
+            "codex"
+        );
+
+        let (without_codex, without_dir) =
+            state_with_credentials("unknown-claude", &[("claude.json", credential("claude"))]);
+        let route = resolve_route(
+            &without_codex.pool.load_full(),
+            Some("new-open-model"),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(route.provider_classes.is_empty());
+
+        std::fs::remove_dir_all(with_dir).ok();
+        std::fs::remove_dir_all(without_dir).ok();
+    }
+
+    #[test]
+    fn eligibility_applies_unsupported_health_scheduler_and_api_key_binding() {
+        let credential_a = credential("codex").replace(
+            "\"identity_slug\":\"codex\"",
+            "\"identity_slug\":\"codex-a\"",
+        );
+        let credential_b = credential("codex").replace(
+            "\"identity_slug\":\"codex\"",
+            "\"identity_slug\":\"codex-b\"",
+        );
+        let (state, auth_dir) = state_with_credentials(
+            "filters",
+            &[("a.json", credential_a), ("b.json", credential_b)],
+        );
+        let pool = state.pool.load_full();
+        let route = resolve_route(&pool, Some("gpt-5.6-sol"), None)
+            .unwrap()
+            .unwrap();
+
+        pool.members[0].mark_model_unsupported("gpt-5.6-sol");
+        let eligible = eligible_indices(
+            &pool,
+            Some(&route),
+            Some("gpt-5.6-sol"),
+            0,
+            None,
+            None,
+            &state,
+        );
+        assert_eq!(eligible, vec![1]);
+
+        pool.members[0].unsupported_models.write().unwrap().clear();
+        pool.members[0].set_health(Health::AuthFailed);
+        let eligible = eligible_indices(
+            &pool,
+            Some(&route),
+            Some("gpt-5.6-sol"),
+            0,
+            None,
+            None,
+            &state,
+        );
+        assert_eq!(eligible, vec![1]);
+
+        pool.members[0].set_health(Health::Available);
+        state.scheduler.reserve("fixture", "codex-a").unwrap();
+        let eligible = eligible_indices(
+            &pool,
+            Some(&route),
+            Some("gpt-5.6-sol"),
+            0,
+            None,
+            None,
+            &state,
+        );
+        assert_eq!(eligible, vec![1]);
+
+        let account_binding = crate::management::settings::ApiKeyBinding {
+            key_identifier: "fixture".to_string(),
+            account: Some("codex-a".to_string()),
+            provider: None,
+        };
+        assert!(eligible_indices(
+            &pool,
+            Some(&route),
+            Some("gpt-5.6-sol"),
+            0,
+            Some(&account_binding),
+            None,
+            &state,
+        )
+        .is_empty());
+        state.scheduler.release("fixture");
+        assert_eq!(
+            eligible_indices(
+                &pool,
+                Some(&route),
+                Some("gpt-5.6-sol"),
+                0,
+                Some(&account_binding),
+                None,
+                &state,
+            ),
+            vec![0]
+        );
+
+        std::fs::remove_dir_all(auth_dir).ok();
+    }
+
     #[test]
     fn default_routing_never_selects_an_account_that_rejects_the_requested_model() {
         let (state, auth_dir) = six_provider_state();
         let hint = SessionHint { affinity_key: None };
 
+        let pool = state.pool.load_full();
         for model in [
             "gpt-5.6-sol",
             "gemini-3.7-flash-high",
@@ -1699,11 +2223,15 @@ mod routing_tests {
             "kiro/claude-haiku-4-5-20251001",
             "cursor/auto",
         ] {
-            let selected = select_index(&state, &hint, Some(model), &[], None).expect("selection");
-            assert!(
-                state.pool.load().members[selected].supports_model(model),
-                "model {model} was routed to {}",
-                state.pool.load().members[selected].kind().as_str()
+            let route = resolve_route(&pool, Some(model), None).unwrap().unwrap();
+            let eligible =
+                eligible_indices(&pool, Some(&route), Some(model), 0, None, None, &state);
+            let selected = select_index(&state, &pool, &hint, &eligible, &[]).expect("selection");
+            let provider = provider_for_member(&route, &pool.members[selected]).unwrap();
+            assert_eq!(
+                member_provider_id(&pool.members[selected]).as_ref(),
+                Some(&provider.binding.provider_id),
+                "model {model} was routed outside its resolved binding"
             );
         }
 
