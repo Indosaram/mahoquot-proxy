@@ -37,6 +37,54 @@ fn struct_response(raw: &str) -> Value {
     }
 }
 
+fn build_thinking_config(model: &str, body: &Value) -> Option<Value> {
+    let mut config = Map::new();
+
+    let reasoning_effort = body.get("reasoning_effort").and_then(Value::as_str);
+    let explicit_budget = body
+        .pointer("/thinking/budget_tokens")
+        .or_else(|| body.get("thinking_budget"))
+        .and_then(Value::as_i64);
+
+    if reasoning_effort == Some("none") {
+        config.insert("thinkingBudget".to_string(), json!(0));
+        return Some(Value::Object(config));
+    }
+
+    let thinking_level = match reasoning_effort {
+        Some("high") => Some("HIGH"),
+        Some("medium") => Some("HIGH"),
+        Some("low") => Some("LOW"),
+        _ => {
+            if model.ends_with("-high") || model.contains("-high") {
+                Some("HIGH")
+            } else if model.ends_with("-low") || model.contains("-low") {
+                Some("LOW")
+            } else if is_thinking_model(model) {
+                Some("HIGH")
+            } else {
+                None
+            }
+        }
+    };
+
+    if let Some(level) = thinking_level {
+        config.insert("thinkingLevel".to_string(), json!(level));
+        config.insert("includeThoughts".to_string(), json!(true));
+    } else if let Some(budget) = explicit_budget {
+        config.insert("thinkingBudget".to_string(), json!(budget));
+        config.insert("includeThoughts".to_string(), json!(true));
+    } else if is_thinking_model(model) {
+        config.insert("includeThoughts".to_string(), json!(true));
+    }
+
+    if config.is_empty() {
+        None
+    } else {
+        Some(Value::Object(config))
+    }
+}
+
 pub fn openai_to_gemini(body: &Value) -> Result<Value, String> {
     let model = body
         .get("model")
@@ -54,8 +102,8 @@ pub fn openai_to_gemini(body: &Value) -> Result<Value, String> {
 
     // OpenAI tool messages carry `tool_call_id`, not `name`; Gemini's
     // functionResponse needs the originating function name, so index every
-    // assistant tool_call by id up front.
-    let mut call_names: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    // assistant tool_call by id up front (indexing both full id and plain id).
+    let mut call_names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     // Gemini 3.x hard-rejects (400 INVALID_ARGUMENT) any historical
     // functionCall part without a thoughtSignature. When the client loses
     // the signature (stripped id suffix, client-generated ids), it cannot be
@@ -75,7 +123,9 @@ pub fn openai_to_gemini(body: &Value) -> Result<Value, String> {
                     call.get("id").and_then(Value::as_str),
                     call.pointer("/function/name").and_then(Value::as_str),
                 ) {
-                    call_names.insert(id, name);
+                    call_names.insert(id.to_string(), name.to_string());
+                    let (plain, _) = split_signature_from_call_id(id);
+                    call_names.insert(plain, name.to_string());
                 }
             }
         }
@@ -114,6 +164,9 @@ pub fn openai_to_gemini(body: &Value) -> Result<Value, String> {
                     let (_, signature) = split_signature_from_call_id(raw_id);
                     let signature = signature.or_else(|| {
                         call.get("thought_signature")
+                            .or_else(|| call.get("thoughtSignature"))
+                            .or_else(|| call.get("signature"))
+                            .or_else(|| call.pointer("/extra_content/google/thought_signature"))
                             .and_then(Value::as_str)
                             .map(str::to_string)
                     });
@@ -144,7 +197,8 @@ pub fn openai_to_gemini(body: &Value) -> Result<Value, String> {
                     .get("tool_call_id")
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                if dropped_unsigned_ids.contains(call_id) {
+                let (plain_id, _) = split_signature_from_call_id(call_id);
+                if dropped_unsigned_ids.contains(call_id) || dropped_unsigned_ids.contains(&plain_id) {
                     continue;
                 }
                 let explicit_name = msg
@@ -160,13 +214,12 @@ pub fn openai_to_gemini(body: &Value) -> Result<Value, String> {
                         call_names
                             .get(call_id)
                             .or_else(|| call_names.get(plain_id.as_str()))
-                            .copied()
+                            .cloned()
                             .ok_or_else(|| {
                                 format!(
                                     "tool response references unknown tool_call_id {call_id:?}; Gemini functionResponse needs the originating function name"
                                 )
                             })?
-                            .to_string()
                     }
                 };
                 let raw = content_to_text(msg.get("content")).unwrap_or_default();
@@ -238,9 +291,58 @@ pub fn openai_to_gemini(body: &Value) -> Result<Value, String> {
             json!(reserve_thinking_budget(model, m)),
         );
     }
+    if let Some(thinking) = build_thinking_config(model, body) {
+        generation.insert("thinkingConfig".to_string(), thinking);
+    }
     if !generation.is_empty() {
         request.insert("generationConfig".to_string(), Value::Object(generation));
     }
+
+    if let Some(tool_choice) = body.get("tool_choice") {
+        if let Some(mode_str) = tool_choice.as_str() {
+            let mode = match mode_str {
+                "auto" => Some("AUTO"),
+                "none" => Some("NONE"),
+                "required" => Some("ANY"),
+                _ => None,
+            };
+            if let Some(m) = mode {
+                request.insert(
+                    "toolConfig".to_string(),
+                    json!({
+                        "functionCallingConfig": { "mode": m }
+                    }),
+                );
+            }
+        } else if let Some(obj) = tool_choice.as_object() {
+            if let Some(name) = obj
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+            {
+                request.insert(
+                    "toolConfig".to_string(),
+                    json!({
+                        "functionCallingConfig": {
+                            "mode": "ANY",
+                            "allowedFunctionNames": [name]
+                        }
+                    }),
+                );
+            }
+        }
+    }
+
+    request.insert(
+        "safetySettings".to_string(),
+        json!([
+            { "category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE" },
+            { "category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE" },
+            { "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE" },
+            { "category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE" },
+            { "category": "HARM_CATEGORY_CIVIC_INTEGRITY", "threshold": "BLOCK_NONE" }
+        ]),
+    );
 
     if let Some(tools) = body.get("tools").and_then(Value::as_array) {
         let decls: Vec<Value> = tools
@@ -330,6 +432,7 @@ pub fn gemini_json_to_openai(body: &Value, model: &str, created: i64) -> Value {
         .and_then(|c| c.first());
 
     let mut text = String::new();
+    let mut reasoning = String::new();
     let mut tool_calls: Vec<Value> = Vec::new();
     let mut pending_signature: Option<String> = None;
 
@@ -363,8 +466,13 @@ pub fn gemini_json_to_openai(body: &Value, model: &str, created: i64) -> Value {
                     }
                 }));
             } else if let Some(t) = part.get("text").and_then(Value::as_str) {
-                text.push_str(t);
-                pending_signature = None;
+                let is_thought = part.get("thought").and_then(Value::as_bool).unwrap_or(false);
+                if is_thought {
+                    reasoning.push_str(t);
+                } else {
+                    text.push_str(t);
+                    pending_signature = None;
+                }
             } else if let Some(sig) = part.get("thoughtSignature").and_then(Value::as_str) {
                 pending_signature = Some(sig.to_string());
             }
@@ -396,8 +504,12 @@ pub fn gemini_json_to_openai(body: &Value, model: &str, created: i64) -> Value {
         .and_then(|u| u.get("totalTokenCount"))
         .and_then(Value::as_u64)
         .unwrap_or(prompt_tokens + completion_tokens);
+    let reasoning_tokens = usage
+        .and_then(|u| u.get("thoughtsTokenCount"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
 
-    let message = if !tool_calls.is_empty() {
+    let mut message = if !tool_calls.is_empty() {
         if text.is_empty() {
             json!({
                 "role": "assistant",
@@ -417,6 +529,9 @@ pub fn gemini_json_to_openai(body: &Value, model: &str, created: i64) -> Value {
             "content": text
         })
     };
+    if !reasoning.is_empty() {
+        message["reasoning_content"] = Value::String(reasoning);
+    }
 
     let id = response
         .get("responseId")
@@ -438,6 +553,9 @@ pub fn gemini_json_to_openai(body: &Value, model: &str, created: i64) -> Value {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "total_tokens": total_tokens,
+            "completion_tokens_details": {
+                "reasoning_tokens": reasoning_tokens,
+            }
         }
     })
 }
@@ -634,7 +752,10 @@ impl GeminiDecoder {
                     }
                 }
                 if let Some(text) = part.get("text").and_then(Value::as_str) {
-                    if !text.is_empty() {
+                    let is_thought = part.get("thought").and_then(Value::as_bool).unwrap_or(false);
+                    if is_thought {
+                        out.push(CodexEvent::ReasoningDelta(text.to_string()));
+                    } else if !text.is_empty() {
                         // Text ends the signature-bearing block; a stale
                         // signature must not leak into a later tool turn.
                         self.pending_signature = None;
@@ -1089,5 +1210,166 @@ mod signature_tests {
             "both the dropped tool response and the resulting stranded model turn must not end the request"
         );
         assert_eq!(contents[0]["role"], "user");
+    }
+
+    #[test]
+    fn thinking_config_generated_for_high_flash_models() {
+        let body = json!({
+            "model": "gemini-3.8-flash-high",
+            "messages": [{ "role": "user", "content": "hello" }]
+        });
+        let req = openai_to_gemini(&body).expect("translate");
+        let thinking = &req["generationConfig"]["thinkingConfig"];
+        assert_eq!(thinking["thinkingLevel"], "HIGH");
+        assert_eq!(thinking["includeThoughts"], true);
+    }
+
+    #[test]
+    fn thinking_config_respects_reasoning_effort() {
+        let body_low = json!({
+            "model": "gemini-3-flash",
+            "reasoning_effort": "low",
+            "messages": [{ "role": "user", "content": "hello" }]
+        });
+        let req_low = openai_to_gemini(&body_low).expect("translate");
+        let thinking_low = &req_low["generationConfig"]["thinkingConfig"];
+        assert_eq!(thinking_low["thinkingLevel"], "LOW");
+        assert_eq!(thinking_low["includeThoughts"], true);
+
+        let body_none = json!({
+            "model": "gemini-3.8-flash-high",
+            "reasoning_effort": "none",
+            "messages": [{ "role": "user", "content": "hello" }]
+        });
+        let req_none = openai_to_gemini(&body_none).expect("translate");
+        let thinking_none = &req_none["generationConfig"]["thinkingConfig"];
+        assert_eq!(thinking_none["thinkingBudget"], 0);
+    }
+
+    #[test]
+    fn safety_settings_are_included_with_block_none() {
+        let body = json!({
+            "model": "gemini-3.8-flash-high",
+            "messages": [{ "role": "user", "content": "hello" }]
+        });
+        let req = openai_to_gemini(&body).expect("translate");
+        let safety = req["safetySettings"].as_array().expect("safetySettings");
+        assert_eq!(safety.len(), 5);
+        for s in safety {
+            assert_eq!(s["threshold"], "BLOCK_NONE");
+        }
+    }
+
+    #[test]
+    fn tool_choice_mode_maps_correctly() {
+        let body_req = json!({
+            "model": "gemini-3-flash",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "tool_choice": "required"
+        });
+        let req_req = openai_to_gemini(&body_req).expect("translate");
+        assert_eq!(
+            req_req["toolConfig"]["functionCallingConfig"]["mode"],
+            "ANY"
+        );
+
+        let body_named = json!({
+            "model": "gemini-3-flash",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "tool_choice": { "type": "function", "function": { "name": "my_tool" } }
+        });
+        let req_named = openai_to_gemini(&body_named).expect("translate");
+        let fc = &req_named["toolConfig"]["functionCallingConfig"];
+        assert_eq!(fc["mode"], "ANY");
+        assert_eq!(fc["allowedFunctionNames"][0], "my_tool");
+    }
+
+    #[test]
+    fn decoder_emits_reasoning_delta_for_thought_parts() {
+        let mut decoder = GeminiDecoder::new();
+        let mut out = Vec::new();
+        decoder.decode(
+            br#"{"candidates":[{"content":{"parts":[
+                {"thought":true,"text":"pondering the answer"},
+                {"text":"the actual answer"}
+            ]}}]}"#,
+            &mut out,
+        );
+        let reasoning: Vec<String> = out
+            .iter()
+            .filter_map(|e| match e {
+                CodexEvent::ReasoningDelta(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        let text: Vec<String> = out
+            .iter()
+            .filter_map(|e| match e {
+                CodexEvent::TextDelta(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasoning, vec!["pondering the answer"]);
+        assert_eq!(text, vec!["the actual answer"]);
+    }
+
+    #[test]
+    fn gemini_json_to_openai_separates_reasoning_content() {
+        let gemini_resp = json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        { "thought": true, "text": "I should say hello" },
+                        { "text": "Hello world!" }
+                    ]
+                },
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 5,
+                "thoughtsTokenCount": 12,
+                "totalTokenCount": 27
+            }
+        });
+        let openai_resp = gemini_json_to_openai(&gemini_resp, "gemini-3.8-flash-high", 1000);
+        let choice = &openai_resp["choices"][0]["message"];
+        assert_eq!(choice["content"], "Hello world!");
+        assert_eq!(choice["reasoning_content"], "I should say hello");
+        assert_eq!(
+            openai_resp["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            12
+        );
+    }
+
+    #[test]
+    fn plain_call_id_in_tool_response_matches_signed_assistant_call() {
+        let signed_id = embed_signature_in_call_id("call_lookup_0", "SIG999");
+        let body = json!({
+            "model": "gemini-3.8-flash-high",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": signed_id,
+                        "type": "function",
+                        "function": { "name": "lookup", "arguments": "{}" }
+                    }]
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_lookup_0", // Client stripped the #SIG999 suffix
+                    "content": "{\"result\":\"ok\"}"
+                }
+            ]
+        });
+        let req = openai_to_gemini(&body).expect("translate must succeed even if client stripped signature suffix");
+        let contents = req["contents"].as_array().expect("contents");
+        assert_eq!(contents.len(), 2);
+        assert_eq!(contents[0]["role"], "model");
+        assert_eq!(contents[0]["parts"][0]["thoughtSignature"], "SIG999");
+        assert_eq!(contents[1]["role"], "user");
+        assert_eq!(contents[1]["parts"][0]["functionResponse"]["name"], "lookup");
     }
 }
