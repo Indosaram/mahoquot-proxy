@@ -1,0 +1,1408 @@
+=== TASK 17 CROSS-REPOSITORY GATES VERIFICATION REPORT ===
+Timestamp: Thu Sep  3 00:19:14 UTC 2026
+
+--- GATE: proxy: cargo test --workspace (cwd: /Users/indo/code/project/mahoquot-proxy) ---
+Exit status: 0
+warning: use of deprecated constant `mahoquot_providers::ANTIGRAVITY_MODELS`: query catalog/registry for models instead
+ --> crates/gateway/src/models_route.rs:4:5
+  |
+4 |     ANTIGRAVITY_MODELS, CLAUDE_MODELS, KIRO_MODELS, VERTEX_MODELS, ZCODE_MODELS,
+  |     ^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated constant `mahoquot_providers::CLAUDE_MODELS`: query catalog/registry for models instead
+ --> crates/gateway/src/models_route.rs:4:25
+  |
+4 |     ANTIGRAVITY_MODELS, CLAUDE_MODELS, KIRO_MODELS, VERTEX_MODELS, ZCODE_MODELS,
+  |                         ^^^^^^^^^^^^^
+
+warning: use of deprecated constant `mahoquot_providers::KIRO_MODELS`: query catalog/registry for models instead
+ --> crates/gateway/src/models_route.rs:4:40
+  |
+4 |     ANTIGRAVITY_MODELS, CLAUDE_MODELS, KIRO_MODELS, VERTEX_MODELS, ZCODE_MODELS,
+  |                                        ^^^^^^^^^^^
+
+warning: use of deprecated constant `mahoquot_providers::VERTEX_MODELS`: query catalog/registry for models instead
+ --> crates/gateway/src/models_route.rs:4:53
+  |
+4 |     ANTIGRAVITY_MODELS, CLAUDE_MODELS, KIRO_MODELS, VERTEX_MODELS, ZCODE_MODELS,
+  |                                                     ^^^^^^^^^^^^^
+
+warning: use of deprecated constant `mahoquot_providers::ZCODE_MODELS`: query catalog/registry for models instead
+ --> crates/gateway/src/models_route.rs:4:68
+  |
+4 |     ANTIGRAVITY_MODELS, CLAUDE_MODELS, KIRO_MODELS, VERTEX_MODELS, ZCODE_MODELS,
+  |                                                                    ^^^^^^^^^^^^
+
+warning: use of deprecated constant `mahoquot_providers::ANTIGRAVITY_MODELS`: query catalog/registry for models instead
+   --> crates/gateway/src/models_route.rs:157:19
+    |
+157 |         for id in ANTIGRAVITY_MODELS {
+    |                   ^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated constant `mahoquot_providers::CLAUDE_MODELS`: query catalog/registry for models instead
+   --> crates/gateway/src/models_route.rs:166:45
+    |
+166 |         (ProviderKind::Claude, "anthropic", CLAUDE_MODELS),
+    |                                             ^^^^^^^^^^^^^
+
+warning: use of deprecated constant `mahoquot_providers::ZCODE_MODELS`: query catalog/registry for models instead
+   --> crates/gateway/src/models_route.rs:167:39
+    |
+167 |         (ProviderKind::Zcode, "z-ai", ZCODE_MODELS),
+    |                                       ^^^^^^^^^^^^
+
+warning: use of deprecated constant `mahoquot_providers::KIRO_MODELS`: query catalog/registry for models instead
+   --> crates/gateway/src/models_route.rs:168:38
+    |
+168 |         (ProviderKind::Kiro, "kiro", KIRO_MODELS),
+    |                                      ^^^^^^^^^^^
+
+warning: use of deprecated constant `mahoquot_providers::VERTEX_MODELS`: query catalog/registry for models instead
+   --> crates/gateway/src/models_route.rs:198:19
+    |
+198 |         for id in VERTEX_MODELS {
+    |                   ^^^^^^^^^^^^^
+
+warning: use of deprecated constant `mahoquot_providers::ANTIGRAVITY_MODELS`: query catalog/registry for models instead
+   --> crates/gateway/src/account.rs:135:30
+    |
+135 |     use mahoquot_providers::{ANTIGRAVITY_MODELS, CLAUDE_MODELS, VERTEX_MODELS, ZCODE_MODELS};
+    |                              ^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated constant `mahoquot_providers::CLAUDE_MODELS`: query catalog/registry for models instead
+   --> crates/gateway/src/account.rs:135:50
+    |
+135 |     use mahoquot_providers::{ANTIGRAVITY_MODELS, CLAUDE_MODELS, VERTEX_MODELS, ZCODE_MODELS};
+    |                                                  ^^^^^^^^^^^^^
+
+warning: use of deprecated constant `mahoquot_providers::VERTEX_MODELS`: query catalog/registry for models instead
+   --> crates/gateway/src/account.rs:135:65
+    |
+135 |     use mahoquot_providers::{ANTIGRAVITY_MODELS, CLAUDE_MODELS, VERTEX_MODELS, ZCODE_MODELS};
+    |                                                                 ^^^^^^^^^^^^^
+
+warning: use of deprecated constant `mahoquot_providers::ZCODE_MODELS`: query catalog/registry for models instead
+   --> crates/gateway/src/account.rs:135:80
+    |
+135 |     use mahoquot_providers::{ANTIGRAVITY_MODELS, CLAUDE_MODELS, VERTEX_MODELS, ZCODE_MODELS};
+    |                                                                                ^^^^^^^^^^^^
+
+warning: use of deprecated constant `mahoquot_providers::ANTIGRAVITY_MODELS`: query catalog/registry for models instead
+   --> crates/gateway/src/account.rs:143:22
+    |
+143 |         for model in ANTIGRAVITY_MODELS {
+    |                      ^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated constant `mahoquot_providers::CLAUDE_MODELS`: query catalog/registry for models instead
+   --> crates/gateway/src/account.rs:151:22
+    |
+151 |         for model in CLAUDE_MODELS {
+    |                      ^^^^^^^^^^^^^
+
+warning: use of deprecated constant `mahoquot_providers::ZCODE_MODELS`: query catalog/registry for models instead
+   --> crates/gateway/src/account.rs:159:22
+    |
+159 |         for model in ZCODE_MODELS {
+    |                      ^^^^^^^^^^^^
+
+warning: use of deprecated constant `mahoquot_providers::VERTEX_MODELS`: query catalog/registry for models instead
+   --> crates/gateway/src/account.rs:167:22
+    |
+167 |         for model in VERTEX_MODELS {
+    |                      ^^^^^^^^^^^^^
+
+warning: use of deprecated constant `mahoquot_providers::ANTIGRAVITY_MODELS`: query catalog/registry for models instead
+ --> crates/gateway/src/models_route.rs:4:5
+  |
+4 |     ANTIGRAVITY_MODELS, CLAUDE_MODELS, KIRO_MODELS, VERTEX_MODELS, ZCODE_MODELS,
+  |     ^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated constant `mahoquot_providers::ANTIGRAVITY_MODELS`: query catalog/registry for models instead
+   --> crates/gateway/src/models_route.rs:285:42
+    |
+285 |         for model in mahoquot_providers::ANTIGRAVITY_MODELS {
+    |                                          ^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated constant `mahoquot_providers::CLAUDE_MODELS`: query catalog/registry for models instead
+   --> crates/gateway/src/models_route.rs:296:42
+    |
+296 |         for model in mahoquot_providers::CLAUDE_MODELS {
+    |                                          ^^^^^^^^^^^^^
+
+warning: use of deprecated constant `mahoquot_providers::ZCODE_MODELS`: query catalog/registry for models instead
+   --> crates/gateway/src/models_route.rs:307:42
+    |
+307 |         for model in mahoquot_providers::ZCODE_MODELS {
+    |                                          ^^^^^^^^^^^^
+
+warning: use of deprecated constant `mahoquot_providers::KIRO_MODELS`: query catalog/registry for models instead
+   --> crates/gateway/src/models_route.rs:318:42
+    |
+318 |         for model in mahoquot_providers::KIRO_MODELS {
+    |                                          ^^^^^^^^^^^
+
+warning: use of deprecated constant `mahoquot_providers::VERTEX_MODELS`: query catalog/registry for models instead
+   --> crates/gateway/src/models_route.rs:345:42
+    |
+345 |         for model in mahoquot_providers::VERTEX_MODELS {
+    |                                          ^^^^^^^^^^^^^
+
+warning: `mahoquot-gateway` (lib) generated 10 warnings
+warning: `mahoquot-gateway` (lib test) generated 23 warnings (9 duplicates)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.33s
+     Running unittests src/main.rs (target/debug/deps/bench-c248bb2190646a11)
+
+running 5 tests
+test tests::test_nearest_rank_percentile_pure_fn ... ok
+test tests::test_codex_protocol_mock_emits_responses_event_sequence ... ok
+test tests::test_headers_and_body_json_literal_pinning ... ok
+test tests::test_50req_10conc_zero_error_run ... ok
+test tests::test_in_process_mock_ephemeral_port ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+     Running unittests src/lib.rs (target/debug/deps/mahoquot_gateway-1f9b2557eba9e1a8)
+
+running 239 tests
+test account::provider_kind_contract_tests::anthropic_credential_type_maps_to_claude ... ok
+test capability::tests::unknown_provider_carries_code_and_param ... ok
+test account::identity_tests::zcode_provisioned_key_never_counts_as_expired ... ok
+test account::provider_kind_contract_tests::characterization_generic_account_supports_model ... ok
+test compat::claude::contract_tests::custom_prefix_is_stripped_exactly_once ... ok
+test compat::claude::contract_tests::consecutive_tool_results_share_one_user_turn ... ok
+test compat::claude::contract_tests::omitted_max_tokens_defaults_generously ... ok
+test compat::claude::contract_tests::a_tiny_max_tokens_is_raised_to_make_room_for_thinking ... ok
+test compat::claude::contract_tests::reasoning_effort_maps_to_the_upstream_thinking_budget ... ok
+test compat::claude::contract_tests::image_parts_translate_to_anthropic_blocks ... ok
+test compat::claude::contract_tests::system_content_parts_are_preserved ... ok
+test compat::claude::contract_tests::thinking_delta_is_not_visible_text ... ok
+test compat::claude::contract_tests::tool_prefixing_is_idempotent_and_preserves_builtins ... ok
+test compat::claude::contract_tests::unknown_efforts_are_ignored ... ok
+test account::identity_tests::pool_order_ignores_the_console_display_order ... ok
+test compat::claude::contract_tests::signature_delta_opens_a_thinking_block ... ok
+test compat::cursor::tests::a_request_without_messages_is_a_translation_error_not_a_panic ... ok
+test account::identity_tests::antigravity_provider_name_slug_is_replaced_by_filename_identity ... ok
+test account::provider_kind_contract_tests::codex_does_not_claim_standard_claude_models ... ok
+test account::provider_kind_contract_tests::cursor_and_kiro_own_their_reference_models ... ok
+test capability::tests::image_error_matches_captured_upstream_text ... ok
+test capability::tests::video_error_matches_captured_upstream_text ... ok
+test compat::cursor::tests::turn_end_usage_is_preserved ... ok
+test compat::cursor::tests::thinking_and_error_trailers_are_not_success_text ... ok
+test account::provider_kind_contract_tests::characterization_kiro_and_cursor_prefixes ... ok
+test capability::tests::unimplemented_media_models_are_not_advertised_as_routable ... ok
+test compat::gemini::signature_tests::plain_call_ids_decode_without_signature ... ok
+test compat::gemini::signature_tests::decoder_embeds_signature_from_the_function_call_part ... ok
+test compat::gemini::signature_tests::decoder_carries_a_standalone_signature_part_into_the_next_call_id ... ok
+test compat::gemini::signature_tests::decoder_shares_a_pending_signature_across_parallel_calls ... ok
+test compat::gemini::signature_tests::gemini_json_to_openai_embeds_signature_from_function_call ... ok
+test compat::gemini::signature_tests::thought_signature_round_trips_through_call_ids ... ok
+test compat::cursor::tests::request_is_wrapped_in_agent_client_message ... ok
+test capability::tests::open_bindings_do_not_gain_non_chat_capabilities_implicitly ... ok
+test capability::tests::reference_backed_image_models_pass_surface_gate ... ok
+test compat::claude::contract_tests::stream_blocks_pair_start_and_stop_across_transitions ... ok
+test compat::gemini::signature_tests::tool_responses_without_a_known_call_id_fail_explicitly ... ok
+test compat::gemini::signature_tests::function_role_scalar_responses_wrap_into_a_struct ... ok
+test compat::gemini::signature_tests::image_data_urls_become_inline_data_parts ... ok
+test capability::tests::characterization_image_and_video_rejection_text ... ok
+test compat::gemini::tests::non_tool_fields_are_untouched_by_the_sanitizer ... ok
+test compat::mimo::tests::a_body_without_messages_is_untouched ... ok
+test compat::gemini::tests::tool_parameters_strip_gemini_rejected_keywords_recursively ... ok
+test compat::gemini::tests::tool_parameters_fold_oneof_into_anyof ... ok
+test compat::mimo::tests::an_existing_system_message_carrying_the_marker_is_left_alone ... ok
+test compat::mimo::tests::the_marker_is_prepended_once_and_never_duplicated ... ok
+test compat::mimo::tests::the_session_affinity_id_is_stable_for_the_process ... ok
+test compat::cursor::tests::server_kv_and_context_requests_receive_matching_client_replies ... ok
+test compat::render::gemini_stream_tests::created_event_overrides_response_id ... ok
+test compat::render::gemini_stream_tests::reasoning_signature_is_emitted_as_thought_signature_part ... ok
+test compat::kiro::tests::decodes_streamed_tool_call_into_codex_events ... ok
+test compat::gemini::signature_tests::unsigned_history_pairs_are_dropped_before_send ... ok
+test compat::gemini::signature_tests::tool_responses_resolve_the_function_name_from_tool_call_id ... ok
+test compat::render::gemini_stream_tests::terminal_frame_sets_stop_and_stream_has_no_done_sentinel ... ok
+test compat::render::gemini_stream_tests::text_deltas_stream_immediately_and_usage_rides_the_terminal_frame ... ok
+test compat::gemini::signature_tests::signed_history_calls_keep_their_thought_signature ... ok
+test compat::gemini::signature_tests::request_history_stays_signature_free_for_plain_ids ... ok
+test compat::kiro::tests::profile_reasoning_and_object_tool_input_follow_reference_wire ... ok
+test config::tests::bind_addr_defaults_to_loopback ... ok
+test config::tests::bind_addr_env_wins_over_cli ... ok
+test config::tests::explicit_cli_bind_addr_wins_over_default ... ok
+test compat::gemini::signature_tests::request_history_attaches_signature_from_tool_call_id ... ok
+test compat::kiro::tests::replays_tool_results_images_and_reasoning_on_kiro_wire ... ok
+test config::tests::unauthenticated_non_loopback_bind_requires_warning ... ok
+test cp_routes::tests::empty_body_parses_as_an_empty_object ... ok
+test compat::render::gemini_stream_tests::tool_calls_stream_as_function_call_parts_with_restored_arguments ... ok
+test compat::render::openai_stream_tests::reasoning_deltas_forward_as_reasoning_content ... ok
+test cp_routes::tests::missing_multipart_field_is_none ... ok
+test cp_routes::tests::max_output_tokens_is_renamed_for_the_chat_surface ... ok
+test cp_routes::tests::chat_reply_is_rewrapped_as_a_responses_object ... ok
+test cp_routes::tests::structured_input_parts_are_concatenated_per_message ... ok
+test cp_routes::tests::multipart_model_is_extracted_from_the_part_body ... ok
+test cp_routes::tests::instructions_become_a_system_message_ahead_of_the_input ... ok
+test compat::gemini::signature_tests::scalar_tool_responses_wrap_into_a_struct ... ok
+test management::apikeys::tests::every_upstream_apikey_path_is_registered ... ok
+test management::lists::tests::edit_overwrites_by_index ... ok
+test management::lists::tests::edit_replaces_a_match_and_appends_when_absent ... ok
+test management::lists::tests::edit_without_usable_fields_reports_missing_fields ... ok
+test management::lists::tests::remove_by_index_and_by_value ... ok
+test management::lists::tests::remove_without_either_query_is_refused ... ok
+test account::provider_kind_contract_tests::characterization_unsupported_model_inheritance ... ok
+test management::creds::tests::zcode_accepts_a_pasted_provisioned_key_without_oauth_fields ... ok
+test management::creds::tests::claude_relay_documents_skip_the_oauth_quartet_but_stay_pinned ... ok
+test management::creds::tests::provider_imports_reject_credentials_the_loader_cannot_use ... ok
+test management::creds::tests::provider_imports_accept_reference_credential_shapes ... ok
+test management::creds::tests::explicit_account_order_precedes_unlisted_files ... ok
+test management::creds::tests::account_order_manifest_is_not_a_credential ... ok
+test management::creds::reserved_file_tests::reserved_data_files_are_not_listed_as_credentials ... ok
+test management::lists::tests::replace_refuses_an_empty_items_wrapper ... ok
+test management::lists::tests::replace_accepts_a_bare_array_and_the_items_wrapper ... ok
+test management::creds::tests::a_credential_listing_reports_type_and_email_from_the_file ... ok
+test management::oauth::tests::sha256_matches_the_standard_abc_vector ... ok
+test management::oauth::tests::every_provider_upstream_advertises_has_a_route ... ok
+test management::oauth::tests::pkce_generation_produces_valid_challenge ... ok
+test management::observability::tests::log_routes_are_available_once_file_logging_is_on ... ok
+test management::oauth::tests::each_login_attempt_gets_a_distinct_state ... ok
+test management::apikeys::tests::each_key_list_targets_a_distinct_field ... ok
+test management::oauth::tests::command_code_auth_url_carries_studio_url_and_callback ... ok
+test management::oauth::tests::anthropic_auth_url_carries_full_pkce_and_scopes ... ok
+test management::oauth::tests::cursor_auth_url_carries_pkce_and_uuid ... ok
+test management::scalars::tests::an_invalid_strategy_is_refused_with_its_own_message ... ok
+test management::scalars::tests::a_provider_map_accepts_both_upstream_body_shapes ... ok
+test management::plugins::tests::every_upstream_plugin_path_is_registered ... ok
+test management::scalars::tests::deleting_a_provider_list_requires_the_provider_query ... ok
+test management::oauth::tests::antigravity_auth_url_carries_pkce_client_id_and_scopes ... ok
+test management::scalars::tests::routing_strategy_answers_under_its_own_key ... ok
+test management::scalars::tests::routing_strategy_normalizes_every_upstream_spelling ... ok
+test management::settings::tests::an_empty_document_yields_defaults ... ok
+test management::scalars::tests::every_upstream_scalar_path_is_registered ... ok
+test management::core::tests::redaction_keeps_the_rest_of_the_document ... ok
+test management::core::tests::get_config_never_exposes_the_management_secret ... ok
+test management::observability::tests::file_backed_log_routes_are_refused_while_file_logging_is_off ... ok
+test management::observability::tests::log_tail_serves_recent_lines_in_order_and_stays_bounded ... ok
+test management::settings::tests::upstream_yaml_key_names_are_kebab_case ... ok
+test models_route::tests::characterization_device_oauth_defaults ... ok
+test models_route::tests::characterization_duplicate_owner_ordering_first_wins ... ok
+test models_route::tests::characterization_generic_model_entries_empty_and_non_empty ... ok
+test management::settings::tests::unknown_upstream_keys_survive_a_round_trip ... ok
+test models_route::tests::characterization_provider_presence_exposure_all_providers ... ok
+test models_route::tests::characterization_v1_and_v1beta_models_schemas ... ok
+test models_route::tests::entries_track_loaded_providers ... ok
+test models_route::tests::env_override_scopes_codex_only ... ok
+test models_route::tests::payload_dedupes_ids_across_owners ... ok
+test models_route::tests::test_project_model_entries_all_advertised_resolve_to_binding ... ok
+test models_route::tests::test_project_model_entries_cooldown_and_unsupported_feedback_do_not_churn ... ok
+test models_route::tests::test_project_model_entries_fixture_model_and_absent_accounts ... ok
+test models_route::tests::test_project_model_entries_respects_manual_disabled ... ok
+test models_route::tests::test_project_model_entries_stable_owner_from_metadata ... ok
+test quota::tests::redeem_ids_are_v4_shaped_and_unique ... ok
+test quota::tests::relay_usage_polling_filters_on_the_target_api_not_the_key ... ok
+test quota::tests::usage_poll_backoff_gates_by_unix_time ... ok
+test models_route::tests::characterization_aliases_and_exclusions_roundtrip ... ok
+test realtime::tests::a_well_formed_offer_passes_validation ... ok
+test realtime::tests::capability_message_matches_captured_upstream_text ... ok
+test realtime::tests::sdp_is_rejected_before_session ... ok
+test realtime::tests::client_secret_carries_prefixed_token_and_nested_session ... ok
+test realtime::tests::legacy_session_nests_the_secret_instead_of_the_session ... ok
+test realtime::tests::session_is_rejected_once_sdp_is_present ... ok
+test relay::routing_tests::body_prefix_affinity_skips_bodies_below_the_cacheable_threshold ... ok
+test relay::routing_tests::body_prefix_affinity_is_decided_by_the_stable_head_alone ... ok
+test account::provider_kind_contract_tests::characterization_codex_negative_space_exclusion ... ok
+test management::creds::tests::writing_a_credential_leaves_no_temp_file ... ok
+test management::store::tests::an_unparsable_file_is_an_error_not_a_silent_fallback ... ok
+test management::observability::tests::listing_reports_real_files_and_skips_directories ... ok
+test relay::usage_capture_tests::claude_responses_are_scanned_for_subscription_quota_headers ... ok
+test management::store::tests::a_failed_persist_leaves_the_live_document_unchanged ... ok
+test management::store::tests::a_present_file_wins_over_the_env_fallback ... ok
+test management::settings::tests::persist_leaves_no_temp_file_behind ... ok
+test management::settings::tests::persist_then_load_round_trips ... ok
+test management::observability::tests::append_log_line_obeys_the_total_size_cap ... ok
+test management::store::tests::the_env_fallback_is_used_when_no_file_exists ... ok
+test management::store::tests::reload_picks_up_an_external_edit ... ok
+test management::store::tests::mutate_persists_and_publishes ... ok
+test request_history::extended_tests::open_failure_is_an_explicit_degraded_state ... ok
+test request_history::tests::corrupt_database_opens_in_explicit_degraded_state ... ok
+test request_history::tests::invalid_bucket_is_typed_error ... ok
+test scheduler::algorithm::tests::active_window_precedes_idle_window ... ok
+test scheduler::algorithm::tests::all_exhausted_is_fail_open ... ok
+test scheduler::algorithm::tests::deterministic_key_breaks_ties ... ok
+test scheduler::algorithm::tests::exhausted_candidate_is_held_for_ten_minutes ... ok
+test scheduler::algorithm::tests::exhaustion_uses_three_five_percent_hysteresis ... ok
+test scheduler::algorithm::tests::manual_disabled_is_never_candidate ... ok
+test scheduler::algorithm::tests::manual_priority_is_immediate ... ok
+test scheduler::algorithm::tests::selects_soonest_active_reset ... ok
+test scheduler::algorithm::tests::switch_requires_fifteen_minute_margin ... ok
+test scheduler::reservation_tests::duplicate_account_binding_is_rejected ... ok
+test scheduler::reservation_tests::runtime_reservations_exclude_even_during_fail_open ... ok
+test static_pages::tests::callback_page_closes_itself ... ok
+test static_pages::tests::management_page_is_the_shared_monitor_ui ... ok
+test static_pages::tests::root_advertises_the_three_documented_endpoints ... ok
+test telemetry::tests::persisted_buckets_survive_store_recreation ... ok
+test telemetry::tests::retention_drops_buckets_older_than_thirty_days ... ok
+test telemetry::tests::token_usage_accumulates_without_incrementing_requests ... ok
+test url::tests::an_override_still_wins_for_every_provider ... ok
+test url::tests::each_provider_resolves_to_its_own_upstream_not_codex ... ok
+test url::tests::generic_provider_paths_dedupe_v1_and_preserve_full_endpoints ... ok
+test url::tests::test_antigravity_url_construction ... ok
+test url::tests::test_url_construction ... ok
+test usage::tests::antigravity_flat_windows_take_worst_bucket ... ok
+test usage::tests::antigravity_summary_maps_remaining_fraction_to_used_percent ... ok
+test usage::tests::antigravity_summary_parses_reset_time ... ok
+test usage::tests::antigravity_summary_tolerates_empty_payload ... ok
+test usage::tests::capture_keeps_head_and_tail_within_capacity ... ok
+test usage::tests::capture_windows_preserve_usage_across_large_streams ... ok
+test usage::tests::classifies_windows_by_duration_not_header_family ... ok
+test usage::tests::claude_api_key_headers_report_no_subscription_window ... ok
+test usage::tests::claude_subscription_headers_become_session_and_weekly_windows ... ok
+test usage::tests::cost_deltas_stay_none_when_the_relay_reports_no_value ... ok
+test usage::tests::counter_resets_do_not_underflow_and_restart_the_baseline ... ok
+test usage::tests::empty_headers_are_unknown_not_zero ... ok
+test usage::tests::extract_combines_claude_message_start_and_delta ... ok
+test usage::tests::extract_keeps_claude_cache_reads_when_delta_usage_has_no_details_object ... ok
+test usage::tests::extract_prefers_the_last_usage_frame_in_sse_tail ... ok
+test usage::tests::extract_preserves_cached_and_reasoning_token_breakdowns ... ok
+test usage::tests::extract_reads_gemini_usage_metadata ... ok
+test usage::tests::extract_reads_openai_usage_from_tail_json ... ok
+test usage::tests::extract_reads_responses_api_cached_tokens_from_buffered_json ... ok
+test usage::tests::extract_reads_responses_api_usage_from_sse_completed_frame ... ok
+test usage::tests::extract_returns_none_without_usage ... ok
+test usage::tests::extract_sums_openai_tokens_without_total ... ok
+test usage::tests::maps_live_wham_usage_windows ... ok
+test usage::tests::missing_rate_limit_yields_empty_windows ... ok
+test usage::tests::orders_windows_by_length_regardless_of_field_order ... ok
+test usage::tests::parses_plan_and_credits_from_live_headers ... ok
+test usage::tests::parses_string_credit_balance_and_reset_credits ... ok
+test usage::tests::primary_is_always_the_short_window_across_providers ... ok
+test usage::tests::reset_ages_relative_value_when_no_timestamp ... ok
+test usage::tests::reset_is_unknown_without_any_signal ... ok
+test usage::tests::reset_prefers_absolute_timestamp_over_stale_relative ... ok
+test usage::tests::rfc3339_parser_rejects_non_utc_and_malformed ... ok
+test usage::tests::session_window_carries_its_own_reset_time ... ok
+test usage::tests::the_relay_usage_payload_maps_to_cumulative_totals ... ok
+test usage::tests::the_sample_store_round_trips_across_restart ... ok
+test request_history::extended_tests::explain_query_plan_uses_composite_filter_indexes ... ok
+test usage::tests::window_deltas_cover_hourly_daily_and_weekly_spans_with_cost ... ok
+test relay::routing_tests::generic_account_models_become_exact_discovered_bindings ... ok
+test v1beta::tests::a_bare_model_path_has_no_action ... ok
+test v1beta::tests::action_splits_on_the_verb_colon ... ok
+test v1beta::tests::collection_nests_under_models_and_keeps_methods ... ok
+test v1beta::tests::envelope_passes_the_client_body_through_untranslated ... ok
+test v1beta::tests::image_models_advertise_image_output ... ok
+test v1beta::tests::single_model_drops_generation_methods ... ok
+test warmup::tests::antigravity_warmup_caps_output_to_one_token ... ok
+test warmup::tests::codex_warmup_omits_parameters_the_upstream_rejects ... ok
+test warmup::tests::every_provider_has_a_warmup_path ... ok
+test usage::tests::the_usage_state_store_round_trips_and_expires_stale_snapshots ... ok
+test relay::routing_tests::eligibility_applies_unsupported_health_scheduler_and_api_key_binding ... ok
+test request_history::tests::duplicate_event_id_is_idempotent ... ok
+test relay::routing_tests::default_routing_never_selects_an_account_that_rejects_the_requested_model ... ok
+test request_history::extended_tests::estimated_cost_is_snapshotted_then_explicitly_recomputed ... ok
+test relay::routing_tests::resolved_routes_preserve_virtual_ids_and_provider_upstream_ids ... ok
+test request_history::extended_tests::metadata_imports_and_key_identifier_are_non_secret_and_idempotent ... ok
+test request_history::tests::fixture_roundtrip_all_dimensions ... ok
+test request_history::extended_tests::busy_timeout_is_bounded ... ok
+test request_history::extended_tests::migrations_open_empty_current_and_previous_version_databases ... ok
+test relay::routing_tests::unknown_model_uses_codex_only_when_a_codex_account_is_loaded ... ok
+test request_history::extended_tests::retention_and_size_pruning_are_chunked ... ok
+test request_history::extended_tests::concurrent_prune_and_read_complete_on_the_worker ... ok
+test management::store::tests::readers_observe_a_consistent_document_across_concurrent_mutations ... ok
+
+test result: ok. 239 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s
+
+     Running unittests src/main.rs (target/debug/deps/mahoquot_gateway-2c365f4572f6f511)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/catalog_lkg_recovery.rs (target/debug/deps/catalog_lkg_recovery-7d88feab6037e746)
+
+running 12 tests
+test test_boot_valid_lkg_uses_lkg ... ok
+test test_update_corrupted_signature_rejected_leaves_active_and_lkg_unchanged ... ok
+test test_insecure_remote_url_rejected ... ok
+test test_remote_url_with_credentials_rejected ... ok
+test test_boot_no_network_no_lkg_uses_embedded ... ok
+test test_fetch_and_update_with_local_mock_server_500_leaves_active_and_lkg_unchanged ... ok
+test test_boot_corrupted_lkg_falls_back_to_embedded ... ok
+test test_boot_corrupted_signature_in_lkg_falls_back_to_embedded ... ok
+test test_update_downgrade_rejected_leaves_active_and_lkg_unchanged ... ok
+test test_boot_corrupted_payload_bytes_in_lkg_falls_back_to_embedded ... ok
+test test_atomic_write_of_new_verified_lkg ... ok
+test test_fetch_and_update_with_local_mock_server_success ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/config_endpoints_tests.rs (target/debug/deps/config_endpoints_tests-b0fb785c5cbd8c4c)
+
+running 15 tests
+test contract_route_names_have_one_registration_owner ... ok
+test contract_schema_and_examples_are_versioned_and_complete ... ok
+test rejects_invalid_scheduler_and_history_contract ... ok
+test test_unauthenticated_requests_are_rejected ... ok
+test test_oauth_excluded_models_lifecycle ... ok
+test test_oauth_model_alias_lifecycle ... ok
+test test_oauth_request_scoped_errors_lifecycle ... ok
+test test_error_logs_max_files_lifecycle ... ok
+test test_max_retry_interval_lifecycle ... ok
+test test_force_model_prefix_lifecycle ... ok
+test test_logging_to_file_lifecycle ... ok
+test test_max_retry_credentials_lifecycle ... ok
+test test_logs_max_total_size_mb_lifecycle ... ok
+test test_openai_compatibility_lifecycle ... ok
+test test_all_10_config_endpoints_survive_restart_persistence ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s
+
+     Running tests/key_provider_config_tests.rs (target/debug/deps/key_provider_config_tests-7faf4f8ba0b576f8)
+
+running 7 tests
+test test_unauthenticated_request_is_rejected ... ok
+test test_claude_api_key_endpoint_lifecycle ... ok
+test test_codex_api_key_endpoint_lifecycle ... ok
+test test_interactions_api_key_endpoint_lifecycle ... ok
+test test_gemini_api_key_endpoint_lifecycle ... ok
+test test_xai_api_key_endpoint_lifecycle ... ok
+test test_vertex_api_key_endpoint_lifecycle ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s
+
+     Running tests/management_registry.rs (target/debug/deps/management_registry-72230bf13bd23be2)
+
+running 4 tests
+test management_registry_contract_schema_and_fixture_are_compatible ... ok
+test management_registry_rejects_unauthenticated_and_returns_safe_status ... ok
+test management_registry_reports_stale_error_without_leaking_details ... ok
+test management_registry_refresh_is_nonblocking_and_coalesced ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests/model_capabilities.rs (target/debug/deps/model_capabilities-8d3d97397016a99b)
+
+running 3 tests
+test text_video_sparse_and_wrong_provider_capabilities_fail_before_upstream ... ok
+test realtime_and_count_token_surfaces_require_explicit_binding_capabilities ... ok
+test signed_image_capability_and_alias_reach_only_the_fixture_upstream ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests/model_catalog_settings.rs (target/debug/deps/model_catalog_settings-9ab6c4b329eb209b)
+
+running 7 tests
+test test_old_yaml_roundtrips_byte_semantically ... ok
+test test_unknown_alias_target_rejection ... ok
+test test_alias_cycle_rejection ... ok
+test test_custom_provider_models_validation ... ok
+test test_unsafe_url_rejection ... ok
+test test_atomic_rollback_and_non_mutation_on_reload ... ok
+test test_complete_provider_blackout_rejection ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/model_registry_lifecycle.rs (target/debug/deps/model_registry_lifecycle-0913f80256c8b9ca)
+
+running 10 tests
+test test_lifecycle_10_inflight_request_generation_consistency ... ok
+test test_lifecycle_01_embedded_only_boot ... ok
+test test_lifecycle_02_valid_cached_boot ... ok
+test test_lifecycle_06_rejection_preserves_hashes ... ok
+test test_lifecycle_05_stale_cache_offline ... ok
+test test_lifecycle_04_304_not_modified ... ok
+test test_lifecycle_07_interrupted_persistence ... ok
+test test_lifecycle_08_overlapping_refresh_coalescing ... ok
+test test_lifecycle_03_successful_newer_remote_update ... ok
+test test_lifecycle_09_account_add_delete_during_refresh ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/p1_parity_tests.rs (target/debug/deps/p1_parity_tests-aa8b3c8cd061b8b0)
+
+running 7 tests
+test test_keep_alive_public_endpoint ... ok
+test test_realtime_sip_and_live_subpaths ... ok
+test test_existing_live_and_realtime_calls_regression ... ok
+test test_mount_difference_aliases ... ok
+test test_auth_files_fields_selective_patch ... ok
+test test_auth_files_crud_and_status ... ok
+test test_auth_urls_endpoint_family ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.32s
+
+     Running tests/pool_snapshot.rs (target/debug/deps/pool_snapshot-25848564cbda41dd)
+
+running 6 tests
+test test_pool_snapshot_atomic_generational_pair ... ok
+test invalid_candidates_do_not_publish ... ok
+test registry_reload_updates_effective_model_routing_atomically_zero_half_state ... ok
+test concurrent_registry_refresh_is_generation_atomic ... ok
+test hundred_concurrent_coalesced_triggers_produce_monotonic_unique_generations_without_deadlock ... ok
+test account_add_remove_under_concurrent_requests_sees_atomic_update ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+
+     Running tests/t10_anthropic_compat.rs (target/debug/deps/t10_anthropic_compat-c8e4d4552c1403e9)
+
+running 7 tests
+test test_t10_stop_reason_mapping ... ok
+test test_t10_count_tokens_is_positive_and_scales ... ok
+test test_t10_request_maps_system_and_messages ... ok
+test test_t10_thinking_block_precedes_text_when_signature_present ... ok
+test test_t10_response_shape_matches_anthropic ... ok
+test test_t10_block_content_and_tool_use_roundtrip ... ok
+test test_t10_stream_emits_anthropic_event_sequence ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/t11_multi_provider_pool.rs (target/debug/deps/t11_multi_provider_pool-f450cef27fb36c68)
+
+running 6 tests
+test an_auth_dir_with_only_bad_credentials_yields_an_empty_pool_rather_than_an_error ... ok
+test malformed_and_unknown_credentials_are_skipped_without_dropping_valid_members ... ok
+test pool_loads_every_supported_provider_from_one_auth_dir ... ok
+test each_provider_only_claims_models_it_can_actually_serve ... ok
+test unknown_model_without_loaded_open_binding_is_local_model_not_found ... ok
+test overlapping_closed_bindings_follow_registry_priority_not_pool_order ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/t12_provider_relay.rs (target/debug/deps/t12_provider_relay-4d1b40dc3eeb1990)
+
+running 17 tests
+test codex_does_not_claim_models_owned_by_loaded_provider_accounts ... ok
+test anthropic_stream_forwards_first_delta_before_upstream_finishes ... ok
+test zcode_relays_native_anthropic_wire_end_to_end ... ok
+test claude_relays_native_anthropic_wire_end_to_end ... ok
+test cursor_relays_connect_protobuf_and_decodes_text_delta ... ok
+test kiro_relays_conversation_state_and_decodes_eventstream ... ok
+test generic_provider_forwards_reference_static_headers_without_an_api_key ... ok
+test cursor_keeps_request_open_and_replies_to_server_kv_frames ... ok
+test azure_openai_account_relays_the_responses_wire_with_an_api_key_header ... ok
+test generic_openai_chat_provider_relays_json_without_codex_translation ... ok
+test google_ai_studio_uses_generativelanguage_wire_and_api_key_header ... ok
+test generic_anthropic_adapter_account_relays_native_messages_wire ... ok
+test claude_accepts_openai_input_and_returns_openai_nonstream ... ok
+test mimo_free_rebootstraps_once_when_the_jwt_is_rejected ... ok
+test relay_persists_aggregate_history_and_redacted_proxy_log ... ok
+test mimo_free_account_bootstraps_a_jwt_and_marks_the_request ... ok
+test mimo_free_streaming_declares_event_stream_and_relays_sse_verbatim ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+
+     Running tests/t13_provider_oauth.rs (target/debug/deps/t13_provider_oauth-d16673bf53694332)
+
+running 17 tests
+test test_oauth_session_cancellation ... ok
+test test_zcode_quota_reads_the_desktop_app_balance_log ... ok
+test test_zcode_oauth_flow_end_to_end ... ok
+test test_codex_oauth_flow_persists_a_routable_account ... ok
+test test_anthropic_oauth_flow_end_to_end ... ok
+test test_cursor_oauth_flow_end_to_end ... ok
+test test_command_code_oauth_rejects_whoami_without_identity ... ok
+test test_antigravity_oauth_malformed_token_response_fails_cleanly ... ok
+test test_antigravity_oauth_callback_state_edge ... ok
+test test_command_code_oauth_mismatched_state_fails_without_persistence ... ok
+test test_command_code_oauth_whoami_failure_fails_without_persistence ... ok
+test test_command_code_oauth_malformed_callback_fails_without_persistence ... ok
+test test_command_code_oauth_reports_unavailable_default_callback_port ... ok
+test xai_pkce_callback_writes_a_live_generic_account ... ok
+test test_command_code_oauth_flow_end_to_end ... ok
+test test_antigravity_oauth_flow_end_to_end ... ok
+test device_oauth_starts_polls_and_writes_generic_provider_credentials ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+
+     Running tests/t14_management_route_parity.rs (target/debug/deps/t14_management_route_parity-8c7c2be5e6d52aac)
+
+running 4 tests
+test an_unimplemented_management_path_answers_the_bare_fallback ... ok
+test unimplemented_pluginhost_routes_are_not_advertised_as_handlers ... ok
+test trae_import_local_accepts_the_desktop_apps_bodyless_post ... ok
+test every_manifest_management_route_answers_from_a_registered_handler ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.60s
+
+     Running tests/t15_pool_rescan.rs (target/debug/deps/t15_pool_rescan-a40c957265bf9146)
+
+running 4 tests
+test rescan_preserves_runtime_state_for_surviving_accounts ... ok
+test cors_allows_the_authorization_header_explicitly_for_webviews ... ok
+test a_deleted_credential_leaves_the_live_pool_without_restart ... ok
+test an_imported_credential_appears_in_the_live_pool_without_restart ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running tests/t16_claude_usage.rs (target/debug/deps/t16_claude_usage-7e636827172366af)
+
+running 2 tests
+test claude_usage_is_polled_without_any_relayed_traffic ... ok
+test claude_relay_records_subscription_usage_in_admin_stats ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running tests/t17_account_lifecycle.rs (target/debug/deps/t17_account_lifecycle-d6203e9ade81b31f)
+
+running 3 tests
+test generic_openai_key_provider_joins_pool ... ok
+test vertex_import_exchanges_service_account_and_joins_google_pool ... ok
+test disabled_credentials_leave_and_rejoin_the_pool ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running tests/t18_provider_quota.rs (target/debug/deps/t18_provider_quota-bbe49139f3d85f56)
+
+running 6 tests
+test reset_credit_policy_retains_redeem_id ... ok
+test reset_credit_other_failure_is_upstream_error ... ok
+test reset_credit_no_credit_is_distinct ... ok
+test cursor_and_kiro_quota_payloads_normalize_to_account_usage ... ok
+test reset_credit_errors_are_truthful_and_distinct ... ok
+test reset_credit_refresh_retry_is_idempotent ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/t19_vertex_runtime.rs (target/debug/deps/t19_vertex_runtime-7f024e40711c6d2b)
+
+running 1 test
+test test_vertex_runtime_lifecycle_wire_and_refresh ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests/t1_rr_fairness.rs (target/debug/deps/t1_rr_fairness-3b7230c536b631fe)
+
+running 2 tests
+test test_t1b_body_prefix_affinity_keeps_large_conversations_on_one_account ... ok
+test test_t1_rr_fairness ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+     Running tests/t20_reference_parity.rs (target/debug/deps/t20_reference_parity-c505736832c2fcb9)
+
+running 1 test
+test every_reference_backed_flow_maps_to_an_owner_green_test_and_evidence ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/t21_version_handshake.rs (target/debug/deps/t21_version_handshake-2f427161b031769f)
+
+running 1 test
+test healthz_reports_build_version_and_api_schema ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/t22_command_code_import_validation.rs (target/debug/deps/t22_command_code_import_validation-075584345e9251cf)
+
+running 1 test
+test import_verifies_credentials_before_persisting ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running tests/t23_scheduler.rs (target/debug/deps/t23_scheduler-55c280cb890c6caf)
+
+running 4 tests
+test corrupt_scheduler_state_fails_open_without_auth_mutation ... ok
+test all_exhausted_restores_base_strategy ... ok
+test scheduler_parking_only_filters_future_selections_and_in_flight_arc_completes ... ok
+test scheduler_rotates_two_account_pool_by_reset_time ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running tests/t24_request_history.rs (target/debug/deps/t24_request_history-4d905b3a4c19f675)
+
+running 12 tests
+test invalid_range_is_400 ... ok
+test invalid_cursor_is_400_and_preserves_rows ... ok
+test cancelled_clear_preserves_rows ... ok
+test invalid_cursor_is_400 ... ok
+test unauthorized_export_is_401 ... ok
+test unauthorized_export_is_403_and_preserves_rows ... ok
+test cancelled_clear_is_409_and_preserves_rows ... ok
+test full_channel_is_nonblocking ... ok
+test confirmed_filtered_clear_deletes_only_the_selected_scope ... ok
+test streaming_and_nonstreaming_events_match_analytics ... ok
+test invalid_cursor_unauthorized_export_cancelled_clear ... ok
+test pages_filters_detail_clear_and_exports_large_history ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.72s
+
+     Running tests/t25_account_management.rs (target/debug/deps/t25_account_management-dea48c49e5a8d03f)
+
+running 11 tests
+test task_12_test_ports_stay_inside_reserved_range ... ok
+test binding_rejects_unknown_targets_and_lists_only_key_identifiers ... ok
+test invalid_provider_rejected ... ok
+test duplicate_import_rejected ... ok
+test legacy_download_also_requires_explicit_export_authorization ... ok
+test unauthorized_export_rejected ... ok
+test ordinary_account_hides_relay_fields ... ok
+test explicit_export_returns_selected_secrets_only ... ok
+test inbound_key_binding_routes_to_selected_pool ... ok
+test custom_provider_crud_and_provider_key_management_redacts_secrets ... ok
+test bulk_status_order_and_manual_priority_persist_across_restart ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+
+     Running tests/t2_churn_force_health.rs (target/debug/deps/t2_churn_force_health-4859b41530e44e01)
+
+running 1 test
+test test_t2_churn_via_force_health ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running tests/t3_failover.rs (target/debug/deps/t3_failover-95ff863f8ea9f36e)
+
+running 4 tests
+test test_t3b_final_failure_records_the_attempted_account ... ok
+test test_t3_failover ... ok
+test server_error_failover_keeps_health_and_moves_to_the_next_account ... ok
+test test_t3c_final_failure_attribution_names_the_last_attempted_account ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests/t4_passthrough_integrity.rs (target/debug/deps/t4_passthrough_integrity-af32a3eb3924c290)
+
+running 1 test
+test test_t4_passthrough_integrity ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/t5_monitoring.rs (target/debug/deps/t5_monitoring-c764a16099b9a676)
+
+running 8 tests
+test test_in_flight_tracking ... ok
+test test_record_and_last_error ... ok
+test test_ttft_percentiles_1_to_100 ... ok
+test test_render_prometheus ... ok
+test test_ttft_ring_buffer_capacity ... ok
+test persisted_history_and_logs_are_exposed_after_state_recreation ... ok
+test logs_endpoint_serves_the_live_tail_while_file_logging_is_off ... ok
+test streamed_requests_record_bytes_and_tokens_at_stream_end ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/t6_inbound_auth.rs (target/debug/deps/t6_inbound_auth-513c4b338e8bd836)
+
+running 6 tests
+test test_inbound_auth_cases ... ok
+test authenticated_shutdown_drains_before_server_exit ... ok
+test config_yaml_api_keys_are_enforced ... ok
+test empty_effective_api_key_set_keeps_local_default_open ... ok
+test management_uses_the_same_api_key_as_proxy_routes ... ok
+test runtime_api_key_replacement_is_enforced_immediately ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/t7_refresh.rs (target/debug/deps/t7_refresh-607cf1dabed0b5af)
+
+running 3 tests
+test generic_oauth_accounts_refresh_with_provider_contracts ... ok
+test test_t7_refresh_lifecycle ... ok
+test test_t7_concurrent_single_flight_refresh ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+     Running tests/t8_openai_compat.rs (target/debug/deps/t8_openai_compat-4f168c0baf78f817)
+
+running 11 tests
+test test_t8_request_translation_shape ... ok
+test test_t8_unimplemented_xai_media_models_fail_closed ... ok
+test test_t8_unsupported_websocket_transport_fails_before_upgrade ... ok
+test test_t8_responses_compact_relays_to_codex_upstream ... ok
+test test_t8_html_upstream_is_never_reported_as_success ... ok
+test test_t8_truncated_upstream_stream_is_closed_for_the_client ... ok
+test test_t8_sse_without_content_type_header_is_served ... ok
+test test_t8_streaming_text_becomes_openai_chunks ... ok
+test test_t8_streaming_tool_calls_become_openai_tool_deltas ... ok
+test test_t8_non_streaming_returns_single_completion ... ok
+test test_t8_model_unsupported_account_fails_over ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/t9_antigravity_compat.rs (target/debug/deps/t9_antigravity_compat-2e8a0dc0fbc5d73b)
+
+running 8 tests
+test test_t9_upstream_error_frame_becomes_failed_not_silence ... ok
+test test_t9_truncated_stream_still_completes ... ok
+test test_t9_thought_signature_part_emits_no_text ... ok
+test test_t9_live_captured_frame_decodes_to_text_and_usage ... ok
+test test_t9_request_targets_antigravity_envelope ... ok
+test test_t9_function_call_maps_to_tool_call_events ... ok
+test test_t9_thinking_model_small_max_tokens_gets_headroom ... ok
+test test_t9_tool_result_roundtrips_as_function_response ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/task_10_qa_driver.rs (target/debug/deps/task_10_qa_driver-69493afd5c1b483b)
+
+running 1 test
+test task_10_http_qa_scenario ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+
+     Running tests/task_11_qa_driver.rs (target/debug/deps/task_11_qa_driver-ab453bb8a789a71d)
+
+running 1 test
+test task_11_http_qa_scenario ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+
+     Running tests/task_12_qa_driver.rs (target/debug/deps/task_12_qa_driver-b62e3c3bc62f5eb8)
+
+running 1 test
+test task_12_http_qa_scenario ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+
+     Running tests/task_13_qa_driver.rs (target/debug/deps/task_13_qa_driver-b217089231c4898d)
+
+running 1 test
+test task_13_http_qa_scenario ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+     Running tests/task_14_qa_driver.rs (target/debug/deps/task_14_qa_driver-e9802ef5f26367fa)
+
+running 1 test
+test task_14_qa_scenario ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+
+     Running tests/todo15_manual_api.rs (target/debug/deps/todo15_manual_api-c9a1199cb59ff0e1)
+
+running 1 test
+test manual_api_driver ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running unittests src/main.rs (target/debug/deps/mahoquot_model_catalog-8b141fc6f5170941)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/cli_tests.rs (target/debug/deps/cli_tests-c8a1d0fadebf179e)
+
+running 7 tests
+test test_cli_validate_malformed_catalog_fails ... ok
+test test_cli_generate_key ... ok
+test test_cli_validate_valid_catalog ... ok
+test test_cli_verify_detects_tampered_signature ... ok
+test test_cli_verify_anti_downgrade ... ok
+test test_cli_verify_detects_tampered_payload ... ok
+test test_cli_sign_and_verify_roundtrip ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.36s
+
+     Running unittests src/lib.rs (target/debug/deps/mahoquot_providers-8e22aaef55af17c9)
+
+running 56 tests
+test cursor::tests::chat_url_uses_default_and_override_bases ... ok
+test claude::tests::messages_url_uses_default_and_override_bases ... ok
+test antigravity::tests::stream_url_targets_daily_host ... ok
+test cursor::tests::login_url_carries_the_cli_redirect_target ... ok
+test antigravity::client_credential_tests::encoded_client_pair_decodes_to_a_google_installed_app_client ... ok
+test antigravity::tests::slug_keeps_full_email ... ok
+test antigravity::client_credential_tests::env_override_replaces_the_encoded_default ... ok
+test edge_tests::io_error_on_nonexistent_file ... ok
+test edge_tests::expiry_past_future_malformed ... ok
+test claude::tests::credential_parses_and_redacts_tokens_in_debug ... ok
+test edge_tests::secrets_debug_redacted ... ok
+test cursor::tests::credential_parses_and_redacts_tokens_in_debug ... ok
+test edge_tests::slug_derivation_edges ... ok
+test edge_tests::getters_and_upstream_headers ... ok
+test claude::plan_tests::relay_documents_carry_an_optional_plan_label ... ok
+test credential_file::tests::failed_write_leaves_original_file_intact ... ok
+test kiro::tests::generate_url_uses_region_host_or_override ... ok
+test kiro::tests::refresh_url_switches_host_per_auth_mode_and_region ... ok
+test edge_tests::refresh_request_and_response_pure_builders ... ok
+test mimo::tests::an_unreadable_or_past_expiry_never_yields_a_negative_lifetime ... ok
+test mimo::tests::expiry_comes_from_the_jwt_minus_the_refresh_buffer ... ok
+test kiro::tests::credential_parses_defaults_to_social_and_redacts_secrets ... ok
+test mimo::tests::only_the_canonical_host_and_loopback_receive_mimo_credentials ... ok
+test cursor::tests::model_matcher_accepts_known_models_only ... ok
+test kiro::tests::model_matcher_accepts_known_models_only ... ok
+test antigravity::tests::model_membership ... ok
+test claude::tests::model_matcher_accepts_known_models_only ... ok
+test refresh_exec::tests::cursor_refresh_uses_bearer_empty_json_and_camelcase_response ... ok
+test refresh_exec::tests::execute_refresh_parse_error_malformed_json ... ok
+test refresh_exec::tests::claude_refresh_uses_anthropic_json_contract ... ok
+test refresh_exec::tests::execute_refresh_status_error_429 ... ok
+test refresh_exec::tests::execute_refresh_success ... ok
+test refresh_exec::tests::kiro_social_refresh_uses_refresh_token_json ... ok
+test zcode::tests::api_key_lookup_finds_the_named_key_and_ignores_others ... ok
+test zcode::tests::authorize_url_carries_client_redirect_and_state ... ok
+test zcode::tests::broker_and_business_tokens_unwrap_the_data_envelope ... ok
+test zcode::tests::callback_code_accepts_the_canonical_redirect ... ok
+test zcode::tests::callback_code_rejects_malformed_redirects ... ok
+test zcode::tests::credential_parses_and_redacts_tokens_in_debug ... ok
+test zcode::tests::customer_info_prefers_default_org_and_project ... ok
+test zcode::tests::messages_url_uses_anthropic_prefix_and_override ... ok
+test zcode::tests::provisioned_key_requires_both_halves ... ok
+test zcode::tests::model_matcher_accepts_known_models_only ... ok
+test refresh_exec::tests::zcode_refresh_reprovisions_composite_api_key ... ok
+test refresh_exec::tests::zcode_refresh_creates_missing_named_api_key ... ok
+test edge_tests::missing_field_mapping ... ok
+test antigravity::tests::parses_live_shaped_auth_file ... ok
+test credential_file::tests::resulting_file_mode_is_owner_read_write_only ... ok
+test claude::tests::listing_takes_claude_files_and_leaves_other_providers_alone ... ok
+test cursor::tests::listing_takes_cursor_files_and_leaves_other_providers_alone ... ok
+test red_tests::parses_fixture_and_extracts_account_identity ... ok
+test kiro::tests::listing_takes_kiro_files_and_leaves_other_providers_alone ... ok
+test zcode::tests::listing_takes_zcode_files_and_leaves_other_providers_alone ... ok
+test refresh_exec::tests::apply_refresh_updates_timestamp_only_when_present ... ok
+test refresh_exec::tests::apply_refresh_to_file_round_trip ... ok
+test credential_file::tests::concurrent_writes_to_same_path_are_complete ... ok
+
+test result: ok. 56 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.49s
+
+     Running tests/provider_contributions_tests.rs (target/debug/deps/provider_contributions_tests-d5c10a30f1710253)
+
+running 8 tests
+test test_kiro_typed_contribution_and_capabilities ... ok
+test test_zcode_typed_contribution_and_capabilities ... ok
+test test_cursor_typed_contribution_and_capabilities ... ok
+test test_codex_typed_contribution_and_capabilities ... ok
+test test_dynamic_snapshot_fixture_adds_fictitious_model_without_rust_constants_change ... ok
+test test_claude_typed_contribution_and_capabilities ... ok
+test test_antigravity_typed_contribution_and_capabilities ... ok
+test test_vertex_typed_contribution_and_capabilities ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/mahoquot_registry-f95cba18d18ef253)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/catalog-tool.rs (target/debug/deps/catalog_tool-615e4e6a61549f1d)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/authority_tests.rs (target/debug/deps/authority_tests-9c441746e503f79d)
+
+running 5 tests
+test test_unauthorized_contribution_for_unknown_provider ... ok
+test test_closed_provider_rejects_dynamic_discovery ... ok
+test test_open_provider_allows_passthrough_with_exclusions ... ok
+test test_discovered_provider_cannot_overwrite_catalog_capabilities_or_aliases ... ok
+test test_discovered_provider_accepts_bounded_discovery ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/catalog_tests.rs (target/debug/deps/catalog_tests-32260513aa0e308a)
+
+running 3 tests
+test test_embedded_catalog_resolves_closed_and_open_models ... ok
+test embedded_catalog_covers_legacy_sources ... ok
+test embedded_catalog_roundtrips_deterministically ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/domain_tests.rs (target/debug/deps/domain_tests-0f78a7a10c2568c8)
+
+running 8 tests
+test test_invalid_and_empty_ids ... ok
+test test_duplicate_binding_merge ... ok
+test test_capability_lookup ... ok
+test test_stable_ordering ... ok
+test test_unknown_targets ... ok
+test resolves_closed_discovered_and_open_without_ambiguity ... ok
+test test_alias_cycles_and_depth ... ok
+test test_deterministic_serialization ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/envelope_tests.rs (target/debug/deps/envelope_tests-59972838aaf2e8a2)
+
+running 11 tests
+test test_canonicalize_and_is_canonical ... ok
+test test_version_downgrade_rejected ... ok
+test test_future_timestamp_rejected ... ok
+test test_incompatible_schema_rejected ... ok
+test test_unknown_key_id_rejected ... ok
+test test_empty_catalog_rejected ... ok
+test test_zero_fallback_routable_bindings_rejected ... ok
+test test_expired_catalog_rejected ... ok
+test test_tampered_payload_fails_signature ... ok
+test test_valid_envelope_roundtrip ... ok
+test test_payload_version_mismatch_rejected ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/signed_catalog.rs (target/debug/deps/signed_catalog-1cdca654a9f61c0c)
+
+running 15 tests
+test signed_catalog_canonicalize_json_and_is_canonical_json ... ok
+test signed_catalog_unknown_key_id_rejection ... ok
+test signed_catalog_empty_catalog_rejection ... ok
+test signed_catalog_zero_fallback_routable_bindings_rejection ... ok
+test signed_catalog_wrong_key_rejection ... ok
+test signed_catalog_valid_signature_verification ... ok
+test signed_catalog_non_canonical_json_rejection ... ok
+test signed_catalog_anti_downgrade_equal_and_lower_version_rejection ... ok
+test signed_catalog_expired_catalog_rejection ... ok
+test signed_catalog_future_timestamp_rejection ... ok
+test signed_catalog_incompatible_schema_rejection ... ok
+test signed_catalog_version_mismatch_between_envelope_and_payload ... ok
+test signed_catalog_corrupted_byte_rejection ... ok
+test signed_catalog_corrupted_signature_rejection ... ok
+test signed_catalog_key_rotation_overlap ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/mahoquot_router-031aa267cbab00e6)
+
+running 7 tests
+test red_tests::empty_or_all_unavailable_pool_returns_none ... ok
+test red_tests::distinct_sessions_spread_across_accounts ... ok
+test red_tests::fill_first_pins_to_first_available_then_moves_on_cooldown ... ok
+test red_tests::session_moves_off_an_unhealthy_account ... ok
+test red_tests::session_sticks_to_one_account_across_turns ... ok
+test red_tests::strict_rr_survives_membership_churn_without_cursor_poisoning ... ok
+test red_tests::strict_rr_distributes_evenly_over_four ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/mahoquot_types-de0de7905ea0663c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests mahoquot_gateway
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests mahoquot_providers
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests mahoquot_registry
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests mahoquot_router
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests mahoquot_types
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+
+--- GATE: proxy: bash scripts/verify-catalog.sh (cwd: /Users/indo/code/project/mahoquot-proxy) ---
+Exit status: 0
+=== Mahoquot Model Catalog Verification Pipeline ===
+Workspace root: /Users/indo/code/project/mahoquot-proxy
+
+[Step 1/6] Checking required files...
+  OK: crates/registry/catalog/models-v1.json
+  OK: crates/registry/schema/catalog-v1.schema.json
+  OK: crates/registry/schema/envelope-v1.schema.json
+  OK: tests/fixtures/test-ed25519.key
+  OK: tests/fixtures/test-ed25519.pub
+
+[Step 2/6] Validating catalog and envelope JSON Schemas...
+  OK: Both schemas are syntactically valid JSON Schema draft-07 documents
+
+[Step 3/6] Validating catalog with mahoquot-model-catalog...
+Catalog valid: crates/registry/catalog/models-v1.json (version: v1, models: 102, providers: 14, aliases: 5, exclusions: 0)
+
+[Step 4/6] Canonicalizing and signing catalog with test Ed25519 key...
+Signed catalog: version=v1, key_id='test-ed25519-v1', models=102, generated_at=1788394771
+  Output payload: /var/folders/zh/7cc25lt91b1_dj577306nwdh0000gn/T/tmp.AlqGtcJWaf/models-v1.json
+  Output signature: /var/folders/zh/7cc25lt91b1_dj577306nwdh0000gn/T/tmp.AlqGtcJWaf/models-v1.json.sig
+  Generated canonical payload at /var/folders/zh/7cc25lt91b1_dj577306nwdh0000gn/T/tmp.AlqGtcJWaf/models-v1.json
+  Generated signature envelope at /var/folders/zh/7cc25lt91b1_dj577306nwdh0000gn/T/tmp.AlqGtcJWaf/models-v1.json.sig
+
+[Step 5/6] Verifying signed envelope with public key...
+Verified catalog: version=v1, source=embedded_fallback, models=102, key_id='test-ed25519-v1', generated_at=1788394771
+
+[Step 6/6] Running adversarial rejection tests...
+  PASS: Tampered payload rejected as expected (canonicalization mismatch)
+  PASS: Tampered semantic content rejected as expected (signature verification failed)
+  PASS: Tampered signature rejected as expected
+  PASS: Version downgrade rejected as expected
+  PASS: Incompatible schema version rejected as expected
+
+=== ALL VERIFICATION CHECKS PASSED SUCCESSFULLY ===
+
+
+--- GATE: quotio-rs: cargo check -p mahoquot-monitor-ui (cwd: /Users/indo/code/project/quotio-rs) ---
+Exit status: 0
+   Compiling mahoquot-monitor-ui v0.1.0 (/Users/indo/code/project/quotio-rs/crates/monitor-ui)
+warning: mahoquot-monitor-ui@0.1.0: synced mahoquot-gateway from /Users/indo/code/project/mahoquot-proxy/target/debug/mahoquot-gateway
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.74s
+
+
+--- GATE: quotio-rs: cargo test --workspace (cwd: /Users/indo/code/project/quotio-rs) ---
+Exit status: 0
+   Compiling mahoquot-monitor-ui v0.1.0 (/Users/indo/code/project/quotio-rs/crates/monitor-ui)
+warning: mahoquot-monitor-ui@0.1.0: synced mahoquot-gateway from /Users/indo/code/project/mahoquot-proxy/target/debug/mahoquot-gateway
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.30s
+     Running unittests src/main.rs (target/debug/deps/mahoquot-77dbbfb29fe5e068)
+
+running 80 tests
+test gateway_process::tests::remote_gateway_is_never_signaled ... ok
+test gateway_process::tests::owned_sidecar_graceful_shutdown_flushes_and_reaps ... ok
+test bootstrap::tests::api_key_is_never_persisted_in_browser_storage ... ok
+test bootstrap::tests::quote_breaking_characters_never_reach_the_embedded_script ... ok
+test gateway_process::tests::hung_owned_sidecar_escalates_once ... ok
+test bootstrap::tests::seeds_storage_with_the_launched_gateway_coordinates ... ok
+test lifecycle_tests::stop_policy_attempts_graceful_shutdown_before_forcing_exit ... ok
+test lifecycle_tests::a_remote_gateway_target_never_launches_or_reclaims_the_local_port ... ok
+test notch::tests::certified_target_session_matrix_requires_full_notch_parity ... ok
+test lifecycle_tests::reclaim_policy_kills_only_the_gateway_executable ... ok
+test notch::tests::gnome_wayland_is_explicitly_unsupported_without_a_tray_fallback ... ok
+test notch::tests::geometry_matrix ... ok
+test codex_launcher::tests::missing_binary_is_actionable ... ok
+test notch::tests::kde_wayland_requires_layer_shell_and_surface_pointer_tracking ... ok
+test notch::tests::kde_wayland_uses_native_layer_surface_resize ... ok
+test notch::tests::pointer_exit_collapses_before_native_cleanup ... ok
+test notch::tests::removed_monitor_falls_back_to_primary ... ok
+test notch::tests::unsupported_or_mismatched_sessions_fail_with_parity_unsupported ... ok
+test os_integration::tests::login_start_and_auth_isolation_notification ... ok
+test secrets::tests::create_read_update_delete_round_trip ... ok
+test secrets::tests::endpoint_and_profile_separation ... ok
+test secrets::tests::failed_write_preserves_legacy_value ... ok
+test secrets::tests::locked_store_is_actionable ... ok
+test secrets::tests::management_keys_and_totp_material_are_separate ... ok
+test secrets::tests::migrates_legacy_key_and_reconnects ... ok
+test secrets::tests::unavailable_store_is_actionable ... ok
+test secrets::tests::migration_is_one_time_when_keyring_already_has_a_value ... ok
+test self_certification::tests::linux_x11_live_report_requires_exact_native_contract ... ok
+test self_certification::tests::macos_live_report_requires_exact_native_contract ... ok
+test secrets::tests::verification_failure_preserves_legacy_value ... ok
+test stats::tests::expired_reset_clamps_to_zero_not_negative ... ok
+test stats::tests::account_ttft_is_surfaced_per_account ... ok
+test stats::tests::derives_failure_and_failover_rates ... ok
+test stats::tests::degraded_flags_cooldown_and_high_failure_accounts ... ok
+test stats::tests::cooldown_remaining_is_clamped_and_relative ... ok
+test stats::tests::null_ttft_from_idle_account_parses ... ok
+test stats::tests::parses_live_shaped_admin_stats ... ok
+test stats::tests::provider_comes_from_the_gateway_not_a_name_heuristic ... ok
+test stats::tests::surfaces_quota_windows_and_marks_unknown_providers ... ok
+test stats::tests::unrecognized_health_states_are_not_reported_as_degraded ... ok
+test tray_tests::an_open_panel_holds_while_the_pointer_roams_the_corridor_toward_its_card ... ok
+test tray_tests::brink_hover_intent_delays_collapse_and_cancels_it_on_reentry ... ok
+test stats::tests::zero_traffic_never_divides_by_zero ... ok
+test stats::tests::quota_groups_reach_the_native_view ... ok
+test tray_tests::cursor_to_window_local_flips_appkit_origin_to_css_top_left ... ok
+test tray_tests::cursor_within_covers_the_strip_edges_and_rejects_the_gap_beside_it ... ok
+test tray_tests::delayed_collapse_applies_only_to_the_latest_closed_generation ... ok
+test tray_tests::gateway_binary_resolves_env_override_then_exe_sibling ... ok
+test tray_tests::hover_region_keeps_the_panel_open_within_the_edge_corridor ... ok
+test tray_tests::notch_position_centers_island_on_right_edge ... ok
+test tray_tests::notch_position_centers_island_on_secondary_display ... ok
+test tray_tests::notch_position_physical_calculation_applies_scale_factor ... ok
+test tray_tests::notched_monitor_prefers_retina_panel_for_island_placement ... ok
+test tray_tests::screen_overlap_detects_stranded_window_after_display_change ... ok
+test tray_tests::notch_position_clamps_when_window_exceeds_display_bounds ... ok
+test tray_tests::tray_menu_ids_match_contract_constants ... ok
+test tray_tests::shipped_notch_sizes_dock_right_and_stay_vertically_centered ... ok
+test tray_tests::the_app_always_owns_its_gateway ... ok
+test tunnel::tests::checksum_manifest_selects_exact_asset ... ok
+test tunnel::tests::archive_extraction_selects_cloudflared_entry ... ok
+test tunnel::tests::checksum_mismatch_rejected ... ok
+test tray_tests::default_auth_dir_creates_mahoquot_auth_when_missing ... ok
+test tray_tests::default_auth_dir_ignores_existing_legacy_auth_dir ... ok
+test tunnel::tests::unsupported_asset_is_actionable ... ok
+test tunnel::tests::url_parser_rejects_lookalikes ... ok
+test codex_launcher::tests::duplicate_binding_rejected ... ok
+test codex_launcher::tests::two_isolated_instances ... ok
+test cli_config::tests::generated_typed_patches_are_deterministic_and_preserve_unrelated_values ... ok
+test tunnel::tests::modified_installed_binary_is_not_trusted ... ok
+test tunnel::tests::remote_gateway_rejected ... ok
+test cli_config::tests::malformed_config_is_unchanged ... ok
+test cli_config::tests::postwrite_user_edit_reports_restore_conflict ... ok
+test tunnel::tests::mock_download_server_provides_manifest_and_asset ... ok
+test codex_launcher::tests::crash_recovers_without_global_mutation ... ok
+test cli_config::tests::config_targets_never_touch_provider_credentials ... ok
+test tunnel::tests::malformed_output_times_out_without_orphan ... ok
+test cli_config::tests::golden_states_cover_absent_unmanaged_configured_modified_and_backup ... ok
+test cli_config::tests::configure_and_restore_all_adapters ... ok
+test tunnel::tests::fake_cloudflared_start_url_stop ... ok
+test tunnel::tests::crash_clears_state ... ok
+
+test result: ok. 80 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.86s
+
+
+
+--- GATE: quotio-rs: bun run test (cwd: /Users/indo/code/project/quotio-rs/crates/monitor-ui/frontend) ---
+Exit status: 0
+$ vitest run
+
+ RUN  v3.2.7 /Users/indo/code/project/quotio-rs/crates/monitor-ui/frontend
+
+ ✓ src/__tests__/toasts.test.tsx (7 tests) 113ms
+ ✓ src/__tests__/layout.test.tsx (15 tests) 90ms
+ ✓ src/__tests__/agents-surface.test.tsx (1 test) 68ms
+ ✓ src/__tests__/provider-mix-colors.test.tsx (2 tests) 43ms
+ ✓ src/__tests__/durable-logs.test.tsx (4 tests) 172ms
+ ✓ src/__tests__/todo15-focused-red-green.test.tsx (3 tests) 268ms
+ ✓ src/__tests__/totp-vault.test.ts (7 tests) 78ms
+ ✓ src/__tests__/tray-panel.test.tsx (2 tests) 111ms
+ ✓ src/__tests__/dial-probe.test.tsx (2 tests) 70ms
+ ✓ src/__tests__/accounts-surface.test.tsx (10 tests) 273ms
+stderr | src/__tests__/app.test.tsx > operations console > loads management controls without a separate password
+An update to App inside a test was not wrapped in act(...).
+
+When testing, code that causes React state updates should be wrapped into act(...):
+
+act(() => {
+  /* fire events that update state */
+});
+/* assert on the output */
+
+This ensures that you're testing the behavior the user would see in the browser. Learn more at https://react.dev/link/wrap-tests-with-act
+An update to App inside a test was not wrapped in act(...).
+
+When testing, code that causes React state updates should be wrapped into act(...):
+
+act(() => {
+  /* fire events that update state */
+});
+/* assert on the output */
+
+This ensures that you're testing the behavior the user would see in the browser. Learn more at https://react.dev/link/wrap-tests-with-act
+
+ ✓ src/__tests__/connection-settings.test.tsx (2 tests) 216ms
+ ✓ src/__tests__/startup-loading.test.ts (5 tests) 93ms
+ ✓ src/__tests__/codex-launcher.test.tsx (1 test) 83ms
+ ✓ src/__tests__/artifact.test.ts (1 test) 15ms
+ ✓ src/__tests__/tunnel-settings.test.tsx (2 tests) 442ms
+ ✓ src/__tests__/task15-runtime-model-alignment.test.tsx (6 tests) 51ms
+ ✓ src/__tests__/provider-catalog.test.ts (18 tests) 11ms
+ ✓ src/__tests__/api.test.ts (9 tests) 23ms
+ ✓ src/__tests__/operations-history.test.tsx (8 tests) 728ms
+ ✓ src/__tests__/context-menu.test.ts (6 tests) 9ms
+ ✓ src/__tests__/durable-logs-api.test.ts (2 tests) 9ms
+ ✓ src/__tests__/storage.test.ts (9 tests) 12ms
+ ✓ src/__tests__/logs-settings-surface.test.tsx (9 tests) 944ms
+ ✓ src/__tests__/theme-contrast.test.ts (2 tests) 14ms
+ ✓ src/__tests__/telemetry.test.ts (14 tests) 4ms
+ ✓ src/__tests__/schemas.test.ts (6 tests) 4ms
+ ✓ src/__tests__/accounts.test.ts (10 tests) 4ms
+ ✓ src/__tests__/pending.test.ts (7 tests) 2ms
+ ✓ src/__tests__/relay-plans.test.ts (5 tests) 2ms
+ ✓ src/__tests__/notch.test.ts (8 tests) 3ms
+ ✓ src/components/dither-kit/axis-ticks.test.ts (5 tests) 2ms
+ ✓ src/__tests__/provider-colors.test.ts (4 tests) 2ms
+stderr | src/__tests__/app.test.tsx > operations console > does not duplicate dedicated canonical providers in generic key onboarding
+An update to App inside a test was not wrapped in act(...).
+
+When testing, code that causes React state updates should be wrapped into act(...):
+
+act(() => {
+  /* fire events that update state */
+});
+/* assert on the output */
+
+This ensures that you're testing the behavior the user would see in the browser. Learn more at https://react.dev/link/wrap-tests-with-act
+An update to App inside a test was not wrapped in act(...).
+
+When testing, code that causes React state updates should be wrapped into act(...):
+
+act(() => {
+  /* fire events that update state */
+});
+/* assert on the output */
+
+This ensures that you're testing the behavior the user would see in the browser. Learn more at https://react.dev/link/wrap-tests-with-act
+
+stderr | src/__tests__/app.test.tsx > operations console > keeps gateway lifecycle state in Settings instead of rendering an error
+An update to App inside a test was not wrapped in act(...).
+
+When testing, code that causes React state updates should be wrapped into act(...):
+
+act(() => {
+  /* fire events that update state */
+});
+/* assert on the output */
+
+This ensures that you're testing the behavior the user would see in the browser. Learn more at https://react.dev/link/wrap-tests-with-act
+An update to App inside a test was not wrapped in act(...).
+
+When testing, code that causes React state updates should be wrapped into act(...):
+
+act(() => {
+  /* fire events that update state */
+});
+/* assert on the output */
+
+This ensures that you're testing the behavior the user would see in the browser. Learn more at https://react.dev/link/wrap-tests-with-act
+
+stderr | src/__tests__/app.test.tsx > operations console > keeps gateway lifecycle state in Settings instead of rendering an error
+An update to App inside a test was not wrapped in act(...).
+
+When testing, code that causes React state updates should be wrapped into act(...):
+
+act(() => {
+  /* fire events that update state */
+});
+/* assert on the output */
+
+This ensures that you're testing the behavior the user would see in the browser. Learn more at https://react.dev/link/wrap-tests-with-act
+An update to App inside a test was not wrapped in act(...).
+
+When testing, code that causes React state updates should be wrapped into act(...):
+
+act(() => {
+  /* fire events that update state */
+});
+/* assert on the output */
+
+This ensures that you're testing the behavior the user would see in the browser. Learn more at https://react.dev/link/wrap-tests-with-act
+
+ ✓ src/__tests__/app.test.tsx (46 tests) 2276ms
+
+ Test Files  33 passed (33)
+      Tests  238 passed (238)
+   Start at  09:19:39
+   Duration  4.33s (transform 1.34s, setup 6.31s, collect 8.48s, tests 6.24s, environment 16.22s, prepare 2.01s)
+
+
+
+--- GATE: quotio-rs: bun run build (cwd: /Users/indo/code/project/quotio-rs/crates/monitor-ui/frontend) ---
+Exit status: 0
+$ vite build
+vite v6.4.3 building for production...
+transforming...
+✓ 1939 modules transformed.
+rendering chunks...
+[plugin vite:singlefile] 
+
+[plugin vite:singlefile] Inlining: index-D6dSrnPn.js
+[plugin vite:singlefile] Inlining: style-URBITVog.css
+computing gzip size...
+../ui/index.html  797.73 kB │ gzip: 286.58 kB
+✓ built in 1.28s
+
+
+--- GATE: quotio-rs: bun run typecheck (cwd: /Users/indo/code/project/quotio-rs/crates/monitor-ui/frontend) ---
+Exit status: 0
+$ tsc --noEmit
+
+
+--- GATE: quotio-rs: bun run lint (cwd: /Users/indo/code/project/quotio-rs/crates/monitor-ui/frontend) ---
+Exit status: 0
+$ biome check src
+Checked 118 files in 56ms. No fixes applied.
+
+
+=== SUMMARY ===
+ALL 8 CROSS-REPOSITORY GATES PASSED (EXIT CODE 0).

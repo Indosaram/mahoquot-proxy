@@ -1,0 +1,120 @@
+# Single Embedded Catalog Artifact & Legacy Seed Parity (Task 3)
+Plan: .omo/plans/unified-runtime-model-registry.md
+Workspace: /Users/indo/code/project/mahoquot-proxy
+Date: 2026-09-02
+
+## 1. Executive Summary
+Task 3 consolidates every hardcoded model list and seed source previously scattered across:
+- `crates/providers/src/antigravity.rs` (14 ANTIGRAVITY_MODELS)
+- `crates/providers/src/claude.rs` (12 CLAUDE_MODELS)
+- `crates/providers/src/zcode.rs` (5 ZCODE_MODELS)
+- `crates/providers/src/kiro.rs` (8 KIRO_MODELS, exposed as kiro/{model}, auto-kiro alias)
+- `crates/providers/src/cursor.rs` (4 CURSOR_MODELS in /v1/models + 2 cursor-* models)
+- `crates/providers/src/vertex.rs` (21 VERTEX_MODELS)
+- `crates/gateway/src/models_route.rs` (7 Codex DEFAULT_MODELS)
+- `crates/gateway/src/capability.rs` (2 IMAGE_MODELS, 0 VIDEO_MODELS)
+- `crates/gateway/src/management/oauth.rs` (Device OAuth default models: Kimi 5, Qwen 4, Nous 4, GitHub Copilot 5)
+- OpenCode presets (Opencode-Go, Opencode-Free, Opencode-Zen)
+
+All models are centralized into a single canonical source-of-truth JSON artifact:
+`crates/registry/catalog/models-v1.json`
+
+The artifact is statically embedded in `mahoquot-registry` via `include_str!` and exposed via:
+- `pub fn embedded_catalog() -> &'static str`
+- `pub fn embedded_catalog_bytes() -> &'static [u8]`
+- `pub fn embedded_registry_snapshot() -> Result<RegistrySnapshot, RegistryError>`
+- `pub fn embedded_snapshot() -> &'static RegistrySnapshot`
+
+---
+
+## 2. Catalog Inventory Statistics
+- Total Canonical Models: 102
+- Total Registered Providers: 14 (`antigravity`, `claude`, `codex`, `cursor`, `github-copilot`, `kimi`, `kiro`, `nous`, `opencode-free`, `opencode-go`, `opencode-zen`, `qwen`, `vertex`, `zcode`)
+- Total Model Aliases: 5 (`auto-kiro` -> `kiro/auto`, `gemini-3.1-pro-high` -> `gemini-pro-agent`, `gemini-3.1-pro-preview` -> `gemini-pro-agent`, `hy3` -> `tencent/hy3:free`, `kimi-k3` -> `k3`)
+- Total Exclusions: 0
+- Context Limits: 100% of models carry explicit `context_limit` in descriptor metadata
+- Surface Capabilities: Explicitly annotated (all text models have `chat`, `tools`; image-capable models have `image`; video capability is strictly empty)
+
+---
+
+## 3. TDD RED -> GREEN Verification Record
+
+### 3.1 RED Phase
+Before embedding the populated catalog, `catalog/models-v1.json` was initialized with only open provider `codex` and empty models.
+Running `cargo test -p mahoquot-registry --test catalog_tests -- --nocapture`:
+
+```
+running 3 tests
+
+thread 'embedded_catalog_covers_legacy_sources' panicked at crates/registry/tests/catalog_tests.rs:
+Embedded catalog failed legacy source coverage with 94 errors:
+Antigravity model gemini-3.8-flash-high missing from catalog
+Antigravity model gemini-3.7-flash-high missing from catalog
+Antigravity model gemini-3.6-flash-high missing from catalog
+Antigravity model gemini-3.5-flash-low missing from catalog
+Antigravity model gemini-3.5-flash-extra-low missing from catalog
+Antigravity model gemini-3.1-flash-lite missing from catalog
+Antigravity model gemini-3.1-flash-image missing from catalog
+Antigravity model gemini-3.1-pro-low missing from catalog
+Antigravity model gemini-3-flash missing from catalog
+Antigravity model gemini-3-flash-agent missing from catalog
+Antigravity model gemini-pro-agent missing from catalog
+Antigravity model claude-sonnet-4-6 missing from catalog
+Antigravity model claude-opus-4-6-thinking missing from catalog
+Antigravity model gpt-oss-120b-medium missing from catalog
+Claude model claude-sonnet-4-6 missing from catalog
+...
+[94 missing model errors]
+test embedded_catalog_roundtrips_deterministically ... ok
+test test_embedded_catalog_resolves_closed_and_open_models ... FAILED
+test embedded_catalog_covers_legacy_sources ... FAILED
+
+failures:
+    embedded_catalog_covers_legacy_sources
+    test_embedded_catalog_resolves_closed_and_open_models
+
+test result: FAILED. 1 passed; 2 failed; 0 ignored; finished in 0.00s
+```
+
+### 3.2 GREEN Phase
+After populating `crates/registry/catalog/models-v1.json` with all 102 characterized models, correct bindings, priorities, capabilities, and metadata:
+
+```
+$ cargo test -p mahoquot-registry --test catalog_tests -- --nocapture
+running 3 tests
+test test_embedded_catalog_resolves_closed_and_open_models ... ok
+test embedded_catalog_covers_legacy_sources ... ok
+test embedded_catalog_roundtrips_deterministically ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+```
+
+---
+
+## 4. Acceptance Criteria & Verification Matrix
+
+| Acceptance Criterion | Verification Command | Result |
+| --- | --- | --- |
+| RED test captures missing legacy models | `cargo test -p mahoquot-registry --test catalog_tests` | PASS (94 missing errors captured) |
+| Embedded catalog covers all legacy sources | `cargo test -p mahoquot-registry embedded_catalog_covers_legacy_sources -- --exact --nocapture` | PASS (exit 0, 0 errors) |
+| Deterministic byte-level serialization roundtrip | `cargo test -p mahoquot-registry embedded_catalog_roundtrips_deterministically -- --exact --nocapture` | PASS (reparsed JSON byte-identical) |
+| Closed, Open, and Alias resolution | `cargo test -p mahoquot-registry test_embedded_catalog_resolves_closed_and_open_models -- --exact --nocapture` | PASS (closed models resolve, auto-kiro resolves) |
+| All unit & integration tests pass | `cargo test -p mahoquot-registry` | PASS (22 passed; 0 failed) |
+| Gateway baseline tests unaffected | `cargo test -p mahoquot-gateway` | PASS (226 unit + 23 integration passed) |
+| Crate purity invariant | `cargo tree -p mahoquot-registry` | PASS (0 tokio, 0 reqwest, 0 axum, 0 arc-swap) |
+| Formatting and Clippy clean | `cargo fmt --all -- --check && cargo clippy -p mahoquot-registry --all-targets -- -D warnings` | PASS (exit 0) |
+
+---
+
+## 5. Artifact Parity & Determinism Proof
+- Artifact file: `crates/registry/catalog/models-v1.json`
+- Size: 61,720 bytes
+- Canonical reserialization:
+  - `snapshot.to_json_canonical()` generates byte-identical representation.
+  - `BTreeMap` and `BTreeSet` guarantee key-sorted deterministic ordering across platforms.
+- Integrity:
+  - Zero duplicate model keys.
+  - Zero duplicate binding provider keys per model descriptor.
+  - Zero dangling alias targets.
+  - Zero alias cycles.
+  - Zero empty model or provider IDs.

@@ -1,0 +1,21 @@
+TASK 9 QA SCENARIO: CONCURRENT REGISTRY REFRESH GENERATION ATOMICITY
+=====================================================================
+
+Target: cargo test -p mahoquot-gateway concurrent_registry_refresh_is_generation_atomic -- --exact --nocapture
+
+Command Invocation:
+cargo test -p mahoquot-gateway concurrent_registry_refresh_is_generation_atomic -- --exact --nocapture
+
+Result:
+running 1 test
+test concurrent_registry_refresh_is_generation_atomic ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.07s
+
+Verification Summary:
+- 8 concurrent reader threads continuously inspected snapshot.generation(), snapshot.registry().version(), and effective models.
+- 1 concurrent writer thread stepped the registry version across generations 2..=10.
+- Over 1,000 continuous atomic reads performed under concurrency.
+- Zero mixed-generation observations: `mixed_observations == 0`.
+- Final generation and registry version matched the candidate snapshot generation (10).
+- Exit code: 0.

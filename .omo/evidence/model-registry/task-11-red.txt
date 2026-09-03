@@ -1,0 +1,210 @@
+Task 11 RED/GREEN and HTTP QA evidence
+Date: 2026-09-02
+Repository: /Users/indo/code/project/mahoquot-proxy
+Constraint: no live model calls; fixture upstreams only.
+
+=== RED ===
+Command: cargo test -p mahoquot-gateway --test t11_multi_provider_pool -- --nocapture
+
+warning: use of deprecated constant `mahoquot_providers::ANTIGRAVITY_MODELS`: query catalog/registry for models instead
+ --> crates/gateway/src/models_route.rs:4:5
+  |
+4 |     ANTIGRAVITY_MODELS, CLAUDE_MODELS, KIRO_MODELS, VERTEX_MODELS, ZCODE_MODELS,
+  |     ^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated constant `mahoquot_providers::CLAUDE_MODELS`: query catalog/registry for models instead
+ --> crates/gateway/src/models_route.rs:4:25
+  |
+4 |     ANTIGRAVITY_MODELS, CLAUDE_MODELS, KIRO_MODELS, VERTEX_MODELS, ZCODE_MODELS,
+  |                         ^^^^^^^^^^^^^
+
+warning: use of deprecated constant `mahoquot_providers::KIRO_MODELS`: query catalog/registry for models instead
+ --> crates/gateway/src/models_route.rs:4:40
+  |
+4 |     ANTIGRAVITY_MODELS, CLAUDE_MODELS, KIRO_MODELS, VERTEX_MODELS, ZCODE_MODELS,
+  |                                        ^^^^^^^^^^^
+
+warning: use of deprecated constant `mahoquot_providers::VERTEX_MODELS`: query catalog/registry for models instead
+ --> crates/gateway/src/models_route.rs:4:53
+  |
+4 |     ANTIGRAVITY_MODELS, CLAUDE_MODELS, KIRO_MODELS, VERTEX_MODELS, ZCODE_MODELS,
+  |                                                     ^^^^^^^^^^^^^
+
+warning: use of deprecated constant `mahoquot_providers::ZCODE_MODELS`: query catalog/registry for models instead
+ --> crates/gateway/src/models_route.rs:4:68
+  |
+4 |     ANTIGRAVITY_MODELS, CLAUDE_MODELS, KIRO_MODELS, VERTEX_MODELS, ZCODE_MODELS,
+  |                                                                    ^^^^^^^^^^^^
+
+warning: use of deprecated constant `mahoquot_providers::ANTIGRAVITY_MODELS`: query catalog/registry for models instead
+  --> crates/gateway/src/models_route.rs:55:19
+   |
+55 |         for id in ANTIGRAVITY_MODELS {
+   |                   ^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated constant `mahoquot_providers::CLAUDE_MODELS`: query catalog/registry for models instead
+  --> crates/gateway/src/models_route.rs:64:45
+   |
+64 |         (ProviderKind::Claude, "anthropic", CLAUDE_MODELS),
+   |                                             ^^^^^^^^^^^^^
+
+warning: use of deprecated constant `mahoquot_providers::ZCODE_MODELS`: query catalog/registry for models instead
+  --> crates/gateway/src/models_route.rs:65:39
+   |
+65 |         (ProviderKind::Zcode, "z-ai", ZCODE_MODELS),
+   |                                       ^^^^^^^^^^^^
+
+warning: use of deprecated constant `mahoquot_providers::KIRO_MODELS`: query catalog/registry for models instead
+  --> crates/gateway/src/models_route.rs:66:38
+   |
+66 |         (ProviderKind::Kiro, "kiro", KIRO_MODELS),
+   |                                      ^^^^^^^^^^^
+
+warning: use of deprecated constant `mahoquot_providers::VERTEX_MODELS`: query catalog/registry for models instead
+  --> crates/gateway/src/models_route.rs:96:19
+   |
+96 |         for id in VERTEX_MODELS {
+   |                   ^^^^^^^^^^^^^
+
+warning: `mahoquot-gateway` (lib) generated 10 warnings
+   Compiling mahoquot-gateway v0.1.0 (/Users/indo/code/project/mahoquot-proxy/crates/gateway)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.28s
+     Running tests/t11_multi_provider_pool.rs (target/debug/deps/t11_multi_provider_pool-f450cef27fb36c68)
+
+running 6 tests
+
+thread 'pool_loads_every_supported_provider_from_one_auth_dir' (24089626) panicked at crates/gateway/tests/t11_multi_provider_pool.rs:69:6:
+valid credential fixture: Error("expected `:`", line: 1, column: 80)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'each_provider_only_claims_models_it_can_actually_serve' (24089623) panicked at crates/gateway/tests/t11_multi_provider_pool.rs:69:6:
+valid credential fixture: Error("expected `:`", line: 1, column: 80)
+
+thread 'malformed_and_unknown_credentials_are_skipped_without_dropping_valid_members' (24089624) panicked at crates/gateway/tests/t11_multi_provider_pool.rs:69:6:
+valid credential fixture: Error("expected `:`", line: 1, column: 80)
+test pool_loads_every_supported_provider_from_one_auth_dir ... FAILED
+test each_provider_only_claims_models_it_can_actually_serve ... FAILED
+test malformed_and_unknown_credentials_are_skipped_without_dropping_valid_members ... FAILED
+test an_auth_dir_with_only_bad_credentials_yields_an_empty_pool_rather_than_an_error ... ok
+
+thread 'unknown_model_without_loaded_open_binding_is_local_model_not_found' (24089627) panicked at crates/gateway/tests/t11_multi_provider_pool.rs:276:5:
+assertion `left == right` failed
+  left: 503
+ right: 400
+test unknown_model_without_loaded_open_binding_is_local_model_not_found ... FAILED
+
+thread 'overlapping_closed_bindings_follow_registry_priority_not_pool_order' (24089625) panicked at crates/gateway/tests/t11_multi_provider_pool.rs:250:5:
+higher-priority Antigravity binding must win, captured ["/v1/messages"]
+test overlapping_closed_bindings_follow_registry_priority_not_pool_order ... FAILED
+
+failures:
+
+failures:
+    each_provider_only_claims_models_it_can_actually_serve
+    malformed_and_unknown_credentials_are_skipped_without_dropping_valid_members
+    overlapping_closed_bindings_follow_registry_priority_not_pool_order
+    pool_loads_every_supported_provider_from_one_auth_dir
+    unknown_model_without_loaded_open_binding_is_local_model_not_found
+
+test result: FAILED. 1 passed; 5 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+error: test failed, to rerun pass `-p mahoquot-gateway --test t11_multi_provider_pool`
+
+=== RED confirmation after fixture correction ===
+Command: cargo test -p mahoquot-gateway --test t11_multi_provider_pool -- --nocapture
+
+warning: use of deprecated constant `mahoquot_providers::ANTIGRAVITY_MODELS`: query catalog/registry for models instead
+ --> crates/gateway/src/models_route.rs:4:5
+  |
+4 |     ANTIGRAVITY_MODELS, CLAUDE_MODELS, KIRO_MODELS, VERTEX_MODELS, ZCODE_MODELS,
+  |     ^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated constant `mahoquot_providers::CLAUDE_MODELS`: query catalog/registry for models instead
+ --> crates/gateway/src/models_route.rs:4:25
+  |
+4 |     ANTIGRAVITY_MODELS, CLAUDE_MODELS, KIRO_MODELS, VERTEX_MODELS, ZCODE_MODELS,
+  |                         ^^^^^^^^^^^^^
+
+warning: use of deprecated constant `mahoquot_providers::KIRO_MODELS`: query catalog/registry for models instead
+ --> crates/gateway/src/models_route.rs:4:40
+  |
+4 |     ANTIGRAVITY_MODELS, CLAUDE_MODELS, KIRO_MODELS, VERTEX_MODELS, ZCODE_MODELS,
+  |                                        ^^^^^^^^^^^
+
+warning: use of deprecated constant `mahoquot_providers::VERTEX_MODELS`: query catalog/registry for models instead
+ --> crates/gateway/src/models_route.rs:4:53
+  |
+4 |     ANTIGRAVITY_MODELS, CLAUDE_MODELS, KIRO_MODELS, VERTEX_MODELS, ZCODE_MODELS,
+  |                                                     ^^^^^^^^^^^^^
+
+warning: use of deprecated constant `mahoquot_providers::ZCODE_MODELS`: query catalog/registry for models instead
+ --> crates/gateway/src/models_route.rs:4:68
+  |
+4 |     ANTIGRAVITY_MODELS, CLAUDE_MODELS, KIRO_MODELS, VERTEX_MODELS, ZCODE_MODELS,
+  |                                                                    ^^^^^^^^^^^^
+
+warning: use of deprecated constant `mahoquot_providers::ANTIGRAVITY_MODELS`: query catalog/registry for models instead
+  --> crates/gateway/src/models_route.rs:55:19
+   |
+55 |         for id in ANTIGRAVITY_MODELS {
+   |                   ^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated constant `mahoquot_providers::CLAUDE_MODELS`: query catalog/registry for models instead
+  --> crates/gateway/src/models_route.rs:64:45
+   |
+64 |         (ProviderKind::Claude, "anthropic", CLAUDE_MODELS),
+   |                                             ^^^^^^^^^^^^^
+
+warning: use of deprecated constant `mahoquot_providers::ZCODE_MODELS`: query catalog/registry for models instead
+  --> crates/gateway/src/models_route.rs:65:39
+   |
+65 |         (ProviderKind::Zcode, "z-ai", ZCODE_MODELS),
+   |                                       ^^^^^^^^^^^^
+
+warning: use of deprecated constant `mahoquot_providers::KIRO_MODELS`: query catalog/registry for models instead
+  --> crates/gateway/src/models_route.rs:66:38
+   |
+66 |         (ProviderKind::Kiro, "kiro", KIRO_MODELS),
+   |                                      ^^^^^^^^^^^
+
+warning: use of deprecated constant `mahoquot_providers::VERTEX_MODELS`: query catalog/registry for models instead
+  --> crates/gateway/src/models_route.rs:96:19
+   |
+96 |         for id in VERTEX_MODELS {
+   |                   ^^^^^^^^^^^^^
+
+warning: `mahoquot-gateway` (lib) generated 10 warnings
+   Compiling mahoquot-gateway v0.1.0 (/Users/indo/code/project/mahoquot-proxy/crates/gateway)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.33s
+     Running tests/t11_multi_provider_pool.rs (target/debug/deps/t11_multi_provider_pool-f450cef27fb36c68)
+
+running 6 tests
+test an_auth_dir_with_only_bad_credentials_yields_an_empty_pool_rather_than_an_error ... ok
+test malformed_and_unknown_credentials_are_skipped_without_dropping_valid_members ... ok
+test pool_loads_every_supported_provider_from_one_auth_dir ... ok
+test each_provider_only_claims_models_it_can_actually_serve ... ok
+
+thread 'unknown_model_without_loaded_open_binding_is_local_model_not_found' (24092246) panicked at crates/gateway/tests/t11_multi_provider_pool.rs:276:5:
+assertion `left == right` failed
+  left: 503
+ right: 400
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test unknown_model_without_loaded_open_binding_is_local_model_not_found ... FAILED
+
+thread 'overlapping_closed_bindings_follow_registry_priority_not_pool_order' (24092244) panicked at crates/gateway/tests/t11_multi_provider_pool.rs:250:5:
+higher-priority Antigravity binding must win, captured ["/v1/messages"]
+test overlapping_closed_bindings_follow_registry_priority_not_pool_order ... FAILED
+
+failures:
+
+failures:
+    overlapping_closed_bindings_follow_registry_priority_not_pool_order
+    unknown_model_without_loaded_open_binding_is_local_model_not_found
+
+test result: FAILED. 4 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+error: test failed, to rerun pass `-p mahoquot-gateway --test t11_multi_provider_pool`

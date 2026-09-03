@@ -1,0 +1,25 @@
+TASK 10: VALIDATE LOCAL ALIASES, EXCLUSIONS, AND OVERRIDES TRANSACTIONALLY
+=========================================================================
+
+[SCENARIO 1 - VALID ALIAS]
+Status: 200 OK
+Response: {"status":"ok"}
+Model resolution for 'flash-next': canonical_id = 'gemini-next-flash-high' (OK)
+
+[SCENARIO 2 - CYCLIC ALIAS REJECTION]
+Status: 400 Bad Request
+Response: {"error":"alias cycle detected for 'cycle-a': [ModelId(\"cycle-a\"), ModelId(\"cycle-b\"), ModelId(\"cycle-a\")]"}
+Pool generation before cycle: 2
+Pool generation after cycle: 2
+Atomic generation non-mutation confirmed.
+
+[SCENARIO 3 - UNKNOWN TARGET REJECTION]
+Status: 400 Bad Request
+Response: {"error":"alias 'flash-void' points to unknown target 'completely-unknown-void-model'"}
+Unknown alias target rejection confirmed.
+
+[SCENARIO 4 - PROVIDER BLACKOUT REJECTION]
+Status: 400 Bad Request
+Response: {"error":"provider blackout: exclusions eliminate all fallback-routable models for provider 'antigravity' without explicit override"}
+Complete provider blackout rejection confirmed.
+

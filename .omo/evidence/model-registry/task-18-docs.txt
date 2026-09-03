@@ -1,0 +1,158 @@
+================================================================================
+TASK 18 OPERATOR DRY-RUN QA & EVIDENCE RECEIPT
+Date: Thu Sep  3 00:03:04 UTC 2026
+Host: Darwin arm64 arm
+================================================================================
+
+--- Step 1: Validate Catalog using CLI Tooling ---
+Catalog valid: /Users/indo/code/project/mahoquot-proxy/crates/registry/catalog/models-v1.json (version: v1, models: 102, providers: 14, aliases: 5, exclusions: 0)
+
+--- Step 2: Sign Catalog using Fixture Key into Temp Dir ---
+Temp dir: /var/folders/zh/7cc25lt91b1_dj577306nwdh0000gn/T/tmp.51xHL0Z6XW
+Signed catalog: version=v1, key_id='test-ed25519-v1', models=102, generated_at=1788393788
+  Output payload: /var/folders/zh/7cc25lt91b1_dj577306nwdh0000gn/T/tmp.51xHL0Z6XW/models-v1.json
+  Output signature: /var/folders/zh/7cc25lt91b1_dj577306nwdh0000gn/T/tmp.51xHL0Z6XW/models-v1.json.sig
+
+Generated artifacts in /var/folders/zh/7cc25lt91b1_dj577306nwdh0000gn/T/tmp.51xHL0Z6XW:
+total 112
+-rw-r--r--@ 1 indo  staff    44K Sep  3 09:03 models-v1.json
+-rw-r--r--@ 1 indo  staff   217B Sep  3 09:03 models-v1.json.sig
+-rw-r--r--@ 1 indo  staff   997B Sep  3 09:03 task-18-docs.txt
+
+Envelope contents (/var/folders/zh/7cc25lt91b1_dj577306nwdh0000gn/T/tmp.51xHL0Z6XW/models-v1.json.sig):
+{
+  "schema_version": 1,
+  "catalog_version": 1,
+  "key_id": "test-ed25519-v1",
+  "generated_at": 1788393788,
+  "signature": "S2xDyaxDomjeJHh7M5xcZ3PQ20jFfKO5k0nPebo7CQ2P/nsex3W9SMuXisVWl178d1w1FUMYlQQLWckWwkf7AQ=="
+}
+--- Step 3: Verify Signed Catalog Envelope ---
+Verified catalog: version=v1, source=embedded_fallback, models=102, key_id='test-ed25519-v1', generated_at=1788393788
+
+--- Step 4: Run scripts/verify-catalog.sh pipeline ---
+=== Mahoquot Model Catalog Verification Pipeline ===
+Workspace root: /Users/indo/code/project/mahoquot-proxy
+
+[Step 1/6] Checking required files...
+  OK: crates/registry/catalog/models-v1.json
+  OK: crates/registry/schema/catalog-v1.schema.json
+  OK: crates/registry/schema/envelope-v1.schema.json
+  OK: tests/fixtures/test-ed25519.key
+  OK: tests/fixtures/test-ed25519.pub
+
+[Step 2/6] Validating catalog and envelope JSON Schemas...
+  OK: Both schemas are syntactically valid JSON Schema draft-07 documents
+
+[Step 3/6] Validating catalog with mahoquot-model-catalog...
+Catalog valid: crates/registry/catalog/models-v1.json (version: v1, models: 102, providers: 14, aliases: 5, exclusions: 0)
+
+[Step 4/6] Canonicalizing and signing catalog with test Ed25519 key...
+Signed catalog: version=v1, key_id='test-ed25519-v1', models=102, generated_at=1788393790
+  Output payload: /var/folders/zh/7cc25lt91b1_dj577306nwdh0000gn/T/tmp.yNwtmFkaP7/models-v1.json
+  Output signature: /var/folders/zh/7cc25lt91b1_dj577306nwdh0000gn/T/tmp.yNwtmFkaP7/models-v1.json.sig
+  Generated canonical payload at /var/folders/zh/7cc25lt91b1_dj577306nwdh0000gn/T/tmp.yNwtmFkaP7/models-v1.json
+  Generated signature envelope at /var/folders/zh/7cc25lt91b1_dj577306nwdh0000gn/T/tmp.yNwtmFkaP7/models-v1.json.sig
+
+[Step 5/6] Verifying signed envelope with public key...
+Verified catalog: version=v1, source=embedded_fallback, models=102, key_id='test-ed25519-v1', generated_at=1788393790
+
+[Step 6/6] Running adversarial rejection tests...
+  PASS: Tampered payload rejected as expected (canonicalization mismatch)
+  PASS: Tampered semantic content rejected as expected (signature verification failed)
+  PASS: Tampered signature rejected as expected
+  PASS: Version downgrade rejected as expected
+  PASS: Incompatible schema version rejected as expected
+
+=== ALL VERIFICATION CHECKS PASSED SUCCESSFULLY ===
+
+--- Step 5: Verification of Remote Branches & Live Services Isolation ---
+git status mahoquot-proxy:
+ M Cargo.lock
+ M Cargo.toml
+ M README.md
+ M crates/gateway/Cargo.toml
+ M crates/gateway/src/account.rs
+ M crates/gateway/src/capability.rs
+ M crates/gateway/src/compat/gemini.rs
+ M crates/gateway/src/config.rs
+ M crates/gateway/src/cp_routes.rs
+ M crates/gateway/src/lib.rs
+ M crates/gateway/src/main.rs
+ M crates/gateway/src/management/core.rs
+ M crates/gateway/src/management/mod.rs
+ M crates/gateway/src/management/oauth.rs
+ M crates/gateway/src/management/scalars.rs
+ M crates/gateway/src/management/settings.rs
+ M crates/gateway/src/management/store.rs
+ M crates/gateway/src/metrics.rs
+ M crates/gateway/src/models_route.rs
+ M crates/gateway/src/relay.rs
+ M crates/gateway/src/routes.rs
+ M crates/gateway/src/state.rs
+ M crates/gateway/tests/config_endpoints_tests.rs
+ M crates/gateway/tests/t11_multi_provider_pool.rs
+ M crates/gateway/tests/t21_version_handshake.rs
+ M crates/gateway/tests/t22_command_code_import_validation.rs
+ M crates/gateway/tests/t6_inbound_auth.rs
+ M crates/providers/Cargo.toml
+ M crates/providers/src/antigravity.rs
+ M crates/providers/src/claude.rs
+ M crates/providers/src/cursor.rs
+ M crates/providers/src/kiro.rs
+ M crates/providers/src/lib.rs
+ M crates/providers/src/vertex.rs
+ M crates/providers/src/zcode.rs
+ M docs/examples/management-contract-v1.json
+ M docs/management-contract-v1.schema.json
+?? .github/workflows/model-catalog.yml
+?? .omo/evidence/model-registry/
+?? crates/gateway/src/management/registry.rs
+?? crates/gateway/src/registry/
+?? crates/gateway/src/runtime_state.rs
+?? crates/gateway/tests/catalog_lkg_recovery.rs
+?? crates/gateway/tests/management_registry.rs
+?? crates/gateway/tests/model_capabilities.rs
+?? crates/gateway/tests/model_catalog_settings.rs
+?? crates/gateway/tests/model_registry_lifecycle.rs
+?? crates/gateway/tests/pool_snapshot.rs
+?? crates/gateway/tests/task_10_qa_driver.rs
+?? crates/gateway/tests/task_11_qa_driver.rs
+?? crates/gateway/tests/task_12_qa_driver.rs
+?? crates/gateway/tests/task_13_qa_driver.rs
+?? crates/gateway/tests/task_14_qa_driver.rs
+?? crates/providers/src/codex.rs
+?? crates/providers/tests/
+?? crates/registry/
+?? docs/catalog-publication.md
+?? docs/schemas/
+?? scripts/
+?? tests/
+?? tools/model-catalog/
+git status quotio-rs:
+ M crates/monitor-ui/frontend/e2e/todo13-focused.spec.ts
+ M crates/monitor-ui/frontend/src/App.tsx
+ M crates/monitor-ui/frontend/src/__tests__/operations-history.test.tsx
+ M crates/monitor-ui/frontend/src/components/AgentsSurface.tsx
+ M crates/monitor-ui/frontend/src/components/DurableLogs.tsx
+ M crates/monitor-ui/frontend/src/components/SettingsSurface.tsx
+ M crates/monitor-ui/frontend/src/components/TotpVaultSurface.tsx
+ M crates/monitor-ui/frontend/src/components/ui.tsx
+ M crates/monitor-ui/frontend/src/hooks/useGatewayPolling.ts
+ M crates/monitor-ui/frontend/src/lib/api.ts
+ M crates/monitor-ui/frontend/src/lib/pending.ts
+ M crates/monitor-ui/frontend/src/lib/schemas.ts
+ M crates/monitor-ui/frontend/src/styles/globals.css
+ M crates/monitor-ui/ui/index.html
+ M docs/CONTRACTS.md
+ M docs/examples/management-contract-v1.json
+?? crates/monitor-ui/frontend/src/__tests__/task15-runtime-model-alignment.test.tsx
+Git remotes in mahoquot-proxy:
+origin	https://github.com/Indosaram/mahoquot-proxy.git (fetch)
+origin	https://github.com/Indosaram/mahoquot-proxy.git (push)
+Remote branch check (dry-run only; no remote pushes performed):
+Confirmed: Zero remote branches modified, zero live service calls made.
+
+================================================================================
+OPERATOR DRY-RUN COMPLETE - ALL CHECKS PASSED
+================================================================================

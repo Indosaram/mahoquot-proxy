@@ -1,0 +1,176 @@
+=== TASK 6 OFFLINE-FIRST CATALOG LOADING & ATOMIC LKG CACHE EVIDENCE ===
+Plan: .omo/plans/unified-runtime-model-registry.md
+Workspace: /Users/indo/code/project/mahoquot-proxy
+Crate: crates/gateway (mahoquot-gateway)
+Date: 2026-09-02
+Host: Darwin arm64 (Apple M4 Max)
+
+## 1. Executive Summary
+
+Task 6 implements offline-first catalog loading, Last-Known-Good (LKG) disk cache persistence, and runtime catalog management in `mahoquot-gateway` (`crates/gateway/src/registry/`).
+
+Key architectural invariants implemented and verified:
+1. Dependency & loading order:
+   - Synchronous boot sequence loads embedded fallback catalog (`mahoquot_registry::embedded_registry_snapshot()`).
+   - Checks configured state dir or default `~/.mahoquot/cache/models-v1.signed.json` for LKG cache.
+   - If LKG exists, is valid, and has version >= embedded version, LKG is adopted with source `CatalogSource::LkgCache`.
+   - Background remote update fetches signed envelope and canonical payload without blocking gateway relay hot paths.
+2. Graceful error recovery & zero startup failure:
+   - If LKG cache file is absent: boots cleanly with embedded catalog, recording `CatalogSource::EmbeddedFallback`.
+   - If LKG cache is corrupted, has invalid signature, tampered payload bytes, or invalid JSON: logs a warning and falls back gracefully to embedded catalog without startup failure or panic.
+3. Atomic LKG persistence:
+   - Verified updates are persisted to disk via tempfile creation in same directory (`.{filename}.tmp.{pid}.{nonce}`).
+   - Unix 0600 (`-rw-------`) mode is enforced upon file creation and verified on disk.
+   - `file.sync_all()` flushes data and metadata to disk prior to atomic rename (`fs::rename`).
+   - Temporary files are cleanly unlinked on write failures.
+4. Active snapshot publication:
+   - Snapshots are exposed lock-free through `ArcSwap<RegistrySnapshot>`, allowing zero-latency reads on relay paths.
+   - Verified updates swap `Arc<RegistrySnapshot>` atomically without intermediate inconsistent states.
+   - Failed remote refreshes (HTTP 500, network loss, signature tampering, downgrade) leave both active snapshot and LKG cache completely unchanged.
+5. Strict anti-downgrade & network safety:
+   - Remote updates require strictly monotonic catalog versions exceeding both active and LKG versions. Equal and lower versions are rejected.
+   - HTTPS-only transport is enforced for remote catalogs (with loopback/localhost permitted for test harnesses). URLs with embedded credentials are explicitly rejected. Responses exceeding size caps (5MB default) are rejected.
+
+---
+
+## 2. TDD RED Phase: Verification Stubs & Failing Assertions
+
+Initial implementation defined `LkgCache` and `CatalogManager` method stubs with `todo!()`, asserting RED on the 4 mandatory test scenarios:
+1. Boot with no network & no LKG (uses embedded).
+2. Boot with valid LKG (uses LKG).
+3. Boot with corrupted LKG (falls back to embedded without crashing).
+4. Atomic write of new verified LKG.
+
+Invocation:
+```
+$ cargo test -p mahoquot-gateway --test catalog_lkg_recovery
+```
+
+RED Output:
+```
+   Compiling mahoquot-gateway v0.1.0 (/Users/indo/code/project/mahoquot-proxy/crates/gateway)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.03s
+     Running tests/catalog_lkg_recovery.rs (target/debug/deps/catalog_lkg_recovery-d5b4c6e517ae6f1c)
+
+running 4 tests
+test test_boot_no_network_no_lkg_uses_embedded ... FAILED
+test test_boot_corrupted_lkg_falls_back_to_embedded ... FAILED
+test test_atomic_write_of_new_verified_lkg ... FAILED
+test test_boot_valid_lkg_uses_lkg ... FAILED
+
+failures:
+
+---- test_boot_no_network_no_lkg_uses_embedded stdout ----
+thread 'test_boot_no_network_no_lkg_uses_embedded' panicked at crates/gateway/src/registry/manager.rs:56:9:
+not yet implemented: CatalogManager::boot
+
+---- test_boot_corrupted_lkg_falls_back_to_embedded stdout ----
+thread 'test_boot_corrupted_lkg_falls_back_to_embedded' panicked at crates/gateway/src/registry/manager.rs:56:9:
+not yet implemented: CatalogManager::boot
+
+---- test_atomic_write_of_new_verified_lkg stdout ----
+thread 'test_atomic_write_of_new_verified_lkg' panicked at crates/gateway/src/registry/manager.rs:56:9:
+not yet implemented: CatalogManager::boot
+
+---- test_boot_valid_lkg_uses_lkg stdout ----
+thread 'test_boot_valid_lkg_uses_lkg' panicked at crates/gateway/src/registry/cache.rs:72:9:
+not yet implemented: LkgCache::write_atomically
+
+failures:
+    test_atomic_write_of_new_verified_lkg
+    test_boot_corrupted_lkg_falls_back_to_embedded
+    test_boot_no_network_no_lkg_uses_embedded
+    test_boot_valid_lkg_uses_lkg
+
+test result: FAILED. 0 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+```
+
+---
+
+## 3. TDD GREEN Phase: Implementation & Verification
+
+Completed implementation in:
+- `crates/gateway/src/registry/mod.rs`
+- `crates/gateway/src/registry/cache.rs`
+- `crates/gateway/src/registry/manager.rs`
+- `crates/gateway/src/registry/error.rs`
+- `crates/gateway/tests/catalog_lkg_recovery.rs`
+
+Invocation:
+```
+$ cargo test -p mahoquot-gateway --test catalog_lkg_recovery -- --nocapture
+```
+
+GREEN Output:
+```
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.08s
+     Running tests/catalog_lkg_recovery.rs (target/debug/deps/catalog_lkg_recovery-7d88feab6037e746)
+
+running 12 tests
+test test_remote_url_with_credentials_rejected ... ok
+test test_insecure_remote_url_rejected ... ok
+test test_update_corrupted_signature_rejected_leaves_active_and_lkg_unchanged ... ok
+test test_fetch_and_update_with_local_mock_server_500_leaves_active_and_lkg_unchanged ... ok
+test test_boot_no_network_no_lkg_uses_embedded ... ok
+test test_boot_corrupted_lkg_falls_back_to_embedded ... ok
+test test_boot_valid_lkg_uses_lkg ... ok
+test test_boot_corrupted_signature_in_lkg_falls_back_to_embedded ... ok
+test test_update_downgrade_rejected_leaves_active_and_lkg_unchanged ... ok
+test test_boot_corrupted_payload_bytes_in_lkg_falls_back_to_embedded ... ok
+test test_fetch_and_update_with_local_mock_server_success ... ok
+test test_atomic_write_of_new_verified_lkg ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+```
+
+---
+
+## 4. Scenario Breakdown
+
+### Scenario 1: Boot with no network & no LKG (Uses Embedded)
+- Path: `test_boot_no_network_no_lkg_uses_embedded`
+- Invariant: Cache path points to non-existent location. Boot succeeds synchronously.
+- Active Version: Matches `embedded_registry_snapshot().version()`.
+- Active Source: `CatalogSource::EmbeddedFallback`.
+- LKG Version: `None`.
+
+### Scenario 2: Boot with valid LKG (Uses LKG)
+- Path: `test_boot_valid_lkg_uses_lkg`
+- Invariant: Valid signed catalog with version 888 and custom model is present in LKG file.
+- Active Version: CatalogVersion(888).
+- Active Source: `CatalogSource::LkgCache`.
+- Resolution: Model descriptor from LKG resolves immediately.
+- LKG Version: `Some(CatalogVersion(888))`.
+
+### Scenario 3: Boot with corrupted LKG (Falls back to embedded without crash)
+- Path: `test_boot_corrupted_lkg_falls_back_to_embedded`, `test_boot_corrupted_signature_in_lkg_falls_back_to_embedded`, `test_boot_corrupted_payload_bytes_in_lkg_falls_back_to_embedded`
+- Invariant: LKG contains malformed JSON, invalid signature bytes, or tampered payload bytes.
+- Outcome: Manager logs warning, does not crash or panic.
+- Active Version: Embedded catalog version.
+- Active Source: `CatalogSource::EmbeddedFallback`.
+- Status: Records warning in `last_error`, reports `lkg_version = None`.
+
+### Scenario 4: Atomic write of new verified LKG
+- Path: `test_atomic_write_of_new_verified_lkg`
+- Invariant: Verified remote update is received and applied.
+- Active Version: Transitioned from embedded to new version.
+- Active Source: `CatalogSource::RemoteSigned`.
+- Disk State: `models-v1.signed.json` exists on disk.
+- Unix Permissions: File permissions verified as `0o600` (`-rw-------`).
+- Reboot Test: Fresh `CatalogManager` instance rebooting from that cache path adopts version with `CatalogSource::LkgCache` without network connection.
+
+### Scenario 5: Remote Refresh Failures Leave State Unchanged
+- Path: `test_fetch_and_update_with_local_mock_server_500_leaves_active_and_lkg_unchanged`, `test_update_corrupted_signature_rejected_leaves_active_and_lkg_unchanged`, `test_update_downgrade_rejected_leaves_active_and_lkg_unchanged`
+- Invariant: Remote HTTP 500 error, corrupted signature, or version downgrade attempt.
+- Outcome: Error returned. Active snapshot version and source remain identical to pre-attempt state. Disk cache file is not created or modified. Status records refresh failure.
+
+---
+
+## 5. Gateway Test Suite Verification
+
+Invocation:
+```
+$ cargo test -p mahoquot-gateway
+```
+Result: 226 library unittests + 12 catalog recovery tests + 15 config endpoint tests + all integration tests pass with 0 failures, 0 ignored.
+Linting: `cargo clippy -p mahoquot-gateway -- -D warnings` and `cargo fmt --all -- --check` pass clean.

@@ -1,0 +1,249 @@
+GET /healthz HTTP/1.1
+Host: 127.0.0.1:18880
+
+HTTP/1.1 200 OK
+content-type: application/json
+access-control-allow-origin: *
+access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
+access-control-allow-headers: Authorization, Content-Type
+content-length: 48
+date: Thu, 03 Sep 2026 00:21:08 GMT
+
+{"api_schema":1,"status":"ok","version":"0.1.0"}
+
+---
+
+GET /v1/models HTTP/1.1
+Host: 127.0.0.1:18880
+Authorization: Bearer test-admin
+
+HTTP/1.1 200 OK
+content-type: application/json
+access-control-allow-origin: *
+access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
+access-control-allow-headers: Authorization, Content-Type
+content-length: 1344
+date: Thu, 03 Sep 2026 00:21:08 GMT
+
+{"data":[{"created":1788394868,"id":"claude-opus-4-6-thinking","object":"model","owned_by":"google"},{"created":1788394868,"id":"claude-sonnet-4-6","object":"model","owned_by":"google"},{"created":1788394868,"id":"gemini-3-flash","object":"model","owned_by":"google"},{"created":1788394868,"id":"gemini-3-flash-agent","object":"model","owned_by":"google"},{"created":1788394868,"id":"gemini-3.1-flash-image","object":"model","owned_by":"google"},{"created":1788394868,"id":"gemini-3.1-flash-lite","object":"model","owned_by":"google"},{"created":1788394868,"id":"gemini-3.1-pro-low","object":"model","owned_by":"google"},{"created":1788394868,"id":"gemini-3.5-flash-extra-low","object":"model","owned_by":"google"},{"created":1788394868,"id":"gemini-3.5-flash-low","object":"model","owned_by":"google"},{"created":1788394868,"id":"gemini-3.6-flash-high","object":"model","owned_by":"google"},{"created":1788394868,"id":"gemini-3.7-flash-high","object":"model","owned_by":"google"},{"created":1788394868,"id":"gemini-3.8-flash-high","object":"model","owned_by":"google"},{"created":1788394868,"id":"gemini-pro-agent","object":"model","owned_by":"google"},{"created":1788394868,"id":"gpt-oss-120b-medium","object":"model","owned_by":"google"},{"created":1788394868,"id":"task-17-test-model","object":"model","owned_by":"google"}],"object":"list"}
+
+---
+
+GET /v1beta/models HTTP/1.1
+Host: 127.0.0.1:18880
+Authorization: Bearer test-admin
+
+HTTP/1.1 200 OK
+content-type: application/json
+access-control-allow-origin: *
+access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
+access-control-allow-headers: Authorization, Content-Type
+content-length: 3899
+date: Thu, 03 Sep 2026 00:21:08 GMT
+
+{"models":[{"description":"claude-opus-4-6-thinking","displayName":"claude-opus-4-6-thinking","name":"models/claude-opus-4-6-thinking","supportedGenerationMethods":["generateContent"],"supportedInputModalities":["text","image","audio","video"],"supportedOutputModalities":["text"]},{"description":"claude-sonnet-4-6","displayName":"claude-sonnet-4-6","name":"models/claude-sonnet-4-6","supportedGenerationMethods":["generateContent"],"supportedInputModalities":["text","image","audio","video"],"supportedOutputModalities":["text"]},{"description":"gemini-3-flash","displayName":"gemini-3-flash","name":"models/gemini-3-flash","supportedGenerationMethods":["generateContent"],"supportedInputModalities":["text","image","audio","video"],"supportedOutputModalities":["text"]},{"description":"gemini-3-flash-agent","displayName":"gemini-3-flash-agent","name":"models/gemini-3-flash-agent","supportedGenerationMethods":["generateContent"],"supportedInputModalities":["text","image","audio","video"],"supportedOutputModalities":["text"]},{"description":"gemini-3.1-flash-image","displayName":"gemini-3.1-flash-image","name":"models/gemini-3.1-flash-image","supportedGenerationMethods":["generateContent"],"supportedInputModalities":["text","image","audio","video"],"supportedOutputModalities":["text","image"]},{"description":"gemini-3.1-flash-lite","displayName":"gemini-3.1-flash-lite","name":"models/gemini-3.1-flash-lite","supportedGenerationMethods":["generateContent"],"supportedInputModalities":["text","image","audio","video"],"supportedOutputModalities":["text"]},{"description":"gemini-3.1-pro-low","displayName":"gemini-3.1-pro-low","name":"models/gemini-3.1-pro-low","supportedGenerationMethods":["generateContent"],"supportedInputModalities":["text","image","audio","video"],"supportedOutputModalities":["text"]},{"description":"gemini-3.5-flash-extra-low","displayName":"gemini-3.5-flash-extra-low","name":"models/gemini-3.5-flash-extra-low","supportedGenerationMethods":["generateContent"],"supportedInputModalities":["text","image","audio","video"],"supportedOutputModalities":["text"]},{"description":"gemini-3.5-flash-low","displayName":"gemini-3.5-flash-low","name":"models/gemini-3.5-flash-low","supportedGenerationMethods":["generateContent"],"supportedInputModalities":["text","image","audio","video"],"supportedOutputModalities":["text"]},{"description":"gemini-3.6-flash-high","displayName":"gemini-3.6-flash-high","name":"models/gemini-3.6-flash-high","supportedGenerationMethods":["generateContent"],"supportedInputModalities":["text","image","audio","video"],"supportedOutputModalities":["text"]},{"description":"gemini-3.7-flash-high","displayName":"gemini-3.7-flash-high","name":"models/gemini-3.7-flash-high","supportedGenerationMethods":["generateContent"],"supportedInputModalities":["text","image","audio","video"],"supportedOutputModalities":["text"]},{"description":"gemini-3.8-flash-high","displayName":"gemini-3.8-flash-high","name":"models/gemini-3.8-flash-high","supportedGenerationMethods":["generateContent"],"supportedInputModalities":["text","image","audio","video"],"supportedOutputModalities":["text"]},{"description":"gemini-pro-agent","displayName":"gemini-pro-agent","name":"models/gemini-pro-agent","supportedGenerationMethods":["generateContent"],"supportedInputModalities":["text","image","audio","video"],"supportedOutputModalities":["text"]},{"description":"gpt-oss-120b-medium","displayName":"gpt-oss-120b-medium","name":"models/gpt-oss-120b-medium","supportedGenerationMethods":["generateContent"],"supportedInputModalities":["text","image","audio","video"],"supportedOutputModalities":["text"]},{"description":"task-17-test-model","displayName":"task-17-test-model","name":"models/task-17-test-model","supportedGenerationMethods":["generateContent"],"supportedInputModalities":["text","image","audio","video"],"supportedOutputModalities":["text"]}]}
+
+---
+
+GET /v0/management/model-registry HTTP/1.1
+Host: 127.0.0.1:18880
+Authorization: Bearer test-admin
+
+HTTP/1.1 200 OK
+content-type: application/json
+x-cpa-version: 7.2.140
+x-cpa-commit: a7e3596b
+x-cpa-build-date: 2026-08-22T14:51:09Z
+x-cpa-support-plugin: 1
+access-control-expose-headers: X-CPA-TRACE-ID, X-CPA-VERSION, X-CPA-COMMIT, X-CPA-BUILD-DATE, X-CPA-SUPPORT-PLUGIN, X-CPA-HOME-VERSION, X-CPA-HOME-BUILD-DATE, X-SERVER-VERSION, X-SERVER-BUILD-DATE, Location, Retry-After, X-Request-Id, OpenAI-Request-Id
+access-control-allow-origin: *
+access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
+access-control-allow-headers: Authorization, Content-Type
+content-length: 282
+date: Thu, 03 Sep 2026 00:21:08 GMT
+
+{"source":"lkg_cache","catalog-version":2,"generation":1,"generated-at":1788394868,"loaded-at":1788394868,"stale":false,"last-refresh":{"outcome":"never","attempted-at":null,"duration-ms":null,"rejection-reason":null},"provider-count":14,"model-count":103,"refresh-in-flight":false}
+
+---
+
+POST /v1/chat/completions HTTP/1.1
+Host: 127.0.0.1:18880
+Authorization: Bearer test-user
+Content-Type: application/json
+
+{
+  "model": "claude-sonnet-4-6",
+  "messages": [
+    {
+      "role": "user",
+      "content": "hello"
+    }
+  ]
+}
+
+HTTP/1.1 200 OK
+content-type: application/json
+access-control-allow-origin: *
+access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
+access-control-allow-headers: Authorization, Content-Type
+content-length: 387
+date: Thu, 03 Sep 2026 00:21:08 GMT
+
+{"choices":[{"finish_reason":"stop","index":0,"message":{"content":"hello from antigravity fixture","role":"assistant"}}],"created":1788394868,"id":"chatcmpl-ag_task17","model":"claude-sonnet-4-6","object":"chat.completion","usage":{"completion_tokens":5,"completion_tokens_details":{"reasoning_tokens":0},"prompt_tokens":5,"prompt_tokens_details":{"cached_tokens":0},"total_tokens":10}}
+
+---
+
+POST /v1/chat/completions HTTP/1.1
+Host: 127.0.0.1:18880
+Authorization: Bearer test-user
+Content-Type: application/json
+
+{
+  "model": "completely-unknown-fixture-model-xyz",
+  "messages": [
+    {
+      "role": "user",
+      "content": "hello"
+    }
+  ]
+}
+
+HTTP/1.1 400 Bad Request
+content-type: application/json
+access-control-allow-origin: *
+access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
+access-control-allow-headers: Authorization, Content-Type
+content-length: 159
+date: Thu, 03 Sep 2026 00:21:08 GMT
+
+{"error":{"code":"model_not_found","message":"unknown provider for model completely-unknown-fixture-model-xyz","param":"model","type":"invalid_request_error"}}
+
+---
+
+PUT /v0/management/oauth-model-alias HTTP/1.1
+Host: 127.0.0.1:18880
+Authorization: Bearer test-admin
+Content-Type: application/json
+
+{
+  "antigravity": [
+    {
+      "name": "cycle-b",
+      "alias": "cycle-a"
+    },
+    {
+      "name": "cycle-a",
+      "alias": "cycle-b"
+    }
+  ]
+}
+
+HTTP/1.1 400 Bad Request
+content-type: application/json
+x-cpa-version: 7.2.140
+x-cpa-commit: a7e3596b
+x-cpa-build-date: 2026-08-22T14:51:09Z
+x-cpa-support-plugin: 1
+access-control-expose-headers: X-CPA-TRACE-ID, X-CPA-VERSION, X-CPA-COMMIT, X-CPA-BUILD-DATE, X-CPA-SUPPORT-PLUGIN, X-CPA-HOME-VERSION, X-CPA-HOME-BUILD-DATE, X-SERVER-VERSION, X-SERVER-BUILD-DATE, Location, Retry-After, X-Request-Id, OpenAI-Request-Id
+access-control-allow-origin: *
+access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
+access-control-allow-headers: Authorization, Content-Type
+content-length: 114
+date: Thu, 03 Sep 2026 00:21:08 GMT
+
+{"error":"alias cycle detected for 'cycle-a': [ModelId(\"cycle-a\"), ModelId(\"cycle-b\"), ModelId(\"cycle-a\")]"}
+
+---
+
+GET /healthz HTTP/1.1
+Host: 127.0.0.1:18880
+
+HTTP/1.1 200 OK
+content-type: application/json
+access-control-allow-origin: *
+access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
+access-control-allow-headers: Authorization, Content-Type
+content-length: 48
+date: Thu, 03 Sep 2026 00:21:10 GMT
+
+{"api_schema":1,"status":"ok","version":"0.1.0"}
+
+---
+
+GET /v0/management/model-registry HTTP/1.1
+Host: 127.0.0.1:18880
+Authorization: Bearer test-admin
+
+HTTP/1.1 200 OK
+content-type: application/json
+x-cpa-version: 7.2.140
+x-cpa-commit: a7e3596b
+x-cpa-build-date: 2026-08-22T14:51:09Z
+x-cpa-support-plugin: 1
+access-control-expose-headers: X-CPA-TRACE-ID, X-CPA-VERSION, X-CPA-COMMIT, X-CPA-BUILD-DATE, X-CPA-SUPPORT-PLUGIN, X-CPA-HOME-VERSION, X-CPA-HOME-BUILD-DATE, X-SERVER-VERSION, X-SERVER-BUILD-DATE, Location, Retry-After, X-Request-Id, OpenAI-Request-Id
+access-control-allow-origin: *
+access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
+access-control-allow-headers: Authorization, Content-Type
+content-length: 282
+date: Thu, 03 Sep 2026 00:21:10 GMT
+
+{"source":"lkg_cache","catalog-version":2,"generation":1,"generated-at":1788394868,"loaded-at":1788394870,"stale":false,"last-refresh":{"outcome":"never","attempted-at":null,"duration-ms":null,"rejection-reason":null},"provider-count":14,"model-count":103,"refresh-in-flight":false}
+
+---
+
+POST /v0/management/model-registry HTTP/1.1
+Host: 127.0.0.1:18880
+Authorization: Bearer test-admin
+Content-Length: 0
+
+HTTP/1.1 202 Accepted
+content-type: application/json
+x-cpa-version: 7.2.140
+x-cpa-commit: a7e3596b
+x-cpa-build-date: 2026-08-22T14:51:09Z
+x-cpa-support-plugin: 1
+access-control-expose-headers: X-CPA-TRACE-ID, X-CPA-VERSION, X-CPA-COMMIT, X-CPA-BUILD-DATE, X-CPA-SUPPORT-PLUGIN, X-CPA-HOME-VERSION, X-CPA-HOME-BUILD-DATE, X-SERVER-VERSION, X-SERVER-BUILD-DATE, Location, Retry-After, X-Request-Id, OpenAI-Request-Id
+access-control-allow-origin: *
+access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
+access-control-allow-headers: Authorization, Content-Type
+content-length: 325
+date: Thu, 03 Sep 2026 00:21:10 GMT
+
+{"accepted":true,"coalesced":false,"state":{"source":"lkg_cache","catalog-version":2,"generation":1,"generated-at":1788394868,"loaded-at":1788394870,"stale":false,"last-refresh":{"outcome":"never","attempted-at":null,"duration-ms":null,"rejection-reason":null},"provider-count":14,"model-count":103,"refresh-in-flight":true}}
+
+---
+
+GET /v0/management/model-registry HTTP/1.1
+Host: 127.0.0.1:18880
+Authorization: Bearer test-admin
+
+HTTP/1.1 200 OK
+content-type: application/json
+x-cpa-version: 7.2.140
+x-cpa-commit: a7e3596b
+x-cpa-build-date: 2026-08-22T14:51:09Z
+x-cpa-support-plugin: 1
+access-control-expose-headers: X-CPA-TRACE-ID, X-CPA-VERSION, X-CPA-COMMIT, X-CPA-BUILD-DATE, X-CPA-SUPPORT-PLUGIN, X-CPA-HOME-VERSION, X-CPA-HOME-BUILD-DATE, X-SERVER-VERSION, X-SERVER-BUILD-DATE, Location, Retry-After, X-Request-Id, OpenAI-Request-Id
+access-control-allow-origin: *
+access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
+access-control-allow-headers: Authorization, Content-Type
+content-length: 292
+date: Thu, 03 Sep 2026 00:21:11 GMT
+
+{"source":"remote_signed","catalog-version":3,"generation":2,"generated-at":1788394868,"loaded-at":1788394870,"stale":false,"last-refresh":{"outcome":"success","attempted-at":1788394870,"duration-ms":16,"rejection-reason":null},"provider-count":14,"model-count":104,"refresh-in-flight":false}
+
+---
+
+GET /v1/models HTTP/1.1
+Host: 127.0.0.1:18880
+Authorization: Bearer test-admin
+
+HTTP/1.1 200 OK
+content-type: application/json
+access-control-allow-origin: *
+access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
+access-control-allow-headers: Authorization, Content-Type
+content-length: 1442
+date: Thu, 03 Sep 2026 00:21:11 GMT
+
+{"data":[{"created":1788394871,"id":"claude-opus-4-6-thinking","object":"model","owned_by":"google"},{"created":1788394871,"id":"claude-sonnet-4-6","object":"model","owned_by":"google"},{"created":1788394871,"id":"gemini-3-flash","object":"model","owned_by":"google"},{"created":1788394871,"id":"gemini-3-flash-agent","object":"model","owned_by":"google"},{"created":1788394871,"id":"gemini-3.1-flash-image","object":"model","owned_by":"google"},{"created":1788394871,"id":"gemini-3.1-flash-lite","object":"model","owned_by":"google"},{"created":1788394871,"id":"gemini-3.1-pro-low","object":"model","owned_by":"google"},{"created":1788394871,"id":"gemini-3.5-flash-extra-low","object":"model","owned_by":"google"},{"created":1788394871,"id":"gemini-3.5-flash-low","object":"model","owned_by":"google"},{"created":1788394871,"id":"gemini-3.6-flash-high","object":"model","owned_by":"google"},{"created":1788394871,"id":"gemini-3.7-flash-high","object":"model","owned_by":"google"},{"created":1788394871,"id":"gemini-3.8-flash-high","object":"model","owned_by":"google"},{"created":1788394871,"id":"gemini-pro-agent","object":"model","owned_by":"google"},{"created":1788394871,"id":"gpt-oss-120b-medium","object":"model","owned_by":"google"},{"created":1788394871,"id":"task-17-test-model","object":"model","owned_by":"google"},{"created":1788394871,"id":"task-17-v3-hot-refreshed-model","object":"model","owned_by":"google"}],"object":"list"}

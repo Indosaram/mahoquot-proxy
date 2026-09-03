@@ -1,0 +1,315 @@
+# Model Registry Characterization & Baseline Contract Pinning (Task 1)
+Plan: .omo/plans/unified-runtime-model-registry.md
+Workspace: /Users/indo/code/project/mahoquot-proxy
+Date: 2026-09-02
+
+## 1. Executive Summary
+Before refactoring the catalog into a unified runtime registry, the entire existing model catalog, routing exclusivity rules, schema contracts, failover dynamics, and settings round-trip behaviors have been characterized and pinned with regression tests in `mahoquot-proxy`.
+
+All 10 contract dimensions required by Task 1 are now permanently pinned by unit and integration tests, verified green against existing behavior, and proved robust by 11 mutation probes.
+
+---
+
+## 2. Complete Catalog Inventory & Static Truth Sources
+
+### 2.1 Codex Defaults (`crates/gateway/src/models_route.rs`)
+- Default models (7):
+  - `gpt-5.6-sol`
+  - `gpt-5.6-luna`
+  - `gpt-5.6-terra`
+  - `gpt-5.5`
+  - `gpt-5.4`
+  - `gpt-5.4-mini`
+  - `gpt-5.3-codex-spark`
+- Owned by: `"openai"`
+- Env override (`MODELS` env var):
+  - When set to non-empty comma-separated strings, overrides ONLY Codex models.
+  - Leaves all other provider catalogs untouched.
+
+### 2.2 Antigravity (`crates/providers/src/antigravity.rs`)
+- Models (14):
+  - `gemini-3.8-flash-high`
+  - `gemini-3.7-flash-high`
+  - `gemini-3.6-flash-high`
+  - `gemini-3.5-flash-low`
+  - `gemini-3.5-flash-extra-low`
+  - `gemini-3.1-flash-lite`
+  - `gemini-3.1-flash-image`
+  - `gemini-3.1-pro-low`
+  - `gemini-3-flash`
+  - `gemini-3-flash-agent`
+  - `gemini-pro-agent`
+  - `claude-sonnet-4-6`
+  - `claude-opus-4-6-thinking`
+  - `gpt-oss-120b-medium`
+- Owned by: `"google"`
+- Exclusivity: Closed.
+
+### 2.3 Claude (Anthropic) (`crates/providers/src/claude.rs`)
+- Models (12):
+  - `claude-sonnet-4-6`
+  - `claude-sonnet-4-5`
+  - `claude-sonnet-4-5-20250929`
+  - `claude-sonnet-4-5-20250929-thinking`
+  - `claude-opus-4-6`
+  - `claude-opus-4-5`
+  - `claude-opus-4-5-20251101`
+  - `claude-opus-4-5-20251101-thinking`
+  - `claude-haiku-4-5`
+  - `claude-haiku-4-5-20251001`
+  - `claude-3-7-sonnet-20250219`
+  - `claude-3-5-sonnet-20241022`
+- Owned by: `"anthropic"`
+- Exclusivity: Closed.
+
+### 2.4 Zcode (Z.AI) (`crates/providers/src/zcode.rs`)
+- Models (5):
+  - `glm-5.3`
+  - `glm-5.3-flash`
+  - `glm-5.2`
+  - `glm-5.1`
+  - `glm-4.6`
+- Owned by: `"z-ai"`
+- Exclusivity: Closed.
+
+### 2.5 Kiro (`crates/providers/src/kiro.rs`)
+- Models (8):
+  - `auto`
+  - `claude-sonnet-4.6`
+  - `claude-opus-4.6`
+  - `claude-haiku-4.5`
+  - `claude-sonnet-4-5-20250929`
+  - `claude-sonnet-4-5-20250929-thinking`
+  - `claude-haiku-4-5-20251001`
+  - `claude-haiku-4-5-20251001-thinking`
+- Exposed in `/v1/models` as: `kiro/{model}`
+- Owned by: `"kiro"`
+- Routing rule: accepts `"auto-kiro"` or any model with prefix `"kiro/"` matching `KIRO_MODELS`. Bare model IDs (e.g. `"auto"` or `"claude-sonnet-4.6"`) are rejected.
+
+### 2.6 Cursor (`crates/providers/src/cursor.rs`)
+- Models exposed in `/v1/models` (4):
+  - `cursor/auto`
+  - `cursor/auto-cost`
+  - `cursor/auto-balance`
+  - `cursor/auto-intelligence`
+- Owned by: `"cursor"`
+- Routing rule: accepts anything starting with `"cursor/"`, or matching `CURSOR_MODELS` (`cursor-small`, `cursor-fast`, `gpt-5.6-sol`, `claude-sonnet-4-5-20250929`).
+
+### 2.7 Vertex (`crates/providers/src/vertex.rs`)
+- Models (21):
+  - `gemini-2.5-pro`
+  - `gemini-2.5-flash`
+  - `gemini-2.0-flash`
+  - `gemini-2.0-flash-001`
+  - `gemini-2.0-pro-exp-02-05`
+  - `gemini-1.5-pro`
+  - `gemini-1.5-pro-001`
+  - `gemini-1.5-pro-002`
+  - `gemini-1.5-flash`
+  - `gemini-1.5-flash-001`
+  - `gemini-1.5-flash-002`
+  - `gemini-1.5-flash-8b`
+  - `gemini-3-pro`
+  - `gemini-3-flash`
+  - `gemini-3.1-pro-preview`
+  - `gemini-3.1-flash-lite`
+  - `gemini-3-flash-preview`
+  - `gemini-3.7-flash`
+  - `gemini-3.7-flash-thinking`
+  - `gemini-3.5-flash`
+  - `gemini-3.6-flash`
+- Owned by: `"google-vertex"`
+- Routing rule: matches `VERTEX_MODELS`, or any model starting with `"gemini-"` or `"google/"`.
+
+### 2.8 Generic Accounts (`crates/gateway/src/account.rs`)
+- Routing rule (`supports_model`):
+  - Empty `models` vec: Wildcard. Serves any requested model.
+  - Non-empty `models` vec: Restricted. Serves ONLY models in its explicit list.
+- Model list exposure (`generic_model_entries`):
+  - Empty `models` vec: Produces 0 entries in catalog.
+  - Non-empty `models` vec: Produces `ModelEntry { id, owned_by: account.provider }`, deduping IDs across accounts (first account wins).
+
+### 2.9 Device-OAuth Onboarding Defaults (`crates/gateway/src/management/oauth.rs`)
+- `"kimi"`:
+  - client_id: `"17e5f671-d194-4dfb-9706-5516cb48c098"`
+  - device_url: `"https://auth.kimi.com/api/oauth/device_authorization"`
+  - token_url: `"https://auth.kimi.com/api/oauth/token"`
+  - base_url: `"https://api.kimi.com/coding/v1"`
+  - models: `["k3", "k3[1m]", "kimi-k2.7-code", "kimi-k2.6", "kimi-k2.5"]`
+  - camel_case_poll: `false`
+  - scope: `None`
+- `"qwen"`:
+  - client_id: `"e883ade2-e6e3-4d6d-adf7-f92ceff5fdcb"`
+  - device_url: `"https://openapi.qoder.sh/api/v1/deviceToken/register"`
+  - token_url: `"https://openapi.qoder.sh/api/v1/deviceToken/poll"`
+  - base_url: `"https://openapi.qoder.sh/api/v1"`
+  - models: `["qwen3.8-max", "qwen3.7-max", "qwen3.7-plus", "qwen3.6-flash"]`
+  - camel_case_poll: `true`
+  - scope: `None`
+- `"nous"`:
+  - client_id: `"hermes-cli"`
+  - device_url: `"https://portal.nousresearch.com/api/oauth/device/code"`
+  - token_url: `"https://portal.nousresearch.com/api/oauth/token"`
+  - base_url: `"https://inference-api.nousresearch.com/v1"`
+  - models: `["tencent/hy3:free", "poolside/laguna-s-2.1:free", "stepfun/step-3.7-flash:free", "poolside/laguna-xs-2.1:free"]`
+  - camel_case_poll: `false`
+  - scope: `Some("inference:invoke")`
+- `"github-copilot"`:
+  - client_id: `"Iv1.b507a08c87ecfe98"`
+  - device_url: `"https://github.com/login/device/code"`
+  - token_url: `"https://github.com/login/oauth/access_token"`
+  - base_url: `"https://api.github.com/copilot_internal/v2/token"`
+  - models: `["gpt-4o", "gpt-4.1", "gpt-5.3-codex", "gpt-5.4", "gpt-5.5"]`
+  - camel_case_poll: `false`
+  - scope: `Some("read:user")`
+- Unknown provider string: returns `None`.
+
+---
+
+## 3. Pinned Routing & Exclusivity Invariants
+
+### 3.1 Codex Negative-Space Exclusion
+Codex is the sole open-ended fallback provider, but it is strictly bounded by negative space:
+- Codex MUST NOT claim any model belonging to Antigravity (`ANTIGRAVITY_MODELS`).
+- Codex MUST NOT claim any model belonging to Claude (`CLAUDE_MODELS`).
+- Codex MUST NOT claim any model belonging to Zcode (`ZCODE_MODELS`).
+- Codex MUST NOT claim any model belonging to Vertex (`VERTEX_MODELS` or `gemini-*` / `google/*`).
+- Codex MUST NOT claim any Cursor models or prefixes (`cursor-*`, `cursor/*`).
+- Codex MUST NOT claim any Kiro models or prefixes (`kiro/*`, `auto-kiro`).
+- Codex DOES claim all OpenAI and unmapped models (`gpt-5.6-sol`, `gpt-5.5`, `gpt-4o`, `o3-mini`, `text-embedding-3-small`, etc.).
+- In relay candidate selection (`relay.rs`), when any non-Codex pool member can serve a model, Codex accounts are filtered out entirely.
+
+### 3.2 Duplicate-Owner Ordering & Deduplication
+- Order of evaluation in `model_entries`: Codex -> Antigravity -> Claude -> Zcode -> Kiro -> Cursor -> Vertex.
+- In `models_payload`, deduplication preserves FIRST OWNER ENCOUNTERED.
+- Example: `claude-sonnet-4-6` is listed in both Antigravity and Claude. Because Antigravity is evaluated before Claude, `claude-sonnet-4-6` is reported with `owned_by: "google"`.
+
+### 3.3 Unsupported-Model Inheritance & Failover
+- When upstream returns an account-scoped model rejection (400 with "is not supported when using Codex", "model is not supported", "INVALID_MODEL_ID", or "MONTHLY_REQUEST_COUNT", or 402):
+  - `member.mark_model_unsupported(model)` adds the model ID to `member.unsupported_models`.
+  - `member.supports_model(model)` immediately returns `false` on subsequent queries.
+  - Adding the same model multiple times does not create duplicate entries in `unsupported_models`.
+  - On pool reload / rescan, `adopt_runtime_state(target, previous)` copies `previous.unsupported_models` to `target.unsupported_models`. Dynamic unsupported model marks survive rescans across the running process.
+
+### 3.4 Image/Video Surface Capability Gates & Error Text
+- Image surface (`/v1/images/generations`, `/v1/images/edits`):
+  - Supported: `IMAGE_MODELS` = `["gpt-image-1.5", "gpt-image-2"]`.
+  - Rejection: HTTP 400 `{"error":{"message":"Model {model} is not supported on /v1/images/generations or /v1/images/edits. Use gpt-image-1.5, gpt-image-2, or a configured openai-compatibility image model.","type":"invalid_request_error"}}`. (No `code` or `param`).
+- Video surface (`/v1/videos/generations`, `/v1/videos/edits`, `/v1/videos/extensions`):
+  - Supported: `VIDEO_MODELS` = `[]` (none).
+  - Rejection: HTTP 400 `{"error":{"message":"Model {model} is not supported on /v1/videos/generations, /v1/videos/edits, or /v1/videos/extensions. No reference-backed video model is configured.","type":"invalid_request_error"}}`. (No `code` or `param`).
+- Unknown provider error:
+  - `{"error":{"message":"unknown provider for model {model}","type":"invalid_request_error","code":"model_not_found","param":"model"}}`.
+
+### 3.5 Schema Wire Contracts
+- `/v1/models` and `/models`:
+  ```json
+  {
+    "object": "list",
+    "data": [
+      {
+        "id": "<model_id>",
+        "object": "model",
+        "created": <unix_secs>,
+        "owned_by": "<owner>"
+      }
+    ]
+  }
+  ```
+- `/v1beta/models`:
+  ```json
+  {
+    "models": [
+      {
+        "name": "models/<model_id>",
+        "displayName": "<model_id>",
+        "description": "<model_id>",
+        "supportedInputModalities": ["text", "image", "audio", "video"],
+        "supportedOutputModalities": ["text"], // ["text", "image"] if id contains "image"
+        "supportedGenerationMethods": ["generateContent"]
+      }
+    ]
+  }
+  ```
+- `/v1beta/models/{model}` (single model):
+  - Exact same object as element of `/v1beta/models`, but omitting `"supportedGenerationMethods"`.
+
+### 3.6 Settings Aliases & Exclusions Round-Trip
+- Stored in `Settings`:
+  - `oauth_excluded_models`: `BTreeMap<String, Vec<String>>` under YAML key `oauth-excluded-models`. Defaults to `{}`.
+  - `oauth_model_alias`: `serde_json::Value` under YAML key `oauth-model-alias`. Defaults to `Value::Null`.
+- Round-trips with full fidelity through `Settings::to_yaml()` and `Settings::from_yaml()`.
+
+---
+
+## 4. Test Execution Receipts
+
+### 4.1 Primary Characterization Suite
+Command: `cargo test -p mahoquot-gateway -- models_route capability provider_kind --nocapture`
+Output:
+```
+running 23 tests
+test account::provider_kind_contract_tests::anthropic_credential_type_maps_to_claude ... ok
+test account::provider_kind_contract_tests::codex_does_not_claim_standard_claude_models ... ok
+test capability::tests::reference_backed_image_models_pass_surface_gate ... ok
+test models_route::tests::characterization_device_oauth_defaults ... ok
+test account::provider_kind_contract_tests::cursor_and_kiro_own_their_reference_models ... ok
+test account::provider_kind_contract_tests::characterization_kiro_and_cursor_prefixes ... ok
+test account::provider_kind_contract_tests::characterization_codex_negative_space_exclusion ... ok
+test capability::tests::video_error_matches_captured_upstream_text ... ok
+test capability::tests::characterization_image_and_video_rejection_text ... ok
+test capability::tests::unimplemented_media_models_are_not_advertised_as_routable ... ok
+test capability::tests::unknown_provider_carries_code_and_param ... ok
+test realtime::tests::capability_message_matches_captured_upstream_text ... ok
+test capability::tests::image_error_matches_captured_upstream_text ... ok
+test models_route::tests::entries_track_loaded_providers ... ok
+test models_route::tests::env_override_scopes_codex_only ... ok
+test models_route::tests::characterization_provider_presence_exposure_all_providers ... ok
+test account::provider_kind_contract_tests::characterization_generic_account_supports_model ... ok
+test models_route::tests::characterization_generic_model_entries_empty_and_non_empty ... ok
+test account::provider_kind_contract_tests::characterization_unsupported_model_inheritance ... ok
+test models_route::tests::payload_dedupes_ids_across_owners ... ok
+test models_route::tests::characterization_duplicate_owner_ordering_first_wins ... ok
+test models_route::tests::characterization_v1_and_v1beta_models_schemas ... ok
+test models_route::tests::characterization_aliases_and_exclusions_roundtrip ... ok
+
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 203 filtered out; finished in 0.01s
+```
+
+### 4.2 Auxiliary Integration Test Surfaces
+Command: `cargo test -p mahoquot-gateway --test t11_multi_provider_pool --test t8_openai_compat -- --nocapture`
+Output:
+```
+     Running tests/t11_multi_provider_pool.rs (target/debug/deps/t11_multi_provider_pool-9f0b1e48ad51aee3)
+
+running 4 tests
+test an_auth_dir_with_only_bad_credentials_yields_an_empty_pool_rather_than_an_error ... ok
+test malformed_and_unknown_credentials_are_skipped_without_dropping_valid_members ... ok
+test each_provider_only_claims_models_it_can_actually_serve ... ok
+test pool_loads_every_supported_provider_from_one_auth_dir ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/t8_openai_compat.rs (target/debug/deps/t8_openai_compat-14cba8c08fcc73e8)
+
+running 11 tests
+test test_t8_request_translation_shape ... ok
+test test_t8_truncated_upstream_stream_is_closed_for_the_client ... ok
+test test_t8_unimplemented_xai_media_models_fail_closed ... ok
+test test_t8_streaming_tool_calls_become_openai_tool_deltas ... ok
+test test_t8_model_unsupported_account_fails_over ... ok
+test test_t8_sse_without_content_type_header_is_served ... ok
+test test_t8_streaming_text_becomes_openai_chunks ... ok
+test test_t8_responses_compact_relays_to_codex_upstream ... ok
+test test_t8_html_upstream_is_never_reported_as_success ... ok
+test test_t8_non_streaming_returns_single_completion ... ok
+test test_t8_unsupported_websocket_transport_fails_before_upgrade ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+```
+
+---
+
+## 5. Pre-Existing Issues Noted
+- During full `cargo test -p mahoquot-gateway`, `p1_parity_tests::test_auth_urls_endpoint_family` failed with status 409 on `/v0/management/codex-auth-url`.
+- Diagnosis: Port 1455 was already bound by PID 39056 (`mahoquot-` instance running on the workstation). Per policy, this pre-existing condition was not altered.

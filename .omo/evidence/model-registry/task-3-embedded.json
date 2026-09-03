@@ -1,0 +1,3498 @@
+{
+  "version": 1,
+  "source": "embedded_fallback",
+  "models": {
+    "claude-3-5-sonnet-20241022": {
+      "id": "claude-3-5-sonnet-20241022",
+      "owned_by": "anthropic",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "claude": {
+          "provider_id": "claude",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "200000"
+      }
+    },
+    "claude-3-7-sonnet-20250219": {
+      "id": "claude-3-7-sonnet-20250219",
+      "owned_by": "anthropic",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "claude": {
+          "provider_id": "claude",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "200000"
+      }
+    },
+    "claude-haiku-4-5": {
+      "id": "claude-haiku-4-5",
+      "owned_by": "anthropic",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "claude": {
+          "provider_id": "claude",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "200000"
+      }
+    },
+    "claude-haiku-4-5-20251001": {
+      "id": "claude-haiku-4-5-20251001",
+      "owned_by": "anthropic",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "claude": {
+          "provider_id": "claude",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "200000"
+      }
+    },
+    "claude-opus-4-5": {
+      "id": "claude-opus-4-5",
+      "owned_by": "anthropic",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "claude": {
+          "provider_id": "claude",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "200000"
+      }
+    },
+    "claude-opus-4-5-20251101": {
+      "id": "claude-opus-4-5-20251101",
+      "owned_by": "anthropic",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "claude": {
+          "provider_id": "claude",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "200000"
+      }
+    },
+    "claude-opus-4-5-20251101-thinking": {
+      "id": "claude-opus-4-5-20251101-thinking",
+      "owned_by": "anthropic",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "claude": {
+          "provider_id": "claude",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "200000"
+      }
+    },
+    "claude-opus-4-6": {
+      "id": "claude-opus-4-6",
+      "owned_by": "anthropic",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "claude": {
+          "provider_id": "claude",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1000000"
+      }
+    },
+    "claude-opus-4-6-thinking": {
+      "id": "claude-opus-4-6-thinking",
+      "owned_by": "google",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "antigravity": {
+          "provider_id": "antigravity",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "250000"
+      }
+    },
+    "claude-sonnet-4-5": {
+      "id": "claude-sonnet-4-5",
+      "owned_by": "anthropic",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "claude": {
+          "provider_id": "claude",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1000000"
+      }
+    },
+    "claude-sonnet-4-5-20250929": {
+      "id": "claude-sonnet-4-5-20250929",
+      "owned_by": "anthropic",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "claude": {
+          "provider_id": "claude",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1000000"
+      }
+    },
+    "claude-sonnet-4-5-20250929-thinking": {
+      "id": "claude-sonnet-4-5-20250929-thinking",
+      "owned_by": "anthropic",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "claude": {
+          "provider_id": "claude",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1000000"
+      }
+    },
+    "claude-sonnet-4-6": {
+      "id": "claude-sonnet-4-6",
+      "owned_by": "google",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "antigravity": {
+          "provider_id": "antigravity",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        },
+        "claude": {
+          "provider_id": "claude",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 90
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1000000"
+      }
+    },
+    "cursor-fast": {
+      "id": "cursor-fast",
+      "owned_by": "cursor",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "cursor": {
+          "provider_id": "cursor",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100,
+          "upstream_model_id": "cursor-fast"
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "200000"
+      }
+    },
+    "cursor-small": {
+      "id": "cursor-small",
+      "owned_by": "cursor",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "cursor": {
+          "provider_id": "cursor",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100,
+          "upstream_model_id": "cursor-small"
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "200000"
+      }
+    },
+    "cursor/auto": {
+      "id": "cursor/auto",
+      "owned_by": "cursor",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "cursor": {
+          "provider_id": "cursor",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100,
+          "upstream_model_id": "auto"
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "200000"
+      }
+    },
+    "cursor/auto-balance": {
+      "id": "cursor/auto-balance",
+      "owned_by": "cursor",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "cursor": {
+          "provider_id": "cursor",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100,
+          "upstream_model_id": "auto-balance"
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "200000"
+      }
+    },
+    "cursor/auto-cost": {
+      "id": "cursor/auto-cost",
+      "owned_by": "cursor",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "cursor": {
+          "provider_id": "cursor",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100,
+          "upstream_model_id": "auto-cost"
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "200000"
+      }
+    },
+    "cursor/auto-intelligence": {
+      "id": "cursor/auto-intelligence",
+      "owned_by": "cursor",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "cursor": {
+          "provider_id": "cursor",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100,
+          "upstream_model_id": "auto-intelligence"
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "200000"
+      }
+    },
+    "deepseek-v4-flash": {
+      "id": "deepseek-v4-flash",
+      "owned_by": "deepseek",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "opencode-go": {
+          "provider_id": "opencode-go",
+          "policy": "discovered",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1000000"
+      }
+    },
+    "deepseek-v4-pro": {
+      "id": "deepseek-v4-pro",
+      "owned_by": "deepseek",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "opencode-go": {
+          "provider_id": "opencode-go",
+          "policy": "discovered",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1000000"
+      }
+    },
+    "gemini-1.5-flash": {
+      "id": "gemini-1.5-flash",
+      "owned_by": "google-vertex",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "vertex": {
+          "provider_id": "vertex",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1000000"
+      }
+    },
+    "gemini-1.5-flash-001": {
+      "id": "gemini-1.5-flash-001",
+      "owned_by": "google-vertex",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "vertex": {
+          "provider_id": "vertex",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1000000"
+      }
+    },
+    "gemini-1.5-flash-002": {
+      "id": "gemini-1.5-flash-002",
+      "owned_by": "google-vertex",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "vertex": {
+          "provider_id": "vertex",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1000000"
+      }
+    },
+    "gemini-1.5-flash-8b": {
+      "id": "gemini-1.5-flash-8b",
+      "owned_by": "google-vertex",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "vertex": {
+          "provider_id": "vertex",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1000000"
+      }
+    },
+    "gemini-1.5-pro": {
+      "id": "gemini-1.5-pro",
+      "owned_by": "google-vertex",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "vertex": {
+          "provider_id": "vertex",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1000000"
+      }
+    },
+    "gemini-1.5-pro-001": {
+      "id": "gemini-1.5-pro-001",
+      "owned_by": "google-vertex",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "vertex": {
+          "provider_id": "vertex",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1000000"
+      }
+    },
+    "gemini-1.5-pro-002": {
+      "id": "gemini-1.5-pro-002",
+      "owned_by": "google-vertex",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "vertex": {
+          "provider_id": "vertex",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1000000"
+      }
+    },
+    "gemini-2.0-flash": {
+      "id": "gemini-2.0-flash",
+      "owned_by": "google-vertex",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "vertex": {
+          "provider_id": "vertex",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1048576"
+      }
+    },
+    "gemini-2.0-flash-001": {
+      "id": "gemini-2.0-flash-001",
+      "owned_by": "google-vertex",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "vertex": {
+          "provider_id": "vertex",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1048576"
+      }
+    },
+    "gemini-2.0-pro-exp-02-05": {
+      "id": "gemini-2.0-pro-exp-02-05",
+      "owned_by": "google-vertex",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "vertex": {
+          "provider_id": "vertex",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1048576"
+      }
+    },
+    "gemini-2.5-flash": {
+      "id": "gemini-2.5-flash",
+      "owned_by": "google-vertex",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "vertex": {
+          "provider_id": "vertex",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1048576"
+      }
+    },
+    "gemini-2.5-pro": {
+      "id": "gemini-2.5-pro",
+      "owned_by": "google-vertex",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "vertex": {
+          "provider_id": "vertex",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1048576"
+      }
+    },
+    "gemini-3-flash": {
+      "id": "gemini-3-flash",
+      "owned_by": "google",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "antigravity": {
+          "provider_id": "antigravity",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        },
+        "vertex": {
+          "provider_id": "vertex",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 90
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1048576"
+      }
+    },
+    "gemini-3-flash-agent": {
+      "id": "gemini-3-flash-agent",
+      "owned_by": "google",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "antigravity": {
+          "provider_id": "antigravity",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1048576"
+      }
+    },
+    "gemini-3-flash-preview": {
+      "id": "gemini-3-flash-preview",
+      "owned_by": "google-vertex",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "vertex": {
+          "provider_id": "vertex",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1048576"
+      }
+    },
+    "gemini-3-pro": {
+      "id": "gemini-3-pro",
+      "owned_by": "google-vertex",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "vertex": {
+          "provider_id": "vertex",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1048576"
+      }
+    },
+    "gemini-3.1-flash-image": {
+      "id": "gemini-3.1-flash-image",
+      "owned_by": "google",
+      "capabilities": [
+        "chat",
+        "image",
+        "tools"
+      ],
+      "bindings": {
+        "antigravity": {
+          "provider_id": "antigravity",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "image",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1048576"
+      }
+    },
+    "gemini-3.1-flash-lite": {
+      "id": "gemini-3.1-flash-lite",
+      "owned_by": "google",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "antigravity": {
+          "provider_id": "antigravity",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        },
+        "vertex": {
+          "provider_id": "vertex",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 90
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1048576"
+      }
+    },
+    "gemini-3.1-pro-low": {
+      "id": "gemini-3.1-pro-low",
+      "owned_by": "google",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "antigravity": {
+          "provider_id": "antigravity",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1048576"
+      }
+    },
+    "gemini-3.1-pro-preview": {
+      "id": "gemini-3.1-pro-preview",
+      "owned_by": "google-vertex",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "vertex": {
+          "provider_id": "vertex",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1048576"
+      }
+    },
+    "gemini-3.5-flash": {
+      "id": "gemini-3.5-flash",
+      "owned_by": "google-vertex",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "vertex": {
+          "provider_id": "vertex",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1048576"
+      }
+    },
+    "gemini-3.5-flash-extra-low": {
+      "id": "gemini-3.5-flash-extra-low",
+      "owned_by": "google",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "antigravity": {
+          "provider_id": "antigravity",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1048576"
+      }
+    },
+    "gemini-3.5-flash-low": {
+      "id": "gemini-3.5-flash-low",
+      "owned_by": "google",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "antigravity": {
+          "provider_id": "antigravity",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1048576"
+      }
+    },
+    "gemini-3.6-flash": {
+      "id": "gemini-3.6-flash",
+      "owned_by": "google-vertex",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "vertex": {
+          "provider_id": "vertex",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1048576"
+      }
+    },
+    "gemini-3.6-flash-high": {
+      "id": "gemini-3.6-flash-high",
+      "owned_by": "google",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "antigravity": {
+          "provider_id": "antigravity",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1048576"
+      }
+    },
+    "gemini-3.7-flash": {
+      "id": "gemini-3.7-flash",
+      "owned_by": "google-vertex",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "vertex": {
+          "provider_id": "vertex",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1048576"
+      }
+    },
+    "gemini-3.7-flash-high": {
+      "id": "gemini-3.7-flash-high",
+      "owned_by": "google",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "antigravity": {
+          "provider_id": "antigravity",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1048576"
+      }
+    },
+    "gemini-3.7-flash-thinking": {
+      "id": "gemini-3.7-flash-thinking",
+      "owned_by": "google-vertex",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "vertex": {
+          "provider_id": "vertex",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1048576"
+      }
+    },
+    "gemini-3.8-flash-high": {
+      "id": "gemini-3.8-flash-high",
+      "owned_by": "google",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "antigravity": {
+          "provider_id": "antigravity",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1048576"
+      }
+    },
+    "gemini-pro-agent": {
+      "id": "gemini-pro-agent",
+      "owned_by": "google",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "antigravity": {
+          "provider_id": "antigravity",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1048576"
+      }
+    },
+    "glm-4.6": {
+      "id": "glm-4.6",
+      "owned_by": "z-ai",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "zcode": {
+          "provider_id": "zcode",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "131072"
+      }
+    },
+    "glm-5": {
+      "id": "glm-5",
+      "owned_by": "z-ai",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "opencode-go": {
+          "provider_id": "opencode-go",
+          "policy": "discovered",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "204800"
+      }
+    },
+    "glm-5.1": {
+      "id": "glm-5.1",
+      "owned_by": "z-ai",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "zcode": {
+          "provider_id": "zcode",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        },
+        "opencode-go": {
+          "provider_id": "opencode-go",
+          "policy": "discovered",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 90
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "200000"
+      }
+    },
+    "glm-5.2": {
+      "id": "glm-5.2",
+      "owned_by": "z-ai",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "zcode": {
+          "provider_id": "zcode",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        },
+        "opencode-go": {
+          "provider_id": "opencode-go",
+          "policy": "discovered",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 90
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1000000"
+      }
+    },
+    "glm-5.3": {
+      "id": "glm-5.3",
+      "owned_by": "z-ai",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "zcode": {
+          "provider_id": "zcode",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        },
+        "opencode-go": {
+          "provider_id": "opencode-go",
+          "policy": "discovered",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 90
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1000000"
+      }
+    },
+    "glm-5.3-flash": {
+      "id": "glm-5.3-flash",
+      "owned_by": "z-ai",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "zcode": {
+          "provider_id": "zcode",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1000000"
+      }
+    },
+    "gpt-4.1": {
+      "id": "gpt-4.1",
+      "owned_by": "openai",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "github-copilot": {
+          "provider_id": "github-copilot",
+          "policy": "discovered",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 90
+        },
+        "codex": {
+          "provider_id": "codex",
+          "policy": "open",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1047576"
+      }
+    },
+    "gpt-4o": {
+      "id": "gpt-4o",
+      "owned_by": "openai",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "github-copilot": {
+          "provider_id": "github-copilot",
+          "policy": "discovered",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 90
+        },
+        "codex": {
+          "provider_id": "codex",
+          "policy": "open",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "128000"
+      }
+    },
+    "gpt-5.3-codex": {
+      "id": "gpt-5.3-codex",
+      "owned_by": "openai",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "github-copilot": {
+          "provider_id": "github-copilot",
+          "policy": "discovered",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 90
+        },
+        "codex": {
+          "provider_id": "codex",
+          "policy": "open",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "272000"
+      }
+    },
+    "gpt-5.3-codex-spark": {
+      "id": "gpt-5.3-codex-spark",
+      "owned_by": "openai",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "codex": {
+          "provider_id": "codex",
+          "policy": "open",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "128000"
+      }
+    },
+    "gpt-5.4": {
+      "id": "gpt-5.4",
+      "owned_by": "openai",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "codex": {
+          "provider_id": "codex",
+          "policy": "open",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        },
+        "github-copilot": {
+          "provider_id": "github-copilot",
+          "policy": "discovered",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 90
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1050000"
+      }
+    },
+    "gpt-5.4-mini": {
+      "id": "gpt-5.4-mini",
+      "owned_by": "openai",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "codex": {
+          "provider_id": "codex",
+          "policy": "open",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "400000"
+      }
+    },
+    "gpt-5.5": {
+      "id": "gpt-5.5",
+      "owned_by": "openai",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "codex": {
+          "provider_id": "codex",
+          "policy": "open",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        },
+        "github-copilot": {
+          "provider_id": "github-copilot",
+          "policy": "discovered",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 90
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1050000"
+      }
+    },
+    "gpt-5.6-luna": {
+      "id": "gpt-5.6-luna",
+      "owned_by": "openai",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "codex": {
+          "provider_id": "codex",
+          "policy": "open",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "373000"
+      }
+    },
+    "gpt-5.6-sol": {
+      "id": "gpt-5.6-sol",
+      "owned_by": "openai",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "codex": {
+          "provider_id": "codex",
+          "policy": "open",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "373000"
+      }
+    },
+    "gpt-5.6-terra": {
+      "id": "gpt-5.6-terra",
+      "owned_by": "openai",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "codex": {
+          "provider_id": "codex",
+          "policy": "open",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "373000"
+      }
+    },
+    "gpt-image-1.5": {
+      "id": "gpt-image-1.5",
+      "owned_by": "openai",
+      "capabilities": [
+        "image"
+      ],
+      "bindings": {
+        "codex": {
+          "provider_id": "codex",
+          "policy": "open",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "image"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "128000"
+      }
+    },
+    "gpt-image-2": {
+      "id": "gpt-image-2",
+      "owned_by": "openai",
+      "capabilities": [
+        "image"
+      ],
+      "bindings": {
+        "codex": {
+          "provider_id": "codex",
+          "policy": "open",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "image"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "128000"
+      }
+    },
+    "gpt-oss-120b-medium": {
+      "id": "gpt-oss-120b-medium",
+      "owned_by": "google",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "antigravity": {
+          "provider_id": "antigravity",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "131072"
+      }
+    },
+    "grok-4.5": {
+      "id": "grok-4.5",
+      "owned_by": "xai",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "opencode-go": {
+          "provider_id": "opencode-go",
+          "policy": "discovered",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "500000"
+      }
+    },
+    "grok-4.6": {
+      "id": "grok-4.6",
+      "owned_by": "xai",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "opencode-go": {
+          "provider_id": "opencode-go",
+          "policy": "discovered",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "500000"
+      }
+    },
+    "k3": {
+      "id": "k3",
+      "owned_by": "kimi",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "kimi": {
+          "provider_id": "kimi",
+          "policy": "discovered",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1048576"
+      }
+    },
+    "k3[1m]": {
+      "id": "k3[1m]",
+      "owned_by": "kimi",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "kimi": {
+          "provider_id": "kimi",
+          "policy": "discovered",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1048576"
+      }
+    },
+    "kimi-k2.5": {
+      "id": "kimi-k2.5",
+      "owned_by": "kimi",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "kimi": {
+          "provider_id": "kimi",
+          "policy": "discovered",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        },
+        "opencode-go": {
+          "provider_id": "opencode-go",
+          "policy": "discovered",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 90
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "262144"
+      }
+    },
+    "kimi-k2.6": {
+      "id": "kimi-k2.6",
+      "owned_by": "kimi",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "kimi": {
+          "provider_id": "kimi",
+          "policy": "discovered",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        },
+        "opencode-go": {
+          "provider_id": "opencode-go",
+          "policy": "discovered",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 90
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "262144"
+      }
+    },
+    "kimi-k2.7-code": {
+      "id": "kimi-k2.7-code",
+      "owned_by": "kimi",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "kimi": {
+          "provider_id": "kimi",
+          "policy": "discovered",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        },
+        "opencode-go": {
+          "provider_id": "opencode-go",
+          "policy": "discovered",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 90
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "262144"
+      }
+    },
+    "kiro/auto": {
+      "id": "kiro/auto",
+      "owned_by": "kiro",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "kiro": {
+          "provider_id": "kiro",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100,
+          "upstream_model_id": "auto"
+        }
+      },
+      "aliases": [
+        "auto-kiro"
+      ],
+      "metadata": {
+        "context_limit": "200000"
+      }
+    },
+    "kiro/claude-haiku-4-5-20251001": {
+      "id": "kiro/claude-haiku-4-5-20251001",
+      "owned_by": "kiro",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "kiro": {
+          "provider_id": "kiro",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100,
+          "upstream_model_id": "claude-haiku-4-5-20251001"
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "200000"
+      }
+    },
+    "kiro/claude-haiku-4-5-20251001-thinking": {
+      "id": "kiro/claude-haiku-4-5-20251001-thinking",
+      "owned_by": "kiro",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "kiro": {
+          "provider_id": "kiro",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100,
+          "upstream_model_id": "claude-haiku-4-5-20251001-thinking"
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "200000"
+      }
+    },
+    "kiro/claude-haiku-4.5": {
+      "id": "kiro/claude-haiku-4.5",
+      "owned_by": "kiro",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "kiro": {
+          "provider_id": "kiro",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100,
+          "upstream_model_id": "claude-haiku-4.5"
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "200000"
+      }
+    },
+    "kiro/claude-opus-4.6": {
+      "id": "kiro/claude-opus-4.6",
+      "owned_by": "kiro",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "kiro": {
+          "provider_id": "kiro",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100,
+          "upstream_model_id": "claude-opus-4.6"
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1000000"
+      }
+    },
+    "kiro/claude-sonnet-4-5-20250929": {
+      "id": "kiro/claude-sonnet-4-5-20250929",
+      "owned_by": "kiro",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "kiro": {
+          "provider_id": "kiro",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100,
+          "upstream_model_id": "claude-sonnet-4-5-20250929"
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "200000"
+      }
+    },
+    "kiro/claude-sonnet-4-5-20250929-thinking": {
+      "id": "kiro/claude-sonnet-4-5-20250929-thinking",
+      "owned_by": "kiro",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "kiro": {
+          "provider_id": "kiro",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100,
+          "upstream_model_id": "claude-sonnet-4-5-20250929-thinking"
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "200000"
+      }
+    },
+    "kiro/claude-sonnet-4.6": {
+      "id": "kiro/claude-sonnet-4.6",
+      "owned_by": "kiro",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "kiro": {
+          "provider_id": "kiro",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100,
+          "upstream_model_id": "claude-sonnet-4.6"
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1000000"
+      }
+    },
+    "mimo-v2-omni": {
+      "id": "mimo-v2-omni",
+      "owned_by": "xiaomi",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "opencode-go": {
+          "provider_id": "opencode-go",
+          "policy": "discovered",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "262144"
+      }
+    },
+    "mimo-v2-pro": {
+      "id": "mimo-v2-pro",
+      "owned_by": "xiaomi",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "opencode-go": {
+          "provider_id": "opencode-go",
+          "policy": "discovered",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1048576"
+      }
+    },
+    "mimo-v2.5": {
+      "id": "mimo-v2.5",
+      "owned_by": "xiaomi",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "opencode-go": {
+          "provider_id": "opencode-go",
+          "policy": "discovered",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1048576"
+      }
+    },
+    "mimo-v2.5-pro": {
+      "id": "mimo-v2.5-pro",
+      "owned_by": "xiaomi",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "opencode-go": {
+          "provider_id": "opencode-go",
+          "policy": "discovered",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1048576"
+      }
+    },
+    "minimax-m2.5": {
+      "id": "minimax-m2.5",
+      "owned_by": "minimax",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "opencode-go": {
+          "provider_id": "opencode-go",
+          "policy": "discovered",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "204800"
+      }
+    },
+    "minimax-m2.7": {
+      "id": "minimax-m2.7",
+      "owned_by": "minimax",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "opencode-go": {
+          "provider_id": "opencode-go",
+          "policy": "discovered",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "204800"
+      }
+    },
+    "minimax-m3": {
+      "id": "minimax-m3",
+      "owned_by": "minimax",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "opencode-go": {
+          "provider_id": "opencode-go",
+          "policy": "discovered",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "512000"
+      }
+    },
+    "poolside/laguna-s-2.1:free": {
+      "id": "poolside/laguna-s-2.1:free",
+      "owned_by": "nous",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "nous": {
+          "provider_id": "nous",
+          "policy": "discovered",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "256000"
+      }
+    },
+    "poolside/laguna-xs-2.1:free": {
+      "id": "poolside/laguna-xs-2.1:free",
+      "owned_by": "nous",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "nous": {
+          "provider_id": "nous",
+          "policy": "discovered",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "256000"
+      }
+    },
+    "qwen3.5-plus": {
+      "id": "qwen3.5-plus",
+      "owned_by": "qwen",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "opencode-go": {
+          "provider_id": "opencode-go",
+          "policy": "discovered",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1000000"
+      }
+    },
+    "qwen3.6-flash": {
+      "id": "qwen3.6-flash",
+      "owned_by": "qwen",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "qwen": {
+          "provider_id": "qwen",
+          "policy": "discovered",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1000000"
+      }
+    },
+    "qwen3.6-plus": {
+      "id": "qwen3.6-plus",
+      "owned_by": "qwen",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "opencode-go": {
+          "provider_id": "opencode-go",
+          "policy": "discovered",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1000000"
+      }
+    },
+    "qwen3.7-max": {
+      "id": "qwen3.7-max",
+      "owned_by": "qwen",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "qwen": {
+          "provider_id": "qwen",
+          "policy": "discovered",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        },
+        "opencode-go": {
+          "provider_id": "opencode-go",
+          "policy": "discovered",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 90
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1000000"
+      }
+    },
+    "qwen3.7-plus": {
+      "id": "qwen3.7-plus",
+      "owned_by": "qwen",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "qwen": {
+          "provider_id": "qwen",
+          "policy": "discovered",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        },
+        "opencode-go": {
+          "provider_id": "opencode-go",
+          "policy": "discovered",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 90
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1000000"
+      }
+    },
+    "qwen3.8-max": {
+      "id": "qwen3.8-max",
+      "owned_by": "qwen",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "qwen": {
+          "provider_id": "qwen",
+          "policy": "discovered",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1000000"
+      }
+    },
+    "stepfun/step-3.7-flash:free": {
+      "id": "stepfun/step-3.7-flash:free",
+      "owned_by": "nous",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "nous": {
+          "provider_id": "nous",
+          "policy": "discovered",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "256000"
+      }
+    },
+    "tencent/hy3:free": {
+      "id": "tencent/hy3:free",
+      "owned_by": "nous",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "nous": {
+          "provider_id": "nous",
+          "policy": "discovered",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "256000"
+      }
+    }
+  },
+  "providers": {
+    "antigravity": "closed",
+    "claude": "closed",
+    "codex": "open",
+    "cursor": "closed",
+    "github-copilot": "discovered",
+    "kimi": "discovered",
+    "kiro": "closed",
+    "nous": "discovered",
+    "opencode-free": "discovered",
+    "opencode-go": "discovered",
+    "opencode-zen": "discovered",
+    "qwen": "discovered",
+    "vertex": "closed",
+    "zcode": "closed"
+  },
+  "aliases": {
+    "auto-kiro": {
+      "alias": "auto-kiro",
+      "target": "kiro/auto",
+      "provider_id": "kiro"
+    },
+    "gemini-3.1-pro-high": {
+      "alias": "gemini-3.1-pro-high",
+      "target": "gemini-pro-agent",
+      "provider_id": "antigravity"
+    },
+    "gemini-3.1-pro-preview": {
+      "alias": "gemini-3.1-pro-preview",
+      "target": "gemini-pro-agent",
+      "provider_id": "antigravity"
+    },
+    "hy3": {
+      "alias": "hy3",
+      "target": "tencent/hy3:free",
+      "provider_id": "nous"
+    },
+    "kimi-k3": {
+      "alias": "kimi-k3",
+      "target": "k3",
+      "provider_id": "kimi"
+    }
+  },
+  "exclusions": []
+}

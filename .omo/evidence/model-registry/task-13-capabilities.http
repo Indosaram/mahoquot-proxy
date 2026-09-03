@@ -1,0 +1,60 @@
+POST /v1/images/generations HTTP/1.1
+Host: 127.0.0.1:18874
+Content-Type: application/json
+
+{
+  "model": "gpt-5.6-sol",
+  "prompt": "fixture"
+}
+
+HTTP/1.1 400 Bad Request
+content-type: application/json
+access-control-allow-origin: *
+access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
+access-control-allow-headers: Authorization, Content-Type
+content-length: 218
+date: Thu, 03 Sep 2026 05:08:25 GMT
+
+{"error":{"message":"Model gpt-5.6-sol is not supported on /v1/images/generations or /v1/images/edits. Use gpt-image-1.5, gpt-image-2, or a configured openai-compatibility image model.","type":"invalid_request_error"}}
+
+---
+
+POST /v1/images/generations HTTP/1.1
+Host: 127.0.0.1:18874
+Content-Type: application/json
+
+{
+  "model": "fixture-signed-image-model",
+  "prompt": "fixture"
+}
+
+HTTP/1.1 200 OK
+content-type: application/json
+access-control-allow-origin: *
+access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
+access-control-allow-headers: Authorization, Content-Type
+transfer-encoding: chunked
+date: Thu, 03 Sep 2026 05:08:25 GMT
+
+{"created":13,"data":[{"url":"fixture://image"}]}
+
+---
+
+POST /v1/images/generations HTTP/1.1
+Host: 127.0.0.1:18874
+Content-Type: application/json
+
+{
+  "model": "fixture-image-alias",
+  "prompt": "fixture"
+}
+
+HTTP/1.1 200 OK
+content-type: application/json
+access-control-allow-origin: *
+access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
+access-control-allow-headers: Authorization, Content-Type
+transfer-encoding: chunked
+date: Thu, 03 Sep 2026 05:08:25 GMT
+
+{"created":13,"data":[{"url":"fixture://image"}]}

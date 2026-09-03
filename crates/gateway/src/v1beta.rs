@@ -25,7 +25,10 @@ pub enum GeminiAction {
 
 /// Model ids never contain a colon, so the first one splits id from verb.
 pub fn parse_action(action: &str) -> (String, Option<GeminiAction>) {
-    let trimmed = action.trim_start_matches('/');
+    let mut trimmed = action.trim_start_matches('/');
+    if let Some(stripped) = trimmed.strip_prefix("models/") {
+        trimmed = stripped;
+    }
     match trimmed.split_once(':') {
         None => (trimmed.to_string(), None),
         Some((model, verb)) => {
@@ -137,6 +140,25 @@ mod tests {
     fn a_bare_model_path_has_no_action() {
         let (m, a) = parse_action("/gemini-3.7-flash-high");
         assert_eq!(m, "gemini-3.7-flash-high");
+        assert_eq!(a, None);
+    }
+
+    #[test]
+    fn parse_action_strips_models_prefix() {
+        let (m, a) = parse_action("models/gemini-2.0-flash:generateContent");
+        assert_eq!(m, "gemini-2.0-flash");
+        assert_eq!(a, Some(GeminiAction::Generate));
+
+        let (m, a) = parse_action("/models/gemini-2.0-flash:streamGenerateContent");
+        assert_eq!(m, "gemini-2.0-flash");
+        assert_eq!(a, Some(GeminiAction::StreamGenerate));
+
+        let (m, a) = parse_action("models/gemini-2.0-flash");
+        assert_eq!(m, "gemini-2.0-flash");
+        assert_eq!(a, None);
+
+        let (m, a) = parse_action("/models/gemini-2.0-flash");
+        assert_eq!(m, "gemini-2.0-flash");
         assert_eq!(a, None);
     }
 

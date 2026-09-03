@@ -5,19 +5,39 @@ use arc_swap::ArcSwap;
 
 use super::settings::{Settings, SettingsError};
 
+pub type SnapshotProvider = Arc<dyn Fn() -> Arc<mahoquot_registry::RegistrySnapshot> + Send + Sync>;
+pub type PoolPublisher = Arc<
+    dyn Fn(Arc<mahoquot_registry::RegistrySnapshot>) -> Result<(), anyhow::Error> + Send + Sync,
+>;
+/// Notified with every newly published document so in-memory projections of
+/// the settings (scoped-key index, and anything added later) rebuild in one
+/// place instead of at each mutation call site.
+pub type SettingsObserver = Arc<dyn Fn(&Settings) + Send + Sync>;
+
 /// Holds the live settings document and swaps it atomically.
 ///
 /// The relay hot path reads settings on every request under a p50 latency
 /// gate, so readers must never contend: `current()` is a lock-free atomic load
 /// and mutation publishes a whole new `Arc` rather than editing in place. A
 /// `RwLock` here would put every proxied request behind a writer.
-#[derive(Debug)]
 pub struct SettingsStore {
     current: ArcSwap<Settings>,
     path: PathBuf,
     /// Serializes read-modify-write cycles so concurrent setting changes
     /// cannot silently drop each other's edits.
     mutate_lock: std::sync::Mutex<()>,
+    snapshot_provider: std::sync::RwLock<Option<SnapshotProvider>>,
+    pool_publisher: std::sync::RwLock<Option<PoolPublisher>>,
+    observers: std::sync::RwLock<Vec<SettingsObserver>>,
+}
+
+impl std::fmt::Debug for SettingsStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SettingsStore")
+            .field("current", &self.current)
+            .field("path", &self.path)
+            .finish()
+    }
 }
 
 impl SettingsStore {
@@ -26,6 +46,9 @@ impl SettingsStore {
             current: ArcSwap::from_pointee(settings),
             path,
             mutate_lock: std::sync::Mutex::new(()),
+            snapshot_provider: std::sync::RwLock::new(None),
+            pool_publisher: std::sync::RwLock::new(None),
+            observers: std::sync::RwLock::new(Vec::new()),
         }
     }
 
@@ -36,7 +59,10 @@ impl SettingsStore {
     pub fn load_or(path: PathBuf, fallback: Settings) -> Result<Self, SettingsError> {
         if path.exists() {
             let settings = Settings::load(&path)?;
-            return Ok(Self::new(settings, path));
+            let store = Self::new(settings, path);
+            let snapshot = store.active_snapshot();
+            store.current().validate_against_registry(&snapshot)?;
+            return Ok(store);
         }
         // Upstream always has a config file, so `GET /config.yaml` never 404s
         // there. Materialise the boot document once so the served surface
@@ -60,15 +86,54 @@ impl SettingsStore {
         &self.path
     }
 
-    /// Re-read the document from disk and publish it.
+    pub fn active_snapshot(&self) -> Arc<mahoquot_registry::RegistrySnapshot> {
+        if let Some(ref provider) = *self.snapshot_provider.read().unwrap() {
+            return provider();
+        }
+        Arc::new(
+            mahoquot_registry::embedded_registry_snapshot()
+                .expect("embedded snapshot must be valid"),
+        )
+    }
+
+    pub fn set_snapshot_provider(&self, provider: SnapshotProvider) {
+        *self.snapshot_provider.write().unwrap() = Some(provider);
+    }
+
+    pub fn set_pool_publisher(&self, publisher: PoolPublisher) {
+        *self.pool_publisher.write().unwrap() = Some(publisher);
+    }
+
+    pub fn add_observer(&self, observer: SettingsObserver) {
+        self.observers.write().unwrap().push(observer);
+    }
+
+    fn notify_observers(&self, settings: &Settings) {
+        for observer in self.observers.read().unwrap().iter() {
+            observer(settings);
+        }
+    }
+
+    /// Re-read the document from disk, validate it atomically against active registry, and publish it.
     pub fn reload(&self) -> Result<Arc<Settings>, SettingsError> {
         let settings = Settings::load(&self.path)?;
+        let active_snapshot = self.active_snapshot();
+        let candidate_registry = settings.validate_against_registry(&active_snapshot)?;
+
         let published = Arc::new(settings);
         self.current.store(published.clone());
+        self.notify_observers(&published);
+
+        if let Some(ref publisher) = *self.pool_publisher.read().unwrap() {
+            if let Err(err) = publisher(Arc::new(candidate_registry)) {
+                tracing::error!("failed to publish candidate registry on reload: {err}");
+            }
+        }
+
         Ok(published)
     }
 
-    /// Apply `edit` to a copy of the live document, persist it, then publish.
+    /// Apply `edit` to a copy of the live document, validate it against active registry, persist it, then publish.
     ///
     /// Persisting before publishing means a failed write leaves the in-memory
     /// document untouched, so the API never reports a change it did not manage
@@ -83,9 +148,21 @@ impl SettingsStore {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut next = Settings::clone(&self.current());
         edit(&mut next);
+
+        let active_snapshot = self.active_snapshot();
+        let candidate_registry = next.validate_against_registry(&active_snapshot)?;
+
         next.persist(&self.path)?;
         let published = Arc::new(next);
         self.current.store(published.clone());
+        self.notify_observers(&published);
+
+        if let Some(ref publisher) = *self.pool_publisher.read().unwrap() {
+            if let Err(err) = publisher(Arc::new(candidate_registry)) {
+                tracing::error!("failed to publish candidate registry on mutate: {err}");
+            }
+        }
+
         Ok(published)
     }
 }

@@ -1,0 +1,99 @@
+TASK 13 RED -> GREEN EVIDENCE
+Date: 2026-09-02
+Workspace: /Users/indo/code/project/mahoquot-proxy
+
+=== RED TEST RUN (before implementation) ===
+Command: cargo test -p mahoquot-gateway --test model_capabilities -- --nocapture
+
+warning: use of deprecated constant `mahoquot_providers::ANTIGRAVITY_MODELS`: query catalog/registry for models instead
+ --> crates/gateway/src/models_route.rs:4:5
+  |
+4 |     ANTIGRAVITY_MODELS, CLAUDE_MODELS, KIRO_MODELS, VERTEX_MODELS, ZCODE_MODELS,
+  |     ^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated constant `mahoquot_providers::CLAUDE_MODELS`: query catalog/registry for models instead
+ --> crates/gateway/src/models_route.rs:4:25
+  |
+4 |     ANTIGRAVITY_MODELS, CLAUDE_MODELS, KIRO_MODELS, VERTEX_MODELS, ZCODE_MODELS,
+  |                         ^^^^^^^^^^^^^
+
+warning: use of deprecated constant `mahoquot_providers::KIRO_MODELS`: query catalog/registry for models instead
+ --> crates/gateway/src/models_route.rs:4:40
+  |
+4 |     ANTIGRAVITY_MODELS, CLAUDE_MODELS, KIRO_MODELS, VERTEX_MODELS, ZCODE_MODELS,
+  |                                        ^^^^^^^^^^^
+
+warning: use of deprecated constant `mahoquot_providers::VERTEX_MODELS`: query catalog/registry for models instead
+ --> crates/gateway/src/models_route.rs:4:53
+  |
+4 |     ANTIGRAVITY_MODELS, CLAUDE_MODELS, KIRO_MODELS, VERTEX_MODELS, ZCODE_MODELS,
+  |                                                     ^^^^^^^^^^^^^
+
+warning: use of deprecated constant `mahoquot_providers::ZCODE_MODELS`: query catalog/registry for models instead
+ --> crates/gateway/src/models_route.rs:4:68
+  |
+4 |     ANTIGRAVITY_MODELS, CLAUDE_MODELS, KIRO_MODELS, VERTEX_MODELS, ZCODE_MODELS,
+  |                                                                    ^^^^^^^^^^^^
+
+warning: use of deprecated constant `mahoquot_providers::ANTIGRAVITY_MODELS`: query catalog/registry for models instead
+  --> crates/gateway/src/models_route.rs:55:19
+   |
+55 |         for id in ANTIGRAVITY_MODELS {
+   |                   ^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated constant `mahoquot_providers::CLAUDE_MODELS`: query catalog/registry for models instead
+  --> crates/gateway/src/models_route.rs:64:45
+   |
+64 |         (ProviderKind::Claude, "anthropic", CLAUDE_MODELS),
+   |                                             ^^^^^^^^^^^^^
+
+warning: use of deprecated constant `mahoquot_providers::ZCODE_MODELS`: query catalog/registry for models instead
+  --> crates/gateway/src/models_route.rs:65:39
+   |
+65 |         (ProviderKind::Zcode, "z-ai", ZCODE_MODELS),
+   |                                       ^^^^^^^^^^^^
+
+warning: use of deprecated constant `mahoquot_providers::KIRO_MODELS`: query catalog/registry for models instead
+  --> crates/gateway/src/models_route.rs:66:38
+   |
+66 |         (ProviderKind::Kiro, "kiro", KIRO_MODELS),
+   |                                      ^^^^^^^^^^^
+
+warning: use of deprecated constant `mahoquot_providers::VERTEX_MODELS`: query catalog/registry for models instead
+  --> crates/gateway/src/models_route.rs:96:19
+   |
+96 |         for id in VERTEX_MODELS {
+   |                   ^^^^^^^^^^^^^
+
+warning: `mahoquot-gateway` (lib) generated 10 warnings
+   Compiling mahoquot-gateway v0.1.0 (/Users/indo/code/project/mahoquot-proxy/crates/gateway)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.40s
+     Running tests/model_capabilities.rs (target/debug/deps/model_capabilities-8d3d97397016a99b)
+
+running 3 tests
+
+thread 'signed_image_capability_and_alias_reach_only_the_fixture_upstream' (24077597) panicked at crates/gateway/tests/model_capabilities.rs:196:9:
+assertion `left == right` failed: response: {"error":{"message":"Model fixture-signed-image-model is not supported on /v1/images/generations or /v1/images/edits. Use gpt-image-1.5, gpt-image-2, or a configured openai-compatibility image model.","type":"invalid_request_error"}}
+  left: 400
+ right: 200
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'realtime_and_count_token_surfaces_require_explicit_binding_capabilities' (24077596) panicked at crates/gateway/tests/model_capabilities.rs:254:5:
+assertion `left == right` failed
+  left: 200
+ right: 501
+test signed_image_capability_and_alias_reach_only_the_fixture_upstream ... FAILED
+test realtime_and_count_token_surfaces_require_explicit_binding_capabilities ... FAILED
+test text_video_sparse_and_wrong_provider_capabilities_fail_before_upstream ... ok
+
+failures:
+
+failures:
+    realtime_and_count_token_surfaces_require_explicit_binding_capabilities
+    signed_image_capability_and_alias_reach_only_the_fixture_upstream
+
+test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+
+error: test failed, to rerun pass `-p mahoquot-gateway --test model_capabilities`

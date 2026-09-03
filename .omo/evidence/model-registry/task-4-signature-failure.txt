@@ -1,0 +1,349 @@
+=== TASK 4 SIGNED REMOTE CATALOG ENVELOPE & ANTI-DOWNGRADE EVIDENCE ===
+Plan: .omo/plans/unified-runtime-model-registry.md
+Workspace: /Users/indo/code/project/mahoquot-proxy
+Crate: crates/registry (mahoquot-registry)
+Date: 2026-09-02
+Host: Darwin arm64
+
+## 1. Executive Summary
+
+Task 4 completes cryptographic specification, detached Ed25519 signature verification, RFC 8785 JSON canonicalization, and anti-downgrade rollback defense rules for the Mahoquot runtime model registry.
+
+Key invariants implemented and verified:
+1. Pure domain invariants: Pure deterministic verification without network I/O, async runtime, axum, or gateway dependencies.
+2. Detached Ed25519 signature: Payload bytes and envelope metadata are covered by detached Ed25519 signature.
+3. Cryptographic order of operations: Signature verification MUST precede payload parsing, schema inspection, or interpretation.
+4. Monotonic version anti-downgrade: Incoming catalog_version must strictly exceed max(active_version, lkg_version). Equal (replay) and lower versions are rejected with typed VersionDowngrade error.
+5. Clock skew & expiration defense: Timestamps in the far future (> now + allowed_skew_secs) are rejected with FutureTimestamp. Expired catalogs (expires_at < now) are rejected with Expired.
+6. Key rotation overlap: Trusted keyring supports simultaneous active public keys, allowing graceful rotation before publisher switches private keys. Remotely supplied or unknown key IDs are rejected with UnknownKeyId.
+7. Canonical RFC 8785 representation: Non-canonical JSON formatting (minification mismatch, extra whitespace, unsorted keys) is rejected with CanonicalizationMismatch.
+8. Domain validation: Zero fallback-routable bindings, empty catalogs, alias cycles, and invalid IDs are rejected before catalog adoption.
+
+---
+
+## 2. RED Test Phase: Unimplemented Envelope Verification Stubs
+
+Invocation:
+```
+$ cargo test -p mahoquot-registry --test signed_catalog
+```
+
+Output:
+```
+   Compiling mahoquot-registry v0.1.0 (/Users/indo/code/project/mahoquot-proxy/crates/registry)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.65s
+     Running tests/signed_catalog.rs (target/debug/deps/signed_catalog-4ea09178038d9673)
+
+running 15 tests
+test test_corrupted_byte_rejection ... FAILED
+test test_anti_downgrade_equal_and_lower_version_rejection ... FAILED
+test test_valid_signature_verification ... FAILED
+test test_expired_catalog_rejection ... FAILED
+test test_wrong_key_rejection ... FAILED
+test test_canonicalize_json_and_is_canonical_json ... FAILED
+test test_incompatible_schema_rejection ... FAILED
+test test_zero_fallback_routable_bindings_rejection ... FAILED
+test test_corrupted_signature_rejection ... FAILED
+test test_unknown_key_id_rejection ... FAILED
+test test_empty_catalog_rejection ... FAILED
+test test_non_canonical_json_rejection ... FAILED
+test test_future_timestamp_rejection ... FAILED
+test test_key_rotation_overlap ... FAILED
+test test_version_mismatch_between_envelope_and_payload ... FAILED
+
+failures:
+
+---- test_corrupted_byte_rejection stdout ----
+thread 'test_corrupted_byte_rejection' panicked at crates/registry/tests/signed_catalog.rs:67:10:
+signing should succeed: CanonicalizationMismatch
+
+---- test_anti_downgrade_equal_and_lower_version_rejection stdout ----
+thread 'test_anti_downgrade_equal_and_lower_version_rejection' panicked at crates/registry/tests/signed_catalog.rs:196:10:
+signing should succeed: CanonicalizationMismatch
+
+---- test_valid_signature_verification stdout ----
+thread 'test_valid_signature_verification' panicked at crates/registry/tests/signed_catalog.rs:41:10:
+signing should succeed: CanonicalizationMismatch
+
+---- test_expired_catalog_rejection stdout ----
+thread 'test_expired_catalog_rejection' panicked at crates/registry/tests/signed_catalog.rs:329:10:
+signing should succeed: CanonicalizationMismatch
+
+---- test_wrong_key_rejection stdout ----
+thread 'test_wrong_key_rejection' panicked at crates/registry/tests/signed_catalog.rs:130:10:
+signing should succeed: CanonicalizationMismatch
+
+---- test_canonicalize_json_and_is_canonical_json stdout ----
+thread 'test_canonicalize_json_and_is_canonical_json' panicked at crates/registry/tests/signed_catalog.rs:616:5:
+assertion failed: is_canonical_json(bytes).unwrap()
+
+---- test_incompatible_schema_rejection stdout ----
+thread 'test_incompatible_schema_rejection' panicked at crates/registry/tests/signed_catalog.rs:548:10:
+signing should succeed: CanonicalizationMismatch
+
+---- test_zero_fallback_routable_bindings_rejection stdout ----
+thread 'test_zero_fallback_routable_bindings_rejection' panicked at crates/registry/tests/signed_catalog.rs:468:10:
+signing should succeed: CanonicalizationMismatch
+
+---- test_corrupted_signature_rejection stdout ----
+thread 'test_corrupted_signature_rejection' panicked at crates/registry/tests/signed_catalog.rs:97:10:
+signing should succeed: CanonicalizationMismatch
+
+---- test_unknown_key_id_rejection stdout ----
+thread 'test_unknown_key_id_rejection' panicked at crates/registry/tests/signed_catalog.rs:163:10:
+signing should succeed: CanonicalizationMismatch
+
+---- test_empty_catalog_rejection stdout ----
+thread 'test_empty_catalog_rejection' panicked at crates/registry/tests/signed_catalog.rs:379:10:
+signing should succeed: CanonicalizationMismatch
+
+---- test_non_canonical_json_rejection stdout ----
+thread 'test_non_canonical_json_rejection' panicked at crates/registry/tests/signed_catalog.rs:424:90:
+called `Result::unwrap()` on an `Err` value: CanonicalizationMismatch
+
+---- test_future_timestamp_rejection stdout ----
+thread 'test_future_timestamp_rejection' panicked at crates/registry/tests/signed_catalog.rs:282:10:
+signing should succeed: CanonicalizationMismatch
+
+---- test_key_rotation_overlap stdout ----
+thread 'test_key_rotation_overlap' panicked at crates/registry/tests/signed_catalog.rs:504:10:
+called `Result::unwrap()` on an `Err` value: CanonicalizationMismatch
+
+---- test_version_mismatch_between_envelope_and_payload stdout ----
+thread 'test_version_mismatch_between_envelope_and_payload' panicked at crates/registry/tests/signed_catalog.rs:601:5:
+assertion `left == right` failed
+  left: Err(CanonicalizationMismatch)
+ right: Err(VersionMismatch { envelope_version: CatalogVersion(20), payload_version: CatalogVersion(10) })
+
+failures:
+    test_anti_downgrade_equal_and_lower_version_rejection
+    test_canonicalize_json_and_is_canonical_json
+    test_corrupted_byte_rejection
+    test_corrupted_signature_rejection
+    test_empty_catalog_rejection
+    test_expired_catalog_rejection
+    test_future_timestamp_rejection
+    test_incompatible_schema_rejection
+    test_key_rotation_overlap
+    test_non_canonical_json_rejection
+    test_unknown_key_id_rejection
+    test_valid_signature_verification
+    test_version_mismatch_between_envelope_and_payload
+    test_wrong_key_rejection
+    test_zero_fallback_routable_bindings_rejection
+
+test result: FAILED. 0 passed; 15 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+```
+
+---
+
+## 3. GREEN Test Phase: Complete Implementation & All Passing Tests
+
+Invocation:
+```
+$ cargo test -p mahoquot-registry signed_catalog -- --nocapture
+```
+
+Output:
+```
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/lib.rs (target/debug/deps/mahoquot_registry-92078c910a3389e3)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/catalog-tool.rs (target/debug/deps/catalog_tool-47ef416eb1c64398)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/catalog_tests.rs (target/debug/deps/catalog_tests-3c26b4bed88697d1)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/domain_tests.rs (target/debug/deps/domain_tests-59f9db66776ecdd7)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+
+     Running tests/envelope_tests.rs (target/debug/deps/envelope_tests-4dca5c39f9e9d835)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.00s
+
+     Running tests/signed_catalog.rs (target/debug/deps/signed_catalog-4ea09178038d9673)
+
+running 15 tests
+test signed_catalog_canonicalize_json_and_is_canonical_json ... ok
+test signed_catalog_empty_catalog_rejection ... ok
+test signed_catalog_corrupted_byte_rejection ... ok
+test signed_catalog_anti_downgrade_equal_and_lower_version_rejection ... ok
+test signed_catalog_future_timestamp_rejection ... ok
+test signed_catalog_corrupted_signature_rejection ... ok
+test signed_catalog_unknown_key_id_rejection ... ok
+test signed_catalog_expired_catalog_rejection ... ok
+test signed_catalog_incompatible_schema_rejection ... ok
+test signed_catalog_non_canonical_json_rejection ... ok
+test signed_catalog_version_mismatch_between_envelope_and_payload ... ok
+test signed_catalog_wrong_key_rejection ... ok
+test signed_catalog_valid_signature_verification ... ok
+test signed_catalog_key_rotation_overlap ... ok
+test signed_catalog_zero_fallback_routable_bindings_rejection ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+```
+
+Full workspace test suite execution:
+```
+$ cargo test -p mahoquot-registry
+```
+
+Output:
+```
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/lib.rs (target/debug/deps/mahoquot_registry-92078c910a3389e3)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/catalog-tool.rs (target/debug/deps/catalog_tool-47ef416eb1c64398)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/catalog_tests.rs (target/debug/deps/catalog_tests-3c26b4bed88697d1)
+running 3 tests
+test test_embedded_catalog_resolves_closed_and_open_models ... ok
+test embedded_catalog_covers_legacy_sources ... ok
+test embedded_catalog_roundtrips_deterministically ... ok
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/domain_tests.rs (target/debug/deps/domain_tests-59f9db66776ecdd7)
+running 8 tests
+test test_invalid_and_empty_ids ... ok
+test test_unknown_targets ... ok
+test test_stable_ordering ... ok
+test test_alias_cycles_and_depth ... ok
+test test_deterministic_serialization ... ok
+test test_duplicate_binding_merge ... ok
+test test_capability_lookup ... ok
+test resolves_closed_discovered_and_open_without_ambiguity ... ok
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/envelope_tests.rs (target/debug/deps/envelope_tests-4dca5c39f9e9d835)
+running 11 tests
+test test_canonicalize_and_is_canonical ... ok
+test test_future_timestamp_rejected ... ok
+test test_expired_catalog_rejected ... ok
+test test_unknown_key_id_rejected ... ok
+test test_version_downgrade_rejected ... ok
+test test_zero_fallback_routable_bindings_rejected ... ok
+test test_incompatible_schema_rejected ... ok
+test test_tampered_payload_fails_signature ... ok
+test test_valid_envelope_roundtrip ... ok
+test test_payload_version_mismatch_rejected ... ok
+test test_empty_catalog_rejected ... ok
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/signed_catalog.rs (target/debug/deps/signed_catalog-4ea09178038d9673)
+running 15 tests
+test signed_catalog_canonicalize_json_and_is_canonical_json ... ok
+test signed_catalog_corrupted_byte_rejection ... ok
+test signed_catalog_corrupted_signature_rejection ... ok
+test signed_catalog_empty_catalog_rejection ... ok
+test signed_catalog_incompatible_schema_rejection ... ok
+test signed_catalog_anti_downgrade_equal_and_lower_version_rejection ... ok
+test signed_catalog_future_timestamp_rejection ... ok
+test signed_catalog_expired_catalog_rejection ... ok
+test signed_catalog_non_canonical_json_rejection ... ok
+test signed_catalog_unknown_key_id_rejection ... ok
+test signed_catalog_version_mismatch_between_envelope_and_payload ... ok
+test signed_catalog_valid_signature_verification ... ok
+test signed_catalog_zero_fallback_routable_bindings_rejection ... ok
+test signed_catalog_wrong_key_rejection ... ok
+test signed_catalog_key_rotation_overlap ... ok
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+   Doc-tests mahoquot_registry
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+```
+
+Total: 37 tests passed across 4 test suites; 0 failures; 0 ignored.
+
+---
+
+## 4. Plan Exact QA Scenario: Mutated Byte Signature Failure
+
+QA Scenario Specification:
+"bad input — run the catalog verifier CLI from Todo 5 against a one-byte-mutated fixture; PASS iff exit is nonzero, stderr identifies `signature verification failed`, and no output/cache file changes."
+
+Script execution:
+```bash
+TMP=$(mktemp -d)
+
+# 1. Sign catalog
+cargo run -p mahoquot-model-catalog -- sign \
+  --key-file tests/fixtures/test-ed25519.key \
+  --input crates/registry/catalog/models-v1.json \
+  --output "$TMP/models-v1.json" \
+  --signature "$TMP/models-v1.json.sig"
+
+# 2. Verify intact catalog (Sanity Check)
+cargo run -p mahoquot-model-catalog -- verify \
+  --input "$TMP/models-v1.json" \
+  --signature "$TMP/models-v1.json.sig"
+
+# 3. Mutate 1 byte in payload
+cp "$TMP/models-v1.json" "$TMP/models-v1-corrupt.json"
+python3 -c "
+with open('$TMP/models-v1-corrupt.json', 'r+b') as f:
+    f.seek(15)
+    b = f.read(1)
+    f.seek(15)
+    f.write(bytes([b[0] ^ 0x01]))
+"
+
+# 4. Verify corrupted catalog (Must fail with signature verification failed)
+cargo run -p mahoquot-model-catalog -- verify \
+  --input "$TMP/models-v1-corrupt.json" \
+  --signature "$TMP/models-v1.json.sig"
+```
+
+Console Output:
+```
+=== Step 1: Sign catalog ===
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.05s
+     Running `target/debug/mahoquot-model-catalog sign --key-file tests/fixtures/test-ed25519.key --input crates/registry/catalog/models-v1.json --output /var/folders/zh/7cc25lt91b1_dj577306nwdh0000gn/T/tmp.1cuDd46lTK/models-v1.json --signature /var/folders/zh/7cc25lt91b1_dj577306nwdh0000gn/T/tmp.1cuDd46lTK/models-v1.json.sig`
+Signed catalog: version=v1, key_id='test-ed25519-v1', models=102, generated_at=1788370346
+  Output payload: /var/folders/zh/7cc25lt91b1_dj577306nwdh0000gn/T/tmp.1cuDd46lTK/models-v1.json
+  Output signature: /var/folders/zh/7cc25lt91b1_dj577306nwdh0000gn/T/tmp.1cuDd46lTK/models-v1.json.sig
+
+=== Step 2: Verify intact catalog ===
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.05s
+     Running `target/debug/mahoquot-model-catalog verify --input /var/folders/zh/7cc25lt91b1_dj577306nwdh0000gn/T/tmp.1cuDd46lTK/models-v1.json --signature /var/folders/zh/7cc25lt91b1_dj577306nwdh0000gn/T/tmp.1cuDd46lTK/models-v1.json.sig`
+Verified catalog: version=v1, source=embedded_fallback, models=102, key_id='test-ed25519-v1', generated_at=1788370346
+
+=== Step 3: Mutate single byte in payload ===
+
+=== Step 4: Verify corrupted catalog (Must fail with signature verification failed) ===
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.05s
+     Running `target/debug/mahoquot-model-catalog verify --input /var/folders/zh/7cc25lt91b1_dj577306nwdh0000gn/T/tmp.1cuDd46lTK/models-v1-corrupt.json --signature /var/folders/zh/7cc25lt91b1_dj577306nwdh0000gn/T/tmp.1cuDd46lTK/models-v1.json.sig`
+signature verification failed
+Error: signature verification failed
+Exit status: 1
+
+=== Step 5: Verify no files modified or cached ===
+total 200
+drwx------@    5 indo  staff     160 Sep  3 02:32 .
+drwx------@ 3719 indo  staff  119008 Sep  3 02:32 ..
+-rw-r--r--@    1 indo  staff   45219 Sep  3 02:32 models-v1-corrupt.json
+-rw-r--r--@    1 indo  staff   45219 Sep  3 02:32 models-v1.json
+-rw-r--r--@    1 indo  staff     217 Sep  3 02:32 models-v1.json.sig
+```
+
+Verdict:
+- Nonzero exit code: 1 (PASS)
+- Output contains `signature verification failed`: Yes (PASS)
+- No cache or state altered: Yes (PASS)

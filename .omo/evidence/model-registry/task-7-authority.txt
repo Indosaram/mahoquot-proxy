@@ -1,0 +1,83 @@
+================================================================================
+Task 7: Provider Discovery Authority & Typed Contributions Verification Evidence
+Location: mahoquot-proxy / mahoquot-registry
+Date: 2026-09-02
+================================================================================
+
+1. SUMMARY
+----------
+Task 7 implements explicit provider discovery policies and typed contributions
+in `mahoquot-registry`:
+- Provider Policies:
+  - `Closed`: Dedicated providers (Claude, Antigravity, Kiro, Cursor, Vertex, Zcode)
+    only expose catalog-declared models. Dynamic discovery cannot add models here.
+    Unauthorized discovery contributions are rejected with typed
+    `RegistryError::UnauthorizedContribution`.
+  - `Discovered`: Providers (e.g. local accounts / adapters / custom device auth)
+    discover models dynamically with explicit authority masks (chat/tools/image etc.)
+    and cannot overwrite catalog capabilities or alias targets.
+  - `Open`: Provider (Codex) accepts arbitrary model identifiers dynamically,
+    with optional negative-space exclusions.
+- Typed Contributions:
+  - `DiscoveredModel { id, capabilities, context_limit, authority }`
+  - `ContributionItem::Descriptor(ModelDescriptor)` / `ContributionItem::Discovered(DiscoveredModel)`
+  - `ProviderContribution { provider_id, models: Vec<ContributionItem> }`
+- RegistryBuilder Invariant:
+  - Rejects dynamic discovery for Closed providers via `apply_contribution`.
+  - Merges discovered models for Discovered/Open providers without overwriting
+    higher-precedence catalog capabilities.
+  - Rejects unknown providers with `RegistryError::UnknownProvider`.
+
+2. TDD RED PHASE EVIDENCE
+-------------------------
+Initial test run before implementing `DiscoveredModel`, `ProviderContribution`,
+`apply_contribution`, and `RegistryError::UnauthorizedContribution`:
+
+Command: `cargo test -p mahoquot-registry --test authority_tests`
+Output:
+   Compiling mahoquot-registry v0.1.0 (/Users/indo/code/project/mahoquot-proxy/crates/registry)
+error[E0432]: unresolved imports `mahoquot_registry::DiscoveredModel`, `mahoquot_registry::ProviderContribution`
+error[E0599]: no method named `apply_contribution` found for struct `RegistryBuilder`
+error[E0599]: no variant named `UnauthorizedContribution` found for enum `RegistryError`
+error: could not compile `mahoquot-registry` (test "authority_tests") due to 7 previous errors
+
+3. TDD GREEN PHASE EVIDENCE
+---------------------------
+Test command: `cargo test -p mahoquot-registry --test authority_tests -- --nocapture`
+Output:
+     Running tests/authority_tests.rs (target/debug/deps/authority_tests-cb396f12d66b1d61)
+
+running 5 tests
+test test_unauthorized_contribution_for_unknown_provider ... ok
+test test_open_provider_allows_passthrough_with_exclusions ... ok
+test test_closed_provider_rejects_dynamic_discovery ... ok
+test test_discovered_provider_cannot_overwrite_catalog_capabilities_or_aliases ... ok
+test test_discovered_provider_accepts_bounded_discovery ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+4. FULL SUITE VERIFICATION
+--------------------------
+Command: `cargo test -p mahoquot-registry`
+Output:
+     Running tests/authority_tests.rs (target/debug/deps/authority_tests-cb396f12d66b1d61)
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/catalog_tests.rs (target/debug/deps/catalog_tests-3c26b4bed88697d1)
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/domain_tests.rs (target/debug/deps/domain_tests-59f9db66776ecdd7)
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/envelope_tests.rs (target/debug/deps/envelope_tests-4dca5c39f9e9d835)
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/signed_catalog.rs (target/debug/deps/signed_catalog-4ea09178038d9673)
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+Total tests in mahoquot-registry: 42 passed; 0 failed; 0 ignored.
+
+Formatting & Lints:
+- `cargo fmt --check --package mahoquot-registry`: Clean (exit code 0).
+- `cargo clippy -p mahoquot-registry --all-targets -- -D warnings`: Clean (exit code 0).
+================================================================================

@@ -6,6 +6,33 @@ use crate::account::LoadError;
 use crate::refresh::Tokens;
 use crate::refresh_exec::RefreshError;
 
+use mahoquot_registry::{embedded_snapshot, ProviderContribution, ProviderId, RegistrySnapshot};
+
+pub fn provider_id() -> ProviderId {
+    ProviderId::vertex()
+}
+
+pub fn contribution(snapshot: &RegistrySnapshot) -> ProviderContribution {
+    snapshot.contribution_for_provider(&provider_id())
+}
+
+pub fn default_contribution() -> ProviderContribution {
+    contribution(embedded_snapshot())
+}
+
+pub fn supported_models(snapshot: &RegistrySnapshot) -> Vec<String> {
+    contribution(snapshot).supported_model_ids()
+}
+
+pub fn is_vertex_model_in_snapshot(snapshot: &RegistrySnapshot, model: &str) -> bool {
+    contribution(snapshot).supports_model(model)
+}
+
+pub fn is_vertex_model(model: &str) -> bool {
+    is_vertex_model_in_snapshot(embedded_snapshot(), model)
+}
+
+#[deprecated(note = "query catalog/registry for models instead")]
 pub const VERTEX_MODELS: &[&str] = &[
     "gemini-2.5-pro",
     "gemini-2.5-flash",
@@ -29,10 +56,6 @@ pub const VERTEX_MODELS: &[&str] = &[
     "gemini-3.5-flash",
     "gemini-3.6-flash",
 ];
-
-pub fn is_vertex_model(model: &str) -> bool {
-    VERTEX_MODELS.contains(&model) || model.starts_with("gemini-") || model.starts_with("google/")
-}
 
 fn default_vertex_type() -> String {
     "vertex".to_string()

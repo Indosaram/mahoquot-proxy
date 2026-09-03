@@ -2,10 +2,12 @@
 resolver = "2"
 members = [
     "crates/types",
+    "crates/registry",
     "crates/router",
     "crates/providers",
     "crates/gateway",
     "tools/bench",
+    "tools/model-catalog",
 ]
 default-members = ["crates/gateway"]
 
@@ -17,6 +19,7 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 mahoquot-types = { path = "crates/types" }
+mahoquot-registry = { path = "crates/registry" }
 mahoquot-router = { path = "crates/router" }
 mahoquot-providers = { path = "crates/providers" }
 tokio = { version = "1", features = ["full"] }
@@ -47,3 +50,4 @@ tower = "0.5"
 prost = "0.13"
 prost-types = "0.13"
 clap = { version = "4", features = ["derive", "env"] }
+ed25519-dalek = { version = "2.1", default-features = false, features = ["alloc", "std"] }

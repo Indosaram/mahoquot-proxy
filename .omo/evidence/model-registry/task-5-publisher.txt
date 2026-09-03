@@ -1,0 +1,107 @@
+=== TASK 5 MODEL REGISTRY TOOLING EVIDENCE ===
+Date: 2026-09-02 17:21:58Z
+Host: Darwin arm64
+
+--- 1. Workspace Member and Binary Verification ---
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.05s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.04s
+
+--- 2. Catalog Validation against Domain & Schema Invariants ---
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.04s
+     Running `target/debug/mahoquot-model-catalog validate crates/registry/catalog/models-v1.json`
+Catalog valid: crates/registry/catalog/models-v1.json (version: v1, models: 102, providers: 14, aliases: 5, exclusions: 0)
+
+--- 3. Plan Exact QA Scenario: Ephemeral Sign & Verify Pipeline ---
+Using temporary directory: /var/folders/zh/7cc25lt91b1_dj577306nwdh0000gn/T/tmp.NIheV4dr8t
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.04s
+     Running `target/debug/mahoquot-model-catalog sign --key-file tests/fixtures/test-ed25519.key --input crates/registry/catalog/models-v1.json --output /var/folders/zh/7cc25lt91b1_dj577306nwdh0000gn/T/tmp.NIheV4dr8t/models-v1.json --signature /var/folders/zh/7cc25lt91b1_dj577306nwdh0000gn/T/tmp.NIheV4dr8t/models-v1.json.sig`
+Signed catalog: version=v1, key_id='test-ed25519-v1', models=102, generated_at=1788369719
+  Output payload: /var/folders/zh/7cc25lt91b1_dj577306nwdh0000gn/T/tmp.NIheV4dr8t/models-v1.json
+  Output signature: /var/folders/zh/7cc25lt91b1_dj577306nwdh0000gn/T/tmp.NIheV4dr8t/models-v1.json.sig
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.04s
+     Running `target/debug/mahoquot-model-catalog verify --input /var/folders/zh/7cc25lt91b1_dj577306nwdh0000gn/T/tmp.NIheV4dr8t/models-v1.json --signature /var/folders/zh/7cc25lt91b1_dj577306nwdh0000gn/T/tmp.NIheV4dr8t/models-v1.json.sig`
+Verified catalog: version=v1, source=embedded_fallback, models=102, key_id='test-ed25519-v1', generated_at=1788369719
+Detached signature envelope content:
+{
+  "schema_version": 1,
+  "catalog_version": 1,
+  "key_id": "test-ed25519-v1",
+  "generated_at": 1788369719,
+  "signature": "82VVpnDnFs8xRx7n87zuBqNVZL4gh/Rnl6iqWg+F2uSMVcyRMKGFV+Yo6/7ffUU9ibnlQrBNzBMviapxxfiXDA=="
+}Temporary directory cleaned up.
+
+--- 4. Full Automated Verification Script Output ---
+=== Mahoquot Model Catalog Verification Pipeline ===
+Workspace root: /Users/indo/code/project/mahoquot-proxy
+
+[Step 1/6] Checking required files...
+  OK: crates/registry/catalog/models-v1.json
+  OK: crates/registry/schema/catalog-v1.schema.json
+  OK: crates/registry/schema/envelope-v1.schema.json
+  OK: tests/fixtures/test-ed25519.key
+  OK: tests/fixtures/test-ed25519.pub
+
+[Step 2/6] Validating catalog and envelope JSON Schemas...
+  OK: Both schemas are syntactically valid JSON Schema draft-07 documents
+
+[Step 3/6] Validating catalog with mahoquot-model-catalog...
+Catalog valid: crates/registry/catalog/models-v1.json (version: v1, models: 102, providers: 14, aliases: 5, exclusions: 0)
+
+[Step 4/6] Canonicalizing and signing catalog with test Ed25519 key...
+Signed catalog: version=v1, key_id='test-ed25519-v1', models=102, generated_at=1788369720
+  Output payload: /var/folders/zh/7cc25lt91b1_dj577306nwdh0000gn/T/tmp.ZIdnszJ1ni/models-v1.json
+  Output signature: /var/folders/zh/7cc25lt91b1_dj577306nwdh0000gn/T/tmp.ZIdnszJ1ni/models-v1.json.sig
+  Generated canonical payload at /var/folders/zh/7cc25lt91b1_dj577306nwdh0000gn/T/tmp.ZIdnszJ1ni/models-v1.json
+  Generated signature envelope at /var/folders/zh/7cc25lt91b1_dj577306nwdh0000gn/T/tmp.ZIdnszJ1ni/models-v1.json.sig
+
+[Step 5/6] Verifying signed envelope with public key...
+Verified catalog: version=v1, source=embedded_fallback, models=102, key_id='test-ed25519-v1', generated_at=1788369720
+
+[Step 6/6] Running adversarial rejection tests...
+  PASS: Tampered payload rejected as expected (canonicalization mismatch)
+  PASS: Tampered semantic content rejected as expected (signature verification failed)
+  PASS: Tampered signature rejected as expected
+  PASS: Version downgrade rejected as expected
+  PASS: Incompatible schema version rejected as expected
+
+=== ALL VERIFICATION CHECKS PASSED SUCCESSFULLY ===
+
+--- 5. Unit and Integration Test Results ---
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.04s
+     Running tests/envelope_tests.rs (target/debug/deps/envelope_tests-4dca5c39f9e9d835)
+
+running 11 tests
+test test_canonicalize_and_is_canonical ... ok
+test test_incompatible_schema_rejected ... ok
+test test_unknown_key_id_rejected ... ok
+test test_expired_catalog_rejected ... ok
+test test_version_downgrade_rejected ... ok
+test test_future_timestamp_rejected ... ok
+test test_zero_fallback_routable_bindings_rejected ... ok
+test test_empty_catalog_rejected ... ok
+test test_payload_version_mismatch_rejected ... ok
+test test_valid_envelope_roundtrip ... ok
+test test_tampered_payload_fails_signature ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.04s
+     Running unittests src/main.rs (target/debug/deps/mahoquot_model_catalog-151fb0e8ed5910d6)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/cli_tests.rs (target/debug/deps/cli_tests-42b768e0ec88b126)
+
+running 7 tests
+test test_cli_validate_malformed_catalog_fails ... ok
+test test_cli_generate_key ... ok
+test test_cli_validate_valid_catalog ... ok
+test test_cli_verify_anti_downgrade ... ok
+test test_cli_verify_detects_tampered_payload ... ok
+test test_cli_verify_detects_tampered_signature ... ok
+test test_cli_sign_and_verify_roundtrip ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.29s
+

@@ -130,8 +130,198 @@ impl ProviderKind {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod provider_kind_contract_tests {
-    use super::ProviderKind;
+    use super::*;
+    use mahoquot_providers::{ANTIGRAVITY_MODELS, CLAUDE_MODELS, VERTEX_MODELS, ZCODE_MODELS};
+    use std::sync::Arc;
+
+    #[test]
+    fn characterization_codex_negative_space_exclusion() {
+        let codex = ProviderKind::Codex;
+
+        // 1. Rejects all 13 Antigravity models
+        for model in ANTIGRAVITY_MODELS {
+            assert!(
+                !codex.serves_model(model),
+                "Codex must not serve Antigravity model {model}"
+            );
+        }
+
+        // 2. Rejects all 12 Claude models
+        for model in CLAUDE_MODELS {
+            assert!(
+                !codex.serves_model(model),
+                "Codex must not serve Claude model {model}"
+            );
+        }
+
+        // 3. Rejects all 5 Zcode models
+        for model in ZCODE_MODELS {
+            assert!(
+                !codex.serves_model(model),
+                "Codex must not serve Zcode model {model}"
+            );
+        }
+
+        // 4. Rejects all 21 Vertex models
+        for model in VERTEX_MODELS {
+            assert!(
+                !codex.serves_model(model),
+                "Codex must not serve Vertex model {model}"
+            );
+        }
+
+        // 5. Rejects cursor- and cursor/ prefixes
+        assert!(!codex.serves_model("cursor-small"));
+        assert!(!codex.serves_model("cursor-fast"));
+        assert!(!codex.serves_model("cursor/auto"));
+        assert!(!codex.serves_model("cursor/anything"));
+
+        // 6. Rejects kiro/ prefix and auto-kiro
+        assert!(!codex.serves_model("auto-kiro"));
+        assert!(!codex.serves_model("kiro/auto"));
+        assert!(!codex.serves_model("kiro/claude-sonnet-4.6"));
+
+        // 7. Rejects gemini- and google/ prefixes (via is_vertex_model)
+        assert!(!codex.serves_model("gemini-custom"));
+        assert!(!codex.serves_model("google/custom"));
+
+        // 8. Serves standard Codex / OpenAI models
+        assert!(codex.serves_model("gpt-5.6-sol"));
+        assert!(codex.serves_model("gpt-5.5"));
+        assert!(codex.serves_model("gpt-5.4"));
+        assert!(codex.serves_model("gpt-5.4-mini"));
+        assert!(codex.serves_model("gpt-5.3-codex-spark"));
+        assert!(codex.serves_model("gpt-4o"));
+        assert!(codex.serves_model("o3-mini"));
+        assert!(codex.serves_model("text-embedding-3-small"));
+        assert!(codex.serves_model("custom-codex-open-model"));
+    }
+
+    #[test]
+    fn characterization_kiro_and_cursor_prefixes() {
+        let kiro = ProviderKind::Kiro;
+        let cursor = ProviderKind::Cursor;
+
+        // Kiro serves prefixed models and auto-kiro
+        assert!(kiro.serves_model("auto-kiro"));
+        assert!(kiro.serves_model("kiro/auto"));
+        assert!(kiro.serves_model("kiro/claude-sonnet-4.6"));
+        assert!(kiro.serves_model("kiro/claude-haiku-4-5-20251001"));
+
+        // Kiro rejects bare un-prefixed models
+        assert!(!kiro.serves_model("auto"));
+        assert!(!kiro.serves_model("claude-sonnet-4.6"));
+        assert!(!kiro.serves_model("claude-haiku-4-5-20251001"));
+        assert!(!kiro.serves_model("kiro/non-existent-model"));
+
+        // Cursor serves cursor/ prefixed models, cursor- catalog, and reference models
+        assert!(cursor.serves_model("cursor/auto"));
+        assert!(cursor.serves_model("cursor/auto-cost"));
+        assert!(cursor.serves_model("cursor/arbitrary-name"));
+        assert!(cursor.serves_model("cursor-small"));
+        assert!(cursor.serves_model("cursor-fast"));
+        assert!(cursor.serves_model("gpt-5.6-sol"));
+        assert!(cursor.serves_model("claude-sonnet-4-5-20250929"));
+
+        // Cursor rejects unlisted models without cursor/ prefix
+        assert!(!cursor.serves_model("gpt-5.5"));
+        assert!(!cursor.serves_model("claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn characterization_generic_account_supports_model() {
+        // Generic account with empty models: serves ANY model
+        let empty_account = GenericAccount {
+            identity_slug: "slug-generic-empty".to_string(),
+            provider: "open-generic".to_string(),
+            label: "Open Generic".to_string(),
+            adapter: "openai-chat".to_string(),
+            base_url: "https://example.com".to_string(),
+            api_key: "k".to_string(),
+            auth_mode: "key".to_string(),
+            refresh_token: String::new(),
+            expired: String::new(),
+            token_url: String::new(),
+            client_id: String::new(),
+            project_id: String::new(),
+            models: vec![],
+            static_headers: Default::default(),
+            disabled: false,
+        };
+        let empty_member = AccountMember::for_test(ProviderAccount::Generic(empty_account));
+        assert!(empty_member.supports_model("gpt-4o"));
+        assert!(empty_member.supports_model("claude-sonnet-4-6"));
+        assert!(empty_member.supports_model("arbitrary-novel-model-id"));
+
+        // Generic account with non-empty models: serves ONLY listed models
+        let restricted_account = GenericAccount {
+            identity_slug: "slug-generic-rest".to_string(),
+            provider: "restricted-generic".to_string(),
+            label: "Restricted Generic".to_string(),
+            adapter: "openai-chat".to_string(),
+            base_url: "https://example.com".to_string(),
+            api_key: "k".to_string(),
+            auth_mode: "key".to_string(),
+            refresh_token: String::new(),
+            expired: String::new(),
+            token_url: String::new(),
+            client_id: String::new(),
+            project_id: String::new(),
+            models: vec![
+                "custom-model-alpha".to_string(),
+                "custom-model-beta".to_string(),
+            ],
+            static_headers: Default::default(),
+            disabled: false,
+        };
+        let restricted_member =
+            AccountMember::for_test(ProviderAccount::Generic(restricted_account));
+        assert!(restricted_member.supports_model("custom-model-alpha"));
+        assert!(restricted_member.supports_model("custom-model-beta"));
+        assert!(!restricted_member.supports_model("custom-model-gamma"));
+        assert!(!restricted_member.supports_model("gpt-4o"));
+    }
+
+    #[test]
+    fn characterization_unsupported_model_inheritance() {
+        let member = AccountMember::for_test(ProviderAccount::Codex(CodexAccount {
+            email: "test@example.com".to_string(),
+            ..Default::default()
+        }));
+
+        // Initially supports declared model
+        assert!(member.supports_model("gpt-5.6-sol"));
+        assert!(member.supports_model("gpt-5.5"));
+
+        // Marking a model unsupported removes it from supports_model
+        member.mark_model_unsupported("gpt-5.6-sol");
+        assert!(!member.supports_model("gpt-5.6-sol"));
+        assert!(member.supports_model("gpt-5.5"));
+
+        // Deduplication: marking the same model again does not add duplicate
+        member.mark_model_unsupported("gpt-5.6-sol");
+        assert_eq!(member.unsupported_models.read().unwrap().len(), 1);
+
+        // Rescan / state transition inheritance:
+        // When a new AccountMember instance is loaded, adopt_runtime_state inherits unsupported_models
+        let fresh_member = AccountMember::for_test(ProviderAccount::Codex(CodexAccount {
+            email: "test@example.com".to_string(),
+            ..Default::default()
+        }));
+        // Before adoption, fresh_member would support gpt-5.6-sol
+        assert!(fresh_member.supports_model("gpt-5.6-sol"));
+
+        // After adopting previous runtime state, fresh_member inherits the exclusion
+        crate::state::adopt_runtime_state(&fresh_member, &Arc::new(member));
+        assert!(!fresh_member.supports_model("gpt-5.6-sol"));
+        assert!(fresh_member.supports_model("gpt-5.5"));
+        assert_eq!(
+            *fresh_member.unsupported_models.read().unwrap(),
+            vec!["gpt-5.6-sol".to_string()]
+        );
+    }
 
     #[test]
     fn anthropic_credential_type_maps_to_claude() {
@@ -489,10 +679,13 @@ impl PoolMember for AccountMember {
 }
 
 impl AccountMember {
-    #[cfg(test)]
     pub fn for_test(inner: ProviderAccount) -> Self {
+        Self::for_test_with_id("test", inner)
+    }
+
+    pub fn for_test_with_id(id: impl Into<String>, inner: ProviderAccount) -> Self {
         Self {
-            id: "test".to_string(),
+            id: id.into(),
             file_path: PathBuf::from("/dev/null"),
             inner: RwLock::new(inner),
             health: RwLock::new(Health::Available),
@@ -637,6 +830,26 @@ impl AccountMember {
         match &*guard {
             ProviderAccount::Vertex(account) => Some(account.effective_location().to_string()),
             _ => None,
+        }
+    }
+
+    pub fn is_manually_disabled(&self) -> bool {
+        if self.health() == mahoquot_types::Health::Disabled {
+            return true;
+        }
+        let guard = self
+            .inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match &*guard {
+            ProviderAccount::Generic(account) => account.disabled,
+            ProviderAccount::Antigravity(account) => account.disabled,
+            ProviderAccount::Claude(account) => account.disabled,
+            ProviderAccount::Cursor(account) => account.disabled,
+            ProviderAccount::Kiro(account) => account.disabled,
+            ProviderAccount::Vertex(account) => account.disabled,
+            ProviderAccount::Zcode(account) => account.disabled,
+            ProviderAccount::Codex(_) => false,
         }
     }
 

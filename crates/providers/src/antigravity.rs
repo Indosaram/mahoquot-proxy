@@ -80,7 +80,35 @@ pub fn antigravity_client_secret() -> &'static str {
     )
 }
 
-pub const ANTIGRAVITY_MODELS: [&str; 13] = [
+use mahoquot_registry::{embedded_snapshot, ProviderContribution, ProviderId, RegistrySnapshot};
+
+pub fn provider_id() -> ProviderId {
+    ProviderId::antigravity()
+}
+
+pub fn contribution(snapshot: &RegistrySnapshot) -> ProviderContribution {
+    snapshot.contribution_for_provider(&provider_id())
+}
+
+pub fn default_contribution() -> ProviderContribution {
+    contribution(embedded_snapshot())
+}
+
+pub fn supported_models(snapshot: &RegistrySnapshot) -> Vec<String> {
+    contribution(snapshot).supported_model_ids()
+}
+
+pub fn is_antigravity_model_in_snapshot(snapshot: &RegistrySnapshot, model: &str) -> bool {
+    contribution(snapshot).supports_model(model)
+}
+
+pub fn is_antigravity_model(model: &str) -> bool {
+    is_antigravity_model_in_snapshot(embedded_snapshot(), model)
+}
+
+#[deprecated(note = "query catalog/registry for models instead")]
+pub const ANTIGRAVITY_MODELS: [&str; 14] = [
+    "gemini-3.8-flash-high",
     "gemini-3.7-flash-high",
     "gemini-3.6-flash-high",
     "gemini-3.5-flash-low",
@@ -95,10 +123,6 @@ pub const ANTIGRAVITY_MODELS: [&str; 13] = [
     "claude-opus-4-6-thinking",
     "gpt-oss-120b-medium",
 ];
-
-pub fn is_antigravity_model(model: &str) -> bool {
-    ANTIGRAVITY_MODELS.contains(&model)
-}
 
 #[derive(Clone, Default, serde::Deserialize, serde::Serialize)]
 pub struct AntigravityAccount {

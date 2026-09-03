@@ -5,19 +5,364 @@
   "type": "object",
   "additionalProperties": false,
   "properties": {
-    "scheduler": {"type":"object","properties":{"exhaustion-enter-percent":{"type":"number","minimum":0,"maximum":100},"exhaustion-exit-percent":{"type":"number","minimum":0,"maximum":100},"minimum-hold-seconds":{"type":"integer","minimum":0},"switch-margin-seconds":{"type":"integer","minimum":0}},"required":["exhaustion-enter-percent","exhaustion-exit-percent","minimum-hold-seconds","switch-margin-seconds"]},
-    "history": {"type":"object","properties":{"queue-capacity":{"type":"integer","minimum":1},"retention-days":{"type":"integer","minimum":1},"max-size-mb":{"type":"integer","minimum":1},"time-bucket":{"enum":["minute","hour","day"]}},"required":["queue-capacity","retention-days","max-size-mb"]},
-    "reset": {"type":"object","properties":{"redeem-request-id":{"type":"string","minLength":1},"account-id":{"type":"string","minLength":1}},"required":["redeem-request-id","account-id"]},
-    "graceful-shutdown": {"type":"object","properties":{"deadline-ms":{"type":"integer","minimum":1},"owner":{"enum":["desktop-local","external"]}},"required":["deadline-ms","owner"]},
-    "pricing": {"type":"object","properties":{"model":{"type":"string","minLength":1},"input-per-million":{"type":"number","minimum":0},"output-per-million":{"type":"number","minimum":0},"version":{"type":"integer","minimum":1}},"required":["model","input-per-million","output-per-million","version"]},
-    "cli": {"type":"object","properties":{"agent":{"enum":["claude-code","codex","gemini","omo"]},"expected-current-hash":{"type":"string"}},"required":["agent"]},
-    "totp": {"type":"object","properties":{"entry-id":{"type":"string","minLength":1},"credential-store":{"enum":["available","locked","unavailable"]}},"required":["entry-id","credential-store"]},
-    "tunnel": {"type":"object","properties":{"enabled":{"type":"boolean"},"gateway-profile":{"enum":["local-owned","remote"]}},"required":["enabled","gateway-profile"]},
-    "launcher": {"type":"object","properties":{"account-id":{"type":"string","minLength":1},"instance-id":{"type":"string","minLength":1}},"required":["account-id","instance-id"]},
-    "updater": {"type":"object","properties":{"target":{"type":"string","minLength":1},"schema-version":{"type":"integer","minimum":1},"gateway-profile":{"enum":["local-owned","remote"]}},"required":["target","schema-version","gateway-profile"]},
-    "platform-parity": {"type":"object","properties":{"session":{"enum":["macos","windows","linux-x11","gnome-wayland","kde-wayland"]},"compact":{"const":"8x180"},"expanded":{"const":"420x560"}},"required":["session","compact","expanded"]}
+    "scheduler": {
+      "type": "object",
+      "properties": {
+        "exhaustion-enter-percent": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "exhaustion-exit-percent": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "minimum-hold-seconds": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "switch-margin-seconds": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "exhaustion-enter-percent",
+        "exhaustion-exit-percent",
+        "minimum-hold-seconds",
+        "switch-margin-seconds"
+      ]
+    },
+    "history": {
+      "type": "object",
+      "properties": {
+        "queue-capacity": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "retention-days": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max-size-mb": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "time-bucket": {
+          "enum": [
+            "minute",
+            "hour",
+            "day"
+          ]
+        }
+      },
+      "required": [
+        "queue-capacity",
+        "retention-days",
+        "max-size-mb"
+      ]
+    },
+    "reset": {
+      "type": "object",
+      "properties": {
+        "redeem-request-id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "account-id": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "redeem-request-id",
+        "account-id"
+      ]
+    },
+    "graceful-shutdown": {
+      "type": "object",
+      "properties": {
+        "deadline-ms": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "owner": {
+          "enum": [
+            "desktop-local",
+            "external"
+          ]
+        }
+      },
+      "required": [
+        "deadline-ms",
+        "owner"
+      ]
+    },
+    "pricing": {
+      "type": "object",
+      "properties": {
+        "model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "input-per-million": {
+          "type": "number",
+          "minimum": 0
+        },
+        "output-per-million": {
+          "type": "number",
+          "minimum": 0
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "model",
+        "input-per-million",
+        "output-per-million",
+        "version"
+      ]
+    },
+    "cli": {
+      "type": "object",
+      "properties": {
+        "agent": {
+          "enum": [
+            "claude-code",
+            "codex",
+            "gemini",
+            "omo"
+          ]
+        },
+        "expected-current-hash": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "agent"
+      ]
+    },
+    "totp": {
+      "type": "object",
+      "properties": {
+        "entry-id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "credential-store": {
+          "enum": [
+            "available",
+            "locked",
+            "unavailable"
+          ]
+        }
+      },
+      "required": [
+        "entry-id",
+        "credential-store"
+      ]
+    },
+    "tunnel": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "gateway-profile": {
+          "enum": [
+            "local-owned",
+            "remote"
+          ]
+        }
+      },
+      "required": [
+        "enabled",
+        "gateway-profile"
+      ]
+    },
+    "launcher": {
+      "type": "object",
+      "properties": {
+        "account-id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "instance-id": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "account-id",
+        "instance-id"
+      ]
+    },
+    "updater": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "minLength": 1
+        },
+        "schema-version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "gateway-profile": {
+          "enum": [
+            "local-owned",
+            "remote"
+          ]
+        }
+      },
+      "required": [
+        "target",
+        "schema-version",
+        "gateway-profile"
+      ]
+    },
+    "platform-parity": {
+      "type": "object",
+      "properties": {
+        "session": {
+          "enum": [
+            "macos",
+            "windows",
+            "linux-x11",
+            "gnome-wayland",
+            "kde-wayland"
+          ]
+        },
+        "compact": {
+          "const": "8x180"
+        },
+        "expanded": {
+          "const": "420x560"
+        }
+      },
+      "required": [
+        "session",
+        "compact",
+        "expanded"
+      ]
+    },
+    "model-registry": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "source": {
+          "enum": [
+            "embedded_fallback",
+            "lkg_cache",
+            "remote_signed",
+            "discovered",
+            "local_override"
+          ]
+        },
+        "catalog-version": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "generation": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "generated-at": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "loaded-at": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "stale": {
+          "type": "boolean"
+        },
+        "last-refresh": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "outcome": {
+              "enum": [
+                "never",
+                "success",
+                "error"
+              ]
+            },
+            "attempted-at": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "duration-ms": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "rejection-reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "outcome",
+            "attempted-at",
+            "duration-ms",
+            "rejection-reason"
+          ]
+        },
+        "provider-count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "model-count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "refresh-in-flight": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "source",
+        "catalog-version",
+        "generation",
+        "generated-at",
+        "loaded-at",
+        "stale",
+        "last-refresh",
+        "provider-count",
+        "model-count",
+        "refresh-in-flight"
+      ]
+    }
   },
-  "required": ["scheduler","history","reset","graceful-shutdown","pricing","cli","totp","tunnel","launcher","updater","platform-parity"],
+  "required": [
+    "scheduler",
+    "history",
+    "reset",
+    "graceful-shutdown",
+    "pricing",
+    "cli",
+    "totp",
+    "tunnel",
+    "launcher",
+    "updater",
+    "platform-parity",
+    "model-registry"
+  ],
   "x-route-registration-owners": {
     "GET /v0/management/contracts/v1": "crates/gateway/src/management/contracts.rs",
     "GET /v0/management/scheduler": "crates/gateway/src/management/contracts.rs",
@@ -26,6 +371,8 @@
     "POST /v0/management/history/export": "crates/gateway/src/management/contracts.rs",
     "POST /v0/management/shutdown": "crates/gateway/src/management/contracts.rs",
     "GET /v0/management/prices": "crates/gateway/src/management/contracts.rs",
-    "PUT /v0/management/prices/{model}": "crates/gateway/src/management/contracts.rs"
+    "PUT /v0/management/prices/{model}": "crates/gateway/src/management/contracts.rs",
+    "GET /v0/management/model-registry": "crates/gateway/src/management/registry.rs",
+    "POST /v0/management/model-registry": "crates/gateway/src/management/registry.rs"
   }
 }

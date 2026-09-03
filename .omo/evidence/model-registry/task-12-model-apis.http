@@ -1,0 +1,138 @@
+GET /v1/models HTTP/1.1
+Host: 127.0.0.1:18873
+Authorization: Bearer test-admin
+
+HTTP/1.1 200 OK
+content-type: application/json
+access-control-allow-origin: *
+access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
+access-control-allow-headers: Authorization, Content-Type
+content-length: 1348
+date: Thu, 03 Sep 2026 05:08:25 GMT
+
+{"data":[{"created":1788412105,"id":"claude-opus-4-6-thinking","object":"model","owned_by":"google"},{"created":1788412105,"id":"claude-sonnet-4-6","object":"model","owned_by":"google"},{"created":1788412105,"id":"gemini-3-flash","object":"model","owned_by":"google"},{"created":1788412105,"id":"gemini-3-flash-agent","object":"model","owned_by":"google"},{"created":1788412105,"id":"gemini-3.1-flash-image","object":"model","owned_by":"google"},{"created":1788412105,"id":"gemini-3.1-flash-lite","object":"model","owned_by":"google"},{"created":1788412105,"id":"gemini-3.1-pro-low","object":"model","owned_by":"google"},{"created":1788412105,"id":"gemini-3.5-flash-extra-low","object":"model","owned_by":"google"},{"created":1788412105,"id":"gemini-3.5-flash-low","object":"model","owned_by":"google"},{"created":1788412105,"id":"gemini-3.6-flash-high","object":"model","owned_by":"google"},{"created":1788412105,"id":"gemini-3.7-flash-high","object":"model","owned_by":"google"},{"created":1788412105,"id":"gemini-3.8-flash-high","object":"model","owned_by":"google"},{"created":1788412105,"id":"gemini-next-flash-high","object":"model","owned_by":"google"},{"created":1788412105,"id":"gemini-pro-agent","object":"model","owned_by":"google"},{"created":1788412105,"id":"gpt-oss-120b-medium","object":"model","owned_by":"google"}],"object":"list"}
+
+---
+
+GET /v1beta/models HTTP/1.1
+Host: 127.0.0.1:18873
+Authorization: Bearer test-admin
+
+HTTP/1.1 200 OK
+content-type: application/json
+access-control-allow-origin: *
+access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
+access-control-allow-headers: Authorization, Content-Type
+content-length: 3911
+date: Thu, 03 Sep 2026 05:08:25 GMT
+
+{"models":[{"description":"claude-opus-4-6-thinking","displayName":"claude-opus-4-6-thinking","name":"models/claude-opus-4-6-thinking","supportedGenerationMethods":["generateContent"],"supportedInputModalities":["text","image","audio","video"],"supportedOutputModalities":["text"]},{"description":"claude-sonnet-4-6","displayName":"claude-sonnet-4-6","name":"models/claude-sonnet-4-6","supportedGenerationMethods":["generateContent"],"supportedInputModalities":["text","image","audio","video"],"supportedOutputModalities":["text"]},{"description":"gemini-3-flash","displayName":"gemini-3-flash","name":"models/gemini-3-flash","supportedGenerationMethods":["generateContent"],"supportedInputModalities":["text","image","audio","video"],"supportedOutputModalities":["text"]},{"description":"gemini-3-flash-agent","displayName":"gemini-3-flash-agent","name":"models/gemini-3-flash-agent","supportedGenerationMethods":["generateContent"],"supportedInputModalities":["text","image","audio","video"],"supportedOutputModalities":["text"]},{"description":"gemini-3.1-flash-image","displayName":"gemini-3.1-flash-image","name":"models/gemini-3.1-flash-image","supportedGenerationMethods":["generateContent"],"supportedInputModalities":["text","image","audio","video"],"supportedOutputModalities":["text","image"]},{"description":"gemini-3.1-flash-lite","displayName":"gemini-3.1-flash-lite","name":"models/gemini-3.1-flash-lite","supportedGenerationMethods":["generateContent"],"supportedInputModalities":["text","image","audio","video"],"supportedOutputModalities":["text"]},{"description":"gemini-3.1-pro-low","displayName":"gemini-3.1-pro-low","name":"models/gemini-3.1-pro-low","supportedGenerationMethods":["generateContent"],"supportedInputModalities":["text","image","audio","video"],"supportedOutputModalities":["text"]},{"description":"gemini-3.5-flash-extra-low","displayName":"gemini-3.5-flash-extra-low","name":"models/gemini-3.5-flash-extra-low","supportedGenerationMethods":["generateContent"],"supportedInputModalities":["text","image","audio","video"],"supportedOutputModalities":["text"]},{"description":"gemini-3.5-flash-low","displayName":"gemini-3.5-flash-low","name":"models/gemini-3.5-flash-low","supportedGenerationMethods":["generateContent"],"supportedInputModalities":["text","image","audio","video"],"supportedOutputModalities":["text"]},{"description":"gemini-3.6-flash-high","displayName":"gemini-3.6-flash-high","name":"models/gemini-3.6-flash-high","supportedGenerationMethods":["generateContent"],"supportedInputModalities":["text","image","audio","video"],"supportedOutputModalities":["text"]},{"description":"gemini-3.7-flash-high","displayName":"gemini-3.7-flash-high","name":"models/gemini-3.7-flash-high","supportedGenerationMethods":["generateContent"],"supportedInputModalities":["text","image","audio","video"],"supportedOutputModalities":["text"]},{"description":"gemini-3.8-flash-high","displayName":"gemini-3.8-flash-high","name":"models/gemini-3.8-flash-high","supportedGenerationMethods":["generateContent"],"supportedInputModalities":["text","image","audio","video"],"supportedOutputModalities":["text"]},{"description":"gemini-next-flash-high","displayName":"gemini-next-flash-high","name":"models/gemini-next-flash-high","supportedGenerationMethods":["generateContent"],"supportedInputModalities":["text","image","audio","video"],"supportedOutputModalities":["text"]},{"description":"gemini-pro-agent","displayName":"gemini-pro-agent","name":"models/gemini-pro-agent","supportedGenerationMethods":["generateContent"],"supportedInputModalities":["text","image","audio","video"],"supportedOutputModalities":["text"]},{"description":"gpt-oss-120b-medium","displayName":"gpt-oss-120b-medium","name":"models/gpt-oss-120b-medium","supportedGenerationMethods":["generateContent"],"supportedInputModalities":["text","image","audio","video"],"supportedOutputModalities":["text"]}]}
+
+---
+
+GET /v1beta/models/gemini-next-flash-high HTTP/1.1
+Host: 127.0.0.1:18873
+Authorization: Bearer test-admin
+
+HTTP/1.1 200 OK
+content-type: application/json
+access-control-allow-origin: *
+access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
+access-control-allow-headers: Authorization, Content-Type
+content-length: 215
+date: Thu, 03 Sep 2026 05:08:25 GMT
+
+{"description":"gemini-next-flash-high","displayName":"gemini-next-flash-high","name":"models/gemini-next-flash-high","supportedInputModalities":["text","image","audio","video"],"supportedOutputModalities":["text"]}
+
+---
+
+GET /v0/management/auth-files/models?name=antigravity-1.json HTTP/1.1
+Host: 127.0.0.1:18873
+Authorization: Bearer test-admin
+
+HTTP/1.1 200 OK
+content-type: application/json
+x-cpa-version: 7.2.140
+x-cpa-commit: a7e3596b
+x-cpa-build-date: 2026-08-22T14:51:09Z
+x-cpa-support-plugin: 1
+access-control-expose-headers: X-CPA-TRACE-ID, X-CPA-VERSION, X-CPA-COMMIT, X-CPA-BUILD-DATE, X-CPA-SUPPORT-PLUGIN, X-CPA-HOME-VERSION, X-CPA-HOME-BUILD-DATE, X-SERVER-VERSION, X-SERVER-BUILD-DATE, Location, Retry-After, X-Request-Id, OpenAI-Request-Id
+access-control-allow-origin: *
+access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
+access-control-allow-headers: Authorization, Content-Type
+content-length: 1224
+date: Thu, 03 Sep 2026 05:08:25 GMT
+
+{"models":{"data":[{"created":0,"id":"claude-opus-4-6-thinking","object":"model","owned_by":"google"},{"created":0,"id":"claude-sonnet-4-6","object":"model","owned_by":"google"},{"created":0,"id":"gemini-3-flash","object":"model","owned_by":"google"},{"created":0,"id":"gemini-3-flash-agent","object":"model","owned_by":"google"},{"created":0,"id":"gemini-3.1-flash-image","object":"model","owned_by":"google"},{"created":0,"id":"gemini-3.1-flash-lite","object":"model","owned_by":"google"},{"created":0,"id":"gemini-3.1-pro-low","object":"model","owned_by":"google"},{"created":0,"id":"gemini-3.5-flash-extra-low","object":"model","owned_by":"google"},{"created":0,"id":"gemini-3.5-flash-low","object":"model","owned_by":"google"},{"created":0,"id":"gemini-3.6-flash-high","object":"model","owned_by":"google"},{"created":0,"id":"gemini-3.7-flash-high","object":"model","owned_by":"google"},{"created":0,"id":"gemini-3.8-flash-high","object":"model","owned_by":"google"},{"created":0,"id":"gemini-next-flash-high","object":"model","owned_by":"google"},{"created":0,"id":"gemini-pro-agent","object":"model","owned_by":"google"},{"created":0,"id":"gpt-oss-120b-medium","object":"model","owned_by":"google"}],"object":"list"}}
+
+---
+
+GET /v0/management/model-definitions/stable HTTP/1.1
+Host: 127.0.0.1:18873
+Authorization: Bearer test-admin
+
+HTTP/1.1 200 OK
+content-type: application/json
+x-cpa-version: 7.2.140
+x-cpa-commit: a7e3596b
+x-cpa-build-date: 2026-08-22T14:51:09Z
+x-cpa-support-plugin: 1
+access-control-expose-headers: X-CPA-TRACE-ID, X-CPA-VERSION, X-CPA-COMMIT, X-CPA-BUILD-DATE, X-CPA-SUPPORT-PLUGIN, X-CPA-HOME-VERSION, X-CPA-HOME-BUILD-DATE, X-SERVER-VERSION, X-SERVER-BUILD-DATE, Location, Retry-After, X-Request-Id, OpenAI-Request-Id
+access-control-allow-origin: *
+access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
+access-control-allow-headers: Authorization, Content-Type
+content-length: 32
+date: Thu, 03 Sep 2026 05:08:25 GMT
+
+{"channel":"stable","models":[]}
+
+---
+
+GET /v1/models HTTP/1.1
+Host: 127.0.0.1:18873
+Authorization: Bearer test-admin
+
+HTTP/1.1 200 OK
+content-type: application/json
+access-control-allow-origin: *
+access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
+access-control-allow-headers: Authorization, Content-Type
+content-length: 27
+date: Thu, 03 Sep 2026 05:08:25 GMT
+
+{"data":[],"object":"list"}
+
+---
+
+GET /v1beta/models HTTP/1.1
+Host: 127.0.0.1:18873
+Authorization: Bearer test-admin
+
+HTTP/1.1 200 OK
+content-type: application/json
+access-control-allow-origin: *
+access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
+access-control-allow-headers: Authorization, Content-Type
+content-length: 13
+date: Thu, 03 Sep 2026 05:08:25 GMT
+
+{"models":[]}
+
+---
+
+GET /v1beta/models/gemini-next-flash-high HTTP/1.1
+Host: 127.0.0.1:18873
+Authorization: Bearer test-admin
+
+HTTP/1.1 404 Not Found
+content-type: application/json
+access-control-allow-origin: *
+access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
+access-control-allow-headers: Authorization, Content-Type
+content-length: 142
+date: Thu, 03 Sep 2026 05:08:25 GMT
+
+{"error":{"code":404,"message":"models/gemini-next-flash-high is not found or your account does not have access to it.","status":"NOT_FOUND"}}
+
+---
+

@@ -147,6 +147,9 @@ impl ServeArgs {
             auth_refresh_enabled,
             usage_poll_secs,
             config_path,
+            catalog_cache_path: std::env::var("MAHOQUOT_CACHE_DIR")
+                .ok()
+                .map(|dir| PathBuf::from(dir).join("models-v1.signed.json")),
             history_queue_capacity: 1024,
             history_batch_size: 64,
         })

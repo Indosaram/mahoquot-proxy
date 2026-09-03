@@ -15,6 +15,7 @@ use axum::extract::{Path, State, WebSocketUpgrade};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 use bytes::Bytes;
+use mahoquot_registry::ModelCapability;
 use serde_json::{json, Value};
 
 use crate::capability::{self, model_of};
@@ -77,11 +78,19 @@ pub async fn oauth_callback() -> Response {
         .into_response()
 }
 
-pub async fn images_generations(body: Bytes) -> Response {
-    image_surface(&body)
+pub async fn images_generations(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    image_surface(state, &headers, body).await
 }
 
-pub async fn images_edits(headers: HeaderMap, body: Bytes) -> Response {
+pub async fn images_edits(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     let is_multipart = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -90,7 +99,8 @@ pub async fn images_edits(headers: HeaderMap, body: Bytes) -> Response {
     if is_multipart {
         let text = String::from_utf8_lossy(&body);
         let model = multipart_field(&text, "model").unwrap_or_default();
-        return match capability::check_image(&model) {
+        let snapshot = state.pool.load();
+        return match capability::check_image(&snapshot, &model) {
             Some(err) => json_status(StatusCode::BAD_REQUEST, err),
             None => json_status(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -98,7 +108,7 @@ pub async fn images_edits(headers: HeaderMap, body: Bytes) -> Response {
             ),
         };
     }
-    image_surface(&body)
+    image_surface(state, &headers, body).await
 }
 
 fn multipart_field(text: &str, name: &str) -> Option<String> {
@@ -111,28 +121,45 @@ fn multipart_field(text: &str, name: &str) -> Option<String> {
     Some(value[..end].to_string())
 }
 
-fn image_surface(body: &Bytes) -> Response {
-    let parsed = match parse_body(body) {
-        Ok(v) => v,
-        Err(resp) => return *resp,
-    };
-    let model = model_of(&parsed);
-    match capability::check_image(model) {
-        Some(err) => json_status(StatusCode::BAD_REQUEST, err),
-        None => json_status(
-            StatusCode::SERVICE_UNAVAILABLE,
-            capability::unknown_provider(model),
-        ),
-    }
-}
-
-pub async fn videos(body: Bytes) -> Response {
+async fn image_surface(state: Arc<AppState>, headers: &HeaderMap, body: Bytes) -> Response {
     let parsed = match parse_body(&body) {
         Ok(v) => v,
         Err(resp) => return *resp,
     };
     let model = model_of(&parsed);
-    match capability::check_video(model) {
+    let resolved = {
+        let snapshot = state.pool.load();
+        capability::resolve_for_capability(&snapshot, model, ModelCapability::Image)
+    };
+    let Some(resolved) = resolved else {
+        let snapshot = state.pool.load();
+        return json_status(
+            StatusCode::BAD_REQUEST,
+            capability::check_image(&snapshot, model).expect("missing image capability"),
+        );
+    };
+    let mut canonical_body = parsed;
+    if let Some(object) = canonical_body.as_object_mut() {
+        object.insert("model".to_string(), json!(resolved.canonical_id.as_str()));
+    }
+    handle_relay(
+        state,
+        RelayMode::Image,
+        "/v1/images/generations",
+        headers,
+        Bytes::from(canonical_body.to_string()),
+    )
+    .await
+}
+
+pub async fn videos(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+    let parsed = match parse_body(&body) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
+    let model = model_of(&parsed);
+    let snapshot = state.pool.load();
+    match capability::check_video(&snapshot, model) {
         Some(err) => json_status(StatusCode::BAD_REQUEST, err),
         None => json_status(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -157,11 +184,35 @@ pub async fn openai_videos() -> Response {
     )
 }
 
-pub async fn realtime_offer(body: Bytes) -> Response {
+fn realtime_model(body: &Value) -> &str {
+    body.get("session")
+        .and_then(|session| session.get("model"))
+        .and_then(Value::as_str)
+        .or_else(|| body.get("model").and_then(Value::as_str))
+        .filter(|model| !model.is_empty())
+        .unwrap_or("gpt-realtime")
+}
+
+fn realtime_allowed(state: &AppState, body: &Value) -> bool {
+    let model = realtime_model(body);
+    if model == "gpt-realtime" {
+        return true;
+    }
+    capability::resolve_registry_capability(&state.pool.load(), model, ModelCapability::Realtime)
+        .is_some()
+}
+
+pub async fn realtime_offer(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
     let parsed = match parse_body(&body) {
         Ok(v) => v,
         Err(resp) => return *resp,
     };
+    if !realtime_allowed(&state, &parsed) {
+        return json_status(
+            StatusCode::NOT_IMPLEMENTED,
+            realtime::capability_not_supported("Realtime WebRTC offers"),
+        );
+    }
     match realtime::validate_offer(&parsed) {
         Some(err) => json_status(StatusCode::BAD_REQUEST, err),
         None => json_status(
@@ -171,13 +222,25 @@ pub async fn realtime_offer(body: Bytes) -> Response {
     }
 }
 
-pub async fn realtime_client_secrets(body: Bytes) -> Response {
+pub async fn realtime_client_secrets(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
     let parsed = parse_body(&body).unwrap_or_else(|_| json!({}));
+    if !realtime_allowed(&state, &parsed) {
+        return json_status(
+            StatusCode::NOT_IMPLEMENTED,
+            realtime::capability_not_supported("Realtime client secrets"),
+        );
+    }
     Json(realtime::client_secret(&parsed)).into_response()
 }
 
-pub async fn realtime_sessions(body: Bytes) -> Response {
+pub async fn realtime_sessions(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
     let parsed = parse_body(&body).unwrap_or_else(|_| json!({}));
+    if !realtime_allowed(&state, &parsed) {
+        return json_status(
+            StatusCode::NOT_IMPLEMENTED,
+            realtime::capability_not_supported("Realtime sessions"),
+        );
+    }
     Json(realtime::legacy_session(&parsed)).into_response()
 }
 
@@ -533,6 +596,15 @@ pub async fn v1beta_action(
         GeminiAction::CountTokens => {
             if !parsed.get("contents").map(Value::is_array).unwrap_or(false) {
                 return json_status(StatusCode::BAD_REQUEST, v1beta::contents_not_specified());
+            }
+            if capability::resolve_for_capability(
+                &state.pool.load(),
+                &model,
+                ModelCapability::CountTokens,
+            )
+            .is_none()
+            {
+                return json_status(StatusCode::NOT_FOUND, v1beta::model_not_found(&model));
             }
             let mut req = parsed.clone();
             if let Some(obj) = req.as_object_mut() {

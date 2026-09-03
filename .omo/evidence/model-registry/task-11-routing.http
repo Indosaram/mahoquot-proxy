@@ -1,0 +1,49 @@
+POST /v1/chat/completions HTTP/1.1
+Host: 127.0.0.1:18872
+Content-Type: application/json
+
+{
+  "messages": [
+    {
+      "content": "fixture",
+      "role": "user"
+    }
+  ],
+  "model": "claude-sonnet-4-6"
+}
+
+HTTP/1.1 200 OK
+content-type: application/json
+access-control-allow-origin: *
+access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
+access-control-allow-headers: Authorization, Content-Type
+content-length: 376
+date: Thu, 03 Sep 2026 05:08:25 GMT
+
+{"choices":[{"finish_reason":"stop","index":0,"message":{"content":"antigravity fixture","role":"assistant"}}],"created":1788412105,"id":"chatcmpl-ag_fixture","model":"claude-sonnet-4-6","object":"chat.completion","usage":{"completion_tokens":1,"completion_tokens_details":{"reasoning_tokens":0},"prompt_tokens":1,"prompt_tokens_details":{"cached_tokens":0},"total_tokens":2}}
+
+---
+
+POST /v1/chat/completions HTTP/1.1
+Host: 127.0.0.1:18872
+Content-Type: application/json
+
+{
+  "messages": [
+    {
+      "content": "fixture",
+      "role": "user"
+    }
+  ],
+  "model": "unknown-fixture-model"
+}
+
+HTTP/1.1 400 Bad Request
+content-type: application/json
+access-control-allow-origin: *
+access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
+access-control-allow-headers: Authorization, Content-Type
+content-length: 144
+date: Thu, 03 Sep 2026 05:08:25 GMT
+
+{"error":{"code":"model_not_found","message":"unknown provider for model unknown-fixture-model","param":"model","type":"invalid_request_error"}}

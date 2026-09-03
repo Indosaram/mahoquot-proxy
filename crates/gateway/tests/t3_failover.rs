@@ -219,9 +219,7 @@ async fn test_t3c_final_failure_attribution_names_the_last_attempted_account() {
     let port_a = listener_a.local_addr().unwrap().port();
     let app_a = Router::new().route(
         common::CODEX_PATH,
-        post(|| async {
-            (StatusCode::INTERNAL_SERVER_ERROR, "{\"error\":\"boom\"}")
-        }),
+        post(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "{\"error\":\"boom\"}") }),
     );
     tokio::spawn(async move {
         axum::serve(listener_a, app_a).await.unwrap();
@@ -237,7 +235,12 @@ async fn test_t3c_final_failure_attribution_names_the_last_attempted_account() {
         ("a", format!("http://127.0.0.1:{port_a}")),
         ("b", format!("http://127.0.0.1:{dead_port}")),
     ] {
-        let json = create_auth_file_json(id, &format!("acc_{id}"), &format!("token_{id}"), Some(&upstream));
+        let json = create_auth_file_json(
+            id,
+            &format!("acc_{id}"),
+            &format!("token_{id}"),
+            Some(&upstream),
+        );
         std::fs::write(temp_dir.join(format!("codex-{id}-plus.json")), json).unwrap();
     }
 

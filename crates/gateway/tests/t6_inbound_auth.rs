@@ -104,6 +104,7 @@ fn gateway_config(auth_dir: &std::path::Path) -> GatewayConfig {
         config_path: auth_dir.join("config.yaml"),
         history_queue_capacity: 1024,
         history_batch_size: 64,
+        catalog_cache_path: None,
     }
 }
 
@@ -208,6 +209,7 @@ async fn management_uses_the_same_api_key_as_proxy_routes() {
         config_path: auth_dir.join("config.yaml"),
         history_queue_capacity: 1024,
         history_batch_size: 64,
+        catalog_cache_path: None,
     };
     let app = create_app(Arc::new(AppState::new(&config).expect("state")));
 

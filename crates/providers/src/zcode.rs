@@ -33,13 +33,35 @@ pub const ZCODE_API_BASE: &str = "https://api.z.ai";
 pub const ZCODE_ANTHROPIC_BASE: &str = "https://api.z.ai/api/anthropic";
 pub const ZCODE_MESSAGES_PATH: &str = "/v1/messages";
 
-pub const ZCODE_MODELS: &[&str] = &["glm-5.3", "glm-5.3-flash", "glm-5.2", "glm-5.1", "glm-4.6"];
-
+use mahoquot_registry::{embedded_snapshot, ProviderContribution, ProviderId, RegistrySnapshot};
 use serde_json::Value;
 
-pub fn is_zcode_model(model: &str) -> bool {
-    ZCODE_MODELS.contains(&model)
+pub fn provider_id() -> ProviderId {
+    ProviderId::zcode()
 }
+
+pub fn contribution(snapshot: &RegistrySnapshot) -> ProviderContribution {
+    snapshot.contribution_for_provider(&provider_id())
+}
+
+pub fn default_contribution() -> ProviderContribution {
+    contribution(embedded_snapshot())
+}
+
+pub fn supported_models(snapshot: &RegistrySnapshot) -> Vec<String> {
+    contribution(snapshot).supported_model_ids()
+}
+
+pub fn is_zcode_model_in_snapshot(snapshot: &RegistrySnapshot, model: &str) -> bool {
+    contribution(snapshot).supports_model(model)
+}
+
+pub fn is_zcode_model(model: &str) -> bool {
+    is_zcode_model_in_snapshot(embedded_snapshot(), model)
+}
+
+#[deprecated(note = "query catalog/registry for models instead")]
+pub const ZCODE_MODELS: &[&str] = &["glm-5.3", "glm-5.3-flash", "glm-5.2", "glm-5.1", "glm-4.6"];
 
 pub fn zcode_messages_url(upstream_base: &str) -> String {
     format!(

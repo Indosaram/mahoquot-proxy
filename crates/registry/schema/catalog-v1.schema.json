@@ -1,0 +1,247 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "MahoquotModelCatalogV1",
+  "description": "Schema for the Mahoquot versioned model catalog manifest (v1)",
+  "type": "object",
+  "required": [
+    "version",
+    "source",
+    "models",
+    "providers"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "description": "Monotonic unsigned integer catalog version",
+      "type": "integer",
+      "minimum": 1
+    },
+    "source": {
+      "description": "Precedence source identifier for this catalog snapshot",
+      "type": "string",
+      "enum": [
+        "embedded_fallback",
+        "lkg_cache",
+        "remote_signed",
+        "discovered",
+        "local_override"
+      ]
+    },
+    "models": {
+      "description": "Dictionary of models keyed by canonical ModelId",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/definitions/ModelDescriptor"
+      }
+    },
+    "providers": {
+      "description": "Dictionary of registered providers and their policy",
+      "type": "object",
+      "additionalProperties": {
+        "type": "string",
+        "enum": [
+          "closed",
+          "discovered",
+          "open"
+        ]
+      }
+    },
+    "aliases": {
+      "description": "Dictionary of public model aliases mapping to alias rules",
+      "type": "object",
+      "default": {},
+      "additionalProperties": {
+        "$ref": "#/definitions/ModelAliasRule"
+      }
+    },
+    "exclusions": {
+      "description": "List of global or provider-specific model exclusions",
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/definitions/ModelExclusionRule"
+      }
+    }
+  },
+  "definitions": {
+    "ModelCapability": {
+      "type": "string",
+      "enum": [
+        "chat",
+        "image",
+        "video",
+        "realtime",
+        "count_tokens",
+        "embedding",
+        "audio",
+        "tools"
+      ]
+    },
+    "ProviderBinding": {
+      "type": "object",
+      "required": [
+        "provider_id",
+        "policy",
+        "source"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "provider_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "policy": {
+          "type": "string",
+          "enum": [
+            "closed",
+            "discovered",
+            "open"
+          ]
+        },
+        "source": {
+          "type": "string",
+          "enum": [
+            "embedded_fallback",
+            "lkg_cache",
+            "remote_signed",
+            "discovered",
+            "local_override"
+          ]
+        },
+        "upstream_model_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "upstream_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "priority": {
+          "type": "integer",
+          "default": 0
+        },
+        "capabilities": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/ModelCapability"
+          }
+        },
+        "authority": {
+          "type": "object",
+          "description": "Optional authority mask for discovery contributions",
+          "additionalProperties": {
+            "type": "boolean"
+          }
+        },
+        "metadata": {
+          "type": "object",
+          "default": {},
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "ModelDescriptor": {
+      "type": "object",
+      "required": [
+        "id",
+        "owned_by"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "owned_by": {
+          "type": "string",
+          "minLength": 1
+        },
+        "display_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "capabilities": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/ModelCapability"
+          }
+        },
+        "bindings": {
+          "type": "object",
+          "default": {},
+          "additionalProperties": {
+            "$ref": "#/definitions/ProviderBinding"
+          }
+        },
+        "aliases": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "metadata": {
+          "type": "object",
+          "default": {},
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "ModelAliasRule": {
+      "type": "object",
+      "required": [
+        "alias",
+        "target"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "alias": {
+          "type": "string",
+          "minLength": 1
+        },
+        "target": {
+          "type": "string",
+          "minLength": 1
+        },
+        "provider_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "ModelExclusionRule": {
+      "type": "object",
+      "required": [
+        "model_id"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "model_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "provider_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    }
+  }
+}

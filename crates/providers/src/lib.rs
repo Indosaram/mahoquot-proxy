@@ -8,6 +8,7 @@
 pub mod account;
 pub mod antigravity;
 pub mod claude;
+pub mod codex;
 pub mod credential_file;
 pub mod cursor;
 pub mod kiro;
@@ -21,6 +22,7 @@ pub use account::{
     derive_identity_slug, derive_identity_slug_from_filename, list_codex_auth_files,
     load_codex_account, parse_expired_unix, CodexAccount, LoadError, UPSTREAM_BASE, USER_AGENT,
 };
+#[allow(deprecated)]
 pub use antigravity::{
     antigravity_client_id, antigravity_client_secret, antigravity_count_tokens_url,
     antigravity_quota_summary_url, antigravity_stream_url, derive_antigravity_slug_from_filename,
@@ -28,16 +30,20 @@ pub use antigravity::{
     AntigravityAccount, ANTIGRAVITY_API_VERSION, ANTIGRAVITY_LOAD_BASE, ANTIGRAVITY_MODELS,
     ANTIGRAVITY_TOKEN_URL, ANTIGRAVITY_UPSTREAM_BASE, ANTIGRAVITY_USER_AGENT,
 };
+#[allow(deprecated)]
 pub use claude::{
     claude_messages_url, is_claude_model, list_claude_auth_files, ClaudeAccount,
     CLAUDE_AUTHORIZE_URL, CLAUDE_BETA_HEADER, CLAUDE_MESSAGES_PATH, CLAUDE_MODELS, CLAUDE_SCOPES,
     CLAUDE_TOKEN_URL, CLAUDE_UPSTREAM_BASE,
 };
+pub use codex::{is_codex_model, is_codex_model_in_snapshot};
+#[allow(deprecated)]
 pub use cursor::{
     cursor_chat_url, cursor_login_url, is_cursor_model, list_cursor_auth_files, CursorAccount,
     CURSOR_CHAT_PATH, CURSOR_LOGIN_URL, CURSOR_MODELS, CURSOR_POLL_URL, CURSOR_REFRESH_URL,
     CURSOR_UPSTREAM_BASE,
 };
+#[allow(deprecated)]
 pub use kiro::{
     is_kiro_model, kiro_generate_url, kiro_refresh_url, list_kiro_auth_files, KiroAccount,
     KiroAuthMode, KIRO_API_HOST_TEMPLATE, KIRO_DEFAULT_REGION, KIRO_GENERATE_PATH,
@@ -53,10 +59,12 @@ pub use refresh::{
     parse_refresh_response, RefreshRequest, Tokens, REFRESH_CLIENT_ID, REFRESH_TOKEN_URL,
 };
 pub use refresh_exec::format_expired_rfc3339;
+#[allow(deprecated)]
 pub use vertex::{
     build_vertex_jwt_assertion, derive_vertex_slug_from_filename, execute_vertex_refresh,
     is_vertex_model, list_vertex_auth_files, load_vertex_account, VertexAccount, VERTEX_MODELS,
 };
+#[allow(deprecated)]
 pub use zcode::{
     extract_callback_code, find_existing_api_key, is_provisioned_api_key, is_zcode_model,
     list_zcode_auth_files, parse_broker_token, parse_business_token, parse_copied_secret,

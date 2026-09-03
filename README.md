@@ -65,6 +65,30 @@ Every setting can be specified via CLI flag or environment variable (CLI flags t
 | **Vertex AI** | Service Account JSON | Google Generative Language | Project quotas & OAuth token exchange |
 | **Generic Adapters** | API Key, OAuth | OpenAI Chat, Anthropic Messages | Custom base URL forwarding |
 
+## Unified Runtime Model Registry
+
+Mahoquot includes a centralized, offline-first runtime model registry (`mahoquot-registry`) that unifies model discovery, request routing, capability gating, and model list APIs (`/v1/models`, `/v1beta/models`).
+
+New provider models, capabilities, and aliases can be added dynamically via a cryptographically signed catalog distributed on the orphan branch `model-catalog-v1` without rebuilding or reinstalling the gateway binary.
+
+### Provider Admission Policy Matrix
+
+| Policy | Providers | Dynamic Discovery | Codex Negative Space Fallback |
+|---|---|---|---|
+| **`Closed`** | `antigravity`, `claude`, `cursor`, `kiro`, `vertex`, `zcode` | Prohibited. Must be declared via signed catalog or local operator overrides. | Ineligible. Cannot claim arbitrary IDs. |
+| **`Discovered`** | Generic OpenAI-compatible accounts with explicit discovery | Permitted within authority mask. Cannot overwrite signed catalog capabilities. | Ineligible. |
+| **`Open`** | `codex` | Unmapped models fall back to Codex open negative space. | Yes (cannot steal closed provider IDs). |
+
+### Source Precedence
+1. **Local Override** (Highest: `config.yaml` aliases and exclusions)
+2. **Authoritative Discovery** (Generic `/models` discovery)
+3. **Remote Signed Catalog** (Published to `model-catalog-v1` branch)
+4. **Last-Known-Good (LKG) Cache** (`~/.mahoquot/cache/models-v1.signed.json`, mode 0600)
+5. **Embedded Fallback** (Compiled into binary)
+
+For comprehensive details on catalog format, signing keys, key rotation, publication workflows, and operator tooling, see the [Model Catalog Publication Guide](docs/catalog-publication.md).
+
+
 ## Routing Strategies
 
 - **Strict Round-Robin (`round_robin`)**: Requests rotate evenly across healthy accounts matching the requested model. Unhealthy accounts enter cooldown and bypass selection until restored.

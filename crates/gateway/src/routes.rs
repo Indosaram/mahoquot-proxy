@@ -23,6 +23,8 @@ pub fn create_app(state: Arc<AppState>) -> Router {
     let authed_routes = Router::new()
         .route("/v1/models", get(models_handler))
         .route("/models", get(models_handler))
+        .route("/v1", get(cp_routes::root))
+        .route("/v1/", get(cp_routes::root))
         .route("/v1beta/models", get(cp_routes::v1beta_models))
         .route(
             "/v1beta/models/{*action}",
@@ -228,12 +230,28 @@ async fn keep_alive_handler() -> impl IntoResponse {
     Json(serde_json::json!({"status": "ok"}))
 }
 
-async fn models_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+async fn models_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
     let now_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    Json(models_payload(&state.pool.load().models, now_unix))
+    let presented_key = crate::inbound::presented_api_key(&headers);
+    let scoped_key = presented_key
+        .and_then(|k| state.scoped_keys.lookup_raw(k))
+        .map(|e| e.key.clone());
+
+    let pool = state.pool.load();
+    // A scoped key must not learn about models it could never route to, so the
+    // catalog is narrowed to its own providers, accounts and model allow list.
+    let models = match scoped_key {
+        Some(scoped) => crate::models_route::scoped_model_entries(&pool, &scoped),
+        None => pool.models.clone(),
+    };
+
+    Json(models_payload(&models, now_unix))
 }
 
 async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -261,7 +279,8 @@ async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoRespons
         })
         .collect();
 
-    let body = state.monitor.render_prometheus(now_unix_ms, &accounts);
+    let mut body = state.monitor.render_prometheus(now_unix_ms, &accounts);
+    body.push_str(&state.metrics.registry_refresh.render_prometheus());
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body)
 }
 
@@ -345,7 +364,7 @@ async fn messages_handler(
     handle_relay(state, RelayMode::Anthropic, "/v1/messages", &headers, body).await
 }
 
-async fn count_tokens_handler(body: Bytes) -> Response {
+async fn count_tokens_handler(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
     let parsed: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
@@ -359,6 +378,24 @@ async fn count_tokens_handler(body: Bytes) -> Response {
                 .into_response()
         }
     };
+    let model = parsed
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let snapshot = state.pool.load();
+    if crate::capability::resolve_for_capability(
+        &snapshot,
+        model,
+        mahoquot_registry::ModelCapability::CountTokens,
+    )
+    .is_none()
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(crate::capability::count_tokens_error(model)),
+        )
+            .into_response();
+    }
     Json(serde_json::json!({
         "input_tokens": crate::compat::estimate_input_tokens(&parsed)
     }))

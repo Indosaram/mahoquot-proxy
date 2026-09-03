@@ -5,29 +5,167 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use mahoquot_router::Router;
 use mahoquot_types::{Health, PoolMember};
 
-use crate::account::{load_account_members, AccountMember, ProviderKind};
+use crate::account::{load_account_members, AccountMember};
 use crate::config::GatewayConfig;
 use crate::inbound::ApiKeys;
 use crate::management::observability::LogTail;
+use crate::management::settings::ScopedApiKey;
 use crate::management::store::SettingsStore;
 use crate::metrics::{AdminStatsResponse, GatewayMetrics};
-use crate::models_route::{model_entries, ModelEntry};
 use crate::monitor::MonitorState;
+pub use crate::runtime_state::{
+    compute_candidate_composition, PoolSnapshot, RefreshCoordinator, RuntimeComposition,
+    RuntimeState, UnifiedRuntimeState,
+};
 use crate::telemetry::TelemetryStore;
 
-pub struct PoolSnapshot {
-    pub members: Vec<Arc<AccountMember>>,
-    pub models: Vec<ModelEntry>,
+/// One scoped key's live state: the immutable published definition plus the
+/// counter that moves on every request.
+///
+/// Token usage is a plain atomic rather than a field inside the settings
+/// document because the relay updates it per request; routing every increment
+/// through `SettingsStore::mutate` would put a disk write and a global mutex on
+/// the hot path.
+#[derive(Debug)]
+pub struct ScopedKeyEntry {
+    pub key: Arc<ScopedApiKey>,
+    token_used: AtomicU64,
+}
+
+impl ScopedKeyEntry {
+    fn new(key: ScopedApiKey) -> Self {
+        let token_used = AtomicU64::new(key.token_used);
+        Self {
+            key: Arc::new(key),
+            token_used,
+        }
+    }
+
+    pub fn token_used(&self) -> u64 {
+        self.token_used.load(Ordering::Relaxed)
+    }
+
+    pub fn token_limit(&self) -> u64 {
+        self.key.token_limit
+    }
+
+    /// A zero limit means unlimited, matching the settings default for a key
+    /// minted without a cap.
+    pub fn is_exhausted(&self) -> bool {
+        self.key.token_limit > 0 && self.token_used() >= self.key.token_limit
+    }
+
+    /// Charge `tokens` against the key and report the new total. Saturating so a
+    /// pathological usage report cannot wrap the counter back under the limit.
+    pub fn consume(&self, tokens: u64) -> u64 {
+        let mut current = self.token_used.load(Ordering::Relaxed);
+        loop {
+            let next = current.saturating_add(tokens);
+            match self.token_used.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return next,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    pub fn is_usable_at(&self, now_ms: i64) -> bool {
+        self.key.is_usable_at(now_ms)
+    }
+}
+
+/// Lock-free index of scoped inbound keys, keyed by the one-way key identifier.
+///
+/// Lookups on the request path are a single `ArcSwap` load plus a hash probe;
+/// writers publish a whole new map, so an authenticating request never blocks
+/// behind a key edit. Counters survive a republish: an identifier still present
+/// after reconciliation keeps its live `token_used`.
+#[derive(Debug, Default)]
+pub struct ScopedKeyTracker {
+    entries: arc_swap::ArcSwap<std::collections::HashMap<String, Arc<ScopedKeyEntry>>>,
+}
+
+impl ScopedKeyTracker {
+    pub fn new(keys: &[ScopedApiKey]) -> Self {
+        let tracker = Self::default();
+        tracker.reconcile(keys);
+        tracker
+    }
+
+    /// Republish the index from the settings document, carrying live usage
+    /// counters across for keys that still exist. A key whose persisted
+    /// `token_used` has moved ahead of the in-memory counter (an operator reset
+    /// or an external edit) adopts the larger of the two, so a restart or a
+    /// manual bump can never hand back already-spent allowance.
+    pub fn reconcile(&self, keys: &[ScopedApiKey]) {
+        let previous = self.entries.load();
+        let mut next = std::collections::HashMap::with_capacity(keys.len());
+        for key in keys {
+            let entry = ScopedKeyEntry::new(key.clone());
+            if let Some(existing) = previous.get(&key.key_identifier) {
+                let live = existing.token_used();
+                if live > entry.token_used() {
+                    entry.token_used.store(live, Ordering::Relaxed);
+                }
+            }
+            next.insert(key.key_identifier.clone(), Arc::new(entry));
+        }
+        self.entries.store(Arc::new(next));
+    }
+
+    /// O(1) lookup by the presented key's stable identifier.
+    pub fn get(&self, key_identifier: &str) -> Option<Arc<ScopedKeyEntry>> {
+        self.entries.load().get(key_identifier).cloned()
+    }
+
+    /// Resolve a raw presented key to its scoped entry, if any.
+    pub fn lookup_raw(&self, presented: &str) -> Option<Arc<ScopedKeyEntry>> {
+        self.get(&crate::request_history::stable_key_identifier(presented))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.load().is_empty()
+    }
+
+    /// Charge a request's tokens to a scoped key and report the key's new
+    /// total. `None` when the identifier belongs to a master key (or to no key
+    /// at all), which is the common case and costs one hash probe.
+    pub fn record_usage(&self, key_identifier: Option<&str>, tokens: u64) -> Option<u64> {
+        let entry = key_identifier.and_then(|id| self.get(id))?;
+        if tokens == 0 {
+            return Some(entry.token_used());
+        }
+        Some(entry.consume(tokens))
+    }
+
+    /// Snapshot of live counters, for reporting and for persisting usage back
+    /// into the settings document.
+    pub fn usage_snapshot(&self) -> Vec<(String, u64)> {
+        self.entries
+            .load()
+            .iter()
+            .map(|(identifier, entry)| (identifier.clone(), entry.token_used()))
+            .collect()
+    }
 }
 
 pub struct AppState {
     pub router: Router,
-    pub pool: arc_swap::ArcSwap<PoolSnapshot>,
+    pub pool: Arc<arc_swap::ArcSwap<PoolSnapshot>>,
+    pub runtime: Arc<UnifiedRuntimeState>,
+    pub catalog: Arc<crate::registry::CatalogManager>,
     pub models_env: Option<String>,
     pub http_client: reqwest::Client,
     pub metrics: Arc<GatewayMetrics>,
     pub monitor: Arc<MonitorState>,
     pub api_keys: Arc<ApiKeys>,
+    /// In-memory scoped-key index: O(1), lock-free authentication and token
+    /// accounting for delegated inbound keys.
+    pub scoped_keys: Arc<ScopedKeyTracker>,
     pub refresh_url: String,
     pub auth_refresh_enabled: bool,
     pub refreshed: AtomicU64,
@@ -47,7 +185,7 @@ pub struct AppState {
     pub usage_poll_backoff: std::sync::Mutex<std::collections::HashMap<String, i64>>,
 }
 
-fn adopt_runtime_state(target: &AccountMember, previous: &Arc<AccountMember>) {
+pub(crate) fn adopt_runtime_state(target: &AccountMember, previous: &Arc<AccountMember>) {
     let seq = std::sync::atomic::Ordering::Relaxed;
     *target
         .health
@@ -79,9 +217,6 @@ fn adopt_runtime_state(target: &AccountMember, previous: &Arc<AccountMember>) {
 impl AppState {
     pub fn new(config: &GatewayConfig) -> anyhow::Result<Self> {
         let members = load_account_members(&config.auth_dir)?;
-        let provider_kinds: Vec<ProviderKind> = members.iter().map(|m| m.kind()).collect();
-        let mut models = model_entries(&provider_kinds, config.models_env.as_deref());
-        models.extend(crate::models_route::generic_model_entries(&members));
 
         let http_client = reqwest::Client::builder()
             .tcp_nodelay(true)
@@ -97,6 +232,14 @@ impl AppState {
             config.config_path.clone(),
             config.as_settings(),
         )?);
+        let scoped_keys = Arc::new(ScopedKeyTracker::new(&settings.current().scoped_api_keys));
+        // Every published settings document rebuilds the index, so a key that
+        // is revoked or re-scoped through the management API takes effect on
+        // the next request without a restart.
+        let scoped_keys_for_observer = Arc::clone(&scoped_keys);
+        settings.add_observer(Arc::new(move |published| {
+            scoped_keys_for_observer.reconcile(&published.scoped_api_keys);
+        }));
         let api_keys = Arc::new(ApiKeys::with_live_settings(
             Arc::clone(&settings),
             config.api_keys.clone(),
@@ -133,6 +276,54 @@ impl AppState {
             }
         }
 
+        let catalog_settings = settings.current().model_catalog.clone();
+        let catalog_config = crate::registry::CatalogConfig {
+            cache_path: config.catalog_cache_path.clone(),
+            remote_catalog_url: catalog_settings.as_ref().map(|catalog| catalog.url.clone()),
+            remote_signature_url: catalog_settings
+                .as_ref()
+                .map(|catalog| catalog.signature_url.clone()),
+            ..crate::registry::CatalogConfig::default()
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or_default();
+        let catalog = Arc::new(crate::registry::CatalogManager::boot_with_metrics(
+            catalog_config,
+            now,
+            Arc::clone(&metrics),
+        ));
+        let base_registry = catalog.current_snapshot();
+        let initial_registry = settings
+            .current()
+            .validate_against_registry(&base_registry)
+            .map(Arc::new)
+            .unwrap_or(base_registry);
+        let candidate = compute_candidate_composition(
+            1,
+            members,
+            initial_registry,
+            config.models_env.as_deref(),
+        )
+        .map_err(|e| anyhow::anyhow!("failed to compute initial composition: {e}"))?;
+
+        let runtime = Arc::new(UnifiedRuntimeState::new(
+            candidate,
+            config.models_env.clone(),
+        ));
+        let pool = runtime.pool();
+        catalog.bind_runtime(&runtime);
+
+        let runtime_for_snapshot = Arc::clone(&runtime);
+        settings.set_snapshot_provider(Arc::new(move || {
+            Arc::clone(&runtime_for_snapshot.composition().registry)
+        }));
+        let runtime_for_publisher = Arc::clone(&runtime);
+        settings.set_pool_publisher(Arc::new(move |registry| {
+            runtime_for_publisher.update_registry(registry).map(|_| ())
+        }));
+
         Ok(Self {
             settings,
             scheduler,
@@ -146,16 +337,23 @@ impl AppState {
             shutdown: Arc::new(tokio::sync::Notify::new()),
             usage_poll_backoff: std::sync::Mutex::default(),
             router,
-            pool: arc_swap::ArcSwap::from_pointee(PoolSnapshot { members, models }),
+            runtime,
+            catalog,
+            pool,
             models_env: config.models_env.clone(),
             http_client,
             metrics,
             monitor,
             api_keys,
+            scoped_keys,
             refresh_url,
             auth_refresh_enabled,
             refreshed: AtomicU64::new(0),
-            max_failover: config.max_failover,
+            max_failover: if config.max_failover == 0 {
+                3
+            } else {
+                config.max_failover
+            },
             model_restrictions: AtomicBool::new(false),
         })
     }
@@ -195,13 +393,18 @@ impl AppState {
                 None => m,
             })
             .collect();
-        let provider_kinds: Vec<ProviderKind> = members.iter().map(|m| m.kind()).collect();
-        let mut models = model_entries(&provider_kinds, self.models_env.as_deref());
-        models.extend(crate::models_route::generic_model_entries(&members));
         let count = members.len();
-        self.pool.store(Arc::new(PoolSnapshot { members, models }));
-        self.scheduler.reconcile(&self.pool.load().members);
+        let new_snapshot = self.runtime.reload_accounts(members)?;
+        self.scheduler.reconcile(&new_snapshot.members);
         Ok(count)
+    }
+
+    pub fn runtime_state(&self) -> Arc<UnifiedRuntimeState> {
+        Arc::clone(&self.runtime)
+    }
+
+    pub fn composition(&self) -> Arc<PoolSnapshot> {
+        self.runtime.composition()
     }
 
     pub fn force_health(&self, id: &str, health: Health) {

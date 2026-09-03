@@ -26,6 +26,33 @@ pub const KIRO_GENERATE_PATH: &str = "/generateAssistantResponse";
 /// Requesting a model outside this set makes the upstream answer
 /// INVALID_MODEL_ID, which cools down the whole Kiro auth and breaks the
 /// supported models too. Expand only for paid accounts.
+use mahoquot_registry::{embedded_snapshot, ProviderContribution, ProviderId, RegistrySnapshot};
+
+pub fn provider_id() -> ProviderId {
+    ProviderId::kiro()
+}
+
+pub fn contribution(snapshot: &RegistrySnapshot) -> ProviderContribution {
+    snapshot.contribution_for_provider(&provider_id())
+}
+
+pub fn default_contribution() -> ProviderContribution {
+    contribution(embedded_snapshot())
+}
+
+pub fn supported_models(snapshot: &RegistrySnapshot) -> Vec<String> {
+    contribution(snapshot).supported_model_ids()
+}
+
+pub fn is_kiro_model_in_snapshot(snapshot: &RegistrySnapshot, model: &str) -> bool {
+    contribution(snapshot).supports_model(model)
+}
+
+pub fn is_kiro_model(model: &str) -> bool {
+    is_kiro_model_in_snapshot(embedded_snapshot(), model)
+}
+
+#[deprecated(note = "query catalog/registry for models instead")]
 pub const KIRO_MODELS: &[&str] = &[
     "auto",
     "claude-sonnet-4.6",
@@ -36,10 +63,6 @@ pub const KIRO_MODELS: &[&str] = &[
     "claude-haiku-4-5-20251001",
     "claude-haiku-4-5-20251001-thinking",
 ];
-
-pub fn is_kiro_model(model: &str) -> bool {
-    KIRO_MODELS.contains(&model)
-}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]

@@ -68,19 +68,32 @@ pub fn apply_edit(
 ) -> Response {
     let mut refusal = None;
     let outcome = state.settings.mutate(|settings| {
-        if let Err(reason) = edit(settings) {
+        let mut candidate = settings.clone();
+        if let Err(reason) = edit(&mut candidate) {
             refusal = Some(reason);
+            return;
         }
+        *settings = candidate;
     });
 
     if let Some(reason) = refusal {
         return refusal_response(reason);
     }
-    if outcome.is_ok() {
-        note_edit(state, "config updated");
-    }
     match outcome {
-        Ok(_) => saved(),
+        Ok(_) => {
+            note_edit(state, "config updated");
+            saved()
+        }
+        Err(super::settings::SettingsError::Validation(err)) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": err.to_string() })),
+        )
+            .into_response(),
+        Err(super::settings::SettingsError::InvalidCatalogConfig(err)) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": err })),
+        )
+            .into_response(),
         Err(err) => persist_failed(err),
     }
 }

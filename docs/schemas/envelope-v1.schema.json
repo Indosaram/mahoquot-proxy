@@ -1,0 +1,52 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "MahoquotCatalogEnvelopeV1",
+  "description": "Detached cryptographic signature envelope for Mahoquot model catalog manifest (v1)",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "catalog_version",
+    "key_id",
+    "generated_at",
+    "signature"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "description": "Envelope schema version, must equal 1 for v1 envelopes",
+      "type": "integer",
+      "enum": [
+        1
+      ]
+    },
+    "catalog_version": {
+      "description": "Monotonic unsigned catalog version matching the signed catalog payload",
+      "type": "integer",
+      "minimum": 1
+    },
+    "key_id": {
+      "description": "Identifier of the Ed25519 key used to produce the signature",
+      "type": "string",
+      "minLength": 1
+    },
+    "generated_at": {
+      "description": "Epoch timestamp in seconds when the envelope signature was generated",
+      "type": "integer",
+      "minimum": 0
+    },
+    "expires_at": {
+      "description": "Optional epoch timestamp in seconds after which the catalog envelope is considered expired",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "signature": {
+      "description": "Base64-encoded 64-byte detached Ed25519 signature",
+      "type": "string",
+      "minLength": 80,
+      "maxLength": 100
+    }
+  }
+}

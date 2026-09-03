@@ -1,0 +1,239 @@
+TASK 1: MUTATION RED-GREEN VERIFICATION LOG
+Plan: .omo/plans/unified-runtime-model-registry.md (Task 1)
+Workspace: /Users/indo/code/project/mahoquot-proxy
+Date: 2026-09-02
+
+================================================================================
+BASELINE GREEN RUN
+================================================================================
+Command: cargo test -p mahoquot-gateway -- models_route capability provider_kind
+Result: 23 passed; 0 failed; 0 ignored; 0 measured; 203 filtered out; finished in 0.01s
+
+================================================================================
+MUTATION 1: Provider-Presence Exposure
+================================================================================
+Target: crates/gateway/src/models_route.rs:48
+Mutation: Change Codex owned_by from "openai" to "mutated-openai".
+Command: cargo test -p mahoquot-gateway -- models_route characterization_provider_presence_exposure
+RED Failure Output:
+---- models_route::tests::characterization_provider_presence_exposure_all_providers stdout ----
+thread 'models_route::tests::characterization_provider_presence_exposure_all_providers' (15982458) panicked at crates/gateway/src/models_route.rs:164:9:
+assertion failed: codex.iter().all(|e| e.owned_by == "openai")
+failures:
+    models_route::tests::characterization_provider_presence_exposure_all_providers
+test result: FAILED. 6 passed; 3 failed; 0 ignored; 0 measured; 215 filtered out.
+
+Revert: Restored owned_by to "openai".
+GREEN Verification:
+Command: cargo test -p mahoquot-gateway -- models_route characterization_provider_presence_exposure
+Result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 215 filtered out.
+
+================================================================================
+MUTATION 2: Duplicate-Owner Ordering (First-Owner-Wins)
+================================================================================
+Target: crates/gateway/src/models_route.rs:130
+Mutation: In models_payload, change entries.iter() to entries.iter().rev(), causing last-owner-wins instead of first-owner-wins.
+Command: cargo test -p mahoquot-gateway -- models_route characterization_duplicate_owner_ordering
+RED Failure Output:
+---- models_route::tests::characterization_duplicate_owner_ordering_first_wins stdout ----
+thread 'models_route::tests::characterization_duplicate_owner_ordering_first_wins' (16009876) panicked at crates/gateway/src/models_route.rs:287:9:
+assertion `left == right` failed
+  left: String("anthropic")
+ right: "google"
+failures:
+    models_route::tests::characterization_duplicate_owner_ordering_first_wins
+test result: FAILED. 7 passed; 2 failed; 0 ignored; 0 measured; 215 filtered out.
+
+Revert: Restored entries.iter() forward traversal in models_payload.
+GREEN Verification:
+Command: cargo test -p mahoquot-gateway -- models_route characterization_duplicate_owner_ordering
+Result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 215 filtered out.
+
+================================================================================
+MUTATION 3: Generic Model Entries (Empty vs Populated)
+================================================================================
+Target: crates/gateway/src/models_route.rs:114
+Mutation: In generic_model_entries, change `for id in models` to `for id in models.into_iter().skip(1)` skipping first model.
+Command: cargo test -p mahoquot-gateway -- models_route characterization_generic_model_entries
+RED Failure Output:
+---- models_route::tests::characterization_generic_model_entries_empty_and_non_empty stdout ----
+thread 'models_route::tests::characterization_generic_model_entries_empty_and_non_empty' (16037479) panicked at crates/gateway/src/models_route.rs:357:9:
+assertion `left == right` failed
+  left: 1
+ right: 2
+failures:
+    models_route::tests::characterization_generic_model_entries_empty_and_non_empty
+test result: FAILED. 8 passed; 1 failed; 0 ignored; 0 measured; 215 filtered out.
+
+Revert: Restored `for id in models` traversal.
+GREEN Verification:
+Command: cargo test -p mahoquot-gateway -- models_route characterization_generic_model_entries
+Result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 215 filtered out.
+
+================================================================================
+MUTATION 4: /v1/models and /v1beta/models Schemas
+================================================================================
+Target: crates/gateway/src/v1beta.rs:47
+Mutation: In modalities_for, mutate non-image model output modalities from vec!["text"] to vec!["text", "video"].
+Command: cargo test -p mahoquot-gateway -- models_route characterization_v1_and_v1beta_models_schemas
+RED Failure Output:
+---- models_route::tests::characterization_v1_and_v1beta_models_schemas stdout ----
+thread 'models_route::tests::characterization_v1_and_v1beta_models_schemas' (16066019) panicked at crates/gateway/src/models_route.rs:439:9:
+assertion `left == right` failed
+  left: Array [String("text"), String("video")]
+ right: Array [String("text")]
+failures:
+    models_route::tests::characterization_v1_and_v1beta_models_schemas
+test result: FAILED. 8 passed; 1 failed; 0 ignored; 0 measured; 215 filtered out.
+
+Revert: Restored modalities_for output to vec!["text"].
+GREEN Verification:
+Command: cargo test -p mahoquot-gateway -- models_route characterization_v1_and_v1beta_models_schemas
+Result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 215 filtered out.
+
+================================================================================
+MUTATION 5: Settings Aliases and Exclusions Round-Trip
+================================================================================
+Target: crates/gateway/src/management/settings.rs:250
+Mutation: In Settings::default(), mutate oauth_model_alias default from Value::Null to json!({"mutated": true}).
+Command: cargo test -p mahoquot-gateway -- models_route characterization_aliases_and_exclusions_roundtrip
+RED Failure Output:
+---- models_route::tests::characterization_aliases_and_exclusions_roundtrip stdout ----
+thread 'models_route::tests::characterization_aliases_and_exclusions_roundtrip' (16103630) panicked at crates/gateway/src/models_route.rs:469:9:
+assertion `left == right` failed
+  left: Object {"mutated": Bool(true)}
+ right: Null
+failures:
+    models_route::tests::characterization_aliases_and_exclusions_roundtrip
+test result: FAILED. 8 passed; 1 failed; 0 ignored; 0 measured; 215 filtered out.
+
+Revert: Restored default to serde_json::Value::Null.
+GREEN Verification:
+Command: cargo test -p mahoquot-gateway -- models_route characterization_aliases_and_exclusions_roundtrip
+Result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 217 filtered out.
+
+================================================================================
+MUTATION 6: Device-OAuth Defaults
+================================================================================
+Target: crates/gateway/src/management/oauth.rs:497
+Mutation: Mutate Kimi client_id from "17e5f671-d194-4dfb-9706-5516cb48c098" to "mutated-kimi-id".
+Command: cargo test -p mahoquot-gateway -- models_route characterization_device_oauth_defaults
+RED Failure Output:
+---- models_route::tests::characterization_device_oauth_defaults stdout ----
+thread 'models_route::tests::characterization_device_oauth_defaults' (16137136) panicked at crates/gateway/src/models_route.rs:501:9:
+assertion `left == right` failed
+  left: "mutated-kimi-id"
+ right: "17e5f671-d194-4dfb-9706-5516cb48c098"
+failures:
+    models_route::tests::characterization_device_oauth_defaults
+test result: FAILED. 8 passed; 1 failed; 0 ignored; 0 measured; 217 filtered out.
+
+Revert: Restored Kimi client_id to "17e5f671-d194-4dfb-9706-5516cb48c098".
+GREEN Verification:
+Command: cargo test -p mahoquot-gateway -- models_route characterization_device_oauth_defaults
+Result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 217 filtered out.
+
+================================================================================
+MUTATION 7: Codex Negative-Space Exclusion
+================================================================================
+Target: crates/gateway/src/account.rs:81
+Mutation: In ProviderKind::serves_model, replace `!is_antigravity_model(model)` with `true`.
+Command: cargo test -p mahoquot-gateway -- provider_kind characterization_codex_negative_space_exclusion
+RED Failure Output:
+---- account::provider_kind_contract_tests::characterization_codex_negative_space_exclusion stdout ----
+thread 'account::provider_kind_contract_tests::characterization_codex_negative_space_exclusion' (16164370) panicked at crates/gateway/src/account.rs:146:13:
+Codex must not serve Antigravity model claude-opus-4-6-thinking
+failures:
+    account::provider_kind_contract_tests::characterization_codex_negative_space_exclusion
+test result: FAILED. 6 passed; 1 failed; 0 ignored; 0 measured; 219 filtered out.
+
+Revert: Restored `!is_antigravity_model(model)`.
+GREEN Verification:
+Command: cargo test -p mahoquot-gateway -- provider_kind characterization_codex_negative_space_exclusion
+Result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 219 filtered out.
+
+================================================================================
+MUTATION 8: Kiro and Cursor Prefix Handling
+================================================================================
+Target: crates/gateway/src/account.rs:90
+Mutation: In ProviderKind::serves_model, remove `model.starts_with("cursor/") ||` for Cursor.
+Command: cargo test -p mahoquot-gateway -- provider_kind characterization_kiro_and_cursor_prefixes
+RED Failure Output:
+---- account::provider_kind_contract_tests::characterization_kiro_and_cursor_prefixes stdout ----
+thread 'account::provider_kind_contract_tests::characterization_kiro_and_cursor_prefixes' (16190960) panicked at crates/gateway/src/account.rs:221:9:
+assertion failed: cursor.serves_model("cursor/auto")
+failures:
+    account::provider_kind_contract_tests::characterization_kiro_and_cursor_prefixes
+test result: FAILED. 6 passed; 1 failed; 0 ignored; 0 measured; 219 filtered out.
+
+Revert: Restored `model.starts_with("cursor/") || mahoquot_providers::is_cursor_model(model)`.
+GREEN Verification:
+Command: cargo test -p mahoquot-gateway -- provider_kind characterization_kiro_and_cursor_prefixes
+Result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 219 filtered out.
+
+================================================================================
+MUTATION 9: Generic Account supports_model (Empty Wildcard vs Explicit List)
+================================================================================
+Target: crates/gateway/src/account.rs:838
+Mutation: In AccountMember::supports_model, replace `account.models.is_empty()` with `false`.
+Command: cargo test -p mahoquot-gateway -- provider_kind characterization_generic_account_supports_model
+RED Failure Output:
+---- account::provider_kind_contract_tests::characterization_generic_account_supports_model stdout ----
+thread 'account::provider_kind_contract_tests::characterization_generic_account_supports_model' (16212514) panicked at crates/gateway/src/account.rs:255:9:
+assertion failed: empty_member.supports_model("gpt-4o")
+failures:
+    account::provider_kind_contract_tests::characterization_generic_account_supports_model
+test result: FAILED. 6 passed; 1 failed; 0 ignored; 0 measured; 219 filtered out.
+
+Revert: Restored `account.models.is_empty() || ...`.
+GREEN Verification:
+Command: cargo test -p mahoquot-gateway -- provider_kind characterization_generic_account_supports_model
+Result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 219 filtered out.
+
+================================================================================
+MUTATION 10: Unsupported-Model Inheritance Across Rescan
+================================================================================
+Target: crates/gateway/src/state.rs:68-75
+Mutation: In adopt_runtime_state, comment out copying previous.unsupported_models to target.unsupported_models.
+Command: cargo test -p mahoquot-gateway -- provider_kind characterization_unsupported_model_inheritance
+RED Failure Output:
+---- account::provider_kind_contract_tests::characterization_unsupported_model_inheritance stdout ----
+thread 'account::provider_kind_contract_tests::characterization_unsupported_model_inheritance' (16229433) panicked at crates/gateway/src/account.rs:315:9:
+assertion failed: !fresh_member.supports_model("gpt-5.6-sol")
+failures:
+    account::provider_kind_contract_tests::characterization_unsupported_model_inheritance
+test result: FAILED. 6 passed; 1 failed; 0 ignored; 0 measured; 219 filtered out.
+
+Revert: Restored copying of unsupported_models in adopt_runtime_state.
+GREEN Verification:
+Command: cargo test -p mahoquot-gateway -- provider_kind characterization_unsupported_model_inheritance
+Result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 219 filtered out.
+
+================================================================================
+MUTATION 11: Image/Video Surface Rejection Exact Text
+================================================================================
+Target: crates/gateway/src/capability.rs:18
+Mutation: In capability.rs, mutate IMAGE_HINT to "Mutated image hint.".
+Command: cargo test -p mahoquot-gateway -- capability characterization_image_and_video_rejection_text
+RED Failure Output:
+---- capability::tests::characterization_image_and_video_rejection_text stdout ----
+thread 'capability::tests::characterization_image_and_video_rejection_text' (16247680) panicked at crates/gateway/src/capability.rs:84:9:
+assertion `left == right` failed
+  left: String("Model dall-e-3 is not supported on /v1/images/generations or /v1/images/edits. Mutated image hint.")
+ right: "Model dall-e-3 is not supported on /v1/images/generations or /v1/images/edits. Use gpt-image-1.5, gpt-image-2, or a configured openai-compatibility image model."
+failures:
+    capability::tests::characterization_image_and_video_rejection_text
+test result: FAILED. 5 passed; 2 failed; 0 ignored; 0 measured; 219 filtered out.
+
+Revert: Restored IMAGE_HINT to "Use gpt-image-1.5, gpt-image-2, or a configured openai-compatibility image model.".
+GREEN Verification:
+Command: cargo test -p mahoquot-gateway -- capability characterization_image_and_video_rejection_text
+Result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 219 filtered out.
+
+================================================================================
+FINAL GREEN STATUS SUMMARY
+================================================================================
+All 11 mutation probes verified RED on fault injection, pinpointing their exact assertion lines.
+All 11 mutations reverted cleanly and verified GREEN.
+Full characterization suite: 23 passed, 0 failed, 0 ignored.
+Auxiliary integration suites (t11_multi_provider_pool, t8_openai_compat): 15 passed, 0 failed, 0 ignored.

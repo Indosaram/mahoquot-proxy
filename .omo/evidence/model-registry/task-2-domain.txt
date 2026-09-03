@@ -1,0 +1,150 @@
+# Pure mahoquot-registry Domain Crate & Policy Verification (Task 2)
+Plan: .omo/plans/unified-runtime-model-registry.md
+Workspace: /Users/indo/code/project/mahoquot-proxy
+Date: 2026-09-02
+
+## 1. Executive Summary
+Task 2 delivers the pure domain crate `mahoquot-registry` defining all core domain types, provider admission policies, source authority masks, capabilities, provider bindings, alias/exclusion rules, immutable snapshots, and builder validation.
+
+Key invariants:
+- Pure domain crate: Zero I/O, no tokio, no reqwest, no axum, no arc-swap, no account secrets, and no gateway dependencies.
+- Deterministic data structures: All collections use `BTreeMap` and `BTreeSet`, guaranteeing byte-stable serialization and predictable iteration order.
+- TDD RED -> GREEN cycle: 8 comprehensive unit/contract tests written first (7 failing on unimplemented stub, 1 passing), then implemented and verified completely green.
+- Verified policy semantics:
+  1. Closed binding wins when resolving a model with explicit closed provider bindings.
+  2. Open Codex cannot steal models claimed by closed or discovered bindings.
+  3. Discovered fallback is bounded: discovered providers cannot serve arbitrary unclaimed models.
+
+---
+
+## 2. Dependency Invariant Verification (`cargo tree -p mahoquot-registry`)
+
+Invocation:
+```
+$ cargo tree -p mahoquot-registry
+```
+
+Output:
+```
+mahoquot-registry v0.1.0 (/Users/indo/code/project/mahoquot-proxy/crates/registry)
+├── serde v1.0.229
+│   ├── serde_core v1.0.229
+│   └── serde_derive v1.0.229 (proc-macro)
+│       ├── proc-macro2 v1.0.107
+│       │   └── unicode-ident v1.0.24
+│       ├── quote v1.0.47
+│       │   └── proc-macro2 v1.0.107 (*)
+│       └── syn v3.0.4
+│           ├── proc-macro2 v1.0.107 (*)
+│           ├── quote v1.0.47 (*)
+│           └── unicode-ident v1.0.24
+├── serde_json v1.0.151
+│   ├── itoa v1.0.18
+│   ├── memchr v2.8.3
+│   ├── serde_core v1.0.229
+│   └── zmij v1.0.23
+└── thiserror v2.0.20
+    └── thiserror-impl v2.0.20 (proc-macro)
+        ├── proc-macro2 v1.0.107 (*)
+        ├── quote v1.0.47 (*)
+        └── syn v3.0.4 (*)
+```
+Conclusion: Crate is 100% pure; zero async/runtime/network/filesystem dependencies.
+
+---
+
+## 3. Strongly Typed Domain Inventory
+
+| Type | Kind | Role & Invariants |
+| --- | --- | --- |
+| `ProviderId` | Newtype (`String`) | Rejects empty strings, whitespace, and control characters. Predefined helpers: `codex()`, `antigravity()`, `claude()`, `cursor()`, `kiro()`, `vertex()`, `zcode()`. |
+| `ModelId` | Newtype (`String`) | Rejects empty strings, whitespace, and control characters. |
+| `CatalogVersion` | Newtype (`u64`) | Monotonic catalog schema version. |
+| `CatalogSource` | Enum | `LocalOverride` (precedence 5) > `Discovered` (4) > `RemoteSigned` (3) > `LkgCache` (2) > `EmbeddedFallback` (1). |
+| `ProviderPolicy` | Enum | `Closed` (Antigravity/Claude/Cursor/Kiro/Vertex/Zcode), `Discovered` (explicit adapter accounts), `Open` (Codex only fallback). |
+| `AuthorityMask` | Struct | Fine-grained boolean flags: `models`, `capabilities`, `aliases`, `prefixes`, `upstream_id`. Preserves existing fields when merging lower-authority sources. |
+| `ModelCapability` | Enum | `Chat`, `Image`, `Video`, `Realtime`, `CountTokens`, `Embedding`, `Audio`, `Tools`. Supports case-insensitive/kebab-case parsing via `from_str_loose`. |
+| `ProviderBinding` | Struct | Binds `(ModelId, ProviderId)` with upstream ID, capabilities set, authority mask, priority, and deterministic `merge_with` logic. |
+| `ModelDescriptor` | Struct | Canonical model descriptor: `id`, `owned_by`, `display_name`, `capabilities`, `bindings: BTreeMap<ProviderId, ProviderBinding>`, `aliases`, `metadata`. |
+| `ModelAliasRule` | Struct | Alias to canonical target with optional provider scoping. |
+| `ModelExclusionRule` | Struct | Global or per-provider exclusion. |
+| `RegistryError` | Enum | Typed error variants: `EmptyProviderId`, `InvalidProviderId`, `EmptyModelId`, `InvalidModelId`, `UnknownModel`, `UnknownProvider`, `AliasCycle`, `AliasDepthExceeded`, `UnknownAliasTarget`, `DuplicateBinding`, `ModelExcluded`, `NoRoutableModels`, `SerializationError`, `DeserializationError`. |
+| `RegistrySnapshot` | Struct | Immutable snapshot holding `BTreeMap<ModelId, ModelDescriptor>`, `BTreeMap<ProviderId, ProviderPolicy>`, `BTreeMap<ModelId, ModelAliasRule>`, `BTreeSet<ModelExclusionRule>`. Supports `resolve`, `capabilities_for`, `to_json_canonical`, `from_json`. |
+| `RegistryBuilder` | Struct | Fluent builder with validation of alias cycles, chain depth (max 10), unknown targets, and routability. |
+
+---
+
+## 4. TDD Verification Record
+
+### 4.1 RED Phase
+Test execution before implementation:
+```
+$ cargo test -p mahoquot-registry
+running 8 tests
+test test_capability_lookup ... FAILED
+test test_alias_cycles_and_depth ... FAILED
+test test_deterministic_serialization ... FAILED
+test test_duplicate_binding_merge ... FAILED
+test test_invalid_and_empty_ids ... ok
+test test_unknown_targets ... FAILED
+test test_stable_ordering ... FAILED
+test resolves_closed_discovered_and_open_without_ambiguity ... FAILED
+
+failures: 7 failed; 1 passed; finished in 0.00s
+```
+
+### 4.2 GREEN Phase
+Test execution after full domain implementation:
+```
+$ cargo test -p mahoquot-registry -- --nocapture
+running 8 tests
+[PASS] Closed binding wins: claude-sonnet-4-6 resolved to ProviderId(claude) with policy Closed
+[PASS] Open Codex cannot steal claimed IDs: codex absent from bindings for claude-sonnet-4-6 and deepseek-chat
+[PASS] Discovered fallback is bounded: custom-unclaimed-model served by Open Codex, not Discovered custom-gateway
+test test_invalid_and_empty_ids ... ok
+test test_stable_ordering ... ok
+[PASS] Without open provider: unknown model fails with typed UnknownModel error
+test test_unknown_targets ... ok
+test test_capability_lookup ... ok
+test test_duplicate_binding_merge ... ok
+test resolves_closed_discovered_and_open_without_ambiguity ... ok
+test test_alias_cycles_and_depth ... ok
+test test_deterministic_serialization ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+```
+
+---
+
+## 5. QA Scenario Execution: Multi-Policy Resolution
+
+Command:
+```
+$ cargo test -p mahoquot-registry resolves_closed_discovered_and_open_without_ambiguity -- --exact --nocapture
+```
+
+Output:
+```
+running 1 test
+[PASS] Closed binding wins: claude-sonnet-4-6 resolved to ProviderId(claude) with policy Closed
+[PASS] Open Codex cannot steal claimed IDs: codex absent from bindings for claude-sonnet-4-6 and deepseek-chat
+[PASS] Discovered fallback is bounded: custom-unclaimed-model served by Open Codex, not Discovered custom-gateway
+[PASS] Without open provider: unknown model fails with typed UnknownModel error
+test resolves_closed_discovered_and_open_without_ambiguity ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.00s
+```
+
+Evaluation:
+1. Closed binding wins: Model with Closed provider binding `claude` resolves to `ProviderId(claude)` as first/only eligible binding.
+2. Open Codex cannot steal claimed ID: Despite Codex (Open) being registered in snapshot, it does not appear in bindings for either `claude-sonnet-4-6` or `deepseek-chat`.
+3. Discovered fallback bounded: Discovered provider `custom-gateway` cannot serve `custom-unclaimed-model`; it falls through to Open Codex.
+4. Without Open provider: Unclaimed model fails cleanly with `RegistryError::UnknownModel`.
+PASS criterion fully satisfied.
+
+---
+
+## 6. Workspace Lints & Formatting
+- `cargo fmt --check`: Clean (exit 0)
+- `cargo clippy --workspace --all-targets -- -D warnings`: Clean (exit 0)
+- `cargo test -p mahoquot-gateway`: All 226 unit tests and 23 integration test binaries pass (exit 0)

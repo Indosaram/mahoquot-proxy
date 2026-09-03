@@ -16,9 +16,11 @@ pub mod lists;
 pub mod oauth;
 pub mod observability;
 pub mod plugins;
+pub mod registry;
 pub mod scalar_table;
 pub mod scalars;
 pub mod scheduler;
+pub mod scoped_keys;
 pub mod settings;
 pub mod store;
 
@@ -36,7 +38,9 @@ pub fn management_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .merge(creds::creds_routes())
         .merge(history::history_routes())
         .merge(observability::observability_routes())
+        .merge(registry::registry_routes())
         .merge(core::core_routes())
+        .merge(scoped_keys::scoped_keys_routes())
         .merge(scalars::scalars_routes())
         .merge(scheduler::scheduler_routes())
         .layer(axum::middleware::from_fn_with_state(

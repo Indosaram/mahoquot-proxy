@@ -74,6 +74,14 @@ async fn put_config_yaml(State(state): State<Arc<AppState>>, raw: bytes::Bytes) 
         // whole-config write is always reported as the single "config"
         // section regardless of what actually differed.
         Ok(_) => json_status(StatusCode::OK, json!({ "ok": true, "changed": ["config"] })),
+        Err(super::settings::SettingsError::Validation(err)) => json_status(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "validation_error", "message": err.to_string() }),
+        ),
+        Err(super::settings::SettingsError::InvalidCatalogConfig(err)) => json_status(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "validation_error", "message": err }),
+        ),
         Err(err) => json_status(
             StatusCode::INTERNAL_SERVER_ERROR,
             json!({ "error": format!("failed to save config: {err}") }),

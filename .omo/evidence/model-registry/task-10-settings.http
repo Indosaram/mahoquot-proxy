@@ -1,0 +1,63 @@
+PUT /v0/management/oauth-model-alias HTTP/1.1
+Host: 127.0.0.1:18871
+Authorization: Bearer test-admin
+Content-Type: application/json
+
+{
+  "antigravity": [
+    {
+      "alias": "flash-next",
+      "name": "gemini-next-flash-high"
+    }
+  ]
+}
+
+HTTP/1.1 200 OK
+content-type: application/json
+x-cpa-version: 7.2.140
+x-cpa-commit: a7e3596b
+x-cpa-build-date: 2026-08-22T14:51:09Z
+x-cpa-support-plugin: 1
+access-control-expose-headers: X-CPA-TRACE-ID, X-CPA-VERSION, X-CPA-COMMIT, X-CPA-BUILD-DATE, X-CPA-SUPPORT-PLUGIN, X-CPA-HOME-VERSION, X-CPA-HOME-BUILD-DATE, X-SERVER-VERSION, X-SERVER-BUILD-DATE, Location, Retry-After, X-Request-Id, OpenAI-Request-Id
+access-control-allow-origin: *
+access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
+access-control-allow-headers: Authorization, Content-Type
+content-length: 15
+date: Thu, 03 Sep 2026 05:08:25 GMT
+
+{"status":"ok"}
+
+---
+
+PUT /v0/management/oauth-model-alias HTTP/1.1
+Host: 127.0.0.1:18871
+Authorization: Bearer test-admin
+Content-Type: application/json
+
+{
+  "antigravity": [
+    {
+      "alias": "cycle-a",
+      "name": "cycle-b"
+    },
+    {
+      "alias": "cycle-b",
+      "name": "cycle-a"
+    }
+  ]
+}
+
+HTTP/1.1 400 Bad Request
+content-type: application/json
+x-cpa-version: 7.2.140
+x-cpa-commit: a7e3596b
+x-cpa-build-date: 2026-08-22T14:51:09Z
+x-cpa-support-plugin: 1
+access-control-expose-headers: X-CPA-TRACE-ID, X-CPA-VERSION, X-CPA-COMMIT, X-CPA-BUILD-DATE, X-CPA-SUPPORT-PLUGIN, X-CPA-HOME-VERSION, X-CPA-HOME-BUILD-DATE, X-SERVER-VERSION, X-SERVER-BUILD-DATE, Location, Retry-After, X-Request-Id, OpenAI-Request-Id
+access-control-allow-origin: *
+access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
+access-control-allow-headers: Authorization, Content-Type
+content-length: 114
+date: Thu, 03 Sep 2026 05:08:25 GMT
+
+{"error":"alias cycle detected for 'cycle-a': [ModelId(\"cycle-a\"), ModelId(\"cycle-b\"), ModelId(\"cycle-a\")]"}

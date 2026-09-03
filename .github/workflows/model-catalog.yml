@@ -1,0 +1,127 @@
+name: Model Catalog Workflow
+
+on:
+  pull_request:
+    paths:
+      - "crates/registry/catalog/**"
+      - "crates/registry/schema/**"
+      - "crates/registry/**"
+      - "tools/model-catalog/**"
+      - "tests/fixtures/**"
+      - "scripts/verify-catalog.sh"
+      - ".github/workflows/model-catalog.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "crates/registry/catalog/**"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish to model-catalog-v1 branch"
+        type: boolean
+        default: true
+
+concurrency:
+  group: model-catalog-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate-and-test:
+    name: Validate Catalog & Test Tooling
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Validate catalog domain and schema invariants
+        run: |
+          cargo run -p mahoquot-model-catalog -- validate crates/registry/catalog/models-v1.json
+
+      - name: Run verification script (validate -> sign -> verify pipeline)
+        run: |
+          bash scripts/verify-catalog.sh
+
+      - name: Run test suite for catalog tooling
+        run: |
+          cargo test -p mahoquot-registry --test envelope_tests
+          cargo test -p mahoquot-model-catalog
+
+  publish-catalog:
+    name: Publish Signed Catalog to model-catalog-v1
+    needs: validate-and-test
+    if: (github.ref == 'refs/heads/main' && github.event_name == 'push') || (github.event_name == 'workflow_dispatch' && inputs.publish == true)
+    runs-on: ubuntu-latest
+    environment: catalog-publication
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build catalog tooling
+        run: |
+          cargo build --release -p mahoquot-model-catalog
+
+      - name: Check version monotonicity and sign catalog
+        env:
+          MAHOQUOT_MODEL_CATALOG_ED25519_PRIVATE_KEY: ${{ secrets.MAHOQUOT_MODEL_CATALOG_ED25519_PRIVATE_KEY }}
+          KEY_ID: "mahoquot-prod-2026-v1"
+        run: |
+          PUBLISH_DIR=$(mktemp -d)
+
+          # If model-catalog-v1 branch exists remotely, fetch and check previous version
+          git fetch origin model-catalog-v1:refs/remotes/origin/model-catalog-v1 || true
+          if git rev-parse --verify origin/model-catalog-v1 >/dev/null 2>&1; then
+            git show origin/model-catalog-v1:models-v1.json > "$PUBLISH_DIR/prev-models-v1.json" || true
+            if [ -f "$PUBLISH_DIR/prev-models-v1.json" ]; then
+              PREV_VERSION=$(jq -r '.version' "$PUBLISH_DIR/prev-models-v1.json")
+              CURR_VERSION=$(jq -r '.version' crates/registry/catalog/models-v1.json)
+              echo "Previous published version: $PREV_VERSION, incoming version: $CURR_VERSION"
+              if [ "$CURR_VERSION" -le "$PREV_VERSION" ]; then
+                echo "Error: non-monotonic version upgrade (incoming $CURR_VERSION <= published $PREV_VERSION)" >&2
+                exit 1
+              fi
+            fi
+          fi
+
+          # Sign incoming catalog
+          target/release/mahoquot-model-catalog sign \
+            --input crates/registry/catalog/models-v1.json \
+            --output "$PUBLISH_DIR/models-v1.json" \
+            --signature "$PUBLISH_DIR/models-v1.json.sig" \
+            --key-id "$KEY_ID"
+
+          # Verify generated envelope before publication
+          target/release/mahoquot-model-catalog verify \
+            --input "$PUBLISH_DIR/models-v1.json" \
+            --signature "$PUBLISH_DIR/models-v1.json.sig"
+
+          # Generate sha256 checksum
+          cd "$PUBLISH_DIR"
+          sha256sum models-v1.json > models-v1.json.sha256
+          cd -
+
+          # Switch to orphan model-catalog-v1 branch
+          git checkout --orphan model-catalog-v1
+          git rm -rf . || true
+
+          cp "$PUBLISH_DIR/models-v1.json" ./
+          cp "$PUBLISH_DIR/models-v1.json.sig" ./
+          cp "$PUBLISH_DIR/models-v1.json.sha256" ./
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add models-v1.json models-v1.json.sig models-v1.json.sha256
+
+          CAT_VERSION=$(jq -r '.version' models-v1.json)
+          git commit -m "publish(catalog): version ${CAT_VERSION} [skip ci]"
+          git push origin model-catalog-v1

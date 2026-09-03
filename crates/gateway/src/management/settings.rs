@@ -2,6 +2,65 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+fn default_catalog_refresh_enabled() -> bool {
+    true
+}
+
+fn default_catalog_url() -> String {
+    crate::registry::DEFAULT_REMOTE_CATALOG_URL.to_string()
+}
+
+fn default_catalog_signature_url() -> String {
+    crate::registry::DEFAULT_REMOTE_SIGNATURE_URL.to_string()
+}
+
+fn default_catalog_refresh_interval_secs() -> u64 {
+    3600
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ModelCatalogSettings {
+    #[serde(
+        rename = "refresh-enabled",
+        default = "default_catalog_refresh_enabled"
+    )]
+    pub refresh_enabled: bool,
+    #[serde(default = "default_catalog_url")]
+    pub url: String,
+    #[serde(rename = "signature-url", default = "default_catalog_signature_url")]
+    pub signature_url: String,
+    #[serde(
+        rename = "refresh-interval-secs",
+        default = "default_catalog_refresh_interval_secs"
+    )]
+    pub refresh_interval_secs: u64,
+    #[serde(
+        rename = "allowed-blackouts",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub allowed_blackouts: Vec<String>,
+    #[serde(
+        rename = "custom-models",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub custom_models: Vec<mahoquot_registry::ModelDescriptor>,
+}
+
+impl Default for ModelCatalogSettings {
+    fn default() -> Self {
+        Self {
+            refresh_enabled: default_catalog_refresh_enabled(),
+            url: default_catalog_url(),
+            signature_url: default_catalog_signature_url(),
+            refresh_interval_secs: default_catalog_refresh_interval_secs(),
+            allowed_blackouts: Vec::new(),
+            custom_models: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RemoteManagement {
     #[serde(rename = "allow-remote", default)]
@@ -45,6 +104,52 @@ pub struct ApiKeyBinding {
     pub account: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+}
+
+/// A delegated inbound key with a restricted blast radius.
+///
+/// Only the one-way `key_identifier` (SHA-256 of the raw key, as produced by
+/// [`crate::request_history::stable_key_identifier`]) is persisted; the raw key
+/// is shown to the operator once at mint time and never stored. `key_prefix` is
+/// a non-secret display fragment so a key can be recognised in a list.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScopedApiKey {
+    pub id: String,
+    pub name: String,
+    pub key_identifier: String,
+    pub key_prefix: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_key: Option<String>,
+    #[serde(default)]
+    pub allowed_providers: Vec<String>,
+    #[serde(default)]
+    pub allowed_accounts: Vec<String>,
+    #[serde(default)]
+    pub allowed_models: Vec<String>,
+    #[serde(default)]
+    pub token_limit: u64,
+    #[serde(default)]
+    pub token_used: u64,
+    #[serde(default = "yes")]
+    pub is_active: bool,
+    #[serde(default)]
+    pub created_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<i64>,
+}
+
+impl ScopedApiKey {
+    /// True when the key may still authenticate at `now_ms`: active, and either
+    /// non-expiring or not yet past its expiry.
+    pub fn is_usable_at(&self, now_ms: i64) -> bool {
+        self.is_active && self.expires_at_ms.map(|at| now_ms < at).unwrap_or(true)
+    }
+
+    /// True when the key has consumed its allowance. A zero `token_limit` means
+    /// unlimited, matching the serde default for keys minted without a cap.
+    pub fn is_exhausted(&self) -> bool {
+        self.token_limit > 0 && self.token_used >= self.token_limit
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -170,6 +275,8 @@ pub struct Settings {
     pub api_keys: Vec<String>,
     #[serde(rename = "api-key-bindings", default)]
     pub api_key_bindings: Vec<ApiKeyBinding>,
+    #[serde(rename = "scoped-api-keys", default)]
+    pub scoped_api_keys: Vec<ScopedApiKey>,
     #[serde(rename = "oauth-excluded-models", default)]
     pub oauth_excluded_models: std::collections::BTreeMap<String, Vec<String>>,
     #[serde(rename = "gemini-api-key", default)]
@@ -190,6 +297,12 @@ pub struct Settings {
     pub oauth_model_alias: serde_json::Value,
     #[serde(rename = "oauth-request-scoped-errors", default)]
     pub oauth_request_scoped_errors: serde_json::Value,
+    #[serde(
+        rename = "model-catalog",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub model_catalog: Option<ModelCatalogSettings>,
 
     #[serde(flatten)]
     pub extra: serde_yaml::Mapping,
@@ -239,6 +352,7 @@ impl Default for Settings {
             remote_management: RemoteManagement::default(),
             api_keys: Vec::new(),
             api_key_bindings: Vec::new(),
+            scoped_api_keys: Vec::new(),
             oauth_excluded_models: std::collections::BTreeMap::new(),
             gemini_api_key: Vec::new(),
             claude_api_key: Vec::new(),
@@ -249,6 +363,7 @@ impl Default for Settings {
             openai_compatibility: Vec::new(),
             oauth_model_alias: serde_json::Value::Null,
             oauth_request_scoped_errors: serde_json::Value::Null,
+            model_catalog: None,
             extra: serde_yaml::Mapping::new(),
         }
     }
@@ -276,6 +391,10 @@ pub enum SettingsError {
         #[source]
         source: std::io::Error,
     },
+    #[error("registry validation error: {0}")]
+    Validation(#[from] mahoquot_registry::RegistryError),
+    #[error("invalid model-catalog setting: {0}")]
+    InvalidCatalogConfig(String),
 }
 
 impl Settings {
@@ -337,6 +456,248 @@ impl Settings {
             }
         })
     }
+
+    /// Parse `oauth_model_alias` JSON value into typed `ModelAliasRule` list.
+    pub fn parse_model_aliases(
+        &self,
+    ) -> Result<Vec<mahoquot_registry::ModelAliasRule>, SettingsError> {
+        let mut rules = Vec::new();
+        if self.oauth_model_alias.is_null() {
+            return Ok(rules);
+        }
+
+        let mut root = &self.oauth_model_alias;
+        if let Some(obj) = root.as_object() {
+            if obj.len() == 1 && obj.contains_key("items") {
+                root = &obj["items"];
+            }
+        }
+
+        match root {
+            serde_json::Value::Object(map) => {
+                for (key, val) in map {
+                    match val {
+                        serde_json::Value::String(target_str) => {
+                            let alias_id = mahoquot_registry::ModelId::new(key)?;
+                            let target_id = mahoquot_registry::ModelId::new(target_str)?;
+                            rules.push(mahoquot_registry::ModelAliasRule {
+                                alias: alias_id,
+                                target: target_id,
+                                provider_id: None,
+                            });
+                        }
+                        serde_json::Value::Object(inner_map) => {
+                            let pid = mahoquot_registry::ProviderId::canonical(key)?;
+                            for (alias_str, target_val) in inner_map {
+                                let target_str = target_val.as_str().ok_or_else(|| {
+                                    SettingsError::InvalidCatalogConfig(format!(
+                                        "alias target for '{alias_str}' must be a string"
+                                    ))
+                                })?;
+                                let alias_id = mahoquot_registry::ModelId::new(alias_str)?;
+                                let target_id = mahoquot_registry::ModelId::new(target_str)?;
+                                rules.push(mahoquot_registry::ModelAliasRule {
+                                    alias: alias_id,
+                                    target: target_id,
+                                    provider_id: Some(pid.clone()),
+                                });
+                            }
+                        }
+                        serde_json::Value::Array(items) => {
+                            let pid = mahoquot_registry::ProviderId::canonical(key)?;
+                            for item in items {
+                                let item_obj = item.as_object().ok_or_else(|| {
+                                    SettingsError::InvalidCatalogConfig(
+                                        "alias item in array must be an object".to_string(),
+                                    )
+                                })?;
+                                let alias_str = item_obj
+                                    .get("alias")
+                                    .and_then(|v| v.as_str())
+                                    .or_else(|| item_obj.get("from").and_then(|v| v.as_str()))
+                                    .ok_or_else(|| {
+                                        SettingsError::InvalidCatalogConfig(
+                                            "alias item missing 'alias' field".to_string(),
+                                        )
+                                    })?;
+                                let target_str = item_obj
+                                    .get("name")
+                                    .and_then(|v| v.as_str())
+                                    .or_else(|| item_obj.get("target").and_then(|v| v.as_str()))
+                                    .or_else(|| item_obj.get("model").and_then(|v| v.as_str()))
+                                    .or_else(|| item_obj.get("to").and_then(|v| v.as_str()))
+                                    .ok_or_else(|| {
+                                        SettingsError::InvalidCatalogConfig(
+                                            "alias item missing 'name' or 'target' field"
+                                                .to_string(),
+                                        )
+                                    })?;
+                                let alias_id = mahoquot_registry::ModelId::new(alias_str)?;
+                                let target_id = mahoquot_registry::ModelId::new(target_str)?;
+                                rules.push(mahoquot_registry::ModelAliasRule {
+                                    alias: alias_id,
+                                    target: target_id,
+                                    provider_id: Some(pid.clone()),
+                                });
+                            }
+                        }
+                        _ => {
+                            return Err(SettingsError::InvalidCatalogConfig(format!(
+                                "unsupported alias value format for key '{key}'"
+                            )));
+                        }
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    let item_obj = item.as_object().ok_or_else(|| {
+                        SettingsError::InvalidCatalogConfig(
+                            "top-level alias array item must be an object".to_string(),
+                        )
+                    })?;
+                    let alias_str = item_obj
+                        .get("alias")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| item_obj.get("from").and_then(|v| v.as_str()))
+                        .ok_or_else(|| {
+                            SettingsError::InvalidCatalogConfig(
+                                "alias item missing 'alias' field".to_string(),
+                            )
+                        })?;
+                    let target_str = item_obj
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| item_obj.get("target").and_then(|v| v.as_str()))
+                        .or_else(|| item_obj.get("model").and_then(|v| v.as_str()))
+                        .or_else(|| item_obj.get("to").and_then(|v| v.as_str()))
+                        .ok_or_else(|| {
+                            SettingsError::InvalidCatalogConfig(
+                                "alias item missing 'name' or 'target' field".to_string(),
+                            )
+                        })?;
+                    let pid = match item_obj
+                        .get("provider")
+                        .or_else(|| item_obj.get("provider_id"))
+                        .and_then(|v| v.as_str())
+                    {
+                        Some(p) if !p.trim().is_empty() => {
+                            Some(mahoquot_registry::ProviderId::canonical(p)?)
+                        }
+                        _ => None,
+                    };
+                    let alias_id = mahoquot_registry::ModelId::new(alias_str)?;
+                    let target_id = mahoquot_registry::ModelId::new(target_str)?;
+                    rules.push(mahoquot_registry::ModelAliasRule {
+                        alias: alias_id,
+                        target: target_id,
+                        provider_id: pid,
+                    });
+                }
+            }
+            _ => {
+                return Err(SettingsError::InvalidCatalogConfig(
+                    "oauth-model-alias must be an object or array".to_string(),
+                ));
+            }
+        }
+
+        Ok(rules)
+    }
+
+    /// Parse `oauth_excluded_models` into typed `ModelExclusionRule` list.
+    pub fn parse_model_exclusions(
+        &self,
+    ) -> Result<Vec<mahoquot_registry::ModelExclusionRule>, SettingsError> {
+        let mut rules = Vec::new();
+        for (provider_str, models) in &self.oauth_excluded_models {
+            let pid = if provider_str == "*"
+                || provider_str.is_empty()
+                || provider_str.eq_ignore_ascii_case("all")
+            {
+                None
+            } else {
+                Some(mahoquot_registry::ProviderId::canonical(provider_str)?)
+            };
+
+            for model_str in models {
+                let model_id = mahoquot_registry::ModelId::new(model_str)?;
+                rules.push(mahoquot_registry::ModelExclusionRule {
+                    model_id,
+                    provider_id: pid.clone(),
+                });
+            }
+        }
+        Ok(rules)
+    }
+
+    /// Validate this settings document atomically against an active registry snapshot,
+    /// returning the composed candidate snapshot on success.
+    pub fn validate_against_registry(
+        &self,
+        snapshot: &mahoquot_registry::RegistrySnapshot,
+    ) -> Result<mahoquot_registry::RegistrySnapshot, SettingsError> {
+        let aliases = self.parse_model_aliases()?;
+        let exclusions = self.parse_model_exclusions()?;
+
+        let mut allowed_blackouts = Vec::new();
+        let mut custom_models = Vec::new();
+
+        if let Some(ref cat) = self.model_catalog {
+            validate_catalog_url(&cat.url, "catalog url")?;
+            validate_catalog_url(&cat.signature_url, "signature url")?;
+
+            for pid_str in &cat.allowed_blackouts {
+                allowed_blackouts.push(mahoquot_registry::ProviderId::canonical(pid_str)?);
+            }
+            custom_models = cat.custom_models.clone();
+        }
+
+        let candidate = snapshot.compose_with_settings(
+            aliases,
+            exclusions.into_iter().collect(),
+            custom_models,
+            &allowed_blackouts,
+        )?;
+
+        Ok(candidate)
+    }
+}
+
+fn validate_catalog_url(url_str: &str, field_name: &str) -> Result<(), SettingsError> {
+    if url_str.trim().is_empty() {
+        return Ok(());
+    }
+    let parsed = reqwest::Url::parse(url_str).map_err(|e| {
+        SettingsError::InvalidCatalogConfig(format!("invalid {field_name} '{url_str}': {e}"))
+    })?;
+
+    let scheme = parsed.scheme();
+    let host = parsed.host_str().unwrap_or("");
+    if host.is_empty() {
+        return Err(SettingsError::InvalidCatalogConfig(format!(
+            "{field_name} must contain a non-empty host: '{url_str}'"
+        )));
+    }
+
+    if scheme != "https" {
+        let is_localhost = host == "127.0.0.1" || host == "localhost";
+        if scheme == "http" && is_localhost {
+            // allowed for local test/dev
+        } else {
+            return Err(SettingsError::InvalidCatalogConfig(format!(
+                "insecure {field_name} scheme '{scheme}': must be https (http only permitted for 127.0.0.1/localhost)"
+            )));
+        }
+    }
+
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(SettingsError::InvalidCatalogConfig(format!(
+            "{field_name} must not contain embedded user/password credentials"
+        )));
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

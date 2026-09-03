@@ -131,7 +131,11 @@ fn contract_route_names_have_one_registration_owner() {
     let mut routes = std::collections::BTreeSet::new();
     for (route, owner) in owners {
         assert!(routes.insert(route), "duplicate route {route}");
-        assert_eq!(owner, "crates/gateway/src/management/contracts.rs");
+        assert!(
+            owner == "crates/gateway/src/management/contracts.rs"
+                || owner == "crates/gateway/src/management/registry.rs",
+            "unexpected route registration owner: {owner}"
+        );
     }
     assert!(!routes.is_empty(), "contract routes must be declared");
 }
@@ -527,7 +531,7 @@ async fn test_oauth_model_alias_lifecycle() {
     let alias_map = json!({
         "openai": {
             "gpt-4": "gpt-4o",
-            "gpt-3.5-turbo": "gpt-4o-mini"
+            "gpt-3.5-turbo": "gpt-5.4-mini"
         }
     });
     let (status, body) = send_request(&app, Method::POST, uri, Some(alias_map.clone())).await;
@@ -542,7 +546,7 @@ async fn test_oauth_model_alias_lifecycle() {
     // 4. PUT wrapped in {"items": ...} -> 200
     let updated_map = json!({
         "anthropic": {
-            "claude-v1": "claude-3-5-sonnet"
+            "claude-v1": "claude-sonnet-4-6"
         }
     });
     let (status, body) =
@@ -551,6 +555,37 @@ async fn test_oauth_model_alias_lifecycle() {
     assert_eq!(body["status"], "ok");
 
     // 5. GET verify -> updated_map
+    let (status, body) = send_request(&app, Method::GET, uri, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["oauth-model-alias"], updated_map);
+
+    // 5b. POST invalid cyclic alias -> 400 rejection and generation / settings unchanged
+    let cyclic_map = json!({
+        "openai": {
+            "cycle-a": "cycle-b",
+            "cycle-b": "cycle-a"
+        }
+    });
+    let (status, body) = send_request(&app, Method::POST, uri, Some(cyclic_map)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"].as_str().unwrap().contains("cycle"));
+
+    // Verify settings still have updated_map (atomic non-mutation)
+    let (status, body) = send_request(&app, Method::GET, uri, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["oauth-model-alias"], updated_map);
+
+    // 5c. POST unknown alias target -> 400 rejection
+    let unknown_target_map = json!({
+        "antigravity": {
+            "my-alias": "totally-unknown-model-xyz"
+        }
+    });
+    let (status, body) = send_request(&app, Method::POST, uri, Some(unknown_target_map)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"].as_str().unwrap().contains("unknown target"));
+
+    // Verify settings still have updated_map (atomic non-mutation)
     let (status, body) = send_request(&app, Method::GET, uri, None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["oauth-model-alias"], updated_map);

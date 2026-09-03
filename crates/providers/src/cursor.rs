@@ -17,16 +17,40 @@ pub const CURSOR_REFRESH_URL: &str = "https://api2.cursor.sh/auth/exchange_user_
 pub const CURSOR_UPSTREAM_BASE: &str = "https://api2.cursor.sh";
 pub const CURSOR_CHAT_PATH: &str = "/v1/chat/completions";
 
+use mahoquot_registry::{embedded_snapshot, ProviderContribution, ProviderId, RegistrySnapshot};
+
+pub fn provider_id() -> ProviderId {
+    ProviderId::cursor()
+}
+
+pub fn contribution(snapshot: &RegistrySnapshot) -> ProviderContribution {
+    snapshot.contribution_for_provider(&provider_id())
+}
+
+pub fn default_contribution() -> ProviderContribution {
+    contribution(embedded_snapshot())
+}
+
+pub fn supported_models(snapshot: &RegistrySnapshot) -> Vec<String> {
+    contribution(snapshot).supported_model_ids()
+}
+
+#[allow(deprecated)]
+pub fn is_cursor_model_in_snapshot(snapshot: &RegistrySnapshot, model: &str) -> bool {
+    contribution(snapshot).supports_model(model) || CURSOR_MODELS.contains(&model)
+}
+
+pub fn is_cursor_model(model: &str) -> bool {
+    is_cursor_model_in_snapshot(embedded_snapshot(), model)
+}
+
+#[deprecated(note = "query catalog/registry for models instead")]
 pub const CURSOR_MODELS: &[&str] = &[
     "cursor-small",
     "cursor-fast",
     "gpt-5.6-sol",
     "claude-sonnet-4-5-20250929",
 ];
-
-pub fn is_cursor_model(model: &str) -> bool {
-    CURSOR_MODELS.contains(&model)
-}
 
 pub fn cursor_chat_url(upstream_base: &str) -> String {
     format!(

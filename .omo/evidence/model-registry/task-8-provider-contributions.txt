@@ -1,0 +1,265 @@
+================================================================================
+Task 8: Convert Provider Implementations to Typed Registry Contributions
+Location: mahoquot-proxy / mahoquot-providers & mahoquot-registry
+Date: 2026-09-02
+================================================================================
+
+1. SUMMARY
+----------
+Task 8 converts provider implementations in `crates/providers` from declaring
+disparate hardcoded model string arrays (`*_MODELS`) as authoritative sources to
+declaring and emitting typed registry contributions (`ProviderContribution`) and
+querying their supported models and capability profiles directly from catalog/registry
+types (`RegistrySnapshot`, `ModelDescriptor`, `ProviderBinding`, `ModelCapability`).
+
+Key Changes:
+- `crates/registry/src/lib.rs`:
+  - Enhanced `ProviderContribution` to include `policy: Option<ProviderPolicy>`,
+    `aliases: Vec<ModelAliasRule>`, and helper methods:
+    - `supports_model(&self, model: &str) -> bool`
+    - `capability_profile(&self, model: &str) -> Option<BTreeSet<ModelCapability>>`
+    - `supported_model_ids(&self) -> Vec<String>`
+    - `model_ids(&self) -> Vec<ModelId>`
+    - `has_prefix_support(&self) -> bool`
+  - Added `RegistrySnapshot::contribution_for_provider(&self, provider_id: &ProviderId) -> ProviderContribution`
+  - Added `RegistryBuilder::add_alias_rule(&mut self, rule: ModelAliasRule) -> Result<&mut Self, RegistryError>`
+  - Enforced that prefix matching is guarded by `provider_id == ProviderId::vertex()`
+    and `has_prefix_support()`.
+- `crates/providers/Cargo.toml`:
+  - Added `mahoquot-registry.workspace = true`.
+- `crates/providers/src/antigravity.rs`:
+  - Added `provider_id()`, `contribution(snapshot)`, `default_contribution()`,
+    `supported_models(snapshot)`, `is_antigravity_model_in_snapshot(snapshot, model)`,
+    and updated `is_antigravity_model(model)`.
+  - Deprecated legacy `ANTIGRAVITY_MODELS`.
+- `crates/providers/src/claude.rs`:
+  - Added `provider_id()`, `contribution(snapshot)`, `default_contribution()`,
+    `supported_models(snapshot)`, `is_claude_model_in_snapshot(snapshot, model)`,
+    and updated `is_claude_model(model)`.
+  - Deprecated legacy `CLAUDE_MODELS`.
+- `crates/providers/src/codex.rs` (new module):
+  - Created provider adapter for Codex with typed contribution, `default_contribution()`,
+    `supported_models()`, `is_codex_model()`, `is_codex_model_in_snapshot()`,
+    and re-exports of `account::*`.
+- `crates/providers/src/cursor.rs`:
+  - Added `provider_id()`, `contribution(snapshot)`, `default_contribution()`,
+    `supported_models(snapshot)`, `is_cursor_model_in_snapshot(snapshot, model)`,
+    and updated `is_cursor_model(model)`.
+  - Deprecated legacy `CURSOR_MODELS`.
+- `crates/providers/src/kiro.rs`:
+  - Added `provider_id()`, `contribution(snapshot)`, `default_contribution()`,
+    `supported_models(snapshot)`, `is_kiro_model_in_snapshot(snapshot, model)`,
+    and updated `is_kiro_model(model)`.
+  - Preserves `kiro/` virtual prefix and unprefixed upstream IDs.
+  - Deprecated legacy `KIRO_MODELS`.
+- `crates/providers/src/vertex.rs`:
+  - Added `provider_id()`, `contribution(snapshot)`, `default_contribution()`,
+    `supported_models(snapshot)`, `is_vertex_model_in_snapshot(snapshot, model)`,
+    and updated `is_vertex_model(model)`.
+  - Preserves prefix matching rules for `gemini-*` and `google/*`.
+  - Deprecated legacy `VERTEX_MODELS`.
+- `crates/providers/src/zcode.rs`:
+  - Added `provider_id()`, `contribution(snapshot)`, `default_contribution()`,
+    `supported_models(snapshot)`, `is_zcode_model_in_snapshot(snapshot, model)`,
+    and updated `is_zcode_model(model)`.
+  - Deprecated legacy `ZCODE_MODELS`.
+- `crates/providers/src/lib.rs`:
+  - Registered and exported `codex` module; re-exported `is_codex_model`,
+    `is_codex_model_in_snapshot`.
+- `crates/gateway/src/management/oauth.rs`:
+  - Updated device OAuth session creation to read default models from the catalog/registry
+    at creation time (`embedded_snapshot().contribution_for_provider(&pid)`).
+- `crates/providers/tests/provider_contributions_tests.rs`:
+  - TDD integration suite asserting all 7 providers emit expected contributions,
+    100% parity with legacy lists, accurate capability profiles, and dynamic catalog support.
+
+2. PROVIDER CATALOG PARITY VERIFICATION
+---------------------------------------
+| Provider    | Policy | Model Count | Parity Notes |
+|-------------|--------|-------------|--------------|
+| antigravity | Closed | 14 models   | 100% legacy parity + aliases (gemini-3.1-pro-high, gemini-3.1-pro-preview) |
+| claude      | Closed | 12 models   | 100% legacy parity (sonnet, opus, haiku variants) |
+| codex       | Open   | 12 models   | 100% legacy parity (gpt-4/5 series, gpt-image-1.5, gpt-image-2) |
+| cursor      | Closed | 6 models    | 100% legacy parity (cursor-fast, cursor-small, cursor/auto*) |
+| kiro        | Closed | 8 models    | 100% legacy parity (kiro/ prefixes mapped to unprefixed upstreams + auto-kiro) |
+| vertex      | Closed | 21 models   | 100% legacy parity + catalog prefix support (gemini-*, google/*) |
+| zcode       | Closed | 5 models    | 100% legacy parity (glm-4.6, 5.1, 5.2, 5.3, 5.3-flash) |
+
+3. TDD RED PHASE EVIDENCE
+-------------------------
+Running test before implementing provider contributions:
+Command: `cargo test -p mahoquot-providers --test provider_contributions_tests`
+
+Output:
+error[E0433]: failed to resolve: could not find `codex` in `mahoquot_providers`
+   --> crates/providers/tests/provider_contributions_tests.rs:178:39
+    |
+178 |     let contrib = mahoquot_providers::codex::default_contribution();
+    |                                       ^^^^^ could not find `codex` in `mahoquot_providers`
+
+error[E0425]: cannot find function `default_contribution` in module `mahoquot_providers::antigravity`
+   --> crates/providers/tests/provider_contributions_tests.rs:110:52
+    |
+110 |     let contrib = mahoquot_providers::antigravity::default_contribution();
+    |                                                    ^^^^^^^^^^^^^^^^^^^^ not found in `mahoquot_providers::antigravity`
+
+error[E0425]: cannot find function `default_contribution` in module `mahoquot_providers::claude`
+   --> crates/providers/tests/provider_contributions_tests.rs:150:47
+    |
+150 |     let contrib = mahoquot_providers::claude::default_contribution();
+    |                                               ^^^^^^^^^^^^^^^^^^^^ not found in `mahoquot_providers::claude`
+
+error[E0425]: cannot find function `default_contribution` in module `mahoquot_providers::cursor`
+   --> crates/providers/tests/provider_contributions_tests.rs:202:47
+    |
+202 |     let contrib = mahoquot_providers::cursor::default_contribution();
+    |                                               ^^^^^^^^^^^^^^^^^^^^ not found in `mahoquot_providers::cursor`
+
+error[E0425]: cannot find function `default_contribution` in module `mahoquot_providers::kiro`
+   --> crates/providers/tests/provider_contributions_tests.rs:229:45
+    |
+229 |     let contrib = mahoquot_providers::kiro::default_contribution();
+    |                                             ^^^^^^^^^^^^^^^^^^^^ not found in `mahoquot_providers::kiro`
+
+error[E0425]: cannot find function `default_contribution` in module `mahoquot_providers::vertex`
+   --> crates/providers/tests/provider_contributions_tests.rs:260:47
+    |
+260 |     let contrib = mahoquot_providers::vertex::default_contribution();
+    |                                               ^^^^^^^^^^^^^^^^^^^^ not found in `mahoquot_providers::vertex`
+
+error[E0425]: cannot find function `default_contribution` in module `mahoquot_providers::zcode`
+   --> crates/providers/tests/provider_contributions_tests.rs:290:46
+    |
+290 |     let contrib = mahoquot_providers::zcode::default_contribution();
+    |                                              ^^^^^^^^^^^^^^^^^^^^ not found in `mahoquot_providers::zcode`
+
+error: could not compile `mahoquot-providers` (test "provider_contributions_tests") due to previous errors
+
+4. TDD GREEN PHASE EVIDENCE
+---------------------------
+Command 1: `cargo test -p mahoquot-providers`
+Output:
+     Running unittests src/lib.rs (target/debug/deps/mahoquot_providers-4b82b841aab06562)
+
+running 56 tests
+test cursor::tests::chat_url_uses_default_and_override_bases ... ok
+test claude::tests::messages_url_uses_default_and_override_bases ... ok
+test antigravity::tests::slug_keeps_full_email ... ok
+test antigravity::tests::stream_url_targets_daily_host ... ok
+test antigravity::client_credential_tests::encoded_client_pair_decodes_to_a_google_installed_app_client ... ok
+test antigravity::client_credential_tests::env_override_replaces_the_encoded_default ... ok
+test cursor::tests::login_url_carries_the_cli_redirect_target ... ok
+test claude::tests::credential_parses_and_redacts_tokens_in_debug ... ok
+test claude::plan_tests::relay_documents_carry_an_optional_plan_label ... ok
+test cursor::tests::credential_parses_and_redacts_tokens_in_debug ... ok
+test edge_tests::io_error_on_nonexistent_file ... ok
+test edge_tests::getters_and_upstream_headers ... ok
+test edge_tests::secrets_debug_redacted ... ok
+test edge_tests::slug_derivation_edges ... ok
+test edge_tests::expiry_past_future_malformed ... ok
+test kiro::tests::credential_parses_defaults_to_social_and_redacts_secrets ... ok
+test edge_tests::refresh_request_and_response_pure_builders ... ok
+test kiro::tests::refresh_url_switches_host_per_auth_mode_and_region ... ok
+test kiro::tests::generate_url_uses_region_host_or_override ... ok
+test mimo::tests::expiry_comes_from_the_jwt_minus_the_refresh_buffer ... ok
+test mimo::tests::an_unreadable_or_past_expiry_never_yields_a_negative_lifetime ... ok
+test mimo::tests::only_the_canonical_host_and_loopback_receive_mimo_credentials ... ok
+test cursor::tests::model_matcher_accepts_known_models_only ... ok
+test kiro::tests::model_matcher_accepts_known_models_only ... ok
+test antigravity::tests::model_membership ... ok
+test claude::tests::model_matcher_accepts_known_models_only ... ok
+test refresh_exec::tests::cursor_refresh_uses_bearer_empty_json_and_camelcase_response ... ok
+test refresh_exec::tests::execute_refresh_parse_error_malformed_json ... ok
+test refresh_exec::tests::claude_refresh_uses_anthropic_json_contract ... ok
+test refresh_exec::tests::execute_refresh_status_error_429 ... ok
+test refresh_exec::tests::execute_refresh_success ... ok
+test zcode::tests::api_key_lookup_finds_the_named_key_and_ignores_others ... ok
+test zcode::tests::authorize_url_carries_client_redirect_and_state ... ok
+test zcode::tests::broker_and_business_tokens_unwrap_the_data_envelope ... ok
+test zcode::tests::callback_code_accepts_the_canonical_redirect ... ok
+test zcode::tests::callback_code_rejects_malformed_redirects ... ok
+test zcode::tests::credential_parses_and_redacts_tokens_in_debug ... ok
+test zcode::tests::customer_info_prefers_default_org_and_project ... ok
+test zcode::tests::messages_url_uses_anthropic_prefix_and_override ... ok
+test zcode::tests::model_matcher_accepts_known_models_only ... ok
+test zcode::tests::provisioned_key_requires_both_halves ... ok
+test refresh_exec::tests::kiro_social_refresh_uses_refresh_token_json ... ok
+test refresh_exec::tests::zcode_refresh_reprovisions_composite_api_key ... ok
+test refresh_exec::tests::zcode_refresh_creates_missing_named_api_key ... ok
+test edge_tests::missing_field_mapping ... ok
+test credential_file::tests::failed_write_leaves_original_file_intact ... ok
+test antigravity::tests::parses_live_shaped_auth_file ... ok
+test credential_file::tests::resulting_file_mode_is_owner_read_write_only ... ok
+test red_tests::parses_fixture_and_extracts_account_identity ... ok
+test cursor::tests::listing_takes_cursor_files_and_leaves_other_providers_alone ... ok
+test claude::tests::listing_takes_claude_files_and_leaves_other_providers_alone ... ok
+test kiro::tests::listing_takes_kiro_files_and_leaves_other_providers_alone ... ok
+test zcode::tests::listing_takes_zcode_files_and_leaves_other_providers_alone ... ok
+test refresh_exec::tests::apply_refresh_updates_timestamp_only_when_present ... ok
+test refresh_exec::tests::apply_refresh_to_file_round_trip ... ok
+test credential_file::tests::concurrent_writes_to_same_path_are_complete ... ok
+
+test result: ok. 56 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.50s
+
+     Running tests/provider_contributions_tests.rs (target/debug/deps/provider_contributions_tests-de2f245140fab326)
+
+running 8 tests
+test test_kiro_typed_contribution_and_capabilities ... ok
+test test_zcode_typed_contribution_and_capabilities ... ok
+test test_cursor_typed_contribution_and_capabilities ... ok
+test test_dynamic_snapshot_fixture_adds_fictitious_model_without_rust_constants_change ... ok
+test test_codex_typed_contribution_and_capabilities ... ok
+test test_claude_typed_contribution_and_capabilities ... ok
+test test_antigravity_typed_contribution_and_capabilities ... ok
+test test_vertex_typed_contribution_and_capabilities ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+   Doc-tests mahoquot_providers
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+Command 2: `cargo test -p mahoquot-gateway -- capability models_route`
+Output:
+     Running unittests src/lib.rs (target/debug/deps/mahoquot_gateway-1f9b2557eba9e1a8)
+
+running 16 tests
+test capability::tests::reference_backed_image_models_pass_surface_gate ... ok
+test models_route::tests::characterization_device_oauth_defaults ... ok
+test capability::tests::unimplemented_media_models_are_not_advertised_as_routable ... ok
+test capability::tests::video_error_matches_captured_upstream_text ... ok
+test capability::tests::image_error_matches_captured_upstream_text ... ok
+test capability::tests::characterization_image_and_video_rejection_text ... ok
+test realtime::tests::capability_message_matches_captured_upstream_text ... ok
+test capability::tests::unknown_provider_carries_code_and_param ... ok
+test models_route::tests::env_override_scopes_codex_only ... ok
+test models_route::tests::entries_track_loaded_providers ... ok
+test models_route::tests::characterization_provider_presence_exposure_all_providers ... ok
+test models_route::tests::payload_dedupes_ids_across_owners ... ok
+test models_route::tests::characterization_duplicate_owner_ordering_first_wins ... ok
+test models_route::tests::characterization_v1_and_v1beta_models_schemas ... ok
+test models_route::tests::characterization_generic_model_entries_empty_and_non_empty ... ok
+test models_route::tests::characterization_aliases_and_exclusions_roundtrip ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 210 filtered out; finished in 0.00s
+
+5. QA SCENARIO VERIFICATION
+---------------------------
+Scenario: Auxiliary data surface: run a fixture catalog containing `gemini-next-flash-high`,
+create an Antigravity contribution without a network call, and PASS iff the contribution
+contains the model with Antigravity binding without changing any Rust constants.
+
+Test: `test_dynamic_snapshot_fixture_adds_fictitious_model_without_rust_constants_change`
+Verification Steps:
+1. Construct a dynamic `RegistrySnapshot` containing `gemini-next-flash-high` with Antigravity binding.
+2. Query `mahoquot_providers::antigravity::contribution(&custom_snapshot)`.
+3. Assert `contribution.supports_model("gemini-next-flash-high")` is TRUE.
+4. Assert `contribution.models.len() == 15` (14 legacy + 1 fictitious).
+5. Assert `is_antigravity_model_in_snapshot(&custom_snapshot, "gemini-next-flash-high")` is TRUE.
+6. Assert capability profile contains `Chat` and `Tools`.
+7. Assert embedded snapshot `is_antigravity_model("gemini-next-flash-high")` remains FALSE (isolated).
+Outcome: PASS. Zero network calls performed. No Rust constants changed.
+================================================================================

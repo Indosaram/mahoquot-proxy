@@ -23,7 +23,7 @@ pub fn should_warn_for_unauthenticated_bind(bind_addr: &str, api_keys_empty: boo
     !is_loopback
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct GatewayConfig {
     pub port: u16,
     pub auth_dir: PathBuf,
@@ -36,8 +36,30 @@ pub struct GatewayConfig {
     pub auth_refresh_enabled: bool,
     pub usage_poll_secs: u64,
     pub config_path: PathBuf,
+    pub catalog_cache_path: Option<PathBuf>,
     pub history_queue_capacity: usize,
     pub history_batch_size: usize,
+}
+
+impl Default for GatewayConfig {
+    fn default() -> Self {
+        Self {
+            port: 0,
+            auth_dir: PathBuf::new(),
+            strategy: Strategy::default(),
+            max_failover: 3,
+            log_level: "info".to_string(),
+            api_keys: ApiKeys::default(),
+            models_env: None,
+            refresh_url: mahoquot_providers::refresh::REFRESH_TOKEN_URL.to_string(),
+            auth_refresh_enabled: true,
+            usage_poll_secs: 120,
+            config_path: PathBuf::new(),
+            catalog_cache_path: None,
+            history_queue_capacity: 1024,
+            history_batch_size: 64,
+        }
+    }
 }
 
 impl GatewayConfig {
@@ -98,6 +120,9 @@ impl GatewayConfig {
 
         Ok(Self {
             config_path,
+            catalog_cache_path: std::env::var("MAHOQUOT_CACHE_DIR")
+                .ok()
+                .map(|dir| PathBuf::from(dir).join("models-v1.signed.json")),
             usage_poll_secs,
             port,
             auth_dir,

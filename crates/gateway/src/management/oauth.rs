@@ -476,17 +476,17 @@ async fn exchange_xai_code(
     Ok(())
 }
 
-struct DeviceProvider {
-    client_id: &'static str,
-    device_url: &'static str,
-    token_url: &'static str,
-    base_url: &'static str,
-    models: &'static [&'static str],
-    camel_case_poll: bool,
-    scope: Option<&'static str>,
+pub(crate) struct DeviceProvider {
+    pub(crate) client_id: &'static str,
+    pub(crate) device_url: &'static str,
+    pub(crate) token_url: &'static str,
+    pub(crate) base_url: &'static str,
+    pub(crate) models: &'static [&'static str],
+    pub(crate) camel_case_poll: bool,
+    pub(crate) scope: Option<&'static str>,
 }
 
-fn device_provider(provider: &str) -> Option<DeviceProvider> {
+pub(crate) fn device_provider(provider: &str) -> Option<DeviceProvider> {
     match provider {
         "kimi" => Some(DeviceProvider {
             client_id: "17e5f671-d194-4dfb-9706-5516cb48c098",
@@ -906,7 +906,32 @@ async fn start_device_session(
             "snake"
         }
         .to_string(),
-        uuid: spec.models.join(","),
+        uuid: {
+            let catalog_models: Vec<String> =
+                if let Ok(pid) = mahoquot_registry::ProviderId::new(provider) {
+                    let contrib =
+                        mahoquot_registry::embedded_snapshot().contribution_for_provider(&pid);
+                    contrib
+                        .models
+                        .iter()
+                        .map(|m| match m {
+                            mahoquot_registry::ContributionItem::Descriptor(d) => {
+                                d.id.as_str().to_string()
+                            }
+                            mahoquot_registry::ContributionItem::Discovered(d) => {
+                                d.id.as_str().to_string()
+                            }
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+            if !catalog_models.is_empty() {
+                catalog_models.join(",")
+            } else {
+                spec.models.join(",")
+            }
+        },
         status: SessionStatus::Pending,
         created_at: Instant::now(),
         saved_account_email: None,

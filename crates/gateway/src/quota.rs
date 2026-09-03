@@ -536,10 +536,52 @@ async fn try_antigravity_quota(
         .json()
         .await
         .map_err(|e| QuotaError::Upstream(e.to_string()))?;
-    member.set_usage(crate::usage::parse_antigravity_quota_summary(
+    let mut usage = crate::usage::parse_antigravity_quota_summary(
         &body,
         now_unix(),
-    ));
+    );
+
+    // Fetch plan tier from loadCodeAssist using the same token
+    let load_url = format!("{}/v1internal:loadCodeAssist", mahoquot_providers::ANTIGRAVITY_LOAD_BASE);
+    if let Ok(load_resp) = state
+        .http_client
+        .post(&load_url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("User-Agent", mahoquot_providers::ANTIGRAVITY_USER_AGENT)
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({}))
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+    {
+        if load_resp.status().is_success() {
+            if let Ok(load_data) = load_resp.json::<serde_json::Value>().await {
+                let paid = load_data.get("paidTier");
+                let tid = paid.and_then(|p| p.get("id")).and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+                let tname = paid.and_then(|p| p.get("name")).and_then(|v| v.as_str()).unwrap_or("");
+                if tid.contains("ultra") || tname.to_lowercase().contains("ultra") {
+                    usage.plan_type = Some("Ultra".to_string());
+                } else if tid.contains("pro") || tname.to_lowercase().contains("pro") {
+                    usage.plan_type = Some("Pro".to_string());
+                } else if !tname.is_empty() {
+                    usage.plan_type = Some(tname.to_string());
+                } else {
+                    let curr = load_data.get("currentTier");
+                    let cid = curr.and_then(|c| c.get("id")).and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+                    let cname = curr.and_then(|c| c.get("name")).and_then(|v| v.as_str()).unwrap_or("");
+                    if cid.contains("ultra") || cname.to_lowercase().contains("ultra") {
+                        usage.plan_type = Some("Ultra".to_string());
+                    } else if cid.contains("pro") || cname.to_lowercase().contains("pro") {
+                        usage.plan_type = Some("Pro".to_string());
+                    } else if cid == "free-tier" {
+                        usage.plan_type = Some("Free".to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    member.set_usage(usage);
     Ok(())
 }
 
