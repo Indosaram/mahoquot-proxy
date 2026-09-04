@@ -116,6 +116,13 @@ impl SettingsStore {
 
     /// Re-read the document from disk, validate it atomically against active registry, and publish it.
     pub fn reload(&self) -> Result<Arc<Settings>, SettingsError> {
+        // Same read-modify-publish shape as `mutate`, so it takes the same lock:
+        // without it a reload can land between a mutation's persist and its
+        // publish and drop that edit from the live document.
+        let _write = self
+            .mutate_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let settings = Settings::load(&self.path)?;
         let active_snapshot = self.active_snapshot();
         let candidate_registry = settings.validate_against_registry(&active_snapshot)?;
@@ -180,6 +187,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("temp dir");
         dir
     }
+
 
     #[test]
     fn a_present_file_wins_over_the_env_fallback() {

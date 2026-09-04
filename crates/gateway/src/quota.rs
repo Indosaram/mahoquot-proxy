@@ -33,6 +33,17 @@ const RELAY_USAGE_HOST_MARKERS: [&str; 2] = ["nekos", "ccapi"];
 /// account that has never observed a snapshot would never get one.
 const USAGE_RATE_LIMIT_BACKOFF_SECS: i64 = 900;
 
+/// Leading `limit` bytes of an upstream message, cut on a character boundary.
+/// Upstream bodies are arbitrary UTF-8, so a raw byte slice panics whenever a
+/// multi-byte character straddles the cut.
+fn snippet(text: &str, limit: usize) -> &str {
+    if text.len() <= limit {
+        return text;
+    }
+    let end = (0..=limit).rev().find(|i| text.is_char_boundary(*i)).unwrap_or(0);
+    &text[..end]
+}
+
 fn poll_allowed(now_unix: i64, backoff_until_unix: Option<i64>) -> bool {
     backoff_until_unix.is_none_or(|until| now_unix >= until)
 }
@@ -524,12 +535,12 @@ async fn try_antigravity_quota(
             return Err(QuotaError::Upstream("quota rejected client (403)".into()));
         }
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            tracing::debug!(%status, detail = %&detail[..detail.len().min(240)], "antigravity quota rejected");
+            tracing::debug!(%status, detail = %snippet(detail, 240), "antigravity quota rejected");
             return Err(QuotaError::Unauthorized);
         }
         return Err(QuotaError::Upstream(format!(
             "quota http {status}: {}",
-            &detail[..detail.len().min(160)]
+            snippet(detail, 160)
         )));
     }
     let body: serde_json::Value = resp
@@ -833,6 +844,25 @@ mod tests {
         assert_eq!(a.as_bytes()[14], b'4');
         assert!(matches!(a.as_bytes()[19], b'8' | b'9' | b'a' | b'b'));
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn upstream_snippets_cut_on_char_boundaries() {
+        // An upstream error body is arbitrary UTF-8. Slicing it at a raw byte
+        // offset panics when a multi-byte character straddles the cut, and the
+        // quota poller swallows the JoinError, so every later poll re-panics.
+        // 3 bytes each, so byte 160 lands inside a character (240 does not:
+        // it is a multiple of 3, which is exactly why the fixture must be
+        // checked rather than assumed).
+        let multibyte = "\u{20ac}".repeat(200);
+        assert!(!multibyte.is_char_boundary(160));
+        for limit in [160usize, 241] {
+            let cut = snippet(&multibyte, limit);
+            assert!(cut.len() <= limit, "snippet exceeded its limit");
+            assert!(multibyte.starts_with(cut), "snippet is not a prefix");
+        }
+        assert_eq!(snippet("short", 160), "short");
+        assert_eq!(snippet("", 160), "");
     }
 
     #[test]
