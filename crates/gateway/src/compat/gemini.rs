@@ -2,9 +2,12 @@ use base64::Engine as _;
 use serde_json::{json, Map, Value};
 
 use super::events::{CodexEvent, Usage};
+use super::signature_ledger;
 
 const SIGNATURE_ID_SEPARATOR: char = '#';
+const GEMINI_SKIP_THOUGHT_SIGNATURE_VALIDATOR: &str = "skip_thought_signature_validator";
 
+#[cfg(test)]
 fn embed_signature_in_call_id(id: &str, signature: &str) -> String {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     format!(
@@ -100,36 +103,10 @@ pub fn openai_to_gemini(body: &Value) -> Result<Value, String> {
     let mut system_parts: Vec<Value> = Vec::new();
     let empty: Vec<Value> = Vec::new();
 
-    // OpenAI tool messages carry `tool_call_id`, not `name`; Gemini's
-    // functionResponse needs the originating function name, so index every
-    // assistant tool_call by id up front (indexing both full id and plain id).
-    let mut call_names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    // Gemini 3.x hard-rejects (400 INVALID_ARGUMENT) any historical
-    // functionCall part without a thoughtSignature. When the client loses
-    // the signature (stripped id suffix, client-generated ids), it cannot be
-    // recovered and must never be fabricated (invalid signatures are also
-    // rejected), so the unsigned call and its matching functionResponse are
-    // dropped instead of failing the whole request.
-    let mut dropped_unsigned_ids: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
-    for msg in messages {
-        if msg.get("role").and_then(Value::as_str) == Some("assistant") {
-            for call in msg
-                .get("tool_calls")
-                .and_then(Value::as_array)
-                .unwrap_or(&empty)
-            {
-                if let (Some(id), Some(name)) = (
-                    call.get("id").and_then(Value::as_str),
-                    call.pointer("/function/name").and_then(Value::as_str),
-                ) {
-                    call_names.insert(id.to_string(), name.to_string());
-                    let (plain, _) = split_signature_from_call_id(id);
-                    call_names.insert(plain, name.to_string());
-                }
-            }
-        }
-    }
+    let mut pending_calls: Vec<(String, String, String, String)> = Vec::new();
+    let mut seen_call_ids: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut generated_call_index = 0_u64;
 
     for msg in messages {
         let role = msg.get("role").and_then(Value::as_str).unwrap_or("user");
@@ -143,6 +120,7 @@ pub fn openai_to_gemini(body: &Value) -> Result<Value, String> {
             }
             "assistant" => {
                 let mut parts: Vec<Value> = Vec::new();
+                let mut first_function_call_seen = false;
                 if let Some(text) = content_to_text(msg.get("content")) {
                     if !text.is_empty() {
                         parts.push(json!({ "text": text }));
@@ -161,32 +139,54 @@ pub fn openai_to_gemini(body: &Value) -> Result<Value, String> {
                         .and_then(|s| serde_json::from_str::<Value>(s).ok())
                         .unwrap_or_else(|| json!({}));
                     let raw_id = call.get("id").and_then(Value::as_str).unwrap_or("");
-                    let (_, signature) = split_signature_from_call_id(raw_id);
-                    let signature = signature.or_else(|| {
-                        call.get("thought_signature")
-                            .or_else(|| call.get("thoughtSignature"))
-                            .or_else(|| call.get("signature"))
-                            .or_else(|| call.pointer("/extra_content/google/thought_signature"))
-                            .and_then(Value::as_str)
-                            .map(str::to_string)
-                    });
-                    let model_name = body.get("model").and_then(Value::as_str).unwrap_or("");
-                    let drop_unsigned = model_name.contains("3.8");
+                    let (plain_id, embedded_signature) = split_signature_from_call_id(raw_id);
+                    let arguments = args.to_string();
+                    let signature = embedded_signature
+                        .or_else(|| {
+                            call.get("thought_signature")
+                                .or_else(|| call.get("thoughtSignature"))
+                                .or_else(|| call.get("signature"))
+                                .or_else(|| call.pointer("/extra_content/google/thought_signature"))
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                        })
+                        .or_else(|| signature_ledger::recall(&plain_id, name, &arguments));
+                    let base_id = if plain_id.is_empty() {
+                        let generated = format!("call_{name}_{generated_call_index}");
+                        generated_call_index += 1;
+                        generated
+                    } else {
+                        plain_id.clone()
+                    };
+                    let occurrence = seen_call_ids.entry(base_id.clone()).or_default();
+                    *occurrence += 1;
+                    let outbound_id = if *occurrence == 1 {
+                        base_id
+                    } else {
+                        format!("{base_id}-{occurrence}")
+                    };
+                    pending_calls.push((
+                        raw_id.to_string(),
+                        plain_id,
+                        name.to_string(),
+                        outbound_id.clone(),
+                    ));
                     if let Some(signature) = signature {
                         parts.push(json!({
-                            "functionCall": { "name": name, "args": args },
+                            "functionCall": { "id": outbound_id, "name": name, "args": args },
                             "thoughtSignature": signature,
                         }));
-                    } else if drop_unsigned {
-                        if !raw_id.is_empty() {
-                            dropped_unsigned_ids.insert(raw_id.to_string());
-                        }
-                        continue;
+                    } else if !first_function_call_seen {
+                        parts.push(json!({
+                            "functionCall": { "id": outbound_id, "name": name, "args": args },
+                            "thoughtSignature": GEMINI_SKIP_THOUGHT_SIGNATURE_VALIDATOR,
+                        }));
                     } else {
                         parts.push(json!({
-                            "functionCall": { "name": name, "args": args }
+                            "functionCall": { "id": outbound_id, "name": name, "args": args }
                         }));
                     }
+                    first_function_call_seen = true;
                 }
                 if !parts.is_empty() {
                     contents.push(json!({ "role": "model", "parts": parts }));
@@ -197,37 +197,50 @@ pub fn openai_to_gemini(body: &Value) -> Result<Value, String> {
                     .get("tool_call_id")
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                let (plain_id, _) = split_signature_from_call_id(call_id);
-                if dropped_unsigned_ids.contains(call_id) || dropped_unsigned_ids.contains(&plain_id) {
-                    continue;
-                }
                 let explicit_name = msg
                     .get("name")
                     .and_then(Value::as_str)
                     .filter(|name| !name.is_empty());
-                let name = match explicit_name {
-                    // Legacy OpenAI clients carry the function name on the
-                    // tool message itself; it outranks the id lookup.
-                    Some(name) => name.to_string(),
-                    None => {
-                        let (plain_id, _) = split_signature_from_call_id(call_id);
-                        call_names
-                            .get(call_id)
-                            .or_else(|| call_names.get(plain_id.as_str()))
-                            .cloned()
-                            .ok_or_else(|| {
-                                format!(
-                                    "tool response references unknown tool_call_id {call_id:?}; Gemini functionResponse needs the originating function name"
-                                )
-                            })?
-                    }
-                };
+                let (plain_id, _) = split_signature_from_call_id(call_id);
+                let pending = pending_calls
+                    .iter()
+                    .position(|(raw, plain, _, _)| raw == call_id || plain == &plain_id)
+                    .map(|index| pending_calls.remove(index));
+                let name = pending
+                    .as_ref()
+                    .map(|(_, _, name, _)| name.clone())
+                    .or_else(|| explicit_name.map(str::to_string))
+                    .ok_or_else(|| {
+                        format!(
+                            "tool response references unknown tool_call_id {call_id:?}; Gemini functionResponse needs the originating function name"
+                        )
+                    })?;
+                let outbound_id = pending
+                    .map(|(_, _, _, outbound_id)| outbound_id)
+                    .unwrap_or(plain_id);
                 let raw = content_to_text(msg.get("content")).unwrap_or_default();
                 let response = struct_response(&raw);
-                contents.push(json!({
-                    "role": "user",
-                    "parts": [{ "functionResponse": { "name": name, "response": response } }]
-                }));
+                let response_part = json!({
+                    "functionResponse": { "id": outbound_id, "name": name, "response": response }
+                });
+                if let Some(parts) = contents
+                    .last_mut()
+                    .filter(|content| content.get("role").and_then(Value::as_str) == Some("user"))
+                    .and_then(|content| content.get_mut("parts"))
+                    .and_then(Value::as_array_mut)
+                    .filter(|parts| {
+                        parts
+                            .iter()
+                            .all(|part| part.get("functionResponse").is_some())
+                    })
+                {
+                    parts.push(response_part);
+                } else {
+                    contents.push(json!({
+                        "role": "user",
+                        "parts": [response_part]
+                    }));
+                }
             }
             "function" => {
                 let name = msg
@@ -252,9 +265,8 @@ pub fn openai_to_gemini(body: &Value) -> Result<Value, String> {
 
     // Gemini rejects any request ending with a model turn (400 INVALID_ARGUMENT:
     // "Requests ending with a model turn are not supported.").
-    // If historical unsigned tool calls were dropped, or if the client sent an
-    // assistant prefill/retry at the tail, strip trailing model turns so the request
-    // always terminates on a user or functionResponse turn.
+    // If the client sent an assistant prefill or retry at the tail, strip trailing
+    // model turns so the request always terminates on a user or functionResponse turn.
     while contents
         .last()
         .and_then(|c| c.get("role"))
@@ -441,21 +453,26 @@ pub fn gemini_json_to_openai(body: &Value, model: &str, created: i64) -> Value {
         .and_then(|c| c.get("parts"))
         .and_then(Value::as_array)
     {
-        for (idx, part) in parts.iter().enumerate() {
+        for part in parts {
             if let Some(call) = part.get("functionCall") {
                 let name = call.get("name").and_then(Value::as_str).unwrap_or("");
                 let args = call
                     .get("args")
                     .map(|a| a.to_string())
                     .unwrap_or_else(|| "{}".to_string());
-                let mut id = format!("call_{name}_{idx}");
+                let id = call
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| signature_ledger::synthetic_call_id(name));
                 let signature = part
                     .get("thoughtSignature")
                     .and_then(Value::as_str)
                     .map(str::to_string)
                     .or_else(|| pending_signature.clone());
-                if let Some(sig) = signature {
-                    id = embed_signature_in_call_id(&id, &sig);
+                if let Some(signature) = signature.as_deref() {
+                    signature_ledger::remember(&id, name, &args, signature);
                 }
                 tool_calls.push(json!({
                     "id": id,
@@ -466,7 +483,10 @@ pub fn gemini_json_to_openai(body: &Value, model: &str, created: i64) -> Value {
                     }
                 }));
             } else if let Some(t) = part.get("text").and_then(Value::as_str) {
-                let is_thought = part.get("thought").and_then(Value::as_bool).unwrap_or(false);
+                let is_thought = part
+                    .get("thought")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 if is_thought {
                     reasoning.push_str(t);
                 } else {
@@ -719,6 +739,10 @@ impl GeminiDecoder {
                         .unwrap_or_else(|| "{}".to_string());
                     let output_index = self.tool_index;
                     self.tool_index += 1;
+                    let native_id = call
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty());
                     let signature = part
                         .get("thoughtSignature")
                         .and_then(Value::as_str)
@@ -727,12 +751,12 @@ impl GeminiDecoder {
                         // signature part for a whole parallel-call block, so
                         // every functionCall in the block must carry it.
                         .or_else(|| self.pending_signature.clone());
-                    let call_id = match signature.as_deref() {
-                        Some(sig) => {
-                            embed_signature_in_call_id(&format!("call_{name}_{output_index}"), sig)
-                        }
-                        None => format!("call_{name}_{output_index}"),
-                    };
+                    let call_id = native_id
+                        .map(str::to_string)
+                        .unwrap_or_else(|| signature_ledger::synthetic_call_id(name));
+                    if let Some(signature) = signature.as_deref() {
+                        signature_ledger::remember(&call_id, name, &args, signature);
+                    }
                     out.push(CodexEvent::ToolCallBegin {
                         output_index,
                         call_id,
@@ -752,7 +776,10 @@ impl GeminiDecoder {
                     }
                 }
                 if let Some(text) = part.get("text").and_then(Value::as_str) {
-                    let is_thought = part.get("thought").and_then(Value::as_bool).unwrap_or(false);
+                    let is_thought = part
+                        .get("thought")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
                     if is_thought {
                         out.push(CodexEvent::ReasoningDelta(text.to_string()));
                     } else if !text.is_empty() {
@@ -1006,7 +1033,12 @@ mod signature_tests {
         let request = openai_to_gemini(&body).expect("translate");
         let parts = &request["contents"][1]["parts"];
         assert_eq!(parts[0]["functionCall"]["name"], "todo");
+        assert_eq!(parts[0]["functionCall"]["id"], "call_todo_4");
         assert_eq!(parts[0]["thoughtSignature"], "SIG");
+        assert_eq!(
+            request["contents"][2]["parts"][0]["functionResponse"]["id"],
+            "call_todo_4"
+        );
     }
 
     #[test]
@@ -1029,10 +1061,10 @@ mod signature_tests {
     }
 
     #[test]
-    fn gemini_json_to_openai_embeds_signature_from_function_call() {
+    fn gemini_json_to_openai_parks_the_signature_under_the_native_call_id() {
         let response = json!({
             "candidates": [{ "content": { "parts": [
-                { "functionCall": { "name": "todo", "args": {} },
+                { "functionCall": { "id": "native-call-17", "name": "todo", "args": {} },
                   "thoughtSignature": "SIGJSON" }
             ]}}]
         });
@@ -1041,24 +1073,169 @@ mod signature_tests {
         let id = out["choices"][0]["message"]["tool_calls"][0]["id"]
             .as_str()
             .expect("tool call id");
-        let (_, decoded) = split_signature_from_call_id(id);
-        assert_eq!(decoded.as_deref(), Some("SIGJSON"));
+        assert_eq!(id, "native-call-17");
+        assert_eq!(
+            signature_ledger::recall(id, "todo", "{}").as_deref(),
+            Some("SIGJSON")
+        );
     }
 
     #[test]
-    fn decoder_embeds_signature_from_the_function_call_part() {
+    fn decoder_parks_the_signature_under_the_native_call_id() {
         let mut decoder = GeminiDecoder::new();
         let mut out = Vec::new();
         decoder.decode(
-            br#"{"candidates":[{"content":{"parts":[{"functionCall":{"name":"todo","args":{}},"thoughtSignature":"SIGSTREAM"}]}}]}"#,
+            br#"{"candidates":[{"content":{"parts":[{"functionCall":{"id":"native-stream-23","name":"todo","args":{}},"thoughtSignature":"SIGSTREAM"}]}}]}"#,
             &mut out,
         );
         let begin = out.iter().find_map(|event| match event {
             CodexEvent::ToolCallBegin { call_id, .. } => Some(call_id.clone()),
             _ => None,
         });
-        let (_, decoded) = split_signature_from_call_id(begin.expect("tool call begin").as_str());
-        assert_eq!(decoded.as_deref(), Some("SIGSTREAM"));
+        let call_id = begin.expect("tool call begin");
+        assert_eq!(call_id, "native-stream-23");
+        assert_eq!(
+            signature_ledger::recall(&call_id, "todo", "{}").as_deref(),
+            Some("SIGSTREAM")
+        );
+    }
+
+    #[test]
+    fn a_parked_signature_replays_into_the_next_request() {
+        let mut decoder = GeminiDecoder::new();
+        let mut out = Vec::new();
+        decoder.decode(
+            br#"{"candidates":[{"content":{"parts":[{"functionCall":{"id":"replay-native-1","name":"bash","args":{"command":"ls"}},"thoughtSignature":"SIGREPLAY"}]}}]}"#,
+            &mut out,
+        );
+        let call_id = out
+            .iter()
+            .find_map(|event| match event {
+                CodexEvent::ToolCallBegin { call_id, .. } => Some(call_id.clone()),
+                _ => None,
+            })
+            .expect("tool call begin");
+
+        let body = json!({
+            "model": "gemini-3.8-flash-high",
+            "messages": [
+                { "role": "user", "content": "list files" },
+                { "role": "assistant", "tool_calls": [{
+                    "id": call_id, "type": "function",
+                    "function": { "name": "bash", "arguments": "{\"command\":\"ls\"}" }
+                }]},
+                { "role": "tool", "tool_call_id": call_id, "content": "out" }
+            ]
+        });
+        let request = openai_to_gemini(&body).expect("translate");
+        assert_eq!(
+            request["contents"][1]["parts"][0]["thoughtSignature"],
+            "SIGREPLAY"
+        );
+    }
+
+    #[test]
+    fn client_visible_call_ids_stay_short_for_large_signatures() {
+        let signature = "A".repeat(40_000);
+        let response = json!({
+            "candidates": [{ "content": { "parts": [
+                { "functionCall": { "id": "native-large-1", "name": "eval", "args": {} },
+                  "thoughtSignature": signature }
+            ]}}]
+        });
+
+        let out = gemini_json_to_openai(&response, "gemini-3.8-flash-high", 0);
+        let id = out["choices"][0]["message"]["tool_calls"][0]["id"]
+            .as_str()
+            .expect("tool call id");
+        assert_eq!(id, "native-large-1");
+        assert_eq!(signature_ledger::recall(id, "eval", "{}"), Some(signature));
+    }
+
+    #[test]
+    fn an_unparked_history_call_falls_back_to_the_bypass_sentinel() {
+        let body = json!({
+            "model": "gemini-3.8-flash-high",
+            "messages": [
+                { "role": "user", "content": "go" },
+                { "role": "assistant", "tool_calls": [{
+                    "id": "never-parked-1", "type": "function",
+                    "function": { "name": "bash", "arguments": "{}" }
+                }]},
+                { "role": "tool", "tool_call_id": "never-parked-1", "content": "out" }
+            ]
+        });
+        let request = openai_to_gemini(&body).expect("translate");
+        assert_eq!(
+            request["contents"][1]["parts"][0]["thoughtSignature"],
+            GEMINI_SKIP_THOUGHT_SIGNATURE_VALIDATOR
+        );
+    }
+
+    #[test]
+    fn a_reused_call_id_with_other_arguments_does_not_replay_a_stale_signature() {
+        signature_ledger::remember("stale-native-1", "eval", "{\"offset\":10}", "SIGSTALE");
+        let body = json!({
+            "model": "gemini-3.8-flash-high",
+            "messages": [
+                { "role": "user", "content": "go" },
+                { "role": "assistant", "tool_calls": [{
+                    "id": "stale-native-1", "type": "function",
+                    "function": { "name": "eval", "arguments": "{\"offset\":20}" }
+                }]},
+                { "role": "tool", "tool_call_id": "stale-native-1", "content": "out" }
+            ]
+        });
+        let request = openai_to_gemini(&body).expect("translate");
+        assert_eq!(
+            request["contents"][1]["parts"][0]["thoughtSignature"],
+            GEMINI_SKIP_THOUGHT_SIGNATURE_VALIDATOR
+        );
+    }
+
+    #[test]
+    fn independent_responses_keep_distinct_native_tool_call_ids() {
+        let decode_id = |native_id: &str| {
+            let payload = json!({
+                "candidates": [{ "content": { "parts": [{
+                    "functionCall": { "id": native_id, "name": "eval", "args": {} },
+                    "thoughtSignature": "SAME-SIGNATURE"
+                }]}}]
+            });
+            let mut decoder = GeminiDecoder::new();
+            let mut out = Vec::new();
+            decoder.decode(payload.to_string().as_bytes(), &mut out);
+            out.into_iter().find_map(|event| match event {
+                CodexEvent::ToolCallBegin { call_id, .. } => Some(call_id),
+                _ => None,
+            })
+        };
+
+        let first = decode_id("eval-native-a").expect("first call id");
+        let second = decode_id("eval-native-b").expect("second call id");
+        assert_ne!(first, second, "independent calls must not collide");
+        assert_eq!(first, "eval-native-a");
+        assert_eq!(second, "eval-native-b");
+    }
+
+    #[test]
+    fn synthetic_call_ids_stay_unique_when_upstream_omits_them() {
+        let decode_id = || {
+            let mut decoder = GeminiDecoder::new();
+            let mut out = Vec::new();
+            decoder.decode(
+                br#"{"candidates":[{"content":{"parts":[{"functionCall":{"name":"eval","args":{}},"thoughtSignature":"SAME-SIGNATURE"}]}}]}"#,
+                &mut out,
+            );
+            out.into_iter().find_map(|event| match event {
+                CodexEvent::ToolCallBegin { call_id, .. } => Some(call_id),
+                _ => None,
+            })
+        };
+
+        let first = decode_id().expect("first call id");
+        let second = decode_id().expect("second call id");
+        assert_ne!(first, second, "unidentified calls must not collide");
     }
 
     #[test]
@@ -1076,8 +1253,10 @@ mod signature_tests {
             CodexEvent::ToolCallBegin { call_id, .. } => Some(call_id.clone()),
             _ => None,
         });
-        let (_, decoded) = split_signature_from_call_id(begin.expect("tool call begin").as_str());
-        assert_eq!(decoded.as_deref(), Some("SIGPENDING"));
+        assert_eq!(
+            signature_ledger::recall(&begin.expect("tool call begin"), "todo", "{}").as_deref(),
+            Some("SIGPENDING")
+        );
     }
 
     #[test]
@@ -1105,14 +1284,18 @@ mod signature_tests {
             })
             .collect();
         assert_eq!(ids.len(), 2);
-        for id in &ids {
-            let (_, decoded) = split_signature_from_call_id(id);
-            assert_eq!(decoded.as_deref(), Some("SIGBLOCK"));
-        }
+        assert_eq!(
+            signature_ledger::recall(&ids[0], "bash", "{}").as_deref(),
+            Some("SIGBLOCK")
+        );
+        assert_eq!(
+            signature_ledger::recall(&ids[1], "edit", "{}").as_deref(),
+            Some("SIGBLOCK")
+        );
     }
 
     #[test]
-    fn unsigned_history_pairs_are_dropped_before_send() {
+    fn unsigned_history_pairs_use_bypass_signature_and_are_preserved() {
         let body = json!({
             "model": "gemini-3.8-flash-high",
             "messages": [
@@ -1129,12 +1312,16 @@ mod signature_tests {
         });
         let request = openai_to_gemini(&body).expect("translate");
         let contents = request["contents"].as_array().expect("contents");
-        assert_eq!(
-            contents.len(),
-            1,
-            "unsigned call+response pair must be dropped"
-        );
+        assert_eq!(contents.len(), 3);
         assert_eq!(contents[0]["role"], "user");
+        assert_eq!(contents[1]["role"], "model");
+        assert_eq!(contents[1]["parts"][0]["functionCall"]["name"], "bash");
+        assert_eq!(
+            contents[1]["parts"][0]["thoughtSignature"],
+            "skip_thought_signature_validator"
+        );
+        assert_eq!(contents[2]["role"], "user");
+        assert_eq!(contents[2]["parts"][0]["functionResponse"]["name"], "bash");
     }
 
     #[test]
@@ -1159,12 +1346,55 @@ mod signature_tests {
         });
         let request = openai_to_gemini(&body).expect("translate");
         let contents = request["contents"].as_array().expect("contents");
-        // user, model(signed call), user(functionResponse) — unsigned pair gone.
         assert_eq!(contents.len(), 3);
-        let call_part = &contents[1]["parts"][0];
-        assert_eq!(call_part["functionCall"]["name"], "bash");
-        assert_eq!(call_part["thoughtSignature"], "SIGREAL");
+        let call_parts = contents[1]["parts"].as_array().expect("call parts");
+        assert_eq!(call_parts.len(), 2);
+        assert_eq!(call_parts[0]["functionCall"]["name"], "bash");
+        assert_eq!(call_parts[0]["thoughtSignature"], "SIGREAL");
+        assert_eq!(call_parts[1]["functionCall"]["name"], "edit");
+        assert!(call_parts[1].get("thoughtSignature").is_none());
         assert_eq!(contents[2]["parts"][0]["functionResponse"]["name"], "bash");
+        assert_eq!(contents[2]["parts"][1]["functionResponse"]["name"], "edit");
+    }
+
+    #[test]
+    fn repeated_openai_call_ids_are_disambiguated_chronologically() {
+        let repeated_id = embed_signature_in_call_id("call_eval_0", "SAME-SIGNATURE");
+        let body = json!({
+            "model": "gemini-3.8-flash-high",
+            "messages": [
+                { "role": "user", "content": "inspect both ranges" },
+                { "role": "assistant", "tool_calls": [{
+                    "id": repeated_id,
+                    "type": "function",
+                    "function": { "name": "eval", "arguments": "{\"offset\":10}" }
+                }]},
+                { "role": "tool", "tool_call_id": repeated_id, "content": "first" },
+                { "role": "assistant", "tool_calls": [{
+                    "id": repeated_id,
+                    "type": "function",
+                    "function": { "name": "eval", "arguments": "{\"offset\":20}" }
+                }]},
+                { "role": "tool", "tool_call_id": repeated_id, "content": "second" }
+            ]
+        });
+
+        let request = openai_to_gemini(&body).expect("translate");
+        let contents = request["contents"].as_array().expect("contents");
+        assert_eq!(contents.len(), 5);
+        assert_eq!(contents[1]["parts"][0]["functionCall"]["id"], "call_eval_0");
+        assert_eq!(
+            contents[2]["parts"][0]["functionResponse"]["id"],
+            "call_eval_0"
+        );
+        assert_eq!(
+            contents[3]["parts"][0]["functionCall"]["id"],
+            "call_eval_0-2"
+        );
+        assert_eq!(
+            contents[4]["parts"][0]["functionResponse"]["id"],
+            "call_eval_0-2"
+        );
     }
 
     #[test]
@@ -1183,7 +1413,7 @@ mod signature_tests {
     }
 
     #[test]
-    fn unsigned_tool_call_with_text_leaves_no_trailing_model_turn() {
+    fn unsigned_tool_call_with_text_is_preserved_with_bypass_signature() {
         let body = json!({
             "model": "gemini-3.8-flash-high",
             "messages": [
@@ -1204,12 +1434,17 @@ mod signature_tests {
         });
         let request = openai_to_gemini(&body).expect("translate");
         let contents = request["contents"].as_array().expect("contents");
-        assert_eq!(
-            contents.len(),
-            1,
-            "both the dropped tool response and the resulting stranded model turn must not end the request"
-        );
+        assert_eq!(contents.len(), 3);
         assert_eq!(contents[0]["role"], "user");
+        assert_eq!(
+            contents[1]["parts"][0]["text"],
+            "thinking aloud before tool call"
+        );
+        assert_eq!(
+            contents[1]["parts"][1]["thoughtSignature"],
+            "skip_thought_signature_validator"
+        );
+        assert_eq!(contents[2]["parts"][0]["functionResponse"]["name"], "bash");
     }
 
     #[test]
@@ -1364,12 +1599,16 @@ mod signature_tests {
                 }
             ]
         });
-        let req = openai_to_gemini(&body).expect("translate must succeed even if client stripped signature suffix");
+        let req = openai_to_gemini(&body)
+            .expect("translate must succeed even if client stripped signature suffix");
         let contents = req["contents"].as_array().expect("contents");
         assert_eq!(contents.len(), 2);
         assert_eq!(contents[0]["role"], "model");
         assert_eq!(contents[0]["parts"][0]["thoughtSignature"], "SIG999");
         assert_eq!(contents[1]["role"], "user");
-        assert_eq!(contents[1]["parts"][0]["functionResponse"]["name"], "lookup");
+        assert_eq!(
+            contents[1]["parts"][0]["functionResponse"]["name"],
+            "lookup"
+        );
     }
 }
