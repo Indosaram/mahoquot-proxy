@@ -407,14 +407,38 @@ impl Aggregator {
     /// Gemini-native shape for the `/v1beta` surface, which nests text under
     /// `candidates[].content.parts[]` instead of `choices[]`.
     pub fn into_gemini(self) -> Value {
-        let mut part = json!({"text": self.text});
-        if let Some(sig) = self.reasoning_signature.as_ref() {
-            part["thoughtSignature"] = Value::String(sig.clone());
+        let mut parts = Vec::new();
+        // An empty text part alongside a functionCall is not a shape Gemini
+        // clients expect, so it is emitted only when there is text or when
+        // there is nothing else to send.
+        if !self.text.is_empty() || self.tools.is_empty() {
+            let mut part = json!({"text": self.text});
+            if let Some(sig) = self.reasoning_signature.as_ref() {
+                part["thoughtSignature"] = Value::String(sig.clone());
+            }
+            parts.push(part);
         }
+        // Mirror GeminiChunkRenderer::close_open_calls: every accumulated call
+        // becomes a functionCall part carrying a complete args object.
+        for tool in &self.tools {
+            let args: Value = if tool.arguments.is_empty() {
+                json!({})
+            } else {
+                serde_json::from_str(&tool.arguments).unwrap_or_else(|_| json!({}))
+            };
+            parts.push(json!({
+                "functionCall": {"name": tool.name, "args": args}
+            }));
+        }
+        let finish_reason = if self.tools.is_empty() {
+            "STOP"
+        } else {
+            "TOOL_CALLS"
+        };
         let mut payload = json!({
             "candidates": [{
-                "content": {"role": "model", "parts": [part]},
-                "finishReason": "STOP",
+                "content": {"role": "model", "parts": parts},
+                "finishReason": finish_reason,
                 "index": 0,
             }],
             "modelVersion": self.model,
@@ -646,4 +670,36 @@ mod gemini_stream_tests {
         let out = payloads(r.render(CodexEvent::Completed { usage: None }));
         assert_eq!(out[0]["responseId"], "resp-xyz");
     }
+    #[test]
+    fn non_streaming_gemini_carries_tool_calls_and_a_matching_finish_reason() {
+        // into_gemini is the non-streaming counterpart of GeminiChunkRenderer,
+        // which emits every closed call as a functionCall part. Dropping them
+        // here silently turns an agent's tool turn into an empty text reply.
+        let mut agg = Aggregator::new("gemini-2.5-pro".to_string(), 1_700_000_000);
+        agg.push(CodexEvent::ToolCallBegin {
+            output_index: 0,
+            call_id: "call_1".to_string(),
+            name: "get_weather".to_string(),
+        });
+        agg.push(CodexEvent::ToolArgsDelta {
+            output_index: 0,
+            delta: "{\"city\":\"Seoul\"}".to_string(),
+        });
+        let out = agg.into_gemini();
+
+        let parts = out["candidates"][0]["content"]["parts"]
+            .as_array()
+            .expect("parts array");
+        let call = parts
+            .iter()
+            .find_map(|part| part.get("functionCall"))
+            .unwrap_or_else(|| panic!("no functionCall part emitted: {out}"));
+        assert_eq!(call["name"], "get_weather");
+        assert_eq!(call["args"]["city"], "Seoul");
+        assert_eq!(
+            out["candidates"][0]["finishReason"], "TOOL_CALLS",
+            "finishReason must not claim STOP for a tool turn: {out}"
+        );
+    }
+
 }

@@ -1,13 +1,21 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 struct TempDir(PathBuf);
 impl TempDir {
     fn new() -> Self {
+        // The clock alone is not a unique name: macOS truncates to microseconds,
+        // so sibling tests entering this function together receive the same path
+        // and the first Drop deletes the directory the others are still using.
+        // The pid plus a monotonic counter makes the name unique per handle.
+        static SEQ: AtomicU64 = AtomicU64::new(0);
         let p = std::env::temp_dir().join(format!(
-            "mc-test-{}",
+            "mc-test-{}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -246,4 +254,31 @@ fn test_cli_generate_key() {
     let pub_content = fs::read_to_string(&pub_file).unwrap();
     assert_eq!(priv_content.trim().len(), 64);
     assert_eq!(pub_content.trim().len(), 64);
+}
+
+#[test]
+fn temp_dirs_are_unique_across_threads_in_the_same_clock_tick() {
+    // SystemTime::as_nanos advances in coarse ticks on macOS, so sibling tests
+    // entering TempDir::new concurrently can receive the same path; the first
+    // Drop then remove_dir_all's the directory the other is still using.
+    let n = 64;
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(n));
+    let dirs: Vec<PathBuf> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..n)
+            .map(|_| {
+                let barrier = std::sync::Arc::clone(&barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    TempDir::new().path().to_path_buf()
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let unique: std::collections::HashSet<_> = dirs.iter().collect();
+    assert_eq!(
+        unique.len(),
+        dirs.len(),
+        "TempDir handed out a colliding path: {dirs:?}"
+    );
 }
