@@ -352,7 +352,7 @@ async fn test_logging_to_file_lifecycle() {
 }
 
 // ---------------------------------------------------------------------------
-// 5. /logs-max-total-size-mb (i64, default 100)
+// 5. /logs-max-total-size-mb (i64, default 1024)
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_logs_max_total_size_mb_lifecycle() {
@@ -361,10 +361,10 @@ async fn test_logs_max_total_size_mb_lifecycle() {
     let app = create_app(state);
     let uri = "/v0/management/logs-max-total-size-mb";
 
-    // 1. Initial GET -> 100
+    // 1. Initial GET -> 1024
     let (status, body) = send_request(&app, Method::GET, uri, None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["logs-max-total-size-mb"], json!(100));
+    assert_eq!(body["logs-max-total-size-mb"], json!(1024));
 
     // 2. POST update to 250 -> 200
     let (status, body) = send_request(&app, Method::POST, uri, Some(json!({"value": 250}))).await;
