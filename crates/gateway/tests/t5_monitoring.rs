@@ -383,6 +383,10 @@ fn test_ttft_ring_buffer_capacity() {
     assert!(snap.p99_ms.is_finite());
 }
 
+fn public_metrics_label(account_id: &str) -> String {
+    mahoquot_gateway::monitor::public_account_label(account_id)
+}
+
 #[test]
 fn test_render_prometheus() {
     let monitor = MonitorState::new(1000);
@@ -460,13 +464,21 @@ fn test_render_prometheus() {
     }
 
     assert_eq!(cooldown_lines.len(), 2);
+    // Labels carry a one-way digest of the account id, never the id itself,
+    // because /metrics is served without the API key that gates /admin/stats.
+    let cooling_label = public_metrics_label("acc_cooling");
+    let active_label = public_metrics_label("acc_active");
+    assert!(
+        !rendered.contains("acc_cooling") && !rendered.contains("acc_active"),
+        "raw account ids reached the public metrics surface:\n{rendered}"
+    );
     let cooling_line = cooldown_lines
         .iter()
-        .find(|l| l.contains("acc_cooling"))
+        .find(|l| l.contains(&cooling_label))
         .expect("cooling account line present");
     let active_line = cooldown_lines
         .iter()
-        .find(|l| l.contains("acc_active"))
+        .find(|l| l.contains(&active_label))
         .expect("active account line present");
 
     let cooling_val: f64 = cooling_line
@@ -498,4 +510,31 @@ fn test_record_and_last_error() {
     assert!(err.unix_ms > 0);
 
     assert_eq!(monitor.last_error("unknown_acc"), None);
+}
+
+#[test]
+fn unauthenticated_metrics_never_publish_credential_identifiers() {
+    // /metrics is deliberately public (routes.rs: Prometheus scrapers send no
+    // credentials), while /admin/stats stays behind the API key precisely
+    // because it exposes account emails. Account ids ARE credential emails, so
+    // the public surface must not label series with them.
+    let monitor = MonitorState::new(1000);
+    let accounts = vec![PromAccount {
+        id: "operator@example.com".to_string(),
+        ok: 10,
+        fails: 1,
+        cooldown_until_unix_ms: Some(20000),
+    }];
+
+    let rendered = monitor.render_prometheus(10000, &accounts);
+
+    assert!(
+        !rendered.contains("operator@example.com"),
+        "public /metrics leaked a credential identifier:\n{rendered}"
+    );
+    // The series itself must survive - scrapers still need per-account counters.
+    assert!(
+        rendered.contains("mahoquot_account_requests_total"),
+        "per-account series was dropped instead of anonymised:\n{rendered}"
+    );
 }

@@ -95,6 +95,17 @@ fn calc_percentile(sorted: &[f64], p: f64) -> f64 {
     }
 }
 
+/// Stable, non-reversible label for an account on the PUBLIC metrics surface.
+///
+/// Account ids are credential emails, and `/metrics` is served without the API
+/// key that gates `/admin/stats` precisely because it exposes those emails.
+/// Scrapers only need a stable series key, so a truncated digest keeps the
+/// per-account counters usable without publishing the identity.
+pub fn public_account_label(account_id: &str) -> String {
+    let digest = crate::request_history::stable_key_identifier(account_id);
+    format!("acct_{}", &digest[..16])
+}
+
 fn escape_label_value(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -214,6 +225,12 @@ impl MonitorState {
         }
     }
 
+    pub fn clear_error(&self, account_id: &str) {
+        if let Ok(mut errors) = self.last_errors.lock() {
+            errors.remove(account_id);
+        }
+    }
+
     pub fn last_error(&self, account_id: &str) -> Option<LastError> {
         self.last_errors
             .lock()
@@ -235,7 +252,7 @@ impl MonitorState {
 
         let _ = writeln!(out, "# HELP mahoquot_account_requests_total Total request count per account.\n# TYPE mahoquot_account_requests_total counter");
         for acc in accounts {
-            let id = escape_label_value(&acc.id);
+            let id = escape_label_value(&public_account_label(&acc.id));
             let _ = writeln!(
                 out,
                 "mahoquot_account_requests_total{{account=\"{id}\",outcome=\"ok\"}} {}",
@@ -250,7 +267,7 @@ impl MonitorState {
 
         let _ = writeln!(out, "# HELP mahoquot_account_cooldown_until_seconds Cooldown target timestamp in seconds.\n# TYPE mahoquot_account_cooldown_until_seconds gauge");
         for acc in accounts {
-            let id = escape_label_value(&acc.id);
+            let id = escape_label_value(&public_account_label(&acc.id));
             let cooldown = match acc.cooldown_until_unix_ms {
                 Some(until_ms) if until_ms > now_unix_ms => until_ms / 1000,
                 _ => 0,
