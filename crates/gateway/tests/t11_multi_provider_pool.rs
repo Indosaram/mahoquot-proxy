@@ -274,3 +274,43 @@ async fn unknown_model_without_loaded_open_binding_is_local_model_not_found() {
     assert_eq!(payload["error"]["code"], "model_not_found");
     assert_eq!(capture.hits.load(Ordering::SeqCst), 0);
 }
+
+/// The google /v1/responses path normalises Responses input into chat messages
+/// and buffers the reply into one JSON object, so it cannot honour stream:true.
+/// It must refuse explicitly rather than hand a waiting SSE client a buffered
+/// body.
+#[tokio::test]
+async fn google_responses_refuses_streaming_instead_of_answering_buffered() {
+    let dir = TempAuthDir::new("responses-stream");
+    let (upstream, capture) = spawn_capture_fixture().await;
+    dir.write(
+        "antigravity-stream.json",
+        &credential_with("antigravity", "antigravity-stream", Some(&upstream)),
+    );
+    let gateway = spawn_gateway(dir.path()).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway}/v1/responses"))
+        .json(&serde_json::json!({
+            "model": "gemini-3-flash",
+            "input": "hello",
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a stream request must not be answered with a buffered object: {body}"
+    );
+    assert_eq!(body["error"]["param"], "stream");
+    assert_eq!(
+        capture.hits.load(Ordering::SeqCst),
+        0,
+        "the request must be refused before any upstream call"
+    );
+}

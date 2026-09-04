@@ -358,6 +358,10 @@ pub async fn responses(
         .await;
     }
 
+    if let Some(refusal) = responses_stream_unsupported(&parsed) {
+        return refusal;
+    }
+
     let chat = responses_input_to_chat(&parsed, &model);
     let relayed = handle_relay(
         state,
@@ -386,6 +390,24 @@ pub async fn responses(
 
 const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
+/// This path buffers the upstream reply and re-wraps it as a single Responses
+/// object, so `stream: true` cannot be honoured. Refuse it rather than return
+/// a buffered body to a client that is waiting for SSE frames.
+fn responses_stream_unsupported(req: &Value) -> Option<Response> {
+    if req.get("stream").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    Some(json_status(
+        StatusCode::BAD_REQUEST,
+        json!({"error": {
+            "message": "Streaming is not supported on /v1/responses for this model. \
+                        Retry without \"stream\": true, or use /v1/chat/completions.",
+            "type": "invalid_request_error",
+            "param": "stream",
+        }}),
+    ))
+}
+
 fn responses_input_to_chat(req: &Value, model: &str) -> Value {
     let mut messages = Vec::new();
     if let Some(instructions) = req.get("instructions").and_then(Value::as_str) {
@@ -413,6 +435,30 @@ fn responses_input_to_chat(req: &Value, model: &str) -> Value {
         _ => {}
     }
     let mut chat = json!({"model": model, "messages": messages, "stream": false});
+    // Tool declarations must survive the hop or the model can never emit a
+    // call. Responses names the function fields inline; chat nests them under
+    // "function", so re-wrap any entry that is not already in chat shape.
+    if let Some(Value::Array(tools)) = req.get("tools") {
+        let mapped: Vec<Value> = tools
+            .iter()
+            .map(|tool| {
+                if tool.get("function").is_some() {
+                    return tool.clone();
+                }
+                let mut function = json!({});
+                for key in ["name", "description", "parameters", "strict"] {
+                    if let Some(v) = tool.get(key) {
+                        function[key] = v.clone();
+                    }
+                }
+                json!({"type": "function", "function": function})
+            })
+            .collect();
+        chat["tools"] = Value::Array(mapped);
+    }
+    if let Some(choice) = req.get("tool_choice") {
+        chat["tool_choice"] = choice.clone();
+    }
     for key in ["temperature", "top_p", "max_output_tokens"] {
         if let Some(v) = req.get(key) {
             let mapped = if key == "max_output_tokens" {
@@ -438,6 +484,48 @@ fn chat_to_responses(chat: &Value, model: &str) -> Value {
         .and_then(Value::as_str)
         .map(|i| format!("resp_{i}"))
         .unwrap_or_else(|| "resp_0".to_string());
+    // A tool turn carries null content, so emitting only the message item
+    // would hand the client an empty assistant reply and lose the call.
+    let mut output = Vec::new();
+    if !text.is_empty() {
+        output.push(json!({
+            "id": "msg_0",
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": text, "annotations": []}],
+        }));
+    }
+    let tool_calls = choice
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("tool_calls"))
+        .and_then(Value::as_array);
+    for (index, call) in tool_calls.into_iter().flatten().enumerate() {
+        let function = call.get("function");
+        output.push(json!({
+            "id": format!("fc_{index}"),
+            "type": "function_call",
+            "status": "completed",
+            "call_id": call.get("id").and_then(Value::as_str).unwrap_or_default(),
+            "name": function
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            "arguments": function
+                .and_then(|f| f.get("arguments"))
+                .and_then(Value::as_str)
+                .unwrap_or("{}"),
+        }));
+    }
+    if output.is_empty() {
+        output.push(json!({
+            "id": "msg_0",
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": text, "annotations": []}],
+        }));
+    }
     let mut out = json!({
         "id": id,
         "object": "response",
@@ -447,13 +535,7 @@ fn chat_to_responses(chat: &Value, model: &str) -> Value {
         "error": Value::Null,
         "incomplete_details": Value::Null,
         "model": model,
-        "output": [{
-            "id": "msg_0",
-            "type": "message",
-            "status": "completed",
-            "role": "assistant",
-            "content": [{"type": "output_text", "text": text, "annotations": []}],
-        }],
+        "output": output,
         "parallel_tool_calls": true,
         "tool_choice": "auto",
         "tools": [],
@@ -735,4 +817,53 @@ mod tests {
         assert_eq!(out["usage"]["output_tokens"], 4);
         assert_eq!(out["usage"]["total_tokens"], 7);
     }
+    #[test]
+    fn the_responses_shim_carries_tools_in_and_tool_calls_back_out() {
+        // A Responses request declaring tools must still be able to call them
+        // on the google path: dropping the declaration means the model can
+        // never emit a call, and dropping the reply's tool_calls means an
+        // agent sees an empty assistant turn instead of its function call.
+        let req = json!({
+            "model": "gemini-2.5-pro",
+            "input": "weather in Seoul?",
+            "tools": [{
+                "type": "function",
+                "name": "get_weather",
+                "parameters": {"type": "object", "properties": {}},
+            }],
+            "tool_choice": "auto",
+        });
+        let chat = responses_input_to_chat(&req, "gemini-2.5-pro");
+        assert!(
+            chat.get("tools").is_some(),
+            "tool declarations were dropped on the way upstream: {chat}"
+        );
+
+        let chat_reply = json!({
+            "id": "c1",
+            "created": 1,
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": Value::Null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": "{\"city\":\"Seoul\"}"},
+                    }],
+                },
+                "finish_reason": "tool_calls",
+            }],
+        });
+        let out = chat_to_responses(&chat_reply, "gemini-2.5-pro");
+        let output = out["output"].as_array().expect("output array");
+        let call = output
+            .iter()
+            .find(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+            .unwrap_or_else(|| panic!("no function_call in the Responses output: {out}"));
+        assert_eq!(call["name"], "get_weather");
+        assert_eq!(call["call_id"], "call_1");
+    }
+
+
 }

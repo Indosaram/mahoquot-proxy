@@ -1322,3 +1322,4 @@ async fn codex_does_not_claim_models_owned_by_loaded_provider_accounts() {
     assert!(!codex.supports_model("kiro/claude-haiku-4-5-20251001"));
     std::fs::remove_dir_all(dir).ok();
 }
+
