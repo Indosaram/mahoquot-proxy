@@ -2,7 +2,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::{from_fn, from_fn_with_state, Next};
 use axum::response::{IntoResponse, Json, Response};
@@ -17,6 +17,11 @@ use crate::models_route::models_payload;
 use crate::monitor::PromAccount;
 use crate::relay::{handle_relay, RelayMode};
 use crate::state::AppState;
+
+// Agent clients replay the whole conversation on every turn, so an inbound
+// request legitimately carries megabytes of history; axum's 2 MiB default
+// answered those with 413 once a session grew.
+const MAX_REQUEST_BODY_BYTES: usize = 128 * 1024 * 1024;
 
 pub fn create_app(state: Arc<AppState>) -> Router {
     // /admin/stats stays behind the key: it exposes account emails and reset times.
@@ -188,6 +193,7 @@ pub fn create_app(state: Arc<AppState>) -> Router {
             crate::management::management_router(Arc::clone(&state)),
         )
         .merge(authed_routes)
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .layer(from_fn(cors))
         .with_state(state)
 }
