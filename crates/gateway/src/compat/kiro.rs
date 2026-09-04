@@ -250,6 +250,8 @@ fn sanitize_schema(value: &mut Value) {
 #[derive(Default)]
 pub struct KiroDecoder {
     buffer: String,
+    /// Bytes of a character split across chunk boundaries, awaiting completion.
+    pending: Vec<u8>,
     completed: bool,
     current_tool: Option<(String, String, u64)>,
 }
@@ -260,7 +262,34 @@ impl KiroDecoder {
     }
 
     pub fn decode(&mut self, bytes: &[u8], out: &mut Vec<CodexEvent>) {
-        self.buffer.push_str(&String::from_utf8_lossy(bytes));
+        // Chunks arrive unaligned to UTF-8 boundaries, so decode from the
+        // accumulated bytes: converting each chunk on its own would replace a
+        // trailing partial character with U+FFFD before the next chunk can
+        // complete it.
+        self.pending.extend_from_slice(bytes);
+        let decoded = match std::str::from_utf8(&self.pending) {
+            Ok(text) => {
+                let text = text.to_string();
+                self.pending.clear();
+                text
+            }
+            Err(error) => {
+                let valid_upto = error.valid_up_to();
+                // A genuine invalid sequence (not a split character) would
+                // otherwise wedge the buffer forever, so only a trailing
+                // incomplete character is held back.
+                if error.error_len().is_some() {
+                    let text = String::from_utf8_lossy(&self.pending).to_string();
+                    self.pending.clear();
+                    text
+                } else {
+                    let text = String::from_utf8_lossy(&self.pending[..valid_upto]).to_string();
+                    self.pending.drain(..valid_upto);
+                    text
+                }
+            }
+        };
+        self.buffer.push_str(&decoded);
         while let Some((start, end)) = next_json_object(&self.buffer) {
             let candidate = self.buffer[start..=end].to_string();
             self.buffer.drain(..=end);
@@ -349,6 +378,35 @@ fn next_json_object(input: &str) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multibyte_split_across_chunks_survives_reassembly() {
+        // Network chunks are not aligned to UTF-8 boundaries. Converting each
+        // chunk with from_utf8_lossy replaces the trailing partial sequence
+        // with U+FFFD before the buffer can rejoin it, corrupting CJK/emoji
+        // text and tool-argument JSON.
+        let full: Vec<u8> = br#"{"content":""#
+            .iter()
+            .copied()
+            .chain("あい".bytes())
+            .chain(br#""}"#.iter().copied())
+            .collect();
+        // Split inside the first multi-byte character.
+        let split = full.iter().position(|b| *b == 0xe3).expect("multibyte start") + 1;
+        let mut decoder = KiroDecoder::new();
+        let mut out = Vec::new();
+        decoder.decode(&full[..split], &mut out);
+        decoder.decode(&full[split..], &mut out);
+        let text: String = out
+            .iter()
+            .filter_map(|event| match event {
+                CodexEvent::TextDelta(delta) => Some(delta.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "あい", "chunk split corrupted the text");
+        assert!(!text.contains('�'), "decoder emitted replacement chars");
+    }
 
     #[test]
     fn decodes_streamed_tool_call_into_codex_events() {

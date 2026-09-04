@@ -1,9 +1,11 @@
 // allow: SIZE_OK — single-loop failover relay state machine with auth refresh, retry, and in-flight tracking
 
+
 use std::hash::Hasher;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+
 
 use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
@@ -738,6 +740,20 @@ async fn extract_failure(resp: reqwest::Response, status_code: u16) -> FinalFail
     }
 }
 
+/// Upper bound on an upstream-supplied cooldown, so a hostile or broken
+/// `Retry-After` cannot bench an account effectively forever.
+const MAX_COOLDOWN_SECS: i64 = 86_400;
+
+/// Cooldown deadline for an upstream-supplied `Retry-After`, in unix ms.
+///
+/// The header is fully upstream-controlled, so the value is clamped in BOTH
+/// directions: saturating arithmetic alone preserves sign, so a negative value
+/// would put the deadline in the past and mean no cooldown at all.
+fn cooldown_deadline_ms(now_ms: i64, retry_after_secs: i64) -> i64 {
+    let bounded = retry_after_secs.clamp(0, MAX_COOLDOWN_SECS);
+    now_ms.saturating_add(bounded.saturating_mul(1000))
+}
+
 async fn record_cooldown(
     resp: reqwest::Response,
     member: &AccountMember,
@@ -1178,6 +1194,26 @@ fn capture_usage(member: &AccountMember, headers: &HeaderMap) {
 
 #[cfg(test)]
 mod usage_capture_tests {
+
+    #[test]
+    fn cooldown_deadline_clamps_hostile_retry_after() {
+        use super::{cooldown_deadline_ms, MAX_COOLDOWN_SECS};
+        let now = 1_000_000_i64;
+        // A negative header must not put the deadline in the past: that would
+        // mean no cooldown at all, since Health::Cooldown compares
+        // until_unix_ms <= now (types/src/lib.rs:28).
+        assert_eq!(cooldown_deadline_ms(now, -1), now);
+        assert_eq!(cooldown_deadline_ms(now, i64::MIN), now);
+        // An absurd header must not bench the account effectively forever.
+        assert_eq!(
+            cooldown_deadline_ms(now, i64::MAX),
+            now + MAX_COOLDOWN_SECS * 1000
+        );
+        // Ordinary values pass through.
+        assert_eq!(cooldown_deadline_ms(now, 300), now + 300_000);
+        assert_eq!(cooldown_deadline_ms(now, 0), now);
+    }
+
     use super::usage_header_prefix;
     use crate::account::ProviderKind;
 
