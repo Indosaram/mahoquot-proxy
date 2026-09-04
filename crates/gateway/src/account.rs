@@ -833,6 +833,35 @@ impl AccountMember {
         }
     }
 
+    pub fn email(&self) -> Option<String> {
+        let guard = self
+            .inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match &*guard {
+            ProviderAccount::Codex(a) => Some(a.email.clone()),
+            ProviderAccount::Antigravity(a) => Some(a.email.clone()),
+            ProviderAccount::Claude(a) => Some(a.email.clone()),
+            ProviderAccount::Cursor(a) => Some(a.email.clone()),
+            ProviderAccount::Kiro(a) => Some(a.email.clone()),
+            ProviderAccount::Zcode(a) => Some(a.email.clone()),
+            ProviderAccount::Vertex(a) => Some(a.email.clone()),
+            ProviderAccount::Generic(_) => None,
+        }
+    }
+
+    pub fn account_id(&self) -> Option<String> {
+        let guard = self
+            .inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match &*guard {
+            ProviderAccount::Codex(a) => Some(a.account_id.clone()),
+            ProviderAccount::Claude(a) => Some(a.account_id.clone()),
+            _ => None,
+        }
+    }
+
     pub fn is_manually_disabled(&self) -> bool {
         if self.health() == mahoquot_types::Health::Disabled {
             return true;
@@ -1162,7 +1191,7 @@ mod identity_tests {
     use super::*;
 
     #[test]
-    fn pool_order_ignores_the_console_display_order() {
+    fn pool_order_respects_the_account_order_manifest() {
         let dir = std::env::temp_dir().join(format!("mahoquot-pool-order-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp auth dir");
         for name in ["codex-a.json", "codex-b.json"] {
@@ -1185,6 +1214,32 @@ mod identity_tests {
             .map(str::to_string)
             .collect();
 
+        // Under SST, the account order manifest MUST determine pool order!
+        assert_eq!(names, vec!["codex-b.json", "codex-a.json"]);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn pool_order_defaults_to_alphabetical_when_no_manifest() {
+        let dir =
+            std::env::temp_dir().join(format!("mahoquot-pool-order-def-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp auth dir");
+        for name in ["codex-b.json", "codex-a.json"] {
+            std::fs::write(
+                dir.join(name),
+                r#"{"type":"codex","access_token":"t","account_id":"a","email":"u@example.com","expired":"2099-01-01T00:00:00Z","id_token":"i","last_refresh":""}"#,
+            )
+            .expect("write credential");
+        }
+
+        let files = list_all_auth_files(&dir).expect("list auth files");
+        let names: Vec<String> = files
+            .iter()
+            .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
+            .map(str::to_string)
+            .collect();
+
+        // Without manifest, fallback is alphabetical order
         assert_eq!(names, vec!["codex-a.json", "codex-b.json"]);
         std::fs::remove_dir_all(dir).ok();
     }
@@ -1270,6 +1325,15 @@ fn classify_credential(file_path: &Path, declared_type: &str) -> Option<Provider
     ProviderKind::from_type_str(declared_type)
 }
 
+pub const ACCOUNT_ORDER_FILE: &str = ".mahoquot-account-order.json";
+
+pub fn ordered_manifest_names(auth_dir: &Path) -> Vec<String> {
+    std::fs::read_to_string(auth_dir.join(ACCOUNT_ORDER_FILE))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
+        .unwrap_or_default()
+}
+
 fn list_all_auth_files(auth_dir: &Path) -> Result<Vec<PathBuf>, LoadError> {
     let mut files: Vec<PathBuf> = std::fs::read_dir(auth_dir)?
         .filter_map(|e| e.ok())
@@ -1277,13 +1341,26 @@ fn list_all_auth_files(auth_dir: &Path) -> Result<Vec<PathBuf>, LoadError> {
         .filter(|p| {
             p.file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|n| n.ends_with(".json") && n != ".mahoquot-account-order.json")
+                .is_some_and(|n| n.ends_with(".json") && n != ACCOUNT_ORDER_FILE)
         })
         .collect();
-    // Pool order is filename order and nothing else. `.mahoquot-account-order.json`
-    // is the console's display order; letting it reach the pool would make a
-    // cosmetic drag in the UI silently repoint FillFirst routing.
-    files.sort();
+
+    // Accounts list ordering is the Single Source of Truth (SST) for routing.
+    // Explicit order manifest determines pool position; unlisted credentials
+    // append to the end sorted alphabetically.
+    let order = ordered_manifest_names(auth_dir);
+    files.sort_by(|a, b| {
+        let a_name = a.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        let b_name = b.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        let a_index = order.iter().position(|name| name == a_name);
+        let b_index = order.iter().position(|name| name == b_name);
+        match (a_index, b_index) {
+            (Some(ai), Some(bi)) => ai.cmp(&bi),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.cmp(b),
+        }
+    });
     Ok(files)
 }
 
