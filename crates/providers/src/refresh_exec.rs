@@ -24,6 +24,19 @@ pub enum RefreshError {
     Io(#[from] std::io::Error),
 }
 
+impl RefreshError {
+    /// Whether this error represents an explicit, permanent authentication rejection by the IdP
+    /// (e.g. HTTP 400 invalid_grant, 401 Unauthorized, 403 Forbidden).
+    /// Network errors, timeouts, 5xx server errors, or I/O errors are transient transport
+    /// problems and MUST NOT cause the account to be marked as AuthFailed.
+    pub fn is_auth_failure(&self) -> bool {
+        match self {
+            RefreshError::Status { code, .. } => (400..=403).contains(code),
+            _ => false,
+        }
+    }
+}
+
 pub async fn execute_refresh(
     client: &reqwest::Client,
     url: &str,

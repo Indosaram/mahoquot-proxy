@@ -650,7 +650,10 @@ async fn send_upstream(
     // If client provided anthropic-beta headers, merge them with member headers
     // so client-requested beta features (e.g. prompt-caching, output-128k) are preserved.
     if let Some(client_beta) = headers.get("anthropic-beta").and_then(|v| v.to_str().ok()) {
-        if let Some((_, val)) = member_headers.iter_mut().find(|(k, _)| k == "anthropic-beta") {
+        if let Some((_, val)) = member_headers
+            .iter_mut()
+            .find(|(k, _)| k == "anthropic-beta")
+        {
             let mut betas: Vec<String> = val.split(',').map(|s| s.trim().to_string()).collect();
             for part in client_beta.split(',') {
                 let p = part.trim();
@@ -1085,7 +1088,10 @@ fn select_index(
             eligible
                 .iter()
                 .copied()
-                .find(|&idx| !exclude.contains(&idx) && pool.members.get(idx).map(|m| m.id()) == Some(&bound_id))
+                .find(|&idx| {
+                    !exclude.contains(&idx)
+                        && pool.members.get(idx).map(|m| m.id()) == Some(&bound_id)
+                })
                 .and_then(|idx| member_provider_id(pool.members.get(idx)?))
         })
         .or_else(|| {
@@ -1196,6 +1202,8 @@ async fn finish_success(
     let protocol = session.protocol;
     let content_type = content_type_of(&resp);
     capture_usage(member, resp.headers());
+    state.monitor.clear_error(member.id());
+    state.monitor.clear_error(member.id());
     state
         .scheduler
         .record_success(member.id(), &state.pool.load().members);
@@ -1572,12 +1580,22 @@ pub async fn handle_relay(
             match state.refresh_member(&member, None).await {
                 Ok(_) => refreshed_this_account = true,
                 Err(e) => {
-                    member.set_health(Health::AuthFailed);
+                    if e.is_auth_failure() {
+                        member.set_health(Health::AuthFailed);
+                        state.monitor.record_error(
+                            member.id(),
+                            401,
+                            &format!("refresh failed: {e}"),
+                        );
+                    } else {
+                        state.monitor.record_error(
+                            member.id(),
+                            502,
+                            &format!("refresh network error: {e}"),
+                        );
+                    }
                     member.record_fail();
                     state.metrics.failed_over.fetch_add(1, Ordering::Relaxed);
-                    state
-                        .monitor
-                        .record_error(member.id(), 401, &format!("refresh failed: {e}"));
                     continue;
                 }
             }
@@ -1655,7 +1673,6 @@ pub async fn handle_relay(
                             status_code = resp.status().as_u16();
                         }
                         Err(e) => {
-                            member.set_health(Health::AuthFailed);
                             member.record_fail();
                             state.metrics.failed_over.fetch_add(1, Ordering::Relaxed);
                             state.monitor.record_error(
@@ -1668,14 +1685,22 @@ pub async fn handle_relay(
                     }
                 }
                 Err(e) => {
-                    member.set_health(Health::AuthFailed);
+                    if e.is_auth_failure() {
+                        member.set_health(Health::AuthFailed);
+                        state.monitor.record_error(
+                            member.id(),
+                            status_code,
+                            &format!("refresh failed: {e}"),
+                        );
+                    } else {
+                        state.monitor.record_error(
+                            member.id(),
+                            502,
+                            &format!("refresh network error: {e}"),
+                        );
+                    }
                     member.record_fail();
                     state.metrics.failed_over.fetch_add(1, Ordering::Relaxed);
-                    state.monitor.record_error(
-                        member.id(),
-                        status_code,
-                        &format!("refresh failed: {e}"),
-                    );
                     last_failure = Some(extract_failure(resp, status_code).await);
                     continue;
                 }

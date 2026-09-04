@@ -15,6 +15,7 @@ use mahoquot_types::{Health, PoolMember, Strategy};
 struct MockOAuthState {
     hit_count: Arc<AtomicUsize>,
     fail_with_400: Arc<AtomicBool>,
+    fail_with_500: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -29,9 +30,11 @@ async fn test_t7_refresh_lifecycle() {
     // --- Setup Mock OAuth Server ---
     let oauth_hit_count = Arc::new(AtomicUsize::new(0));
     let oauth_fail_400 = Arc::new(AtomicBool::new(false));
+    let oauth_fail_500 = Arc::new(AtomicBool::new(false));
     let oauth_state = MockOAuthState {
         hit_count: oauth_hit_count.clone(),
         fail_with_400: oauth_fail_400.clone(),
+        fail_with_500: oauth_fail_500.clone(),
     };
 
     let oauth_app = Router::new()
@@ -50,6 +53,14 @@ async fn test_t7_refresh_lifecycle() {
                             StatusCode::BAD_REQUEST,
                             [("content-type", "application/json")],
                             r#"{"error":"invalid_grant","error_description":"refresh failed"}"#,
+                        );
+                    }
+
+                    if state.fail_with_500.load(Ordering::SeqCst) {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            [("content-type", "application/json")],
+                            r#"{"error":"temporary_server_error"}"#,
                         );
                     }
 
@@ -378,6 +389,78 @@ async fn test_t7_refresh_lifecycle() {
         // Account must end up AuthFailed
         let member = state.find_member("acc_e").unwrap();
         assert_eq!(member.health(), Health::AuthFailed);
+
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    // =========================================================================
+    // Scenario F: OAuth mock returns 500 / transient error -> NOT marked as AuthFailed
+    // =========================================================================
+    {
+        let temp_dir = unique_temp_dir("qgw-test-t7-f");
+        let file_path = temp_dir.join("codex-acc_f-plus.json");
+        let json_content =
+            create_auth_file_json("acc_f", "acc_id_f", "stale_token_f", Some(&upstream_url));
+        std::fs::write(&file_path, json_content).unwrap();
+
+        let config = GatewayConfig {
+            usage_poll_secs: 120,
+            port: 0,
+            auth_dir: temp_dir.clone(),
+            strategy: Strategy::StrictRoundRobin,
+            max_failover: 1,
+            log_level: "info".to_string(),
+            api_keys: mahoquot_gateway::inbound::ApiKeys::default(),
+            models_env: None,
+            refresh_url: oauth_url.clone(),
+            auth_refresh_enabled: true,
+            ..Default::default()
+        };
+
+        let state = Arc::new(AppState::new(&config).unwrap());
+        let app = create_app(state.clone());
+        let gw_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gw_port = gw_listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(gw_listener, app).await.unwrap();
+        });
+
+        oauth_hit_count.store(0, Ordering::SeqCst);
+        upstream_call_count.store(0, Ordering::SeqCst);
+        upstream_always_401.store(true, Ordering::SeqCst);
+        oauth_fail_400.store(false, Ordering::SeqCst);
+        oauth_fail_500.store(true, Ordering::SeqCst); // OAuth returns 500 (transient error)
+
+        // When: client calls chat completions while OAuth is experiencing transient failure
+        let _res = client
+            .post(format!("http://127.0.0.1:{gw_port}/v1/chat/completions"))
+            .header("Content-Type", "application/json")
+            .body(common::OPENAI_REQUEST)
+            .send()
+            .await
+            .unwrap();
+
+        // Account must NOT be marked AuthFailed!
+        let member = state.find_member("acc_f").unwrap();
+        assert_ne!(
+            member.health(),
+            Health::AuthFailed,
+            "transient OAuth failure must NOT mark account as AuthFailed"
+        );
+        assert_eq!(member.health(), Health::Available);
+
+        // When OAuth recovers (500 cleared) and upstream accepts new token:
+        oauth_fail_500.store(false, Ordering::SeqCst);
+        upstream_always_401.store(false, Ordering::SeqCst);
+
+        let res2 = client
+            .post(format!("http://127.0.0.1:{gw_port}/v1/chat/completions"))
+            .header("Content-Type", "application/json")
+            .body(common::OPENAI_REQUEST)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res2.status(), reqwest::StatusCode::OK);
 
         std::fs::remove_dir_all(&temp_dir).ok();
     }
