@@ -60,10 +60,17 @@ pub fn openai_to_cursor_connect(body: &Value) -> Result<Vec<u8>, String> {
         .filter(|message| matches!(message["role"].as_str(), Some("system" | "developer")))
         .map(|message| serde_json::to_vec(message).map_err(|error| error.to_string()))
         .collect::<Result<Vec<_>, _>>()?;
-    let turns = messages
+    // The final conversational message is sent separately as UserMessage.text,
+    // so history must drop the last of the *conversational* messages - counting
+    // against the whole array would keep it whenever a system or developer
+    // message is present and duplicate the current turn.
+    let conversational = messages
         .iter()
         .filter(|message| !matches!(message["role"].as_str(), Some("system" | "developer")))
-        .take(messages.len().saturating_sub(1))
+        .collect::<Vec<_>>();
+    let turns = conversational
+        .iter()
+        .take(conversational.len().saturating_sub(1))
         .map(|message| serde_json::to_vec(message).map_err(|error| error.to_string()))
         .collect::<Result<Vec<_>, _>>()?;
     let run = proto::AgentRunRequest {
@@ -386,6 +393,28 @@ impl CursorDecoder {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn system_prompt_does_not_duplicate_the_current_turn() {
+        // take(messages.len() - 1) applies a whole-array count to the already
+        // filtered conversational subset, so any system/developer message
+        // leaves the final user turn in `turns` while it is also sent as the
+        // new UserMessage.text.
+        let body = serde_json::json!({
+            "model": "gpt-4",
+            "messages": [
+                {"role": "system", "content": "be terse"},
+                {"role": "user", "content": "hi"}
+            ]
+        });
+        let encoded = openai_to_cursor_connect(&body).expect("encodes");
+        let text = String::from_utf8_lossy(&encoded);
+        let occurrences = text.matches("hi").count();
+        assert_eq!(
+            occurrences, 1,
+            "current turn duplicated into conversation history: {occurrences} copies"
+        );
+    }
     use super::*;
 
     #[test]

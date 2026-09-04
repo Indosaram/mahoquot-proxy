@@ -305,6 +305,20 @@ pub fn openai_to_anthropic(body: &Value) -> Result<Value, String> {
                 }));
             }
         }
+        // Anthropic rejects both an empty text block and an empty content
+        // array, so an assistant turn that carried only tool_calls (content
+        // "" or null) must not contribute a blank block, and a message left
+        // with no content at all is dropped rather than sent.
+        content.retain(|block| {
+            block.get("type").and_then(Value::as_str) != Some("text")
+                || block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| !text.is_empty())
+        });
+        if content.is_empty() {
+            continue;
+        }
         out.push(json!({"role": role, "content": content}));
     }
     let tools: Vec<Value> = body
@@ -351,11 +365,11 @@ pub fn openai_to_anthropic(body: &Value) -> Result<Value, String> {
     if let Some(effort) = body.get("reasoning_effort").and_then(Value::as_str) {
         let budget: u64 = match effort {
             "minimal" => 1024,
-            "low" => 2048,
-            "medium" => 8192,
-            "high" => 16384,
-            "xhigh" => 49152,
-            "max" => 32768,
+            "low" => 1024,
+            "medium" => 2048,
+            "high" => 4096,
+            "xhigh" => 8192,
+            "max" => 16384,
             _ => 0,
         };
         if budget > 0 {
@@ -425,6 +439,12 @@ pub fn anthropic_json_to_openai(body: &Value, model: &str, created: i64) -> Valu
         .filter_map(|block| block["text"].as_str())
         .collect::<Vec<_>>()
         .join("");
+    let reasoning = content
+        .iter()
+        .filter(|block| block["type"] == "thinking")
+        .filter_map(|block| block["thinking"].as_str())
+        .collect::<Vec<_>>()
+        .join("");
     let tool_calls: Vec<Value> = content
         .iter()
         .filter(|block| block["type"] == "tool_use")
@@ -440,6 +460,9 @@ pub fn anthropic_json_to_openai(body: &Value, model: &str, created: i64) -> Valu
         })
         .collect();
     let mut message = json!({"role":"assistant","content":text});
+    if !reasoning.is_empty() {
+        message["reasoning_content"] = Value::String(reasoning);
+    }
     if !tool_calls.is_empty() {
         message["tool_calls"] = Value::Array(tool_calls);
     }
@@ -1063,9 +1086,8 @@ mod contract_tests {
         let out = openai_to_anthropic(&body).unwrap();
         assert_eq!(
             out["thinking"],
-            json!({"type": "enabled", "budget_tokens": 2048})
+            json!({"type": "enabled", "budget_tokens": 1024})
         );
-        // low already fits under the client max_tokens; only max needs the raise
         assert_eq!(out["max_tokens"], json!(4096));
 
         let body = json!({
@@ -1077,9 +1099,9 @@ mod contract_tests {
         let out = openai_to_anthropic(&body).unwrap();
         assert_eq!(
             out["thinking"],
-            json!({"type": "enabled", "budget_tokens": 32768})
+            json!({"type": "enabled", "budget_tokens": 16384})
         );
-        assert_eq!(out["max_tokens"], json!(36864));
+        assert_eq!(out["max_tokens"], json!(20480));
     }
 
     #[test]
@@ -1093,9 +1115,26 @@ mod contract_tests {
         let out = openai_to_anthropic(&body).unwrap();
         assert_eq!(
             out["thinking"],
-            json!({"type": "enabled", "budget_tokens": 16384})
+            json!({"type": "enabled", "budget_tokens": 4096})
         );
-        assert_eq!(out["max_tokens"], json!(20480));
+        assert_eq!(out["max_tokens"], json!(8192));
+    }
+
+    #[test]
+    fn anthropic_json_to_openai_preserves_thinking_as_reasoning_content() {
+        let body = json!({
+            "id": "msg_123",
+            "content": [
+                {"type": "thinking", "thinking": "Let me ponder."},
+                {"type": "text", "text": "Here is the answer."}
+            ],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 20}
+        });
+        let out = anthropic_json_to_openai(&body, "glm-5.3-flash", 1234567890);
+        let msg = &out["choices"][0]["message"];
+        assert_eq!(msg["content"], "Here is the answer.");
+        assert_eq!(msg["reasoning_content"], "Let me ponder.");
     }
 
     #[test]
@@ -1109,5 +1148,66 @@ mod contract_tests {
         let out = openai_to_anthropic(&body).unwrap();
         assert!(out.get("thinking").is_none());
         assert_eq!(out["max_tokens"], json!(4096));
+    }
+}
+
+#[cfg(test)]
+mod openai_to_anthropic_tests {
+    use super::openai_to_anthropic;
+    use serde_json::json;
+
+    #[test]
+    fn empty_content_is_not_sent_as_a_blank_block() {
+        // Anthropic rejects "text content blocks must be non-empty" and
+        // "all messages must have non-empty content".
+        let body = json!({
+            "model": "claude-3-5-sonnet",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "", "tool_calls": [{
+                    "id": "call_1",
+                    "function": {"name": "get_time", "arguments": "{}"}
+                }]},
+                {"role": "user", "content": "thanks"}
+            ]
+        });
+        let out = openai_to_anthropic(&body).expect("translates");
+        let messages = out["messages"].as_array().expect("messages array");
+        for message in messages {
+            let content = message["content"].as_array().expect("content array");
+            assert!(
+                !content.is_empty(),
+                "message sent with empty content array: {message}"
+            );
+            for block in content {
+                if block["type"] == "text" {
+                    assert!(
+                        !block["text"].as_str().unwrap_or("").is_empty(),
+                        "empty text block emitted: {message}"
+                    );
+                }
+            }
+        }
+        // The tool_call must survive the empty-text cleanup.
+        let has_tool_use = messages.iter().any(|message| {
+            message["content"]
+                .as_array()
+                .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "tool_use"))
+        });
+        assert!(has_tool_use, "tool_use block was dropped: {messages:?}");
+    }
+
+    #[test]
+    fn message_with_only_null_content_is_dropped_entirely() {
+        let body = json!({
+            "model": "claude-3-5-sonnet",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": null}
+            ]
+        });
+        let out = openai_to_anthropic(&body).expect("translates");
+        let messages = out["messages"].as_array().expect("messages array");
+        assert_eq!(messages.len(), 1, "empty message not dropped: {messages:?}");
     }
 }
