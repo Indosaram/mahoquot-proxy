@@ -211,7 +211,12 @@ async fn save_auth_file_order(State(state): State<Arc<AppState>>, raw: bytes::By
         }
     };
     match write_credential_atomically(&dir.join(ACCOUNT_ORDER_FILE), rendered.as_bytes()) {
-        Ok(()) => json_status(StatusCode::OK, json!({ "status": "ok", "names": names })),
+        Ok(()) => {
+            if let Err(err) = state.rescan_pool() {
+                tracing::warn!(error = %err, "failed to rescan pool after saving account order");
+            }
+            json_status(StatusCode::OK, json!({ "status": "ok", "names": names }))
+        }
         Err(err) => json_status(
             StatusCode::INTERNAL_SERVER_ERROR,
             json!({ "error": err.to_string() }),

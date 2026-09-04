@@ -612,6 +612,18 @@ async fn bulk_status_order_and_manual_priority_persist_across_restart() {
         "display order: {}",
         json_body(order).await
     );
+
+    // Under SST: PUT /auth-files/order must immediately hot-reload the in-memory pool!
+    let live_members = ctx.state.pool.load().members.clone();
+    assert_eq!(
+        live_members
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["beta", "alpha"],
+        "pool member slice order must immediately reflect saved account order"
+    );
+
     let priority = management(
         &ctx.app,
         Method::PUT,
