@@ -321,3 +321,41 @@ fn test_zero_fallback_routable_bindings_rejected() {
 
     assert_eq!(err, CatalogVerificationError::ZeroFallbackRoutableBindings);
 }
+
+
+#[test]
+fn the_production_keyring_does_not_trust_the_committed_test_key() {
+    // crates/registry/tests/fixtures/test-ed25519.key is committed, so anyone
+    // can mint a catalog signed by TEST_KEY_ID_V1. verify_catalog_envelope
+    // resolves keys by key_id alone, and the gateway boots with
+    // Keyring::embedded_default() (gateway/src/registry/manager.rs:47), so the
+    // test key must never be trusted by the default keyring.
+    let keyring = mahoquot_registry::envelope::Keyring::embedded_default();
+    assert!(
+        keyring.contains(mahoquot_registry::envelope::EMBEDDED_PROD_KEY_ID_V1),
+        "keyring lost its real key"
+    );
+    // The test key is gated on cfg(any(test, debug_assertions)); this suite is
+    // built with debug_assertions on, so assert the gate itself rather than a
+    // condition that cannot hold here.
+    assert_eq!(
+        keyring.contains(mahoquot_registry::envelope::TEST_KEY_ID_V1),
+        cfg!(debug_assertions),
+        "test key must be present only in test/debug builds"
+    );
+}
+
+
+#[test]
+fn release_builds_do_not_trust_the_committed_test_key() {
+    // Runs meaningfully under --release: debug_assertions is off there, so the
+    // cfg gate must drop the fixture key from the shipped keyring.
+    if cfg!(debug_assertions) {
+        return;
+    }
+    let keyring = mahoquot_registry::envelope::Keyring::embedded_default();
+    assert!(
+        !keyring.contains(mahoquot_registry::envelope::TEST_KEY_ID_V1),
+        "release keyring trusts the committed test signing key"
+    );
+}

@@ -142,10 +142,25 @@ impl Keyring {
         if let Ok(key) = VerifyingKey::from_bytes(&EMBEDDED_PROD_KEY_BYTES_V1) {
             kr.add_key(EMBEDDED_PROD_KEY_ID_V1, key);
         }
+        // The matching private key is committed under
+        // crates/registry/tests/fixtures/test-ed25519.key and
+        // verify_catalog_envelope resolves keys by key_id alone, so trusting
+        // this key in a shipped binary would let anyone forge a catalog. Test
+        // and debug builds need it to sign fixtures.
+        #[cfg(any(test, debug_assertions))]
         if let Ok(key) = VerifyingKey::from_bytes(&TEST_KEY_BYTES_V1) {
             kr.add_key(TEST_KEY_ID_V1, key);
         }
         kr
+    }
+
+    /// Default keyring plus the test signing key, for tooling that must verify
+    /// fixture-signed catalogs in a release build.
+    pub fn with_test_key(mut self) -> Self {
+        if let Ok(key) = VerifyingKey::from_bytes(&TEST_KEY_BYTES_V1) {
+            self.add_key(TEST_KEY_ID_V1, key);
+        }
+        self
     }
 
     pub fn with_key(mut self, key_id: impl Into<String>, key: VerifyingKey) -> Self {
