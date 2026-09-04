@@ -1170,8 +1170,9 @@ impl UsageSampleStore {
     /// margin, persists, and returns the retained window for delta computation.
     pub fn push(&self, account_id: &str, sample: UsageSample) -> Vec<UsageSample> {
         const SPAN_SECS: i64 = 8 * 24 * 3600;
-        // ~2.6min observed cadence over 8d is ~4.4k samples; 5000 leaves slack
-        // while span pruning stays the real bound
+        // The default 120s poll cadence yields ~5760 samples over the 8d span,
+        // so this cap binds before span pruning does; the newest sample must
+        // survive it.
         const MAX_SAMPLES: usize = 5000;
         let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
         let window = entries.entry(account_id.to_string()).or_default();
@@ -1181,7 +1182,13 @@ impl UsageSampleStore {
             .map(|last| last.unix - SPAN_SECS)
             .unwrap_or(i64::MIN);
         window.retain(|sample| sample.unix >= cutoff);
-        window.truncate(MAX_SAMPLES);
+        // Drop from the FRONT: truncate() would keep the oldest MAX_SAMPLES and
+        // discard the sample just pushed, freezing the window forever. The
+        // default 120s cadence produces 5760 samples per span, so this cap
+        // does bind in a stock install.
+        if window.len() > MAX_SAMPLES {
+            window.drain(..window.len() - MAX_SAMPLES);
+        }
         let retained = window.clone();
         if let Ok(raw) = serde_json::to_string_pretty(&*entries) {
             // Atomic rename: a crash mid-write must not wipe the 24h rolling
@@ -1838,6 +1845,37 @@ mod tests {
         }
         assert!(store.restore().is_empty());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_newest_sample_survives_the_cap() {
+        // truncate() keeps the FRONT of the vec, so once the window reaches
+        // MAX_SAMPLES the just-pushed sample is the one discarded and the
+        // window freezes. The default usage_poll_secs of 120 yields 5760
+        // samples across the 8-day span, so the cap binds in a stock install.
+        let dir = std::env::temp_dir().join(format!("quotio-cap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("usage-cap.json");
+        let store = UsageSampleStore::load(path.clone());
+        let mut retained = Vec::new();
+        // 120s cadence over 8 days exceeds the 5000 cap.
+        for index in 0..5_200i64 {
+            retained = store.push(
+                "capped",
+                UsageSample {
+                    unix: 1_800_000 + index * 120,
+                    requests: index as u64,
+                    tokens: index as u64,
+                    cost_usd: None,
+                },
+            );
+        }
+        let newest = retained.last().expect("a retained sample");
+        assert_eq!(
+            newest.requests, 5_199,
+            "the newest sample was discarded by the cap; the window is frozen"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
