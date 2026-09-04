@@ -20,8 +20,10 @@ use crate::state::AppState;
 
 // Agent clients replay the whole conversation on every turn, so an inbound
 // request legitimately carries megabytes of history; axum's 2 MiB default
-// answered those with 413 once a session grew.
-const MAX_REQUEST_BODY_BYTES: usize = 128 * 1024 * 1024;
+// answered those with 413 once a session grew. A 2M-token context window with
+// inline multimodal assets (base64 images, PDFs) requires up to several hundred
+// megabytes. 512 MiB provides headroom for 2M+ tokens without unbounded memory risk.
+const MAX_REQUEST_BODY_BYTES: usize = 512 * 1024 * 1024;
 
 pub fn create_app(state: Arc<AppState>) -> Router {
     // /admin/stats stays behind the key: it exposes account emails and reset times.

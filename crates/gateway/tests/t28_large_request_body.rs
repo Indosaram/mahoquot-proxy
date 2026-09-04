@@ -65,13 +65,13 @@ fn chat_body(filler_bytes: usize) -> Vec<u8> {
 
 #[tokio::test]
 async fn a_multi_megabyte_conversation_is_not_rejected_by_the_body_limit() {
-    let status = post_chat_completion(chat_body(8 * 1024 * 1024)).await;
+    let status = post_chat_completion(chat_body(32 * 1024 * 1024)).await;
     assert_ne!(status, StatusCode::PAYLOAD_TOO_LARGE);
 }
 
 #[tokio::test]
 async fn a_small_conversation_reaches_the_same_handler() {
     let small = post_chat_completion(chat_body(16)).await;
-    let large = post_chat_completion(chat_body(8 * 1024 * 1024)).await;
+    let large = post_chat_completion(chat_body(32 * 1024 * 1024)).await;
     assert_eq!(large, small);
 }
