@@ -866,4 +866,50 @@ mod tests {
     }
 
 
+    #[test]
+    fn a_reply_with_both_text_and_tool_calls_keeps_both_output_items() {
+        // Self-audit of the output-array rewrite: a model may answer with prose
+        // AND a call in the same turn. Neither may be dropped, and the message
+        // item must still come first.
+        let chat_reply = json!({
+            "id": "c9", "created": 7,
+            "choices": [{"message": {
+                "role": "assistant",
+                "content": "let me check",
+                "tool_calls": [{
+                    "id": "call_9", "type": "function",
+                    "function": {"name": "lookup", "arguments": "{}"}
+                }]
+            }}]
+        });
+        let out = chat_to_responses(&chat_reply, "gemini-3-flash");
+        let items = out["output"].as_array().expect("output");
+        assert_eq!(items.len(), 2, "both items must survive: {out}");
+        assert_eq!(items[0]["type"], "message");
+        assert_eq!(items[0]["content"][0]["text"], "let me check");
+        assert_eq!(items[1]["type"], "function_call");
+        assert_eq!(items[1]["call_id"], "call_9");
+    }
+
+    #[test]
+    fn an_empty_reply_still_emits_one_message_item() {
+        // Guard the fallback branch: no text and no tool calls must not yield
+        // an empty output array, which clients treat as a malformed response.
+        let out = chat_to_responses(&json!({"id":"c0","created":1,"choices":[]}), "m");
+        let items = out["output"].as_array().expect("output");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["type"], "message");
+    }
+
+    #[test]
+    fn a_tool_entry_already_in_chat_shape_is_not_double_wrapped() {
+        // responses_input_to_chat re-wraps Responses-style tools; an entry that
+        // already has a "function" key must pass through untouched.
+        let req = json!({"tools": [{"type":"function","function":{"name":"already"}}]});
+        let chat = responses_input_to_chat(&req, "m");
+        let tools = chat["tools"].as_array().expect("tools");
+        assert_eq!(tools[0]["function"]["name"], "already");
+        assert!(tools[0]["function"]["function"].is_null(), "double wrapped: {chat}");
+    }
+
 }
