@@ -755,7 +755,9 @@ async fn record_cooldown(
         .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
         .unwrap_or(0);
     member.set_health(Health::Cooldown {
-        until_unix_ms: now_ms + retry_after_secs * 1000,
+        // Retry-After is upstream-controlled: clamp so a hostile or broken value
+        // cannot overflow into a past (or panicking) cooldown deadline.
+        until_unix_ms: now_ms.saturating_add(retry_after_secs.saturating_mul(1000)),
     });
     member.record_fail();
     state.metrics.failed_over.fetch_add(1, Ordering::Relaxed);

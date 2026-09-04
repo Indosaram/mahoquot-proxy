@@ -54,8 +54,6 @@ pub struct ScopedKeyView {
     pub name: String,
     pub key_prefix: String,
     pub key_identifier: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub raw_key: Option<String>,
     pub allowed_providers: Vec<String>,
     pub allowed_accounts: Vec<String>,
     pub allowed_models: Vec<String>,
@@ -76,7 +74,6 @@ impl ScopedKeyView {
             name: key.name.clone(),
             key_prefix: key.key_prefix.clone(),
             key_identifier: key.key_identifier.clone(),
-            raw_key: key.raw_key.clone(),
             allowed_providers: key.allowed_providers.clone(),
             allowed_accounts: key.allowed_accounts.clone(),
             allowed_models: key.allowed_models.clone(),
@@ -118,7 +115,7 @@ async fn create_scoped_key(
     let id = format!("shk_{}", uuid::Uuid::new_v4().simple());
     let raw_secret = format!("mq-sh-{}", uuid::Uuid::new_v4().simple());
     let key_identifier = stable_key_identifier(&raw_secret);
-    let key_prefix = format!("{}...", &raw_secret[..10.min(raw_secret.len())]);
+    let key_prefix = format!("{}...", key_prefix_source(&raw_secret));
 
     let new_key = ScopedApiKey {
         id: id.clone(),
@@ -174,7 +171,7 @@ async fn patch_scoped_key(
                 let trimmed = raw.trim().to_string();
                 if !trimmed.is_empty() {
                     key.key_identifier = stable_key_identifier(&trimmed);
-                    key.key_prefix = format!("{}...", &trimmed[..10.min(trimmed.len())]);
+                    key.key_prefix = format!("{}...", key_prefix_source(&trimmed));
                 }
             }
             if let Some(providers) = payload.allowed_providers {
@@ -247,6 +244,15 @@ async fn delete_scoped_key(State(state): State<Arc<AppState>>, Path(id): Path<St
             Json(json!({ "error": format!("failed to delete scoped key: {err}") })),
         )
             .into_response(),
+    }
+}
+
+/// Leading display slice of a secret, cut on a UTF-8 character boundary.
+/// Slicing raw bytes panics when a multi-byte character straddles the cut.
+fn key_prefix_source(secret: &str) -> &str {
+    match secret.char_indices().nth(10) {
+        Some((boundary, _)) => &secret[..boundary],
+        None => secret,
     }
 }
 

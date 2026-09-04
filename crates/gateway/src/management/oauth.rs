@@ -325,7 +325,7 @@ async fn exchange_antigravity_code(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
-    let expired_rfc3339 = format_rfc3339(now_secs + expires_in.max(0) as u64);
+    let expired_rfc3339 = format_rfc3339(now_secs.saturating_add(expires_in.max(0) as u64));
 
     let credential = json!({
         "type": "antigravity",
@@ -1246,7 +1246,7 @@ async fn exchange_codex_code(
         "access_token": access_token,
         "account_id": account_id,
         "email": email,
-        "expired": format_rfc3339(now + expires_in),
+        "expired": format_rfc3339(now.saturating_add(expires_in)),
         "id_token": id_token,
         "last_refresh": format_rfc3339(now),
         "refresh_token": refresh_token

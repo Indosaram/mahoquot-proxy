@@ -912,7 +912,12 @@ async fn command_code_import(
         "base_url":base_url,"api_key":api_key,
         "models":["deepseek/deepseek-v4-flash"],"disabled":false});
     let dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
-    let path = dir.join(format!("generic-command-code-{}.json", std::process::id()));
+    // Name the file after the credential, not the process: a PID-derived name
+    // makes a second import in the same process overwrite the first account.
+    let path = dir.join(format!(
+        "generic-command-code-{}.json",
+        crate::request_history::stable_key_identifier(api_key)
+    ));
     let rendered = match serde_json::to_string_pretty(&credential) {
         Ok(value) => value,
         Err(error) => {
