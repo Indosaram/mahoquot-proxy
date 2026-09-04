@@ -77,6 +77,29 @@ pub async fn execute_refresh_spec(
     crate::refresh::parse_refresh_response(&body).map_err(RefreshError::Parse)
 }
 
+/// Maps a non-success response to a typed `RefreshError::Status`.
+///
+/// `Response::error_for_status` collapses the status into `reqwest::Error`,
+/// surfacing as `RefreshError::Http`, whose `is_auth_failure()` is false - so
+/// a rejected credential would be retried forever instead of marked AuthFailed.
+trait TypedStatus: Sized {
+    fn error_for_status_typed(self) -> Result<Self, RefreshError>;
+}
+
+impl TypedStatus for reqwest::Response {
+    fn error_for_status_typed(self) -> Result<Self, RefreshError> {
+        let status = self.status();
+        if status.is_success() {
+            Ok(self)
+        } else {
+            Err(RefreshError::Status {
+                code: status.as_u16(),
+                body: String::new(),
+            })
+        }
+    }
+}
+
 pub async fn execute_zcode_refresh(
     client: &reqwest::Client,
     api_base: &str,
@@ -88,7 +111,7 @@ pub async fn execute_zcode_refresh(
         .json(&serde_json::json!({"token": upstream_token}))
         .send()
         .await?
-        .error_for_status()?
+        .error_for_status_typed()?
         .json()
         .await?;
     let business = login["data"]["access_token"]
@@ -99,7 +122,7 @@ pub async fn execute_zcode_refresh(
         .bearer_auth(business)
         .send()
         .await?
-        .error_for_status()?
+        .error_for_status_typed()?
         .json()
         .await?;
     let organizations = customer["data"]["organizations"]
@@ -132,7 +155,7 @@ pub async fn execute_zcode_refresh(
         .bearer_auth(business)
         .send()
         .await?
-        .error_for_status()?
+        .error_for_status_typed()?
         .json()
         .await?;
     let existing_key_id = keys["data"]
@@ -153,7 +176,7 @@ pub async fn execute_zcode_refresh(
                 .json(&serde_json::json!({"name": "zcode-api-key"}))
                 .send()
                 .await?
-                .error_for_status()?
+                .error_for_status_typed()?
                 .json()
                 .await?;
             let entry = created_key.get("data").unwrap_or(&created_key);
@@ -170,7 +193,7 @@ pub async fn execute_zcode_refresh(
         .bearer_auth(business)
         .send()
         .await?
-        .error_for_status()?
+        .error_for_status_typed()?
         .json()
         .await?;
     let secret = copied["data"]["secretKey"]
@@ -312,6 +335,34 @@ mod tests {
             }
             other => panic!("expected Status error, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn zcode_refresh_reports_a_401_as_an_auth_failure() {
+        // A rejected zcode login must mark the account AuthFailed like every
+        // other provider; error_for_status() collapses it into
+        // RefreshError::Http, whose is_auth_failure() is false, so the account
+        // would be retried forever instead.
+        let app = Router::new().route(
+            "/api/auth/z/login",
+            post(|| async { (axum::http::StatusCode::UNAUTHORIZED, "token rejected") }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let base = format!("http://{addr}");
+        let err = execute_zcode_refresh(&client, &base, "dead-token")
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.is_auth_failure(),
+            "zcode 401 not classified as an auth failure: {err:?}"
+        );
     }
 
     #[tokio::test]
