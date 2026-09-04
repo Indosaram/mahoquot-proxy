@@ -419,7 +419,14 @@ impl HistoryService {
                     worker_health
                         .queue_depth
                         .fetch_sub(batch.len() as u64, Ordering::Relaxed);
-                    let result = worker_store.insert_batch(&batch);
+                    let (accepted, rejected) =
+                        worker_store.insert_batch_skipping_invalid(&batch);
+                    if rejected > 0 {
+                        worker_health
+                            .dropped_events
+                            .fetch_add(rejected as u64, Ordering::Relaxed);
+                    }
+                    let result = worker_store.insert_batch(&accepted);
                     match result {
                         Ok(written) => {
                             worker_health
@@ -590,6 +597,23 @@ impl RequestHistory {
             validate_event(event)?;
         }
         self.request(|reply| Command::InsertBatch(events.to_vec(), reply))
+    }
+
+    /// Insert a batch assembled from the ingest channel, where events from
+    /// unrelated requests share one batch. A single malformed event must cost
+    /// only itself, so invalid events are skipped and counted rather than
+    /// failing the insert and discarding the valid records batched with it.
+    fn insert_batch_skipping_invalid(&self, events: &[UsageEvent]) -> (Vec<UsageEvent>, usize) {
+        let mut accepted = Vec::with_capacity(events.len());
+        let mut rejected = 0;
+        for event in events {
+            if validate_event(event).is_ok() {
+                accepted.push(event.clone());
+            } else {
+                rejected += 1;
+            }
+        }
+        (accepted, rejected)
     }
 
     pub fn page(
@@ -1093,12 +1117,19 @@ fn detail_event(
         .optional()?)
 }
 
+/// Export materialises rows into a Vec and the handler then builds a second
+/// full JSON or CSV copy, so an uncapped export scales peak memory with the
+/// retention budget. Callers needing more than this must page through `page`.
+pub const HISTORY_EXPORT_MAX_ROWS: usize = 10_000;
+
 fn export_events(
     connection: &Connection,
     query: &HistoryQuery,
 ) -> Result<Vec<HistoryEventRow>, HistoryError> {
     let (where_sql, values) = build_where(query);
-    let sql = format!("{EVENT_SELECT}{where_sql} ORDER BY e.id DESC");
+    let sql = format!(
+        "{EVENT_SELECT}{where_sql} ORDER BY e.id DESC LIMIT {HISTORY_EXPORT_MAX_ROWS}"
+    );
     let mut statement = connection.prepare(&sql)?;
     let rows = statement.query_map(params_from_iter(values.iter()), read_event_row)?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -2347,4 +2378,5 @@ mod extended_tests {
             .windows(secret.len())
             .any(|window| window == secret.as_bytes()));
     }
+
 }

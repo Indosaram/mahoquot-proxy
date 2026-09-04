@@ -12,6 +12,7 @@ use http_body_util::BodyExt;
 use mahoquot_gateway::config::GatewayConfig;
 use mahoquot_gateway::inbound::ApiKeys;
 use mahoquot_gateway::request_history::UsageEvent;
+use mahoquot_gateway::request_history::HistoryQuery;
 use mahoquot_gateway::routes::create_app;
 use mahoquot_gateway::state::AppState;
 use rusqlite::Connection;
@@ -896,4 +897,112 @@ async fn invalid_cursor_unauthorized_export_cancelled_clear() {
         .await
         .expect("cancelled clear unchanged count");
     assert_eq!(json(cancelled_count).await["count"], 1);
+}
+
+/// The ingest worker batches events from unrelated requests into one insert, so
+/// a single malformed event must cost only itself. It previously failed the
+/// whole batch, discarding every valid record that shared it.
+#[tokio::test]
+async fn one_invalid_event_does_not_discard_the_valid_events_in_its_batch() {
+    let fixture = fixture("batch-poison", None, 64);
+
+    let make = |id: &str, event_id: String| UsageEvent {
+        event_id,
+        occurred_at_ms: 1_700_000_000_000,
+        account_identifier: "history-account".to_string(),
+        provider: "codex".to_string(),
+        model: "gpt-5.1-codex".to_string(),
+        key_identifier: Some(id.to_string()),
+        status_code: 200,
+        succeeded: true,
+        input_tokens: 1,
+        output_tokens: 1,
+        cached_input_tokens: 0,
+        reasoning_tokens: 0,
+        total_tokens: 2,
+        latency_ms: 1,
+    };
+
+    fixture.state.history.enqueue(make("k1", "batch-good-1".to_string()));
+    fixture.state.history.enqueue(make("k2", "   ".to_string()));
+    fixture.state.history.enqueue(make("k3", "batch-good-2".to_string()));
+    fixture.state.history.flush().expect("flush ingest worker");
+
+    let totals = fixture
+        .state
+        .history
+        .store()
+        .expect("history store")
+        .totals()
+        .expect("totals");
+    assert_eq!(
+        totals.requests, 2,
+        "both valid events must survive a batch containing one invalid event"
+    );
+    let health = fixture.state.history.health();
+    assert!(
+        !health.degraded,
+        "one malformed event must not latch the store into a degraded state"
+    );
+}
+
+
+/// The export endpoint materialises every matching row into a Vec and then a
+/// second full JSON/CSV copy. With a 512MB retention budget that is unbounded
+/// peak memory, so the row set must be capped rather than growing with the table.
+#[tokio::test]
+async fn export_is_bounded_instead_of_returning_every_row() {
+    const CAP: usize = 10_000;
+    let fixture = fixture("export-bound", None, 512);
+    let total = CAP + 25;
+    // The ingest queue is bounded, so enqueue in waves and flush each one;
+    // otherwise the queue drops most events and the export cap is never reached.
+    for index in 0..total {
+        fixture.state.history.enqueue(UsageEvent {
+            event_id: format!("bound-{index}"),
+            occurred_at_ms: 1_700_000_000_000 + index as i64,
+            account_identifier: "history-account".to_string(),
+            provider: "codex".to_string(),
+            model: "gpt-5.1-codex".to_string(),
+            key_identifier: Some("key-label".to_string()),
+            status_code: 200,
+            succeeded: true,
+            input_tokens: 1,
+            output_tokens: 1,
+            cached_input_tokens: 0,
+            reasoning_tokens: 0,
+            total_tokens: 2,
+            latency_ms: 1,
+        });
+        if index % 200 == 0 {
+            fixture.state.history.flush().expect("flush ingest worker");
+        }
+    }
+    fixture.state.history.flush().expect("flush ingest worker");
+
+    let events = fixture
+        .state
+        .history
+        .store()
+        .expect("history store")
+        .export(&HistoryQuery::default())
+        .expect("export");
+
+    let stored = fixture
+        .state
+        .history
+        .store()
+        .expect("history store")
+        .totals()
+        .expect("totals")
+        .requests;
+    assert!(
+        stored > CAP as u64,
+        "fixture must store more rows than the cap, stored {stored}"
+    );
+    assert!(
+        events.len() <= CAP,
+        "export returned {} rows for {stored} stored: it must be capped, not grow with the table",
+        events.len()
+    );
 }
