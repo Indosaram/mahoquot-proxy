@@ -430,15 +430,14 @@ impl Aggregator {
                 "functionCall": {"name": tool.name, "args": args}
             }));
         }
-        let finish_reason = if self.tools.is_empty() {
-            "STOP"
-        } else {
-            "TOOL_CALLS"
-        };
+        // Gemini's FinishReason enum has no TOOL_CALLS member, and strict
+        // proto-JSON decoders reject unknown enum values outright. Native
+        // Gemini pairs functionCall parts with STOP, which is what the
+        // streaming renderer already emits for the identical turn.
         let mut payload = json!({
             "candidates": [{
                 "content": {"role": "model", "parts": parts},
-                "finishReason": finish_reason,
+                "finishReason": "STOP",
                 "index": 0,
             }],
             "modelVersion": self.model,
@@ -696,9 +695,12 @@ mod gemini_stream_tests {
             .unwrap_or_else(|| panic!("no functionCall part emitted: {out}"));
         assert_eq!(call["name"], "get_weather");
         assert_eq!(call["args"]["city"], "Seoul");
+        // Gemini's FinishReason enum has no TOOL_CALLS member; native Gemini
+        // reports STOP alongside functionCall parts, which is also what the
+        // streaming GeminiChunkRenderer emits for the identical turn.
         assert_eq!(
-            out["candidates"][0]["finishReason"], "TOOL_CALLS",
-            "finishReason must not claim STOP for a tool turn: {out}"
+            out["candidates"][0]["finishReason"], "STOP",
+            "finishReason must stay inside the Gemini enum: {out}"
         );
     }
 

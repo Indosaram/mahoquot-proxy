@@ -419,6 +419,47 @@ fn responses_input_to_chat(req: &Value, model: &str) -> Value {
         }
         Some(Value::Array(items)) => {
             for item in items {
+                // Round-trip items carry no role and no text content. Mapping
+                // them like ordinary turns collapses both the prior call and
+                // its result into empty user messages, so the model never sees
+                // the tool exchange it is being asked to continue.
+                match item.get("type").and_then(Value::as_str) {
+                    Some("function_call") => {
+                        messages.push(json!({
+                            "role": "assistant",
+                            "content": Value::Null,
+                            "tool_calls": [{
+                                "id": item.get("call_id").and_then(Value::as_str).unwrap_or_default(),
+                                "type": "function",
+                                "function": {
+                                    "name": item.get("name").and_then(Value::as_str).unwrap_or_default(),
+                                    "arguments": item
+                                        .get("arguments")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("{}"),
+                                },
+                            }],
+                        }));
+                        continue;
+                    }
+                    Some("function_call_output") => {
+                        let output = match item.get("output") {
+                            Some(Value::String(s)) => s.clone(),
+                            Some(other) => other.to_string(),
+                            None => String::new(),
+                        };
+                        messages.push(json!({
+                            "role": "tool",
+                            "tool_call_id": item
+                                .get("call_id")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default(),
+                            "content": output,
+                        }));
+                        continue;
+                    }
+                    _ => {}
+                }
                 let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
                 let text = match item.get("content") {
                     Some(Value::String(s)) => s.clone(),
@@ -445,19 +486,37 @@ fn responses_input_to_chat(req: &Value, model: &str) -> Value {
                 if tool.get("function").is_some() {
                     return tool.clone();
                 }
-                let mut function = json!({});
-                for key in ["name", "description", "parameters", "strict"] {
+                // Only an inline-named Responses function can be re-wrapped.
+                // Built-in tool types (web_search, file_search, ...) carry no
+                // name, and synthesizing an empty function object makes the
+                // upstream reject the whole request for a missing name.
+                let Some(name) = tool.get("name").and_then(Value::as_str) else {
+                    return Value::Null;
+                };
+                let mut function = json!({ "name": name });
+                for key in ["description", "parameters", "strict"] {
                     if let Some(v) = tool.get(key) {
                         function[key] = v.clone();
                     }
                 }
                 json!({"type": "function", "function": function})
             })
+            .filter(|tool| !tool.is_null())
             .collect();
-        chat["tools"] = Value::Array(mapped);
+        if !mapped.is_empty() {
+            chat["tools"] = Value::Array(mapped);
+        }
     }
+    // Responses names a forced tool inline; chat nests it under "function",
+    // so forwarding the object form verbatim loses the forced selection.
     if let Some(choice) = req.get("tool_choice") {
-        chat["tool_choice"] = choice.clone();
+        let mapped = match choice.get("name").and_then(Value::as_str) {
+            Some(name) if choice.get("function").is_none() => {
+                json!({"type": "function", "function": {"name": name}})
+            }
+            _ => choice.clone(),
+        };
+        chat["tool_choice"] = mapped;
     }
     for key in ["temperature", "top_p", "max_output_tokens"] {
         if let Some(v) = req.get(key) {
@@ -910,6 +969,64 @@ mod tests {
         let tools = chat["tools"].as_array().expect("tools");
         assert_eq!(tools[0]["function"]["name"], "already");
         assert!(tools[0]["function"]["function"].is_null(), "double wrapped: {chat}");
+    }
+
+    #[test]
+    fn function_call_round_trip_items_survive_the_responses_hop() {
+        // A client replying to an emitted function_call sends back the call and
+        // its output; collapsing both to empty user turns loses the tool result.
+        let req = json!({"input": [
+            {"type":"function_call","call_id":"call_1","name":"get_weather","arguments":"{\"city\":\"Seoul\"}"},
+            {"type":"function_call_output","call_id":"call_1","output":"22C"}
+        ]});
+        let chat = responses_input_to_chat(&req, "m");
+        let messages = chat["messages"].as_array().expect("messages");
+        let assistant = messages
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .unwrap_or_else(|| panic!("prior tool call dropped: {chat}"));
+        assert_eq!(assistant["tool_calls"][0]["id"], "call_1");
+        assert_eq!(assistant["tool_calls"][0]["function"]["name"], "get_weather");
+        let tool = messages
+            .iter()
+            .find(|m| m["role"] == "tool")
+            .unwrap_or_else(|| panic!("tool result dropped: {chat}"));
+        assert_eq!(tool["tool_call_id"], "call_1");
+        assert_eq!(tool["content"], "22C");
+        assert!(
+            !messages.iter().any(|m| m["role"] == "user" && m["content"] == ""),
+            "round-trip item collapsed into an empty user turn: {chat}"
+        );
+    }
+
+    #[test]
+    fn builtin_tool_types_are_not_synthesized_into_nameless_functions() {
+        // web_search has neither a "function" key nor an inline name; wrapping it
+        // yields {"type":"function","function":{}}, which upstream rejects as a
+        // missing function.name and fails the whole request.
+        let req = json!({"tools": [{"type":"web_search"}, {"type":"function","name":"ok"}]});
+        let chat = responses_input_to_chat(&req, "m");
+        let tools = chat["tools"].as_array().expect("tools");
+        assert!(
+            !tools.iter().any(|t| t["type"] == "function"
+                && t["function"]["name"].is_null()),
+            "emitted a nameless function tool: {chat}"
+        );
+        assert!(
+            tools.iter().any(|t| t["function"]["name"] == "ok"),
+            "the real function tool must still survive: {chat}"
+        );
+    }
+
+    #[test]
+    fn object_form_tool_choice_is_translated_to_chat_shape() {
+        // Responses names the function inline; chat nests it, so forwarding the
+        // Responses shape verbatim loses forced single-tool selection.
+        let req = json!({"tool_choice": {"type":"function","name":"pick_me"}});
+        let chat = responses_input_to_chat(&req, "m");
+        assert_eq!(chat["tool_choice"]["function"]["name"], "pick_me", "{chat}");
+        let plain = responses_input_to_chat(&json!({"tool_choice":"auto"}), "m");
+        assert_eq!(plain["tool_choice"], "auto");
     }
 
 }
