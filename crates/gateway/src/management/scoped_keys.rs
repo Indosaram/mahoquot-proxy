@@ -133,9 +133,27 @@ async fn create_scoped_key(
         expires_at_ms: payload.expires_at_ms,
     };
 
-    let result = state.settings.mutate(|s| {
-        s.scoped_api_keys.push(new_key.clone());
-    });
+    // The scoped-key write persists YAML under the mutate lock; keep it off
+    // the executor threads.
+    let settings = Arc::clone(&state.settings);
+    let stored = new_key.clone();
+    let result = match tokio::task::spawn_blocking(move || {
+        settings.mutate(|s| {
+            s.scoped_api_keys.push(stored.clone());
+        })
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(err) => {
+            tracing::error!("scoped key write task failed: {err}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "scoped key write task failed" })),
+            )
+                .into_response();
+        }
+    };
 
     if let Err(err) = result {
         return (

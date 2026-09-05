@@ -69,7 +69,22 @@ async fn put_config_yaml(State(state): State<Arc<AppState>>, raw: bytes::Bytes) 
             )
         }
     };
-    match state.settings.mutate(|current| *current = parsed) {
+    // Persisting the whole document is a synchronous YAML write under the
+    // mutate lock, so it is moved off the executor.
+    let settings = Arc::clone(&state.settings);
+    let saved = tokio::task::spawn_blocking(move || settings.mutate(|current| *current = parsed))
+        .await;
+    let saved = match saved {
+        Ok(saved) => saved,
+        Err(err) => {
+            tracing::error!("config write task failed: {err}");
+            return json_status(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({ "error": "write_failed", "message": "settings write task failed" }),
+            );
+        }
+    };
+    match saved {
         // Upstream reports which document sections it rewrote, and a
         // whole-config write is always reported as the single "config"
         // section regardless of what actually differed.
