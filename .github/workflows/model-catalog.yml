@@ -23,8 +23,8 @@ on:
         default: true
 
 concurrency:
-  group: model-catalog-${{ github.ref }}
-  cancel-in-progress: true
+  group: model-catalog-v1
+  cancel-in-progress: false
 
 jobs:
   validate-and-test:
@@ -71,57 +71,10 @@ jobs:
         run: |
           cargo build --release -p mahoquot-model-catalog
 
-      - name: Check version monotonicity and sign catalog
+      - name: Sign and publish catalog
         env:
           MAHOQUOT_MODEL_CATALOG_ED25519_PRIVATE_KEY: ${{ secrets.MAHOQUOT_MODEL_CATALOG_ED25519_PRIVATE_KEY }}
-          KEY_ID: "mahoquot-prod-2026-v1"
         run: |
-          PUBLISH_DIR=$(mktemp -d)
-
-          # If model-catalog-v1 branch exists remotely, fetch and check previous version
-          git fetch origin model-catalog-v1:refs/remotes/origin/model-catalog-v1 || true
-          if git rev-parse --verify origin/model-catalog-v1 >/dev/null 2>&1; then
-            git show origin/model-catalog-v1:models-v1.json > "$PUBLISH_DIR/prev-models-v1.json" || true
-            if [ -f "$PUBLISH_DIR/prev-models-v1.json" ]; then
-              PREV_VERSION=$(jq -r '.version' "$PUBLISH_DIR/prev-models-v1.json")
-              CURR_VERSION=$(jq -r '.version' crates/registry/catalog/models-v1.json)
-              echo "Previous published version: $PREV_VERSION, incoming version: $CURR_VERSION"
-              if [ "$CURR_VERSION" -le "$PREV_VERSION" ]; then
-                echo "Error: non-monotonic version upgrade (incoming $CURR_VERSION <= published $PREV_VERSION)" >&2
-                exit 1
-              fi
-            fi
-          fi
-
-          # Sign incoming catalog
-          target/release/mahoquot-model-catalog sign \
-            --input crates/registry/catalog/models-v1.json \
-            --output "$PUBLISH_DIR/models-v1.json" \
-            --signature "$PUBLISH_DIR/models-v1.json.sig" \
-            --key-id "$KEY_ID"
-
-          # Verify generated envelope before publication
-          target/release/mahoquot-model-catalog verify \
-            --input "$PUBLISH_DIR/models-v1.json" \
-            --signature "$PUBLISH_DIR/models-v1.json.sig"
-
-          # Generate sha256 checksum
-          cd "$PUBLISH_DIR"
-          sha256sum models-v1.json > models-v1.json.sha256
-          cd -
-
-          # Switch to orphan model-catalog-v1 branch
-          git checkout --orphan model-catalog-v1
-          git rm -rf . || true
-
-          cp "$PUBLISH_DIR/models-v1.json" ./
-          cp "$PUBLISH_DIR/models-v1.json.sig" ./
-          cp "$PUBLISH_DIR/models-v1.json.sha256" ./
-
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add models-v1.json models-v1.json.sig models-v1.json.sha256
-
-          CAT_VERSION=$(jq -r '.version' models-v1.json)
-          git commit -m "publish(catalog): version ${CAT_VERSION} [skip ci]"
-          git push origin model-catalog-v1
+          bash scripts/publish-catalog.sh \
+            "$PWD/target/release/mahoquot-model-catalog" \
+            "$PWD/crates/registry/catalog/models-v1.json" mahoquot-prod-2026-v1

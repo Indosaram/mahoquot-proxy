@@ -41,31 +41,14 @@ jobs:
         run: cargo build --release --bin mahoquot-gateway --target ${{ matrix.target }}
 
       - name: Package binary
+        id: package
         shell: bash
-        run: |
-          BIN_PATH="target/${{ matrix.target }}/release/mahoquot-gateway"
-          if [[ "${{ runner.os }}" == "Windows" ]]; then
-            BIN_PATH="${BIN_PATH}.exe"
-            7z a "mahoquot-gateway-${{ matrix.target }}.zip" "$BIN_PATH"
-            sha256sum "mahoquot-gateway-${{ matrix.target }}.zip" > "mahoquot-gateway-${{ matrix.target }}.zip.sha256"
-          elif [ -f "$BIN_PATH" ]; then
-            strip "$BIN_PATH" || true
-            tar -czf "mahoquot-gateway-${{ matrix.target }}.tar.gz" -C "$(dirname "$BIN_PATH")" mahoquot-gateway
-          else
-            strip target/release/mahoquot-gateway || true
-            tar -czf "mahoquot-gateway-${{ matrix.target }}.tar.gz" -C target/release mahoquot-gateway
-          fi
-          if command -v sha256sum >/dev/null 2>&1; then
-            sha256sum "mahoquot-gateway-${{ matrix.target }}.tar.gz" > "mahoquot-gateway-${{ matrix.target }}.tar.gz.sha256"
-          else
-            shasum -a 256 "mahoquot-gateway-${{ matrix.target }}.tar.gz" > "mahoquot-gateway-${{ matrix.target }}.tar.gz.sha256"
-          fi
+        run: bash scripts/package-release.sh "${{ matrix.target }}" "${{ runner.os }}"
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          fail_on_unmatched_files: true
           files: |
-            mahoquot-gateway-${{ matrix.target }}.tar.gz
-            mahoquot-gateway-${{ matrix.target }}.tar.gz.sha256
-            mahoquot-gateway-${{ matrix.target }}.zip
-            mahoquot-gateway-${{ matrix.target }}.zip.sha256
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.checksum }}
