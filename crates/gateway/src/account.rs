@@ -1393,13 +1393,10 @@ pub fn load_account_members(auth_dir: &Path) -> anyhow::Result<Vec<Arc<AccountMe
             .get("type")
             .and_then(|v| v.as_str())
             .unwrap_or_default();
-        if value
+        let is_disabled = value
             .get("disabled")
             .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-        {
-            continue;
-        }
+            .unwrap_or(false);
         let Some(kind) = classify_credential(&file_path, declared_type) else {
             tracing::warn!(
                 path = ?file_path,
@@ -1468,7 +1465,11 @@ pub fn load_account_members(auth_dir: &Path) -> anyhow::Result<Vec<Arc<AccountMe
             id,
             file_path,
             inner: RwLock::new(inner),
-            health: RwLock::new(Health::Available),
+            health: RwLock::new(if is_disabled {
+                Health::Disabled
+            } else {
+                Health::Available
+            }),
             upstream_override,
             usage_override,
             ok_count: AtomicU64::new(0),

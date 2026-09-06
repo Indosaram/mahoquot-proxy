@@ -249,6 +249,8 @@ fn sanitize_schema(value: &mut Value) {
 
 #[derive(Default)]
 pub struct KiroDecoder {
+    wire: Vec<u8>,
+    framed: Option<bool>,
     buffer: String,
     /// Bytes of a character split across chunk boundaries, awaiting completion.
     pending: Vec<u8>,
@@ -262,6 +264,72 @@ impl KiroDecoder {
     }
 
     pub fn decode(&mut self, bytes: &[u8], out: &mut Vec<CodexEvent>) {
+        if self.completed {
+            return;
+        }
+        self.wire.extend_from_slice(bytes);
+        if self.framed.is_none() {
+            let Some(first) = self.wire.iter().find(|byte| !byte.is_ascii_whitespace()) else {
+                return;
+            };
+            self.framed = Some(*first != b'{');
+        }
+        if self.framed == Some(false) {
+            let bytes = std::mem::take(&mut self.wire);
+            self.decode_json(&bytes, out);
+            return;
+        }
+        while self.wire.len() >= 12 && !self.completed {
+            let total = u32::from_be_bytes(self.wire[..4].try_into().unwrap()) as usize;
+            let headers = u32::from_be_bytes(self.wire[4..8].try_into().unwrap()) as usize;
+            if total < 16 || headers > total - 16 {
+                self.fail("Invalid Kiro event-stream framing".to_string(), out);
+                return;
+            }
+            if self.wire.len() < total {
+                return;
+            }
+            let frame: Vec<u8> = self.wire.drain(..total).collect();
+            let mut cursor = 12;
+            let header_end = 12 + headers;
+            let mut error_type = None;
+            while cursor < header_end {
+                let name_len = frame[cursor] as usize;
+                cursor += 1;
+                if cursor + name_len + 3 > header_end || frame[cursor + name_len] != 7 {
+                    self.fail("Invalid Kiro event-stream headers".to_string(), out);
+                    return;
+                }
+                let name = &frame[cursor..cursor + name_len];
+                cursor += name_len + 1;
+                let len = u16::from_be_bytes(frame[cursor..cursor + 2].try_into().unwrap()) as usize;
+                cursor += 2;
+                if cursor + len > header_end {
+                    self.fail("Invalid Kiro event-stream headers".to_string(), out);
+                    return;
+                }
+                let value = &frame[cursor..cursor + len];
+                if name == b":message-type" && (value == b"exception" || value == b"error") {
+                    error_type = Some(String::from_utf8_lossy(value).into_owned());
+                }
+                cursor += len;
+            }
+            let payload = &frame[header_end..total - 4];
+            if let Some(error_type) = error_type {
+                let value = serde_json::from_slice(payload).unwrap_or(Value::Null);
+                self.fail(kiro_error_message(&value).unwrap_or(error_type), out);
+            } else {
+                self.decode_json(payload, out);
+            }
+        }
+    }
+
+    fn fail(&mut self, message: String, out: &mut Vec<CodexEvent>) {
+        self.completed = true;
+        out.push(CodexEvent::Failed { message });
+    }
+
+    fn decode_json(&mut self, bytes: &[u8], out: &mut Vec<CodexEvent>) {
         // Chunks arrive unaligned to UTF-8 boundaries, so decode from the
         // accumulated bytes: converting each chunk on its own would replace a
         // trailing partial character with U+FFFD before the next chunk can
@@ -294,9 +362,13 @@ impl KiroDecoder {
             let candidate = self.buffer[start..=end].to_string();
             self.buffer.drain(..=end);
             let Ok(value) = serde_json::from_str::<Value>(&candidate) else {
-                continue;
+                self.fail("Invalid Kiro JSON payload".to_string(), out);
+                return;
             };
-            if let Some(content) = value.get("content").and_then(Value::as_str) {
+            if value.get("__type").is_some() || value.get("error").is_some() {
+                self.fail(kiro_error_message(&value).unwrap_or_else(|| "Kiro upstream error".to_string()), out);
+                return;
+            } else if let Some(content) = value.get("content").and_then(Value::as_str) {
                 out.push(CodexEvent::TextDelta(content.to_string()));
             } else if let (Some(name), Some(id)) = (
                 value.get("name").and_then(Value::as_str),
@@ -332,16 +404,30 @@ impl KiroDecoder {
             } else if value.get("stopReason").is_some() {
                 self.completed = true;
                 out.push(CodexEvent::Completed { usage: None });
+                return;
             }
         }
     }
 
     pub fn finish(&mut self, out: &mut Vec<CodexEvent>) {
         if !self.completed {
+            if !self.wire.is_empty() || !self.pending.is_empty() || !self.buffer.trim().is_empty() {
+                self.fail("Truncated Kiro stream".to_string(), out);
+                return;
+            }
             out.push(CodexEvent::Completed { usage: None });
             self.completed = true;
         }
     }
+}
+
+fn kiro_error_message(value: &Value) -> Option<String> {
+    [value.get("message"), value.get("Message"), value.pointer("/error/message"),
+        value.get("__type"), value.get("error")]
+        .into_iter()
+        .flatten()
+        .find_map(Value::as_str)
+        .map(str::to_string)
 }
 
 fn next_json_object(input: &str) -> Option<(usize, usize)> {
@@ -378,6 +464,121 @@ fn next_json_object(input: &str) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn aws_frame(message_type: &str, payload: &[u8]) -> Vec<u8> {
+        fn crc(bytes: &[u8]) -> u32 {
+            let mut crc = !0u32;
+            for byte in bytes {
+                crc ^= u32::from(*byte);
+                for _ in 0..8 {
+                    crc = (crc >> 1) ^ (0xedb88320 & (0u32.wrapping_sub(crc & 1)));
+                }
+            }
+            !crc
+        }
+        let mut headers = vec![13];
+        headers.extend_from_slice(b":message-type");
+        headers.push(7);
+        headers.extend_from_slice(&(message_type.len() as u16).to_be_bytes());
+        headers.extend_from_slice(message_type.as_bytes());
+        let mut frame = ((16 + headers.len() + payload.len()) as u32).to_be_bytes().to_vec();
+        frame.extend_from_slice(&(headers.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&crc(&frame).to_be_bytes());
+        frame.extend(headers);
+        frame.extend_from_slice(payload);
+        frame.extend_from_slice(&crc(&frame).to_be_bytes());
+        frame
+    }
+
+    #[test]
+    fn clean_aws_eof_completes_without_stop_reason_at_every_split() {
+        let mut wire = aws_frame("event", br#"{"content":"hello"}"#);
+        wire.extend(aws_frame("event", br#"{"name":"lookup","toolUseId":"clean-eof","input":"{}"}"#));
+        for split in 0..=wire.len() {
+            let mut decoder = KiroDecoder::new();
+            let mut events = Vec::new();
+            decoder.decode(&wire[..split], &mut events);
+            decoder.decode(&wire[split..], &mut events);
+            decoder.finish(&mut events);
+            decoder.finish(&mut events);
+            assert_eq!(events.first(), Some(&CodexEvent::TextDelta("hello".into())));
+            assert_eq!(events.last(), Some(&CodexEvent::Completed { usage: None }));
+            assert_eq!(events.iter().filter(|event| matches!(event, CodexEvent::Completed { .. })).count(), 1);
+            assert!(!events.iter().any(|event| matches!(event, CodexEvent::Failed { .. })));
+        }
+    }
+
+    #[test]
+    fn error_payload_emits_failed_event_and_prevents_completed() {
+        for (payload, expected) in [
+            (r#"{"__type":"ValidationException","message":"Token limit exceeded"}"#, "Token limit exceeded"),
+            (r#"{"error":"AccessDeniedException","Message":"Denied"}"#, "Denied"),
+            (r#"{"error":{"message":"Nested denial"}}"#, "Nested denial"),
+            (r#"{"__type":"ValidationException"}"#, "ValidationException"),
+            (r#"{"error":"AccessDeniedException"}"#, "AccessDeniedException"),
+        ] {
+            let mut decoder = KiroDecoder::new();
+            let mut events = Vec::new();
+            decoder.decode(payload.as_bytes(), &mut events);
+            decoder.decode(br#"{"stopReason":"end_turn"}{"content":"late"}"#, &mut events);
+            decoder.finish(&mut events);
+            assert!(matches!(events.as_slice(), [CodexEvent::Failed { message }] if message == expected), "{payload}: {events:?}");
+        }
+    }
+
+    #[test]
+    fn aws_error_frames_fail_at_every_chunk_boundary_after_text() {
+        for message_type in ["exception", "error"] {
+            let text = aws_frame("event", br#"{"content":"committed"}"#);
+            let error = aws_frame(message_type, br#"{"message":"Denied"}"#);
+            let stop = aws_frame("event", br#"{"stopReason":"end_turn"}"#);
+            let wire = [text, error, stop].concat();
+            for split in 0..=wire.len() {
+                let mut decoder = KiroDecoder::new();
+                let mut events = Vec::new();
+                decoder.decode(&wire[..split], &mut events);
+                decoder.decode(&wire[split..], &mut events);
+                decoder.finish(&mut events);
+                assert!(matches!(events.as_slice(), [CodexEvent::TextDelta(text), CodexEvent::Failed { message }] if text == "committed" && message == "Denied"), "{message_type} split {split}: {events:?}");
+                let mut renderer = super::super::render::ChunkRenderer::new("kiro/test".to_string(), 0, false);
+                let frames: Vec<_> = events.into_iter().flat_map(|event| renderer.render(event)).collect();
+                let payloads: Vec<Value> = frames.iter()
+                    .filter(|frame| frame.as_ref() != super::super::render::DONE_FRAME)
+                    .map(|frame| serde_json::from_slice(&frame[6..frame.len() - 2]).unwrap())
+                    .collect();
+                assert_eq!(payloads.last().unwrap()["error"]["message"], "Denied");
+                assert!(payloads.iter().all(|payload| payload["choices"][0]["finish_reason"].is_null()));
+                assert!(renderer.terminated());
+                assert!(renderer.close_unterminated().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn normal_message_and_partial_aws_frames_are_not_errors() {
+        let wire = [
+            aws_frame("event", br#"{"message":"metadata"}"#),
+            aws_frame("event", br#"{"content":"hello {world}"}"#),
+        ].concat();
+        for split in 0..=wire.len() {
+            let mut decoder = KiroDecoder::new();
+            let mut events = Vec::new();
+            decoder.decode(&wire[..split], &mut events);
+            decoder.decode(&wire[split..], &mut events);
+            decoder.finish(&mut events);
+            assert!(matches!(events.as_slice(), [CodexEvent::TextDelta(text), CodexEvent::Completed { .. }] if text == "hello {world}"), "split {split}: {events:?}");
+        }
+    }
+
+    #[test]
+    fn truncated_aws_frame_fails_instead_of_completing() {
+        let wire = aws_frame("event", br#"{"content":"hello"}"#);
+        let mut decoder = KiroDecoder::new();
+        let mut events = Vec::new();
+        decoder.decode(&wire[..wire.len() - 1], &mut events);
+        decoder.finish(&mut events);
+        assert!(matches!(events.as_slice(), [CodexEvent::Failed { .. }]), "{events:?}");
+    }
 
     #[test]
     fn multibyte_split_across_chunks_survives_reassembly() {

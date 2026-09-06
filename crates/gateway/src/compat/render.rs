@@ -40,7 +40,7 @@ pub struct GeminiChunkRenderer {
     /// decoded stream supplies incremental JSON deltas. Open calls hold only
     /// the growing argument string until the call closes (the next begin or
     /// the terminal event); text and reasoning deltas stream out immediately.
-    open_calls: Vec<(String, String)>,
+    open_calls: Vec<ToolAccumulator>,
 }
 
 impl GeminiChunkRenderer {
@@ -81,21 +81,26 @@ impl GeminiChunkRenderer {
 
     /// Emit every closed call as a functionCall part, restoring its arguments.
     fn close_open_calls(&mut self, out: &mut Vec<Bytes>) {
-        for (name, args) in std::mem::take(&mut self.open_calls) {
-            let parsed: Value = if args.is_empty() {
+        for tool in std::mem::take(&mut self.open_calls) {
+            let parsed: Value = if tool.arguments.is_empty() {
                 json!({})
             } else {
-                serde_json::from_str(&args).unwrap_or_else(|_| json!({}))
+                serde_json::from_str(&tool.arguments).unwrap_or_else(|_| json!({}))
             };
-            out.push(self.frame_for(
-                json!([{ "functionCall": { "name": name, "args": parsed } }]),
-                None,
-                None,
-            ));
+            let mut part = json!({"functionCall":{"id":tool.call_id,"name":tool.name,"args":parsed}});
+            if let Some(signature) =
+                super::signature_ledger::recall(&tool.call_id, &tool.name, &parsed.to_string())
+            {
+                part["thoughtSignature"] = json!(signature);
+            }
+            out.push(self.frame_for(json!([part]), None, None));
         }
     }
 
     pub fn render(&mut self, event: CodexEvent) -> Vec<Bytes> {
+        if self.terminated {
+            return Vec::new();
+        }
         match event {
             CodexEvent::Created { response_id } => {
                 if !response_id.is_empty() {
@@ -104,7 +109,10 @@ impl GeminiChunkRenderer {
                 Vec::new()
             }
             CodexEvent::TextDelta(text) => {
-                vec![self.frame_for(json!([{"text": text}]), None, None)]
+                let mut out = Vec::new();
+                self.close_open_calls(&mut out);
+                out.push(self.frame_for(json!([{"text": text}]), None, None));
+                out
             }
             CodexEvent::ReasoningDelta(text) => {
                 vec![self.frame_for(json!([{"text": text, "thought": true}]), None, None)]
@@ -112,15 +120,31 @@ impl GeminiChunkRenderer {
             CodexEvent::ReasoningSignature(sig) => {
                 vec![self.frame_for(json!([{"thoughtSignature": sig}]), None, None)]
             }
-            CodexEvent::ToolCallBegin { name, .. } => {
+            CodexEvent::ToolCallBegin {
+                output_index,
+                call_id,
+                name,
+            } => {
                 let mut out = Vec::new();
                 self.close_open_calls(&mut out);
-                self.open_calls.push((name, String::new()));
+                self.open_calls.push(ToolAccumulator {
+                    output_index,
+                    call_id,
+                    name,
+                    arguments: String::new(),
+                });
                 out
             }
-            CodexEvent::ToolArgsDelta { delta, .. } => {
-                if let Some((_, args)) = self.open_calls.last_mut() {
-                    args.push_str(&delta);
+            CodexEvent::ToolArgsDelta {
+                output_index,
+                delta,
+            } => {
+                if let Some(tool) = self
+                    .open_calls
+                    .iter_mut()
+                    .find(|tool| tool.output_index == output_index)
+                {
+                    tool.arguments.push_str(&delta);
                 }
                 Vec::new()
             }
@@ -210,6 +234,9 @@ impl ChunkRenderer {
     }
 
     pub fn render(&mut self, event: CodexEvent) -> Vec<Bytes> {
+        if self.terminated {
+            return Vec::new();
+        }
         let mut out = Vec::new();
         match event {
             CodexEvent::Created { response_id } => {
@@ -327,6 +354,8 @@ pub struct Aggregator {
     model: String,
     created: i64,
     text: String,
+    reasoning: String,
+    native_events: Vec<CodexEvent>,
     reasoning_signature: Option<String>,
     tools: Vec<ToolAccumulator>,
     usage: Option<Usage>,
@@ -340,6 +369,8 @@ impl Aggregator {
             model,
             created,
             text: String::new(),
+            reasoning: String::new(),
+            native_events: Vec::new(),
             reasoning_signature: None,
             tools: Vec::new(),
             usage: None,
@@ -348,6 +379,7 @@ impl Aggregator {
     }
 
     pub fn push(&mut self, event: CodexEvent) {
+        self.native_events.push(event.clone());
         match event {
             CodexEvent::Created { response_id } => {
                 if !response_id.is_empty() {
@@ -355,7 +387,7 @@ impl Aggregator {
                 }
             }
             CodexEvent::TextDelta(text) => self.text.push_str(&text),
-            CodexEvent::ReasoningDelta(_) => {}
+            CodexEvent::ReasoningDelta(text) => self.reasoning.push_str(&text),
             CodexEvent::ToolCallBegin {
                 output_index,
                 call_id,
@@ -407,28 +439,27 @@ impl Aggregator {
     /// Gemini-native shape for the `/v1beta` surface, which nests text under
     /// `candidates[].content.parts[]` instead of `choices[]`.
     pub fn into_gemini(self) -> Value {
+        let mut renderer = GeminiChunkRenderer::new(self.model.clone(), self.created);
         let mut parts = Vec::new();
-        // An empty text part alongside a functionCall is not a shape Gemini
-        // clients expect, so it is emitted only when there is text or when
-        // there is nothing else to send.
-        if !self.text.is_empty() || self.tools.is_empty() {
-            let mut part = json!({"text": self.text});
-            if let Some(sig) = self.reasoning_signature.as_ref() {
-                part["thoughtSignature"] = Value::String(sig.clone());
+        for event in self.native_events {
+            for frame in renderer.render(event) {
+                let payload: Value = serde_json::from_slice(&frame[6..]).expect("renderer emits JSON");
+                if let Some(emitted) = payload
+                    .pointer("/candidates/0/content/parts")
+                    .and_then(Value::as_array)
+                {
+                    parts.extend(emitted.iter().cloned());
+                }
             }
-            parts.push(part);
         }
-        // Mirror GeminiChunkRenderer::close_open_calls: every accumulated call
-        // becomes a functionCall part carrying a complete args object.
-        for tool in &self.tools {
-            let args: Value = if tool.arguments.is_empty() {
-                json!({})
-            } else {
-                serde_json::from_str(&tool.arguments).unwrap_or_else(|_| json!({}))
-            };
-            parts.push(json!({
-                "functionCall": {"name": tool.name, "args": args}
-            }));
+        for frame in renderer.close_unterminated() {
+            let payload: Value = serde_json::from_slice(&frame[6..]).expect("renderer emits JSON");
+            if let Some(emitted) = payload
+                .pointer("/candidates/0/content/parts")
+                .and_then(Value::as_array)
+            {
+                parts.extend(emitted.iter().cloned());
+            }
         }
         // Gemini's FinishReason enum has no TOOL_CALLS member, and strict
         // proto-JSON decoders reject unknown enum values outright. Native
@@ -456,6 +487,9 @@ impl Aggregator {
 
     pub fn into_completion(self) -> Value {
         let mut message = json!({"role": "assistant", "content": Value::Null});
+        if !self.reasoning.is_empty() {
+            message["reasoning_content"] = json!(self.reasoning);
+        }
         if !self.text.is_empty() {
             message["content"] = Value::String(self.text);
         }
@@ -560,6 +594,7 @@ mod gemini_stream_tests {
             total_tokens: 92,
             cached_tokens: 0,
             reasoning_tokens: 86,
+            cache_write_tokens: 0,
         }
     }
 
@@ -638,11 +673,11 @@ mod gemini_stream_tests {
         assert_eq!(out.len(), 3);
         assert_eq!(
             out[0]["candidates"][0]["content"]["parts"][0]["functionCall"],
-            json!({"name": "weather", "args": {"city": "seoul"}})
+            json!({"id":"call_1", "name": "weather", "args": {"city": "seoul"}})
         );
         assert_eq!(
             out[1]["candidates"][0]["content"]["parts"][0]["functionCall"],
-            json!({"name": "clock", "args": {}})
+            json!({"id":"call_2", "name": "clock", "args": {}})
         );
         assert_eq!(out[2]["candidates"][0]["finishReason"], "STOP");
     }

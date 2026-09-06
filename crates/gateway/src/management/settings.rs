@@ -118,7 +118,7 @@ pub struct ScopedApiKey {
     pub name: String,
     pub key_identifier: String,
     pub key_prefix: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing, default)]
     pub raw_key: Option<String>,
     #[serde(default)]
     pub allowed_providers: Vec<String>,
@@ -173,8 +173,15 @@ fn yes() -> bool {
     true
 }
 
+/// Total retained log bytes across the active file and its segments (1 GiB).
 fn default_log_size_mb() -> i64 {
-    100
+    1024
+}
+
+/// Size at which the active log rolls into a numbered segment. Segments are
+/// deleted whole, so this is also the granularity of the total cap.
+fn default_log_segment_mb() -> i64 {
+    64
 }
 
 fn default_port() -> u16 {
@@ -203,6 +210,8 @@ pub struct Settings {
     pub logging_to_file: bool,
     #[serde(rename = "logs-max-total-size-mb", default = "default_log_size_mb")]
     pub logs_max_total_size_mb: i64,
+    #[serde(rename = "logs-segment-size-mb", default = "default_log_segment_mb")]
+    pub logs_segment_size_mb: i64,
     #[serde(rename = "error-logs-max-files", default)]
     pub error_logs_max_files: i64,
     #[serde(rename = "usage-statistics-enabled", default)]
@@ -316,6 +325,7 @@ impl Default for Settings {
             debug: false,
             logging_to_file: true,
             logs_max_total_size_mb: default_log_size_mb(),
+            logs_segment_size_mb: default_log_segment_mb(),
             error_logs_max_files: 0,
             usage_statistics_enabled: false,
             request_log: false,

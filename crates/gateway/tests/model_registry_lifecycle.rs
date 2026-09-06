@@ -23,13 +23,98 @@ use mahoquot_registry::envelope::*;
 use mahoquot_registry::*;
 use tokio::sync::{oneshot, Notify};
 
-static PORT_18878_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[test]
+fn test_lifecycle_remote_refresh_preserves_local_settings_composition() {
+    use mahoquot_gateway::management::{settings::Settings, store::SettingsStore};
+    let tmp = unique_temp_dir("local-composition");
+    let (signer, keyring) = test_signer_and_keyring("local-composition");
+    let manager = CatalogManager::boot(CatalogConfig {
+        cache_path: Some(tmp.join("catalog.json")), keyring, ..Default::default()
+    }, 1_700_000_000);
+    let settings = Arc::new(SettingsStore::new(Settings {
+        oauth_model_alias: serde_json::json!({"work": "gemini-3.7-flash-high"}),
+        oauth_excluded_models: [("codex".into(), vec!["gpt-5.4".into()])].into(),
+        model_catalog: Some(mahoquot_gateway::management::settings::ModelCatalogSettings {
+            custom_models: vec![ModelDescriptor::new(ModelId::new("custom-gemini").unwrap(), "google")
+                .with_binding(ProviderBinding::new(ProviderId::antigravity(), ProviderPolicy::Closed, CatalogSource::LocalOverride))],
+            ..Default::default()
+        }),
+        ..Default::default()
+    }, tmp.join("config.yaml")));
+    let initial = Arc::new(settings.current().validate_against_registry(&manager.current_snapshot()).unwrap());
+    let runtime = Arc::new(UnifiedRuntimeState::new(PoolSnapshot::new(1, vec![], vec![], initial), None));
+    manager.bind_runtime(&runtime);
+    let mut raw = serde_json::to_value(embedded_registry_snapshot().unwrap()).unwrap();
+    manager.bind_settings(&settings);
+    raw["version"] = serde_json::json!(900);
+    let payload = canonicalize_json(&serde_json::to_vec(&raw).unwrap()).unwrap();
+    let envelope = signer.sign_catalog(CatalogVersion(900), 1_700_000_000, None, &payload).unwrap();
+    manager.apply_verified_update(&envelope, &payload, 1_700_000_000).unwrap();
+    let after = runtime.load().registry.clone();
+    assert!(after.exclusions.iter().any(|e| e.model_id.as_str() == "gpt-5.4"));
+    assert!(after.get_model(&ModelId::new("custom-gemini").unwrap()).is_some());
+    assert!(manager.raw_snapshot().get_model(&ModelId::new("custom-gemini").unwrap()).is_none());
+    let before_hash = hash_snapshot(&after);
+    let before_raw = hash_snapshot(&manager.raw_snapshot());
+    let before_lkg = hash_file(manager.lkg_path());
+    let (_, incompatible) = sample_catalog(901, "removed-local-alias-target");
+    let rejected = signer.sign_catalog(CatalogVersion(901), 1_700_000_000, None, &incompatible).unwrap();
+    assert!(manager.apply_verified_update(&rejected, &incompatible, 1_700_000_000).is_err());
+    assert_eq!(hash_snapshot(&runtime.load().registry), before_hash);
+    assert_eq!(hash_snapshot(&manager.raw_snapshot()), before_raw);
+    assert_eq!(hash_file(manager.lkg_path()), before_lkg);
+    assert!(!manager.status().last_refresh_success);
+    assert!(manager.status().last_error.is_some());
+    fs::remove_dir_all(&tmp).unwrap();
+    assert_eq!(after.resolve("work").unwrap().canonical_id.as_str(), "gemini-3.7-flash-high", "refresh must preserve local alias");
+}
 
 fn hash_snapshot(snapshot: &RegistrySnapshot) -> u64 {
     let serialized = serde_json::to_vec(snapshot).expect("serialize snapshot");
     let mut hasher = DefaultHasher::new();
     hasher.write(&serialized);
     hasher.finish()
+}
+
+#[test]
+fn test_refresh_and_settings_mutation_publish_latest_pair() {
+    use mahoquot_gateway::management::{settings::Settings, store::SettingsStore};
+    let tmp = unique_temp_dir("serialized-composition");
+    let (signer, keyring) = test_signer_and_keyring("serialized");
+    let manager = Arc::new(CatalogManager::boot(CatalogConfig {
+        cache_path: Some(tmp.join("catalog.json")), keyring, ..Default::default()
+    }, 1_700_000_000));
+    let settings = Arc::new(SettingsStore::new(Settings::default(), tmp.join("config.yaml")));
+    let runtime = Arc::new(UnifiedRuntimeState::new(PoolSnapshot::new(1, vec![], vec![], manager.raw_snapshot()), None));
+    manager.bind_runtime(&runtime);
+    manager.bind_settings(&settings);
+    let catalog = manager.clone();
+    settings.set_snapshot_provider(Arc::new(move || catalog.raw_snapshot()));
+    let publisher = runtime.clone();
+    settings.set_pool_publisher(Arc::new(move |registry| publisher.update_registry(registry).map(|_| ())));
+    let mut raw = serde_json::to_value(embedded_registry_snapshot().unwrap()).unwrap();
+    raw["version"] = serde_json::json!(902);
+    let payload = canonicalize_json(&serde_json::to_vec(&raw).unwrap()).unwrap();
+    let envelope = signer.sign_catalog(CatalogVersion(902), 1_700_000_000, None, &payload).unwrap();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let writer = settings.clone();
+    let mutation = std::thread::spawn(move || writer.mutate(|s| {
+        entered_tx.send(()).unwrap();
+        release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        s.oauth_model_alias = serde_json::json!({"latest-local": "gemini-3.7-flash-high"});
+    }).unwrap());
+    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let refresh = manager.clone();
+    let refresh = std::thread::spawn(move || refresh.apply_verified_update(&envelope, &payload, 1_700_000_000).unwrap());
+    release_tx.send(()).unwrap();
+    mutation.join().unwrap();
+    refresh.join().unwrap();
+    assert_eq!(runtime.load().registry.version(), CatalogVersion(902));
+    assert_eq!(runtime.load().registry.resolve("latest-local").unwrap().canonical_id.as_str(), "gemini-3.7-flash-high");
+    assert_eq!(manager.raw_snapshot().version(), CatalogVersion(902));
+    fs::remove_dir_all(tmp).unwrap();
 }
 
 fn hash_file(path: &Path) -> Option<u64> {
@@ -185,7 +270,6 @@ fn test_lifecycle_02_valid_cached_boot() {
 // =========================================================================
 #[tokio::test]
 async fn test_lifecycle_03_successful_newer_remote_update() {
-    let port = 18876;
     let tmp = unique_temp_dir("lifecycle-03-remote-update");
     let lkg_path = tmp.join("models-v1.signed.json");
 
@@ -253,9 +337,10 @@ async fn test_lifecycle_03_successful_newer_remote_update() {
         )
         .with_state(mock_state.clone());
 
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .unwrap();
+    let port = listener.local_addr().unwrap().port();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let server_handle = tokio::spawn(async move {
         axum::serve(listener, app)
@@ -332,7 +417,6 @@ async fn test_lifecycle_03_successful_newer_remote_update() {
 // =========================================================================
 #[tokio::test]
 async fn test_lifecycle_04_304_not_modified() {
-    let port = 18877;
     let tmp = unique_temp_dir("lifecycle-04-not-modified");
     let lkg_path = tmp.join("models-v1.signed.json");
 
@@ -374,9 +458,10 @@ async fn test_lifecycle_04_304_not_modified() {
         )
         .with_state(mock_state.clone());
 
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .unwrap();
+    let port = listener.local_addr().unwrap().port();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let server_handle = tokio::spawn(async move {
         axum::serve(listener, app)
@@ -467,8 +552,10 @@ async fn test_lifecycle_05_stale_cache_offline() {
         .write_atomically(&env, &payload)
         .unwrap();
 
-    // Configure remote to port 18879 where no server is running (dedicated offline port)
-    let offline_port = 18879;
+    // Configure remote to port where no server is running (dedicated offline port)
+    let offline_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let offline_port = offline_listener.local_addr().unwrap().port();
+    drop(offline_listener);
     let config = CatalogConfig {
         cache_path: Some(lkg_path.clone()),
         remote_catalog_url: Some(format!("http://127.0.0.1:{offline_port}/models-v1.json")),
@@ -690,8 +777,6 @@ fn test_lifecycle_07_interrupted_persistence() {
 // =========================================================================
 #[tokio::test]
 async fn test_lifecycle_08_overlapping_refresh_coalescing() {
-    let _port_lock = PORT_18878_MUTEX.lock().await;
-    let port = 18878;
     let tmp = unique_temp_dir("lifecycle-08-coalesce");
     let lkg_path = tmp.join("models-v1.signed.json");
 
@@ -743,9 +828,10 @@ async fn test_lifecycle_08_overlapping_refresh_coalescing() {
         )
         .with_state(mock_state.clone());
 
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .unwrap();
+    let port = listener.local_addr().unwrap().port();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let server_handle = tokio::spawn(async move {
         axum::serve(listener, app)
@@ -821,8 +907,6 @@ async fn test_lifecycle_08_overlapping_refresh_coalescing() {
 // =========================================================================
 #[tokio::test]
 async fn test_lifecycle_09_account_add_delete_during_refresh() {
-    let _port_lock = PORT_18878_MUTEX.lock().await;
-    let port = 18878;
     let tmp = unique_temp_dir("lifecycle-09-account-refresh");
     let lkg_path = tmp.join("models-v1.signed.json");
 
@@ -907,9 +991,10 @@ async fn test_lifecycle_09_account_add_delete_during_refresh() {
         )
         .with_state(mock_state.clone());
 
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .unwrap();
+    let port = listener.local_addr().unwrap().port();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let server_handle = tokio::spawn(async move {
         axum::serve(listener, app)
@@ -1069,7 +1154,7 @@ fn test_lifecycle_10_inflight_request_generation_consistency() {
     let writer_active = Arc::clone(&readers_active);
     let writer_handle = std::thread::spawn(move || {
         let mut target_gen = 2u64;
-        while writer_active.load(Ordering::Relaxed) {
+        while target_gen <= 3 || writer_active.load(Ordering::Relaxed) {
             let model_name = format!("model-v{target_gen}");
             let reg = Arc::new(sample_catalog(target_gen, &model_name).0);
             let member = test_member("acc-dyn", "claude", vec![model_name.clone()]);

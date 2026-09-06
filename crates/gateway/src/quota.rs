@@ -4,9 +4,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::account::{AccountMember, ProviderKind};
 use crate::state::AppState;
-use crate::usage::{parse_cursor_usage_summary, parse_kiro_usage_summary, WhamUsage};
+use crate::usage::{
+    parse_cursor_usage_summary, parse_kiro_usage_summary, ResetCredit, WhamResetCreditList,
+    WhamUsage,
+};
 
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+const CODEX_RESET_CREDITS_URL: &str =
+    "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
 const CODEX_RESET_URL: &str =
     "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume";
 /// The reset endpoint is a write and rejects clients that don't look like the
@@ -637,8 +642,67 @@ async fn refresh_codex_usage(
         .json()
         .await
         .map_err(|e| QuotaError::Upstream(e.to_string()))?;
-    member.set_usage(parsed.into_account_usage(now_unix()));
+    let now = now_unix();
+    let mut usage = parsed.into_account_usage(now);
+    if usage.reset_credits_available.unwrap_or(0) > 0 {
+        // Enrichment only: an account with credits still has a valid quota
+        // snapshot when the expiry endpoint is unreachable, so a failure here
+        // costs the per-credit detail and nothing else.
+        usage.reset_credits = fetch_codex_reset_credits(state, member, &token, &account_id, now)
+            .await
+            .unwrap_or_default();
+    }
+    member.set_usage(usage);
     Ok(())
+}
+
+/// Read each banked reset credit's grant and expiry.
+///
+/// `wham/usage` carries only the count, and a credit lapses ~30 days after it
+/// is granted, so the expiry is the difference between "you have 2 resets" and
+/// "use one this week or lose it".
+async fn fetch_codex_reset_credits(
+    state: &AppState,
+    member: &Arc<AccountMember>,
+    token: &str,
+    account_id: &str,
+    now_unix: i64,
+) -> Result<Vec<ResetCredit>, QuotaError> {
+    let url = member
+        .upstream_override
+        .as_deref()
+        .map(|base| {
+            format!(
+                "{}/backend-api/wham/rate-limit-reset-credits",
+                base.trim_end_matches('/')
+            )
+        })
+        .unwrap_or_else(|| CODEX_RESET_CREDITS_URL.to_string());
+    let mut req = state
+        .http_client
+        .get(url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", "application/json")
+        .header("User-Agent", CODEX_USER_AGENT)
+        .timeout(Duration::from_secs(20));
+    if !account_id.is_empty() {
+        req = req.header("ChatGPT-Account-Id", account_id);
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| QuotaError::Upstream(e.to_string()))?;
+    if !resp.status().is_success() {
+        return Err(QuotaError::Upstream(format!(
+            "reset credits http {}",
+            resp.status()
+        )));
+    }
+    let parsed: WhamResetCreditList = resp
+        .json()
+        .await
+        .map_err(|e| QuotaError::Upstream(e.to_string()))?;
+    Ok(parsed.into_available(now_unix))
 }
 
 async fn try_consume_reset_credit(

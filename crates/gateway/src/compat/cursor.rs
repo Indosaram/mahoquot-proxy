@@ -16,16 +16,7 @@ pub fn openai_to_cursor_connect(body: &Value) -> Result<Vec<u8>, String> {
     } else {
         requested
     };
-    let text = body
-        .get("messages")
-        .and_then(Value::as_array)
-        .and_then(|messages| messages.last())
-        .and_then(|message| message.get("content"))
-        .map(text_content)
-        .unwrap_or_default();
-    if text.is_empty() {
-        return Err("Cursor requires a user message".to_string());
-    }
+
     let id = format!("{:016x}", rand::random::<u64>());
     let tools = body
         .get("tools")
@@ -68,6 +59,14 @@ pub fn openai_to_cursor_connect(body: &Value) -> Result<Vec<u8>, String> {
         .iter()
         .filter(|message| !matches!(message["role"].as_str(), Some("system" | "developer")))
         .collect::<Vec<_>>();
+    let text = conversational
+        .last()
+        .and_then(|message| message.get("content"))
+        .map(text_content)
+        .unwrap_or_default();
+    if text.is_empty() {
+        return Err("Cursor requires a user message".to_string());
+    }
     let turns = conversational
         .iter()
         .take(conversational.len().saturating_sub(1))
@@ -263,6 +262,7 @@ impl CursorDecoder {
                         total_tokens: usage.input_tokens + usage.output_tokens,
                         cached_tokens: usage.cache_read_tokens + usage.cache_write_tokens,
                         reasoning_tokens: usage.reasoning_tokens,
+                        cache_write_tokens: usage.cache_write_tokens,
                     }),
                 });
             }
@@ -380,6 +380,7 @@ impl CursorDecoder {
                 total_tokens: self.output_tokens,
                 cached_tokens: 0,
                 reasoning_tokens: 0,
+                cache_write_tokens: 0,
             }),
         });
     }
@@ -416,6 +417,54 @@ mod tests {
         );
     }
     use super::*;
+
+    #[test]
+    fn trailing_system_message_does_not_replace_user_prompt() {
+        for role in ["system", "developer"] {
+            for root_index in 0..=3 {
+                let history = vec![
+                    serde_json::json!({"role":"user","content":"earlier question"}),
+                    serde_json::json!({"role":"assistant","content":"earlier answer"}),
+                ];
+                let mut messages = history.clone();
+                messages.push(serde_json::json!({"role":"user","content":"search codebase"}));
+                let root = serde_json::json!({"role":role,"content":"be concise"});
+                messages.insert(root_index, root.clone());
+                let body = serde_json::json!({"model":"cursor/auto-cost","messages":messages});
+                let frame = openai_to_cursor_connect(&body).unwrap();
+                assert_eq!(frame[0], 0);
+                assert_eq!(u32::from_be_bytes(frame[1..5].try_into().unwrap()) as usize, frame.len() - 5);
+                let envelope = proto::AgentClientMessage::decode(&frame[5..]).unwrap();
+                let Some(proto::agent_client_message::Message::RunRequest(run)) = envelope.message else {
+                    panic!("missing run request");
+                };
+                let Some(proto::conversation_action::Action::UserMessageAction(action)) = run.action.unwrap().action else {
+                    panic!("missing user action");
+                };
+                assert_eq!(action.user_message.unwrap().text, "search codebase", "{role} at {root_index}");
+                let state = run.conversation_state.unwrap();
+                let roots: Vec<Value> = state.root_prompt_messages_json.iter()
+                    .map(|bytes| serde_json::from_slice(bytes).unwrap()).collect();
+                let turns: Vec<Value> = state.turns.iter()
+                    .map(|bytes| serde_json::from_slice(bytes).unwrap()).collect();
+                assert_eq!(roots, vec![root]);
+                assert_eq!(turns, history);
+            }
+        }
+    }
+
+    #[test]
+    fn root_prompts_without_conversational_text_are_rejected() {
+        for messages in [
+            serde_json::json!([]),
+            serde_json::json!([{"role":"system","content":"be concise"}]),
+            serde_json::json!([{"role":"developer","content":"be concise"}]),
+            serde_json::json!([{"role":"user","content":""},{"role":"system","content":"be concise"}]),
+        ] {
+            let body = serde_json::json!({"model":"cursor/auto-cost","messages":messages});
+            assert!(openai_to_cursor_connect(&body).is_err(), "{body}");
+        }
+    }
 
     #[test]
     fn a_request_without_messages_is_a_translation_error_not_a_panic() {

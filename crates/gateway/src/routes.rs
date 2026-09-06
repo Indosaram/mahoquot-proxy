@@ -17,6 +17,8 @@ use crate::models_route::models_payload;
 use crate::monitor::PromAccount;
 use crate::relay::{handle_relay, RelayMode};
 use crate::state::AppState;
+use axum::Extension;
+use crate::inbound::ResolvedAuth;
 
 // Agent clients replay the whole conversation on every turn, so an inbound
 // request legitimately carries megabytes of history; axum's 2 MiB default
@@ -240,16 +242,13 @@ async fn keep_alive_handler() -> impl IntoResponse {
 
 async fn models_handler(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    Extension(auth): Extension<ResolvedAuth>,
 ) -> impl IntoResponse {
     let now_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    let presented_key = crate::inbound::presented_api_key(&headers);
-    let scoped_key = presented_key
-        .and_then(|k| state.scoped_keys.lookup_raw(k))
-        .map(|e| e.key.clone());
+    let scoped_key = auth.identity.scoped();
 
     let pool = state.pool.load();
     // A scoped key must not learn about models it could never route to, so the
@@ -351,11 +350,13 @@ async fn admin_reset_handler(
 
 async fn chat_completions_handler(
     State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<ResolvedAuth>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     handle_relay(
         state,
+        &auth,
         RelayMode::OpenAiCompat,
         "/v1/chat/completions",
         &headers,
@@ -366,13 +367,14 @@ async fn chat_completions_handler(
 
 async fn messages_handler(
     State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<ResolvedAuth>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    handle_relay(state, RelayMode::Anthropic, "/v1/messages", &headers, body).await
+    handle_relay(state, &auth, RelayMode::Anthropic, "/v1/messages", &headers, body).await
 }
 
-async fn count_tokens_handler(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+async fn count_tokens_handler(State(state): State<Arc<AppState>>, Extension(auth): Extension<ResolvedAuth>, body: Bytes) -> Response {
     let parsed: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
@@ -391,6 +393,11 @@ async fn count_tokens_handler(State(state): State<Arc<AppState>>, body: Bytes) -
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
     let snapshot = state.pool.load();
+    if let Some(key) = auth.identity.scoped() {
+        if !crate::models_route::scoped_model_entries(&snapshot, key).iter().any(|entry| entry.id == model) {
+            return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error":{"type":"permission_error"}}))).into_response();
+        }
+    }
     if crate::capability::resolve_for_capability(
         &snapshot,
         model,
@@ -414,6 +421,7 @@ async fn count_tokens_handler(State(state): State<Arc<AppState>>, body: Bytes) -
 /// so one relay path serves both surfaces.
 async fn completions_handler(
     State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<ResolvedAuth>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -454,6 +462,7 @@ async fn completions_handler(
 
     handle_relay(
         state,
+        &auth,
         RelayMode::LegacyCompletions,
         "/v1/chat/completions",
         &headers,
@@ -464,11 +473,13 @@ async fn completions_handler(
 
 async fn codex_responses_handler(
     State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<ResolvedAuth>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     handle_relay(
         state,
+        &auth,
         RelayMode::Native,
         "/backend-api/codex/responses",
         &headers,

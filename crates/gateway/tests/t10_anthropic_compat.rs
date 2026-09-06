@@ -1,9 +1,62 @@
 use mahoquot_gateway::compat::claude::{
     anthropic_to_openai, estimate_input_tokens, messages_payload, render_anthropic_stream,
-    stop_reason_for,
+    stop_reason_for, openai_to_anthropic, anthropic_json_to_openai,
 };
 use mahoquot_gateway::compat::events::{CodexEvent, Usage};
 use serde_json::json;
+
+#[test]
+fn native_anthropic_tool_names_are_not_treated_as_gateway_prefixes() {
+    let request = json!({
+        "model":"fixture",
+        "messages":[{"role":"assistant","content":[
+            {"type":"tool_use","id":"call_a","name":"custom_lookup","input":{}}
+        ]}],
+        "tools":[
+            {"name":"lookup","input_schema":{"type":"object"}},
+            {"name":"custom_lookup","input_schema":{"type":"object"}}
+        ],
+        "tool_choice":{"type":"tool","name":"custom_lookup"}
+    });
+    let converted = anthropic_to_openai(&request).expect("native request translation");
+    assert_eq!(converted["tools"][0]["function"]["name"], "lookup");
+    assert_eq!(converted["tools"][1]["function"]["name"], "custom_lookup");
+    assert_eq!(converted["messages"][0]["tool_calls"][0]["function"]["name"], "custom_lookup");
+    assert_eq!(converted["tool_choice"]["function"]["name"], "custom_lookup");
+}
+
+#[test]
+fn test_t10_r24_r28_two_turn_wire_fixture_keeps_history_definition_and_choice_aligned() {
+    let response = anthropic_json_to_openai(&json!({
+        "id":"msg_fixture", "content":[{"type":"tool_use","id":"call_fixture",
+            "name":"custom_lookup","input":{"city":"seoul"}}],
+        "stop_reason":"tool_use", "usage":{"input_tokens":3,"output_tokens":2}
+    }), "fixture", 1);
+    let request = json!({
+        "model":"fixture",
+        "messages":[{"role":"user","content":"weather?"},
+            response["choices"][0]["message"],
+            {"role":"tool","tool_call_id":"call_fixture","content":"21C"},
+            {"role":"user","content":"check again"}],
+        "tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}],
+        "tool_choice":{"type":"function","function":{"name":"lookup"}},
+        "parallel_tool_calls":false
+    });
+    let wire = openai_to_anthropic(&request).unwrap();
+    assert_eq!(wire["messages"], json!([
+        {"role":"user","content":[{"type":"text","text":"weather?"}]},
+        {"role":"assistant","content":[{"type":"tool_use","id":"call_fixture","name":"custom_lookup","input":{"city":"seoul"}}]},
+        {"role":"user","content":[{"type":"tool_result","tool_use_id":"call_fixture","content":"21C"}]},
+        {"role":"user","content":[{"type":"text","text":"check again"}]}
+    ]));
+    assert_eq!(wire["tools"][0]["name"], "custom_lookup");
+    assert_eq!(wire["tool_choice"], json!({"type":"tool","name":"custom_lookup","disable_parallel_tool_use":true}));
+    let back = anthropic_to_openai(&wire).unwrap();
+    assert_eq!(back["tools"][0]["function"]["name"], "custom_lookup");
+    assert_eq!(back["messages"][1]["tool_calls"][0]["function"]["name"], "custom_lookup");
+    assert_eq!(back["tool_choice"], json!({"type":"function","function":{"name":"custom_lookup"}}));
+    assert_eq!(back["parallel_tool_calls"], false);
+}
 
 #[test]
 fn test_t10_request_maps_system_and_messages() {
@@ -70,6 +123,7 @@ fn test_t10_response_shape_matches_anthropic() {
         total_tokens: 8,
         cached_tokens: 0,
         reasoning_tokens: 0,
+        cache_write_tokens: 0,
     };
     let payload = messages_payload(
         "msg_1",
@@ -128,6 +182,7 @@ fn test_t10_stream_emits_anthropic_event_sequence() {
                 total_tokens: 8,
                 cached_tokens: 0,
                 reasoning_tokens: 0,
+                cache_write_tokens: 0,
             }),
         },
     ];
@@ -189,3 +244,27 @@ fn test_t10_count_tokens_is_positive_and_scales() {
     assert!(s > 0, "must return a usable count, got {s}");
     assert!(l > s, "longer input must count higher: {l} vs {s}");
 }
+
+#[test]
+fn test_t10_anthropic_usage_with_cache_creation_input_tokens_parses_into_cache_write_tokens() {
+    let response = json!({
+        "id": "msg_test",
+        "content": [{"type": "text", "text": "cached response"}],
+        "stop_reason": "end_turn",
+        "usage": {
+            "input_tokens": 50,
+            "output_tokens": 15,
+            "cache_read_input_tokens": 30,
+            "cache_creation_input_tokens": 20
+        }
+    });
+    let openai = anthropic_json_to_openai(&response, "claude-3-5-sonnet", 1234);
+    assert_eq!(openai["usage"]["prompt_tokens"], 50);
+    assert_eq!(openai["usage"]["completion_tokens"], 15);
+    assert_eq!(openai["usage"]["total_tokens"], 65);
+    assert_eq!(openai["usage"]["cache_read_input_tokens"], 30);
+    assert_eq!(openai["usage"]["cache_creation_input_tokens"], 20);
+    assert_eq!(openai["usage"]["prompt_tokens_details"]["cached_tokens"], 30);
+    assert_eq!(openai["usage"]["prompt_tokens_details"]["cache_write_tokens"], 20);
+}
+

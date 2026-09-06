@@ -184,7 +184,7 @@ fn test_codex_typed_contribution_and_capabilities() {
             "is_codex_model must return true for legacy model {id}"
         );
     }
-    assert_eq!(contrib.models.len(), 12);
+    assert_eq!(contrib.models.len(), 14);
 
     let img_caps = contrib
         .capability_profile("gpt-image-1.5")

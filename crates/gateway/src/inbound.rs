@@ -22,6 +22,12 @@ pub enum AuthIdentity {
     Scoped(Arc<ScopedApiKey>),
 }
 
+#[derive(Debug, Clone)]
+pub struct ResolvedAuth {
+    pub identity: AuthIdentity,
+    pub key_identifier: Option<String>,
+}
+
 impl AuthIdentity {
     pub fn is_scoped(&self) -> bool {
         matches!(self, AuthIdentity::Scoped(_))
@@ -203,6 +209,12 @@ pub async fn require_api_key(
 
     // Downstream handlers read the identity instead of re-deriving it from the
     // header, so scope enforcement and auth share one decision.
+    let key_identifier = extract_presented_key(&req)
+        .map(crate::request_history::stable_key_identifier);
+    req.extensions_mut().insert(ResolvedAuth {
+        identity: identity.clone(),
+        key_identifier,
+    });
     req.extensions_mut().insert(identity);
     next.run(req).await
 }

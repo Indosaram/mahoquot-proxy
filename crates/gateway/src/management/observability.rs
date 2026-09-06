@@ -404,20 +404,20 @@ async fn write_request_log(State(state): State<Arc<AppState>>, raw: bytes::Bytes
     write_field(state, raw, |settings, value| {
         settings.request_log = value.as_bool().ok_or(Refusal::InvalidBody)?;
         Ok(())
-    })
+    }).await
 }
 
 async fn write_logs_cap(State(state): State<Arc<AppState>>, raw: bytes::Bytes) -> Response {
     write_field(state, raw, |settings, value| {
         settings.logs_max_total_size_mb = value.as_i64().ok_or(Refusal::InvalidBody)?;
         Ok(())
-    })
+    }).await
 }
 
-fn write_field(
+async fn write_field(
     state: Arc<AppState>,
     raw: bytes::Bytes,
-    set: impl FnOnce(&mut Settings, &Value) -> Result<(), Refusal>,
+    set: impl FnOnce(&mut Settings, &Value) -> Result<(), Refusal> + Send + 'static,
 ) -> Response {
     let Ok(body) = serde_json::from_slice::<Value>(&raw) else {
         return scalars::refusal_response(Refusal::InvalidBody);
@@ -425,7 +425,7 @@ fn write_field(
     let Some(value) = body.get("value").cloned() else {
         return scalars::refusal_response(Refusal::InvalidBody);
     };
-    scalars::apply_edit(&state, |settings| set(settings, &value))
+    scalars::apply_edit(&state, move |settings| set(settings, &value)).await
 }
 
 #[cfg(test)]

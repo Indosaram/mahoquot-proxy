@@ -81,6 +81,8 @@ pub enum RefreshEnqueue {
 pub struct CatalogManager {
     config: CatalogConfig,
     active_snapshot: ArcSwap<RegistrySnapshot>,
+    settings: RwLock<Option<std::sync::Weak<crate::management::store::SettingsStore>>>,
+    apply_lock: std::sync::Mutex<()>,
     lkg_cache: LkgCache,
     status: Arc<RwLock<CatalogStatus>>,
     http_client: reqwest::Client,
@@ -179,6 +181,8 @@ impl CatalogManager {
         Self {
             config,
             active_snapshot: ArcSwap::from_pointee(active),
+            settings: RwLock::new(None),
+            apply_lock: std::sync::Mutex::new(()),
             lkg_cache,
             status: Arc::new(RwLock::new(status)),
             http_client,
@@ -197,6 +201,14 @@ impl CatalogManager {
         if let Ok(mut slot) = self.unified_runtime.write() {
             *slot = Some(Arc::downgrade(runtime));
         }
+    }
+
+    pub fn bind_settings(&self, settings: &Arc<crate::management::store::SettingsStore>) {
+        *self.settings.write().unwrap() = Some(Arc::downgrade(settings));
+    }
+
+    pub fn raw_snapshot(&self) -> Arc<RegistrySnapshot> {
+        self.active_snapshot.load_full()
     }
 
     /// Read the currently active catalog snapshot lock-free.
@@ -261,6 +273,27 @@ impl CatalogManager {
         canonical_payload: &[u8],
         now: u64,
     ) -> Result<Arc<RegistrySnapshot>, CatalogError> {
+        let result = self.apply_update_inner(envelope, canonical_payload, now);
+        if let Err(err) = &result {
+            let mut status = self.status.write().unwrap();
+            status.stale = true;
+            status.last_refresh_at = Some(now);
+            status.last_refresh_success = false;
+            status.last_error = Some(err.to_string());
+            status.last_rejection_reason = Some(rejection_reason(err).to_string());
+        }
+        result
+    }
+
+    fn apply_update_inner(
+        &self,
+        envelope: &CatalogEnvelope,
+        canonical_payload: &[u8],
+        now: u64,
+    ) -> Result<Arc<RegistrySnapshot>, CatalogError> {
+        let _apply = self.apply_lock.lock().unwrap();
+        let settings = self.settings.read().unwrap().as_ref().and_then(|s| s.upgrade());
+        let _settings_write = settings.as_ref().map(|s| s.composition_lock());
         let current_active = self.active_snapshot.load();
         let lkg_ver = self.status().lkg_version;
 
@@ -274,27 +307,24 @@ impl CatalogManager {
             self.config.allowed_clock_skew_secs,
         )?;
 
-        // Write verified LKG cache atomically
-        self.lkg_cache
-            .write_atomically(envelope, canonical_payload)?;
-
         verified_snapshot.source = CatalogSource::RemoteSigned;
         let new_snapshot = Arc::new(verified_snapshot);
-
-        // Atomic swap
-        self.active_snapshot.store(new_snapshot.clone());
-
-        // Publish to unified runtime state atomically if bound
-        if let Ok(slot) = self.unified_runtime.read() {
-            if let Some(ref weak) = *slot {
-                if let Some(runtime) = weak.upgrade() {
-                    if let Err(err) = runtime.update_registry(new_snapshot.clone()) {
-                        tracing::warn!(
-                            "Failed to publish verified catalog to unified runtime state: {err}"
-                        );
-                    }
-                }
-            }
+        let composed = match settings.as_ref() {
+            Some(settings) => Arc::new(settings.current().validate_against_registry(&new_snapshot)
+                .map_err(|err| CatalogError::InvalidState(err.to_string()))?),
+            None => new_snapshot.clone(),
+        };
+        let commit = || -> anyhow::Result<()> {
+            self.lkg_cache.write_atomically(envelope, canonical_payload)?;
+            self.active_snapshot.store(new_snapshot.clone());
+            Ok(())
+        };
+        let runtime = self.unified_runtime.read().unwrap().as_ref().and_then(|r| r.upgrade());
+        if let Some(runtime) = runtime {
+            runtime.update_registry_with_commit(composed, commit)
+                .map_err(|err| CatalogError::InvalidState(err.to_string()))?;
+        } else {
+            commit().map_err(|err| CatalogError::InvalidState(err.to_string()))?;
         }
 
         // Update status

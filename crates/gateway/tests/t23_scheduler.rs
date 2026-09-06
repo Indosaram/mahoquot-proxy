@@ -15,11 +15,83 @@ use mahoquot_gateway::inbound::ApiKeys;
 use mahoquot_gateway::routes::create_app;
 use mahoquot_gateway::state::AppState;
 use mahoquot_gateway::usage::{AccountUsage, QuotaWindow};
-use mahoquot_types::Strategy;
+use mahoquot_types::{Health, Strategy};
 use tower::ServiceExt;
 
 static NEXT_PORT: AtomicU16 = AtomicU16::new(18840);
 const KEY: &str = "scheduler-test-key";
+
+#[test]
+fn expired_cooldown_rejoins_available_peer_without_bypassing_scheduler_policies() {
+    use mahoquot_gateway::account::load_account_members;
+    use mahoquot_gateway::scheduler::{SchedulerRegistry, SchedulerSettings};
+
+    let auth_dir = unique_temp_dir("mahoquot-scheduler-cooldown");
+    let result = std::panic::catch_unwind(|| {
+        write_account(&auth_dir, "a", "http://127.0.0.1:18899");
+        write_account(&auth_dir, "b", "http://127.0.0.1:18899");
+        let members = load_account_members(&auth_dir).unwrap();
+        let a = members.iter().find(|member| member.id == "a").unwrap();
+        for member in &members {
+            member.set_usage(usage(60, i64::MAX));
+        }
+        let scheduler = SchedulerRegistry::load(&auth_dir.join("config.yaml"), &members);
+        let settings = SchedulerSettings {
+            enabled: true,
+            priorities: [("a".to_string(), 0), ("b".to_string(), 1)].into(),
+        };
+        for health in [
+            Health::Cooldown { until_unix_ms: i64::MAX },
+            Health::Disabled,
+            Health::AuthFailed,
+        ] {
+            a.set_health(health);
+            let snapshot = scheduler.update_settings(settings.clone(), &members).unwrap();
+            assert_eq!(snapshot.selected.as_deref(), Some("b"), "{health:?}");
+            assert_eq!(snapshot.order, ["b"]);
+            assert!(!snapshot.fail_open);
+            assert!(!scheduler.permits("a"));
+        }
+
+        a.set_health(Health::Cooldown { until_unix_ms: 0 });
+        scheduler.reconcile(&members);
+        let snapshot = scheduler.snapshot();
+        assert_eq!(snapshot.selected.as_deref(), Some("a"), "expired cooldown must rejoin");
+        assert_eq!(snapshot.order, ["a", "b"]);
+        assert!(!snapshot.fail_open);
+        assert!(scheduler.permits("a"));
+
+        let reversed = SchedulerSettings {
+            priorities: [("a".to_string(), 1), ("b".to_string(), 0)].into(),
+            ..settings.clone()
+        };
+        let snapshot = scheduler.update_settings(reversed, &members).unwrap();
+        assert_eq!(snapshot.selected.as_deref(), Some("b"));
+        assert_eq!(snapshot.order, ["b", "a"]);
+
+        scheduler.update_settings(settings, &members).unwrap();
+        for _ in 0..3 {
+            scheduler.record_non_auth_failure("a", &members);
+        }
+        assert_eq!(scheduler.snapshot().order, ["b"]);
+        scheduler.record_success("a", &members);
+        assert_eq!(scheduler.snapshot().selected.as_deref(), Some("a"));
+
+        // Inject a hold timestamp, rather than waiting for its ten-minute deadline.
+        std::fs::write(
+            auth_dir.join("scheduler-state.json"),
+            serde_json::json!({"exhausted_since_unix": {"a": i64::MAX}}).to_string(),
+        ).unwrap();
+        let held = SchedulerRegistry::load(&auth_dir.join("config.yaml"), &members);
+        assert_eq!(held.snapshot().selected.as_deref(), Some("b"));
+        assert_eq!(held.snapshot().order, ["b"]);
+        assert!(!held.permits("a"));
+    });
+    std::fs::remove_dir_all(auth_dir).unwrap();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
 
 async fn bind_test_listener() -> tokio::net::TcpListener {
     for _ in 18840..=18899 {

@@ -123,7 +123,7 @@ mod edge_tests {
         );
         assert_eq!(
             derive_identity_slug_from_filename("codex-a-b-c-d.json"),
-            "a-b-c"
+            "a-b-c-d"
         );
         assert_eq!(
             derive_identity_slug_from_filename("fixture.json"),
@@ -131,14 +131,33 @@ mod edge_tests {
         );
         assert_eq!(
             derive_identity_slug_from_filename("fixtures-plus.json"),
-            "fixtures"
+            "fixtures-plus"
         );
         assert_eq!(derive_identity_slug_from_filename("codex-.json"), "");
         assert_eq!(
             derive_identity_slug_from_filename("noextension"),
             "noextension"
         );
-        assert_eq!(derive_identity_slug_from_filename("no-extension"), "no");
+        assert_eq!(derive_identity_slug_from_filename("no-extension"), "no-extension");
+        for plan in ["pro", "plus", "team", "free"] {
+            assert_eq!(
+                derive_identity_slug_from_filename(&format!("codex-team-alpha-{plan}.json")),
+                "team-alpha"
+            );
+            assert_eq!(
+                derive_identity_slug_from_filename(&format!("team-alpha-{plan}.json")),
+                format!("team-alpha-{plan}")
+            );
+        }
+        for filename in ["a-b-c-d.json", "claude-team-alpha.json", "codex-team-alpha-enterprise.json"] {
+            let expected = filename.strip_prefix("codex-").unwrap_or(filename)
+                .strip_suffix(".json").unwrap();
+            assert_eq!(derive_identity_slug_from_filename(filename), expected);
+        }
+        assert_ne!(
+            derive_identity_slug_from_filename("claude-team-alpha.json"),
+            derive_identity_slug_from_filename("claude-team-beta.json")
+        );
     }
 
     #[test]

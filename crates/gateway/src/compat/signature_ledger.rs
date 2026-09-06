@@ -13,7 +13,6 @@
 //! entry, an expired entry, or a gateway restart lands.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -22,7 +21,6 @@ const MAX_BYTES: usize = 32 * 1024 * 1024;
 const TTL: Duration = Duration::from_secs(60 * 60);
 
 static STORE: LazyLock<Mutex<Store>> = LazyLock::new(|| Mutex::new(Store::default()));
-static SYNTHETIC_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 struct Entry {
     arguments: String,
@@ -117,8 +115,7 @@ pub fn recall(call_id: &str, name: &str, arguments: &str) -> Option<String> {
 /// Process-unique: a per-response index repeats across responses and binds
 /// unrelated tool results to the same call.
 pub fn synthetic_call_id(name: &str) -> String {
-    let sequence = SYNTHETIC_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    format!("call_{name}_{sequence}")
+    format!("call_{name}_{}", uuid::Uuid::new_v4().simple())
 }
 
 #[cfg(test)]
@@ -154,11 +151,25 @@ mod tests {
 
     #[test]
     fn the_oldest_entries_are_evicted_past_capacity() {
-        remember("ledger-evicted", "tool", "{}", "SIG-OLD");
+        let mut store = Store::default();
+        let entry = || Entry {
+            arguments: "{}".to_string(),
+            signature: "SIG-FILL".to_string(),
+            stored_at: Instant::now(),
+        };
+        let oldest = key("ledger-evicted", "tool");
+        store.insert(oldest.clone(), entry());
         for index in 0..MAX_ENTRIES {
-            remember(&format!("ledger-fill-{index}"), "tool", "{}", "SIG-FILL");
+            store.insert(key(&format!("ledger-fill-{index}"), "tool"), entry());
         }
-        assert_eq!(recall("ledger-evicted", "tool", "{}"), None);
+        assert!(!store.entries.contains_key(&oldest));
+        assert_eq!(store.entries.len(), MAX_ENTRIES);
+        assert_eq!(store.order.len(), MAX_ENTRIES);
+        assert!(store.bytes <= MAX_BYTES);
+        assert_eq!(
+            store.bytes,
+            store.entries.iter().map(|(key, entry)| entry.weight(key)).sum::<usize>()
+        );
     }
 
     #[test]

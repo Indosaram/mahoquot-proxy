@@ -62,10 +62,12 @@ fn note_edit(state: &AppState, what: &str) {
     super::observability::append_log_line(&settings, &line);
 }
 
-pub fn apply_edit(
+pub async fn apply_edit(
     state: &Arc<AppState>,
-    edit: impl FnOnce(&mut super::settings::Settings) -> Result<(), Refusal>,
+    edit: impl FnOnce(&mut super::settings::Settings) -> Result<(), Refusal> + Send + 'static,
 ) -> Response {
+    let state = Arc::clone(state);
+    match tokio::task::spawn_blocking(move || {
     let mut refusal = None;
     let outcome = state.settings.mutate(|settings| {
         let mut candidate = settings.clone();
@@ -81,7 +83,7 @@ pub fn apply_edit(
     }
     match outcome {
         Ok(_) => {
-            note_edit(state, "config updated");
+            note_edit(&state, "config updated");
             saved()
         }
         Err(super::settings::SettingsError::Validation(err)) => (
@@ -94,6 +96,10 @@ pub fn apply_edit(
             Json(serde_json::json!({ "error": err })),
         )
             .into_response(),
+        Err(err) => persist_failed(err),
+    }
+    }).await {
+        Ok(response) => response,
         Err(err) => persist_failed(err),
     }
 }
@@ -109,7 +115,7 @@ async fn write_scalar(
     let Ok(body) = serde_json::from_slice::<Value>(&raw) else {
         return refusal_response(Refusal::InvalidBody);
     };
-    apply_edit(&state, |settings| (scalar.write)(settings, &body))
+    apply_edit(&state, move |settings| (scalar.write)(settings, &body)).await
 }
 
 async fn clear_scalar(
@@ -128,8 +134,7 @@ async fn clear_scalar(
             "channel not found"
         }));
     }
-    let provider = params.get("provider").map(String::as_str);
-    apply_edit(&state, |settings| clear(settings, provider))
+    apply_edit(&state, move |settings| clear(settings, params.get("provider").map(String::as_str))).await
 }
 
 fn patch_channel(raw: bytes::Bytes) -> Response {

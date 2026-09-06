@@ -159,9 +159,8 @@ async fn task_13_http_qa_scenario() {
             .unwrap();
     });
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5)).build().expect("bounded HTTP client");
     let images_url = format!("http://127.0.0.1:{QA_PORT}/v1/images/generations");
 
     let mut http_evidence = String::new();
@@ -295,17 +294,17 @@ async fn task_13_http_qa_scenario() {
 
     // Graceful shutdown
     let _ = shutdown_tx.send(());
-    server_handle.await.expect("server stopped");
+    tokio::time::timeout(Duration::from_secs(5), server_handle)
+        .await.expect("server shutdown deadline").expect("server stopped");
     upstream_task.abort();
-    std::fs::remove_dir_all(auth_dir).ok();
+    assert!(upstream_task.await.expect_err("upstream cancelled").is_cancelled());
+    drop(client);
+    drop(state);
+    std::fs::remove_dir_all(auth_dir).expect("remove fixture directory");
 
-    // Write evidence files to both repositories
     let proxy_evidence_dir =
-        PathBuf::from("/Users/indo/code/project/mahoquot-proxy/.omo/evidence/model-registry");
-    let quotio_evidence_dir =
-        PathBuf::from("/Users/indo/code/project/quotio-rs/.omo/evidence/model-registry");
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.omo/evidence/model-registry");
     std::fs::create_dir_all(&proxy_evidence_dir).expect("proxy evidence dir");
-    std::fs::create_dir_all(&quotio_evidence_dir).expect("quotio evidence dir");
 
     std::fs::write(
         proxy_evidence_dir.join("task-13-capabilities.http"),
@@ -313,9 +312,4 @@ async fn task_13_http_qa_scenario() {
     )
     .expect("wrote proxy evidence");
 
-    std::fs::write(
-        quotio_evidence_dir.join("task-13-capabilities.http"),
-        &http_evidence,
-    )
-    .expect("wrote quotio evidence");
 }

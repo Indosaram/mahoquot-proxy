@@ -8,9 +8,9 @@ access-control-allow-origin: *
 access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
 access-control-allow-headers: Authorization, Content-Type
 content-length: 1348
-date: Thu, 03 Sep 2026 05:08:25 GMT
+date: Sun, 06 Sep 2026 04:13:08 GMT
 
-{"data":[{"created":1788412105,"id":"claude-opus-4-6-thinking","object":"model","owned_by":"google"},{"created":1788412105,"id":"claude-sonnet-4-6","object":"model","owned_by":"google"},{"created":1788412105,"id":"gemini-3-flash","object":"model","owned_by":"google"},{"created":1788412105,"id":"gemini-3-flash-agent","object":"model","owned_by":"google"},{"created":1788412105,"id":"gemini-3.1-flash-image","object":"model","owned_by":"google"},{"created":1788412105,"id":"gemini-3.1-flash-lite","object":"model","owned_by":"google"},{"created":1788412105,"id":"gemini-3.1-pro-low","object":"model","owned_by":"google"},{"created":1788412105,"id":"gemini-3.5-flash-extra-low","object":"model","owned_by":"google"},{"created":1788412105,"id":"gemini-3.5-flash-low","object":"model","owned_by":"google"},{"created":1788412105,"id":"gemini-3.6-flash-high","object":"model","owned_by":"google"},{"created":1788412105,"id":"gemini-3.7-flash-high","object":"model","owned_by":"google"},{"created":1788412105,"id":"gemini-3.8-flash-high","object":"model","owned_by":"google"},{"created":1788412105,"id":"gemini-next-flash-high","object":"model","owned_by":"google"},{"created":1788412105,"id":"gemini-pro-agent","object":"model","owned_by":"google"},{"created":1788412105,"id":"gpt-oss-120b-medium","object":"model","owned_by":"google"}],"object":"list"}
+{"data":[{"created":1788667988,"id":"claude-opus-4-6-thinking","object":"model","owned_by":"google"},{"created":1788667988,"id":"claude-sonnet-4-6","object":"model","owned_by":"google"},{"created":1788667988,"id":"gemini-3-flash","object":"model","owned_by":"google"},{"created":1788667988,"id":"gemini-3-flash-agent","object":"model","owned_by":"google"},{"created":1788667988,"id":"gemini-3.1-flash-image","object":"model","owned_by":"google"},{"created":1788667988,"id":"gemini-3.1-flash-lite","object":"model","owned_by":"google"},{"created":1788667988,"id":"gemini-3.1-pro-low","object":"model","owned_by":"google"},{"created":1788667988,"id":"gemini-3.5-flash-extra-low","object":"model","owned_by":"google"},{"created":1788667988,"id":"gemini-3.5-flash-low","object":"model","owned_by":"google"},{"created":1788667988,"id":"gemini-3.6-flash-high","object":"model","owned_by":"google"},{"created":1788667988,"id":"gemini-3.7-flash-high","object":"model","owned_by":"google"},{"created":1788667988,"id":"gemini-3.8-flash-high","object":"model","owned_by":"google"},{"created":1788667988,"id":"gemini-next-flash-high","object":"model","owned_by":"google"},{"created":1788667988,"id":"gemini-pro-agent","object":"model","owned_by":"google"},{"created":1788667988,"id":"gpt-oss-120b-medium","object":"model","owned_by":"google"}],"object":"list"}
 
 ---
 
@@ -24,7 +24,7 @@ access-control-allow-origin: *
 access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
 access-control-allow-headers: Authorization, Content-Type
 content-length: 3911
-date: Thu, 03 Sep 2026 05:08:25 GMT
+date: Sun, 06 Sep 2026 04:13:08 GMT
 
 {"models":[{"description":"claude-opus-4-6-thinking","displayName":"claude-opus-4-6-thinking","name":"models/claude-opus-4-6-thinking","supportedGenerationMethods":["generateContent"],"supportedInputModalities":["text","image","audio","video"],"supportedOutputModalities":["text"]},{"description":"claude-sonnet-4-6","displayName":"claude-sonnet-4-6","name":"models/claude-sonnet-4-6","supportedGenerationMethods":["generateContent"],"supportedInputModalities":["text","image","audio","video"],"supportedOutputModalities":["text"]},{"description":"gemini-3-flash","displayName":"gemini-3-flash","name":"models/gemini-3-flash","supportedGenerationMethods":["generateContent"],"supportedInputModalities":["text","image","audio","video"],"supportedOutputModalities":["text"]},{"description":"gemini-3-flash-agent","displayName":"gemini-3-flash-agent","name":"models/gemini-3-flash-agent","supportedGenerationMethods":["generateContent"],"supportedInputModalities":["text","image","audio","video"],"supportedOutputModalities":["text"]},{"description":"gemini-3.1-flash-image","displayName":"gemini-3.1-flash-image","name":"models/gemini-3.1-flash-image","supportedGenerationMethods":["generateContent"],"supportedInputModalities":["text","image","audio","video"],"supportedOutputModalities":["text","image"]},{"description":"gemini-3.1-flash-lite","displayName":"gemini-3.1-flash-lite","name":"models/gemini-3.1-flash-lite","supportedGenerationMethods":["generateContent"],"supportedInputModalities":["text","image","audio","video"],"supportedOutputModalities":["text"]},{"description":"gemini-3.1-pro-low","displayName":"gemini-3.1-pro-low","name":"models/gemini-3.1-pro-low","supportedGenerationMethods":["generateContent"],"supportedInputModalities":["text","image","audio","video"],"supportedOutputModalities":["text"]},{"description":"gemini-3.5-flash-extra-low","displayName":"gemini-3.5-flash-extra-low","name":"models/gemini-3.5-flash-extra-low","supportedGenerationMethods":["generateContent"],"supportedInputModalities":["text","image","audio","video"],"supportedOutputModalities":["text"]},{"description":"gemini-3.5-flash-low","displayName":"gemini-3.5-flash-low","name":"models/gemini-3.5-flash-low","supportedGenerationMethods":["generateContent"],"supportedInputModalities":["text","image","audio","video"],"supportedOutputModalities":["text"]},{"description":"gemini-3.6-flash-high","displayName":"gemini-3.6-flash-high","name":"models/gemini-3.6-flash-high","supportedGenerationMethods":["generateContent"],"supportedInputModalities":["text","image","audio","video"],"supportedOutputModalities":["text"]},{"description":"gemini-3.7-flash-high","displayName":"gemini-3.7-flash-high","name":"models/gemini-3.7-flash-high","supportedGenerationMethods":["generateContent"],"supportedInputModalities":["text","image","audio","video"],"supportedOutputModalities":["text"]},{"description":"gemini-3.8-flash-high","displayName":"gemini-3.8-flash-high","name":"models/gemini-3.8-flash-high","supportedGenerationMethods":["generateContent"],"supportedInputModalities":["text","image","audio","video"],"supportedOutputModalities":["text"]},{"description":"gemini-next-flash-high","displayName":"gemini-next-flash-high","name":"models/gemini-next-flash-high","supportedGenerationMethods":["generateContent"],"supportedInputModalities":["text","image","audio","video"],"supportedOutputModalities":["text"]},{"description":"gemini-pro-agent","displayName":"gemini-pro-agent","name":"models/gemini-pro-agent","supportedGenerationMethods":["generateContent"],"supportedInputModalities":["text","image","audio","video"],"supportedOutputModalities":["text"]},{"description":"gpt-oss-120b-medium","displayName":"gpt-oss-120b-medium","name":"models/gpt-oss-120b-medium","supportedGenerationMethods":["generateContent"],"supportedInputModalities":["text","image","audio","video"],"supportedOutputModalities":["text"]}]}
 
@@ -40,7 +40,7 @@ access-control-allow-origin: *
 access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
 access-control-allow-headers: Authorization, Content-Type
 content-length: 215
-date: Thu, 03 Sep 2026 05:08:25 GMT
+date: Sun, 06 Sep 2026 04:13:08 GMT
 
 {"description":"gemini-next-flash-high","displayName":"gemini-next-flash-high","name":"models/gemini-next-flash-high","supportedInputModalities":["text","image","audio","video"],"supportedOutputModalities":["text"]}
 
@@ -61,7 +61,7 @@ access-control-allow-origin: *
 access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
 access-control-allow-headers: Authorization, Content-Type
 content-length: 1224
-date: Thu, 03 Sep 2026 05:08:25 GMT
+date: Sun, 06 Sep 2026 04:13:08 GMT
 
 {"models":{"data":[{"created":0,"id":"claude-opus-4-6-thinking","object":"model","owned_by":"google"},{"created":0,"id":"claude-sonnet-4-6","object":"model","owned_by":"google"},{"created":0,"id":"gemini-3-flash","object":"model","owned_by":"google"},{"created":0,"id":"gemini-3-flash-agent","object":"model","owned_by":"google"},{"created":0,"id":"gemini-3.1-flash-image","object":"model","owned_by":"google"},{"created":0,"id":"gemini-3.1-flash-lite","object":"model","owned_by":"google"},{"created":0,"id":"gemini-3.1-pro-low","object":"model","owned_by":"google"},{"created":0,"id":"gemini-3.5-flash-extra-low","object":"model","owned_by":"google"},{"created":0,"id":"gemini-3.5-flash-low","object":"model","owned_by":"google"},{"created":0,"id":"gemini-3.6-flash-high","object":"model","owned_by":"google"},{"created":0,"id":"gemini-3.7-flash-high","object":"model","owned_by":"google"},{"created":0,"id":"gemini-3.8-flash-high","object":"model","owned_by":"google"},{"created":0,"id":"gemini-next-flash-high","object":"model","owned_by":"google"},{"created":0,"id":"gemini-pro-agent","object":"model","owned_by":"google"},{"created":0,"id":"gpt-oss-120b-medium","object":"model","owned_by":"google"}],"object":"list"}}
 
@@ -82,7 +82,7 @@ access-control-allow-origin: *
 access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
 access-control-allow-headers: Authorization, Content-Type
 content-length: 32
-date: Thu, 03 Sep 2026 05:08:25 GMT
+date: Sun, 06 Sep 2026 04:13:08 GMT
 
 {"channel":"stable","models":[]}
 
@@ -98,7 +98,7 @@ access-control-allow-origin: *
 access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
 access-control-allow-headers: Authorization, Content-Type
 content-length: 27
-date: Thu, 03 Sep 2026 05:08:25 GMT
+date: Sun, 06 Sep 2026 04:13:08 GMT
 
 {"data":[],"object":"list"}
 
@@ -114,7 +114,7 @@ access-control-allow-origin: *
 access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
 access-control-allow-headers: Authorization, Content-Type
 content-length: 13
-date: Thu, 03 Sep 2026 05:08:25 GMT
+date: Sun, 06 Sep 2026 04:13:08 GMT
 
 {"models":[]}
 
@@ -130,7 +130,7 @@ access-control-allow-origin: *
 access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
 access-control-allow-headers: Authorization, Content-Type
 content-length: 142
-date: Thu, 03 Sep 2026 05:08:25 GMT
+date: Sun, 06 Sep 2026 04:13:08 GMT
 
 {"error":{"code":404,"message":"models/gemini-next-flash-high is not found or your account does not have access to it.","status":"NOT_FOUND"}}
 

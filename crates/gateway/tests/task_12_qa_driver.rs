@@ -142,8 +142,6 @@ async fn task_12_http_qa_scenario() {
             .unwrap();
     });
 
-    // Give server a moment to start
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
@@ -472,26 +470,24 @@ async fn task_12_http_qa_scenario() {
 
     assert_eq!(single_dis_status, reqwest::StatusCode::NOT_FOUND);
 
-    // Save evidence to both repositories
-    let evidence_path_proxy =
-        PathBuf::from("/Users/indo/code/project/mahoquot-proxy/.omo/evidence/model-registry/task-12-model-apis.http");
-    let evidence_path_quotio = PathBuf::from(
-        "/Users/indo/code/project/quotio-rs/.omo/evidence/model-registry/task-12-model-apis.http",
-    );
-
-    std::fs::write(&evidence_path_proxy, &http_evidence).expect("wrote evidence to mahoquot-proxy");
-    std::fs::write(&evidence_path_quotio, &http_evidence).expect("wrote evidence to quotio-rs");
+    let evidence_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../.omo/evidence/model-registry");
+    std::fs::create_dir_all(&evidence_dir).expect("evidence directory");
+    std::fs::write(evidence_dir.join("task-12-model-apis.http"), &http_evidence)
+        .expect("wrote evidence to current workspace");
 
     // Graceful cleanup
     let _ = shutdown_tx.send(());
-    let _ = server_handle.await;
+    tokio::time::timeout(Duration::from_secs(5), server_handle)
+        .await.expect("server shutdown deadline").expect("server stopped");
 
-    // Verify port 18873 is released
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Verify port 18873 is released after the server has joined.
     let bind_check = tokio::net::TcpListener::bind(format!("127.0.0.1:{QA_PORT}")).await;
     assert!(bind_check.is_ok(), "port 18873 must be cleanly released");
     drop(bind_check);
 
     // Remove temp directory
-    let _ = std::fs::remove_dir_all(&dir);
+    drop(client);
+    drop(state);
+    std::fs::remove_dir_all(&dir).expect("remove fixture directory");
 }

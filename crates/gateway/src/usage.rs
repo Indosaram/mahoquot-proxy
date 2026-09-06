@@ -53,6 +53,19 @@ pub struct QuotaGroup {
     pub buckets: Vec<QuotaBucket>,
 }
 
+/// One banked rate-limit reset credit.
+///
+/// Codex grants these with a fixed life (30 days at the time of writing), so
+/// an unspent credit lapses silently unless its expiry travels alongside the
+/// count. `wham/usage` reports only the aggregate, which is why this detail
+/// comes from the dedicated reset-credit endpoint.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ResetCredit {
+    pub granted_at_unix: Option<i64>,
+    pub expires_at_unix: Option<i64>,
+    pub status: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct AccountUsage {
     pub plan_type: Option<String>,
@@ -67,6 +80,11 @@ pub struct AccountUsage {
     pub has_credits: Option<bool>,
     /// Reset credits left; spending one force-resets the 5h window.
     pub reset_credits_available: Option<i64>,
+    /// Per-credit grant/expiry detail, soonest expiry first. Empty whenever
+    /// the account has no credits or the detail endpoint could not be read;
+    /// `reset_credits_available` stays the authoritative count either way.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reset_credits: Vec<ResetCredit>,
     /// Unix seconds when these headers were observed; `None` means never seen.
     pub observed_at_unix: Option<i64>,
     /// Cumulative relay counters (claude relay deployments).
@@ -724,6 +742,62 @@ pub struct WhamResetCredits {
     pub available_count: Option<i64>,
 }
 
+/// Wire shape of `GET https://chatgpt.com/backend-api/wham/rate-limit-reset-credits`.
+///
+/// The usage endpoint reports how many credits exist; this one is the only
+/// source for when each of them expires.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct WhamResetCreditList {
+    #[serde(default)]
+    pub available_count: Option<i64>,
+    #[serde(default)]
+    pub credits: Vec<WhamResetCreditEntry>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct WhamResetCreditEntry {
+    #[serde(default)]
+    pub granted_at: Option<String>,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+}
+
+/// Statuses that mean the credit is gone. Anything else - including a status
+/// this build has never seen - is kept, because dropping an unknown state
+/// would hide a credit the account can still spend.
+fn reset_credit_is_spent(status: &str) -> bool {
+    matches!(
+        status.trim().to_ascii_lowercase().as_str(),
+        "redeemed" | "consumed" | "expired" | "revoked"
+    )
+}
+
+impl WhamResetCreditList {
+    /// Credits that can still be spent, soonest expiry first.
+    ///
+    /// The endpoint returns history, so spent and lapsed entries are dropped;
+    /// counting them would promise resets the account no longer has. An entry
+    /// with no expiry sorts last rather than being discarded - unknown is not
+    /// the same as imminent.
+    pub fn into_available(self, now_unix: i64) -> Vec<ResetCredit> {
+        let mut credits: Vec<ResetCredit> = self
+            .credits
+            .into_iter()
+            .filter(|c| !c.status.as_deref().is_some_and(reset_credit_is_spent))
+            .map(|c| ResetCredit {
+                granted_at_unix: c.granted_at.as_deref().and_then(parse_offset_datetime_unix),
+                expires_at_unix: c.expires_at.as_deref().and_then(parse_offset_datetime_unix),
+                status: c.status,
+            })
+            .filter(|c| c.expires_at_unix.is_none_or(|at| at > now_unix))
+            .collect();
+        credits.sort_by_key(|c| c.expires_at_unix.unwrap_or(i64::MAX));
+        credits
+    }
+}
+
 impl WhamUsage {
     pub fn into_account_usage(self, now_unix: i64) -> AccountUsage {
         let to_window = |w: WhamWindow| QuotaWindow {
@@ -820,6 +894,7 @@ pub struct ResponseTokenUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_input_tokens: u64,
+    pub cache_write_tokens: u64,
     pub reasoning_tokens: u64,
 }
 
@@ -834,20 +909,61 @@ pub fn extract_response_token_usage(head: &[u8], tail: &[u8]) -> Option<Response
         let prompt = object_number(&usage, &["prompt_tokens"]);
         let completion = object_number(&usage, &["completion_tokens"]);
         if prompt.is_some() || completion.is_some() {
+            let cached_input_tokens = nested_object_number(
+                &usage,
+                "input_tokens_details",
+                "cached_tokens",
+            )
+            .or_else(|| {
+                nested_object_number(&usage, "prompt_tokens_details", "cached_tokens")
+            })
+            .or_else(|| object_number(&usage, &["cache_read_input_tokens", "cache_read_tokens"]))
+            .unwrap_or(0);
+            let cache_write_tokens = nested_object_number(
+                &usage,
+                "prompt_tokens_details",
+                "cache_creation_tokens",
+            )
+            .or_else(|| {
+                nested_object_number(&usage, "prompt_tokens_details", "cache_write_tokens")
+            })
+            .or_else(|| {
+                nested_object_number(
+                    &usage,
+                    "prompt_tokens_details",
+                    "cache_creation_input_tokens",
+                )
+            })
+            .or_else(|| {
+                nested_object_number(&usage, "input_tokens_details", "cache_creation_tokens")
+            })
+            .or_else(|| {
+                nested_object_number(&usage, "input_tokens_details", "cache_write_tokens")
+            })
+            .or_else(|| {
+                object_number(
+                    &usage,
+                    &[
+                        "cache_creation_input_tokens",
+                        "cache_write_tokens",
+                        "cache_creation_tokens",
+                    ],
+                )
+            })
+            .unwrap_or(0);
             return Some(ResponseTokenUsage {
                 input_tokens: prompt.unwrap_or(0),
                 output_tokens: completion.unwrap_or(0),
-                cached_input_tokens: nested_object_number(
-                    &usage,
-                    "input_tokens_details",
-                    "cached_tokens",
-                )
-                .unwrap_or(0),
+                cached_input_tokens,
+                cache_write_tokens,
                 reasoning_tokens: nested_object_number(
                     &usage,
                     "output_tokens_details",
                     "reasoning_tokens",
                 )
+                .or_else(|| {
+                    nested_object_number(&usage, "completion_tokens_details", "reasoning_tokens")
+                })
                 .unwrap_or(0),
             });
         }
@@ -858,10 +974,30 @@ pub fn extract_response_token_usage(head: &[u8], tail: &[u8]) -> Option<Response
         // branch must never swallow Claude's head-side `cache_read_input_tokens`.
         if let Some(cached) = nested_object_number(&usage, "input_tokens_details", "cached_tokens")
         {
+            let cache_write_tokens = nested_object_number(
+                &usage,
+                "input_tokens_details",
+                "cache_creation_tokens",
+            )
+            .or_else(|| {
+                nested_object_number(&usage, "input_tokens_details", "cache_write_tokens")
+            })
+            .or_else(|| {
+                object_number(
+                    &usage,
+                    &[
+                        "cache_creation_input_tokens",
+                        "cache_write_tokens",
+                        "cache_creation_tokens",
+                    ],
+                )
+            })
+            .unwrap_or(0);
             return Some(ResponseTokenUsage {
                 input_tokens: object_number(&usage, &["input_tokens"]).unwrap_or(0),
                 output_tokens: object_number(&usage, &["output_tokens"]).unwrap_or(0),
                 cached_input_tokens: cached,
+                cache_write_tokens,
                 reasoning_tokens: nested_object_number(
                     &usage,
                     "output_tokens_details",
@@ -880,6 +1016,7 @@ pub fn extract_response_token_usage(head: &[u8], tail: &[u8]) -> Option<Response
                 output_tokens: completion.unwrap_or(0),
                 cached_input_tokens: object_number(&usage, &["cachedContentTokenCount"])
                     .unwrap_or(0),
+                cache_write_tokens: 0,
                 reasoning_tokens: object_number(&usage, &["thoughtsTokenCount"]).unwrap_or(0),
             });
         }
@@ -891,6 +1028,8 @@ pub fn extract_response_token_usage(head: &[u8], tail: &[u8]) -> Option<Response
             input_tokens: input.unwrap_or(0),
             output_tokens: output.unwrap_or(0),
             cached_input_tokens: last_number_after(head, b"\"cache_read_input_tokens\"")
+                .unwrap_or(0),
+            cache_write_tokens: last_number_after(head, b"\"cache_creation_input_tokens\"")
                 .unwrap_or(0),
             reasoning_tokens: 0,
         });
@@ -1324,6 +1463,18 @@ mod tests {
         assert_eq!(usage.input_tokens, 21);
         assert_eq!(usage.output_tokens, 9);
         assert_eq!(usage.cached_input_tokens, 19);
+        assert_eq!(usage.cache_write_tokens, 0);
+    }
+
+    #[test]
+    fn extract_reads_claude_cache_creation_input_tokens_as_cache_write_tokens() {
+        let head = b"event: message_start\ndata: {\"message\":{\"usage\":{\"input_tokens\":100,\"cache_read_input_tokens\":20,\"cache_creation_input_tokens\":50}}}\n\n";
+        let tail = b"event: message_delta\ndata: {\"usage\":{\"output_tokens\":10}}\n\n";
+        let usage = extract_response_token_usage(head, tail).expect("claude usage");
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 10);
+        assert_eq!(usage.cached_input_tokens, 20);
+        assert_eq!(usage.cache_write_tokens, 50);
     }
 
     #[test]
@@ -1415,6 +1566,61 @@ mod tests {
         assert_eq!(a.credits_balance, Some(0.0));
         assert_eq!(a.credits_unlimited, Some(false));
         assert_eq!(a.reset_credits_available, Some(0));
+    }
+
+    // Shape taken from GET /backend-api/wham/rate-limit-reset-credits: a
+    // history list, so spent and lapsed entries arrive alongside live ones.
+    const LIVE_RESET_CREDITS: &str = r#"{
+      "available_count": 2,
+      "credits": [
+        {"granted_at": "2026-06-17T17:38:38Z", "expires_at": "2026-07-17T17:38:38Z",
+         "status": "available"},
+        {"granted_at": "2026-06-01T09:00:00+00:00", "expires_at": "2026-07-01T09:00:00+00:00",
+         "status": "redeemed"},
+        {"granted_at": "2026-06-10T00:00:00Z", "expires_at": "2026-07-10T00:00:00Z",
+         "status": "available"}
+      ]
+    }"#;
+
+    #[test]
+    fn reset_credits_drop_spent_entries_and_sort_by_expiry() {
+        let list: WhamResetCreditList = serde_json::from_str(LIVE_RESET_CREDITS).expect("parse");
+        // 2026-06-20T00:00:00Z: every listed credit is still in its window.
+        let credits = list.into_available(1_781_913_600);
+        assert_eq!(credits.len(), 2);
+        assert_eq!(
+            credits[0].expires_at_unix,
+            parse_rfc3339_unix("2026-07-10T00:00:00Z")
+        );
+        assert_eq!(
+            credits[1].expires_at_unix,
+            parse_rfc3339_unix("2026-07-17T17:38:38Z")
+        );
+        assert_eq!(
+            credits[0].granted_at_unix,
+            parse_rfc3339_unix("2026-06-10T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn reset_credits_drop_lapsed_entries_but_keep_unknown_expiry() {
+        let list: WhamResetCreditList = serde_json::from_str(
+            r#"{"credits":[{"expires_at":"2026-07-10T00:00:00Z"},{"status":"available"}]}"#,
+        )
+        .expect("parse");
+        // 2026-08-01T00:00:00Z: the dated credit has lapsed, the undated one
+        // is unknown rather than expired and must survive.
+        let credits = list.into_available(1_785_542_400);
+        assert_eq!(credits.len(), 1);
+        assert_eq!(credits[0].expires_at_unix, None);
+    }
+
+    #[test]
+    fn account_usage_without_credit_detail_stays_empty() {
+        let a = serde_json::from_str::<WhamUsage>(LIVE_WHAM)
+            .expect("parse")
+            .into_account_usage(1);
+        assert!(a.reset_credits.is_empty());
     }
 
     #[test]

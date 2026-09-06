@@ -34,10 +34,12 @@ struct Fixture {
     state: Arc<AppState>,
     app: Router,
     dir: std::path::PathBuf,
+    server: tokio::task::JoinHandle<()>,
 }
 
 impl Drop for Fixture {
     fn drop(&mut self) {
+        self.server.abort();
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -111,8 +113,8 @@ async fn json_body(response: Response) -> Value {
 }
 
 /// A codex-shaped upstream that always answers with a completed SSE turn
-/// carrying usage. Bound on an ephemeral port so tests never collide.
-async fn spawn_upstream() -> String {
+/// carrying usage. Bound in the reserved fixture port range.
+async fn spawn_upstream() -> (String, tokio::task::JoinHandle<()>) {
     const SSE: &str = concat!(
         "event: response.created\n",
         "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_t27\"}}\n\n",
@@ -133,31 +135,35 @@ async fn spawn_upstream() -> String {
                 .expect("upstream response")
         }),
     );
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .expect("bind t27 upstream");
+    let mut bound = None;
+    for port in 18840..=18869 {
+        if let Ok(listener) = tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+            bound = Some(listener);
+            break;
+        }
+    }
+    let listener = bound.expect("bind t27 upstream in reserved range");
     let address = listener.local_addr().expect("upstream address");
-    tokio::spawn(async move {
+    let server = tokio::spawn(async move {
         axum::serve(listener, app)
             .await
             .expect("serve t27 upstream");
     });
-    format!("http://{address}")
+    (format!("http://{address}"), server)
 }
 
 /// A gateway with one codex account pointed at `upstream`, guarded by the
 /// master key. Scoped keys are minted per test through the control plane.
 async fn fixture(label: &str) -> Fixture {
-    let upstream = spawn_upstream().await;
+    let (upstream, server) = spawn_upstream().await;
     let dir = unique_temp_dir(&format!("qg-t27-{label}"));
+    let mut credential: Value = serde_json::from_str(&create_auth_file_json(
+        "t27-account", "account-27", "upstream-token", Some(&upstream),
+    )).unwrap();
+    credential["usage_override"] = json!(upstream);
     std::fs::write(
         dir.join("codex-t27.json"),
-        create_auth_file_json(
-            "t27-account",
-            "account-27",
-            "upstream-token",
-            Some(&upstream),
-        ),
+        credential.to_string(),
     )
     .expect("credential fixture");
     let config_path = dir.join("config.yaml");
@@ -171,7 +177,90 @@ async fn fixture(label: &str) -> Fixture {
     };
     let state = Arc::new(AppState::new(&config).expect("gateway state"));
     let app = create_app(Arc::clone(&state));
-    Fixture { state, app, dir }
+    Fixture { state, app, dir, server }
+}
+
+#[tokio::test]
+async fn query_identity_enforces_scope_catalogue_and_live_budget() {
+    let fixture = fixture("query").await;
+    let (raw, _) = mint(&fixture, json!({"name":"query", "allowed_models":["gpt-5.6-sol"], "token_limit":18})).await;
+    let send = |method: &str, path: &str, body: Value| {
+        Request::builder().method(method).uri(format!("{path}?key={raw}"))
+            .header("content-type", "application/json").body(Body::from(body.to_string())).unwrap()
+    };
+    for path in ["/v1/models", "/models"] {
+        let models = json_body(fixture.send(send("GET", path, Value::Null)).await).await;
+        assert_eq!(models["data"].as_array().unwrap().len(), 1, "query catalogue scope");
+    }
+    for path in ["/v1/chat/completions", "/v1/messages", "/v1/messages/count_tokens", "/v1/responses", "/backend-api/codex/responses"] {
+        assert_eq!(fixture.send(send("POST", path, json!({"model":"forbidden","messages":[{"role":"user","content":"hi"}],"input":"hi","max_tokens":16}))).await.status(), StatusCode::FORBIDDEN, "{path}");
+    }
+    let payload = json!({"model":"gpt-5.6-sol","stream":false,"messages":[{"role":"user","content":"hi"}]});
+    assert_eq!(fixture.send(send("POST", "/v1/chat/completions", payload.clone())).await.status(), StatusCode::OK);
+    assert_eq!(fixture.state.scoped_keys.get(&stable_key_identifier(&raw)).unwrap().token_used(), 18);
+    fixture.state.history.flush().unwrap();
+    let history = fixture.state.history.store().unwrap().query(&mahoquot_gateway::request_history::HistoryQuery {
+        key_identifiers: vec![stable_key_identifier(&raw)], ..Default::default()
+    }).unwrap();
+    assert_eq!(history.totals.requests, 1);
+    assert_eq!(history.totals.total_tokens, 18);
+    assert_eq!(fixture.send(send("POST", "/v1/chat/completions", payload)).await.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn query_scope_accounts_providers_bindings_and_header_precedence() {
+    let fixture = fixture("query-scopes").await;
+    for scope in [json!({"name":"provider","allowed_providers":["claude"]}), json!({"name":"account","allowed_accounts":["absent"]})] {
+        let (raw, _) = mint(&fixture, scope).await;
+        let mut req = request("POST", &format!("/v1/chat/completions?key={raw}"), &raw,
+            Body::from(json!({"model":"gpt-5.6-sol","messages":[{"role":"user","content":"hi"}]}).to_string()));
+        req.headers_mut().remove("authorization");
+        assert_eq!(fixture.send(req).await.status(), StatusCode::FORBIDDEN);
+        for path in ["/v1/models", "/v1beta/models"] {
+            let mut req = request("GET", &format!("{path}?key={raw}"), &raw, Body::empty());
+            req.headers_mut().remove("authorization");
+            let result = json_body(fixture.send(req).await).await;
+            let rows = result.get("data").or_else(|| result.get("models")).unwrap().as_array().unwrap();
+            assert!(rows.is_empty());
+        }
+        let response = fixture.get(&format!("/v1/models?key={raw}"), MASTER).await;
+        assert!(json_body(response).await["data"].as_array().unwrap().len() > 1);
+    }
+    let (raw, _) = mint(&fixture, json!({"name":"bound"})).await;
+    fixture.state.settings.mutate(|settings| {
+        settings.api_key_bindings.push(mahoquot_gateway::management::settings::ApiKeyBinding {
+            key_identifier: stable_key_identifier(&raw), account: Some("absent".into()), provider: None,
+        });
+    }).unwrap();
+    let req = Request::post(format!("/v1/chat/completions?key={raw}"))
+        .header("content-type", "application/json")
+        .body(Body::from(json!({"model":"gpt-5.6-sol","messages":[{"role":"user","content":"hi"}]}).to_string())).unwrap();
+    assert_eq!(fixture.send(req).await.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn query_auth_real_http_forbidden_and_filtered_models() {
+    let fixture = fixture("query-http").await;
+    let (raw, _) = mint(&fixture, json!({"name":"http","allowed_models":["gpt-5.6-sol"]})).await;
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = fixture.app.clone();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)).build().unwrap();
+    let result = async {
+        let response = client.post(format!("http://127.0.0.1:{port}/v1/chat/completions?key={raw}"))
+            .json(&json!({"model":"forbidden","messages":[{"role":"user","content":"hi"}]})).send().await?;
+        let status = response.status();
+        let models: Value = client.get(format!("http://127.0.0.1:{port}/v1/models?key={raw}"))
+            .send().await?.json().await?;
+        Ok::<_, reqwest::Error>((status, models))
+    }.await;
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
+    let (status, models) = result.unwrap();
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(models["data"].as_array().unwrap().len(), 1);
+    assert_eq!(models["data"][0]["id"], "gpt-5.6-sol");
 }
 
 /// Mint a scoped key through the control plane and return `(raw key, id)`.
@@ -468,6 +557,39 @@ async fn an_account_outside_the_allow_list_leaves_no_eligible_account() {
     // then only the pinned-to-a-real-account key is routed
     assert_eq!(refused.status(), StatusCode::FORBIDDEN);
     assert_eq!(served.status(), StatusCode::OK);
+
+    // and matching by file_name or email also admits the resident account
+    let (by_file, _) = mint(
+        &fixture,
+        json!({ "name": "by-file", "allowed_accounts": ["codex-t27.json"] }),
+    )
+    .await;
+    let served_by_file = fixture.relay(&by_file, "gpt-5.6-sol").await;
+    assert_eq!(served_by_file.status(), StatusCode::OK);
+
+    let (by_stem, _) = mint(
+        &fixture,
+        json!({ "name": "by-stem", "allowed_accounts": ["codex-t27"] }),
+    )
+    .await;
+    let served_by_stem = fixture.relay(&by_stem, "gpt-5.6-sol").await;
+    assert_eq!(served_by_stem.status(), StatusCode::OK);
+
+    let (by_email, _) = mint(
+        &fixture,
+        json!({ "name": "by-email", "allowed_accounts": ["t27-account"] }),
+    )
+    .await;
+    let served_by_email = fixture.relay(&by_email, "gpt-5.6-sol").await;
+    assert_eq!(served_by_email.status(), StatusCode::OK);
+
+    let (by_acc_id, _) = mint(
+        &fixture,
+        json!({ "name": "by-acc-id", "allowed_accounts": ["account-27"] }),
+    )
+    .await;
+    let served_by_acc_id = fixture.relay(&by_acc_id, "gpt-5.6-sol").await;
+    assert_eq!(served_by_acc_id.status(), StatusCode::OK);
 }
 
 #[tokio::test]

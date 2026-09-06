@@ -179,9 +179,15 @@ async fn patch_scoped_key(
     Path(id): Path<String>,
     Json(payload): Json<PatchScopedKeyRequest>,
 ) -> Response {
-    let mut updated_view: Option<ScopedKeyView> = None;
-    let result = state.settings.mutate(|s| {
+    let settings = Arc::clone(&state.settings);
+    let tracker = Arc::clone(&state.scoped_keys);
+    let task = tokio::task::spawn_blocking(move || {
+      let mut updated_view: Option<ScopedKeyView> = None;
+      let result = settings.mutate(|s| {
         if let Some(key) = s.scoped_api_keys.iter_mut().find(|k| k.id == id) {
+            if let Some(entry) = tracker.get(&key.key_identifier) {
+                key.token_used = key.token_used.max(entry.token_used());
+            }
             if let Some(name) = payload.name {
                 key.name = name.trim().to_string();
             }
@@ -190,6 +196,7 @@ async fn patch_scoped_key(
                 if !trimmed.is_empty() {
                     key.key_identifier = stable_key_identifier(&trimmed);
                     key.key_prefix = format!("{}...", key_prefix_source(&trimmed));
+                    key.raw_key = Some(trimmed);
                 }
             }
             if let Some(providers) = payload.allowed_providers {
@@ -214,6 +221,12 @@ async fn patch_scoped_key(
         }
     });
 
+      (result, updated_view)
+    }).await;
+    let (result, updated_view) = match task {
+        Ok(result) => result,
+        Err(err) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("scoped key write task failed: {err}")}))).into_response(),
+    };
     match result {
         Ok(_) => match updated_view {
             Some(mut view) => {
@@ -238,13 +251,21 @@ async fn patch_scoped_key(
 }
 
 async fn delete_scoped_key(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
-    let mut found = false;
-    let result = state.settings.mutate(|s| {
+    let settings = Arc::clone(&state.settings);
+    let task = tokio::task::spawn_blocking(move || {
+      let mut found = false;
+      let result = settings.mutate(|s| {
         let initial_len = s.scoped_api_keys.len();
         s.scoped_api_keys.retain(|k| k.id != id);
         found = s.scoped_api_keys.len() < initial_len;
     });
 
+      (result, found)
+    }).await;
+    let (result, found) = match task {
+        Ok(result) => result,
+        Err(err) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("scoped key write task failed: {err}")}))).into_response(),
+    };
     match result {
         Ok(_) => {
             if found {

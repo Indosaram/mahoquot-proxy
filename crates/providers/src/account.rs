@@ -126,10 +126,12 @@ pub fn derive_identity_slug_from_filename(file_name: &str) -> String {
     let stem = without_prefix
         .strip_suffix(".json")
         .unwrap_or(without_prefix);
-    match stem.rfind('-') {
-        Some(idx) => stem[..idx].to_string(),
-        None => stem.to_string(),
+    if file_name.starts_with("codex-") {
+        if let Some((identity, "pro" | "plus" | "team" | "free")) = stem.rsplit_once('-') {
+            return identity.to_string();
+        }
     }
+    stem.to_string()
 }
 
 pub fn load_codex_account(path: &Path) -> Result<CodexAccount, LoadError> {

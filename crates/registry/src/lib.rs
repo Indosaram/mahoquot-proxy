@@ -30,6 +30,8 @@ pub enum RegistryError {
     },
     #[error("alias '{alias}' points to unknown target '{target}'")]
     UnknownAliasTarget { alias: ModelId, target: ModelId },
+    #[error("ambiguous duplicate alias '{alias}'")]
+    DuplicateAlias { alias: ModelId },
     #[error("duplicate binding for model '{model_id}' and provider '{provider_id}'")]
     DuplicateBinding {
         model_id: ModelId,
@@ -1209,7 +1211,13 @@ impl RegistrySnapshot {
 
         // 2. Validate aliases
         let mut combined_aliases: BTreeMap<ModelId, ModelAliasRule> = self.aliases.clone();
+        let mut local_aliases: BTreeMap<ModelId, &ModelAliasRule> = BTreeMap::new();
         for rule in aliases {
+            if let Some(previous) = local_aliases.insert(rule.alias.clone(), rule) {
+                if previous != rule {
+                    return Err(RegistryError::DuplicateAlias { alias: rule.alias.clone() });
+                }
+            }
             ModelId::new(rule.alias.as_str())?;
             ModelId::new(rule.target.as_str())?;
             if let Some(pid) = &rule.provider_id {

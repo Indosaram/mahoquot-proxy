@@ -13,7 +13,7 @@ pub struct ModelEntry {
     pub owned_by: String,
 }
 
-const DEFAULT_MODELS: [&str; 7] = [
+const DEFAULT_MODELS: [&str; 9] = [
     "gpt-5.6-sol",
     "gpt-5.6-luna",
     "gpt-5.6-terra",
@@ -21,6 +21,11 @@ const DEFAULT_MODELS: [&str; 7] = [
     "gpt-5.4",
     "gpt-5.4-mini",
     "gpt-5.3-codex-spark",
+    // Preemptively registered native models (opencodex f4ceae17f, 6f634eddc):
+    // astra routes the moment an entitled account ships; daybreak is the
+    // account-gated surface wire-normalized onto gpt-5.6-sol via its binding.
+    "gpt-6-astra",
+    "gpt-daybreak-blue-latest",
 ];
 
 fn member_matches_provider_binding(
@@ -148,8 +153,49 @@ pub fn member_matches_scope(
     };
     let provider = member.provider_name();
     let account = <AccountMember as mahoquot_types::PoolMember>::id(member);
-    allow_list_admits(&scoped.allowed_providers, &provider)
-        && allow_list_admits(&scoped.allowed_accounts, account)
+
+    if !allow_list_admits(&scoped.allowed_providers, &provider) {
+        return false;
+    }
+
+    if scoped.allowed_accounts.is_empty()
+        || scoped.allowed_accounts.iter().any(|allowed| allowed == "*")
+    {
+        return true;
+    }
+
+    // Collect all identifying identifiers for this account member:
+    // 1. AccountMember::id (e.g. "augustinehazelrigg25612@gmail.com", "claude-code", "588314d6-ZqvM9mzp@doloffer.shop")
+    // 2. file_name (e.g. "antigravity-augustinehazelrigg25612@gmail.com.json", "claude-local.json")
+    // 3. file_stem (e.g. "antigravity-augustinehazelrigg25612@gmail.com", "claude-local")
+    // 4. email from credential if available (e.g. "sookyoung91@gmail.com", "ZqvM9mzp@doloffer.shop")
+    // 5. label / credential name / account_id from credential if available
+    scoped.allowed_accounts.iter().any(|allowed| {
+        if allowed == account {
+            return true;
+        }
+        if let Some(file_name) = member.file_path.file_name().and_then(|n| n.to_str()) {
+            if allowed == file_name {
+                return true;
+            }
+        }
+        if let Some(file_stem) = member.file_path.file_stem().and_then(|s| s.to_str()) {
+            if allowed == file_stem {
+                return true;
+            }
+        }
+        if let Some(email) = member.email() {
+            if !email.is_empty() && allowed == &email {
+                return true;
+            }
+        }
+        if let Some(account_id) = member.account_id() {
+            if !account_id.is_empty() && allowed == &account_id {
+                return true;
+            }
+        }
+        false
+    })
 }
 
 /// An empty or wildcard allow list admits everything; otherwise the candidate
@@ -343,9 +389,9 @@ mod tests {
         // 1. Empty providers -> empty entries
         assert!(model_entries(&[], None).is_empty());
 
-        // 2. Codex only -> DEFAULT_MODELS (7 models) owned by "openai"
+        // 2. Codex only -> DEFAULT_MODELS (9 models) owned by "openai"
         let codex = model_entries(&[ProviderKind::Codex], None);
-        assert_eq!(codex.len(), 7);
+        assert_eq!(codex.len(), 9);
         assert!(codex.iter().all(|e| e.owned_by == "openai"));
         let codex_ids: Vec<&str> = codex.iter().map(|e| e.id.as_str()).collect();
         assert_eq!(
@@ -358,6 +404,8 @@ mod tests {
                 "gpt-5.4",
                 "gpt-5.4-mini",
                 "gpt-5.3-codex-spark",
+                "gpt-6-astra",
+                "gpt-daybreak-blue-latest",
             ]
         );
 
@@ -432,7 +480,7 @@ mod tests {
             );
         }
 
-        // 9. All 7 providers present -> 7 + 14 + 12 + 5 + 8 + 4 + 21 = 71 entries
+        // 9. All 7 providers present -> 9 + 14 + 12 + 5 + 8 + 4 + 21 = 73 entries
         let all = model_entries(
             &[
                 ProviderKind::Codex,
@@ -445,7 +493,7 @@ mod tests {
             ],
             None,
         );
-        assert_eq!(all.len(), 71);
+        assert_eq!(all.len(), 73);
 
         // 10. Env override scopes Codex only
         let custom = model_entries(
@@ -810,7 +858,7 @@ mod tests {
     #[test]
     fn entries_track_loaded_providers() {
         let codex_only = model_entries(&[ProviderKind::Codex], None);
-        assert_eq!(codex_only.len(), 7);
+        assert_eq!(codex_only.len(), 9);
         assert!(codex_only.iter().all(|e| e.owned_by == "openai"));
 
         let ag_only = model_entries(&[ProviderKind::Antigravity], None);
@@ -820,7 +868,7 @@ mod tests {
         assert!(ag_only.iter().all(|e| e.owned_by == "google"));
 
         let both = model_entries(&[ProviderKind::Codex, ProviderKind::Antigravity], None);
-        assert_eq!(both.len(), 21);
+        assert_eq!(both.len(), 23);
 
         assert!(model_entries(&[], None).is_empty());
     }

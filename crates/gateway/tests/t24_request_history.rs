@@ -21,9 +21,90 @@ use tower::ServiceExt;
 
 use common::{create_auth_file_json, unique_temp_dir, OPENAI_REQUEST};
 
-const UPSTREAM_PORT: u16 = 18840;
 const API_KEY: &str = "t24-management-key";
 const EXPORT_SECRET: &str = "task-15-export-secret";
+
+#[test]
+fn runtime_maintenance_prunes_expired_records_at_exact_clock_trigger() {
+    use mahoquot_gateway::request_history::{HistoryConfig, HistoryState, RequestHistory};
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    let dir = unique_temp_dir("t24-maintenance-retention");
+    let now = 1_800_000_000_000_i64;
+    let clock = Arc::new(AtomicI64::new(now));
+    let worker_clock = Arc::clone(&clock);
+    let HistoryState::Ready(store) = RequestHistory::open_with_config_and_clock(
+        &dir.join("history.sqlite"),
+        HistoryConfig {
+            retention: Some(Duration::from_secs(7 * 24 * 60 * 60)),
+            max_size_bytes: Some(100_000),
+            prune_chunk_size: 50,
+            ..HistoryConfig::default()
+        },
+        move || worker_clock.load(Ordering::SeqCst),
+    ) else { panic!("open maintenance fixture") };
+    for index in 0..150 {
+        store.insert(&UsageEvent {
+            event_id: format!("maintenance-{index}"),
+            occurred_at_ms: now - if index < 100 { 10 * 86_400_000 } else { 3_600_000 },
+            account_identifier: "fixture-account".into(),
+            provider: "codex".into(), model: "fixture-model".into(),
+            key_identifier: None, status_code: 200, succeeded: true,
+            input_tokens: 1, output_tokens: 1, cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0, total_tokens: 2, latency_ms: 1,
+        }).unwrap();
+    }
+    clock.store(now + 59_999, Ordering::SeqCst);
+    assert_eq!(store.totals().unwrap().requests, 150, "not due yet");
+    clock.store(now + 60_000, Ordering::SeqCst);
+    assert_eq!(store.totals().unwrap().requests, 50, "runtime maintenance is due");
+    assert!(store.detail("maintenance-99").unwrap().is_none());
+    assert!(store.detail("maintenance-100").unwrap().is_some());
+    drop(store); // Joins the owned worker before deleting its SQLite files.
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert!(!dir.exists());
+}
+
+#[test]
+fn runtime_maintenance_enforces_configured_size_cap_without_retention() {
+    use mahoquot_gateway::request_history::{HistoryConfig, HistoryState, RequestHistory};
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    let dir = unique_temp_dir("t24-maintenance-cap");
+    let clock = Arc::new(AtomicI64::new(1_800_000_000_000));
+    let worker_clock = Arc::clone(&clock);
+    let HistoryState::Ready(store) = RequestHistory::open_with_config_and_clock(
+        &dir.join("history.sqlite"),
+        HistoryConfig {
+            retention: None,
+            max_size_bytes: Some(100_000),
+            prune_chunk_size: 1,
+            ..HistoryConfig::default()
+        },
+        move || worker_clock.load(Ordering::SeqCst),
+    ) else { panic!("open cap fixture") };
+    for index in 0..10 {
+        store.insert(&UsageEvent {
+            event_id: format!("cap-{index}"), occurred_at_ms: index,
+            account_identifier: "fixture-account".into(), provider: "codex".into(),
+            model: "m".repeat(20_000), key_identifier: None,
+            status_code: 200, succeeded: true, input_tokens: 1, output_tokens: 1,
+            cached_input_tokens: 0, cache_write_tokens: 0, reasoning_tokens: 0, total_tokens: 2, latency_ms: 1,
+        }).unwrap();
+    }
+    assert_eq!(store.totals().unwrap().requests, 10);
+    clock.fetch_add(60_000, Ordering::SeqCst);
+    let remaining = store.totals().unwrap().requests;
+    assert!(remaining < 10, "runtime size cap must delete rows, got {remaining}");
+    let result = store.prune(clock.load(Ordering::SeqCst)).unwrap();
+    assert_eq!(result.deleted_events, 0, "scheduled maintenance already enforced the cap");
+    assert!(result.size_cap_satisfied);
+    assert!(result.logical_size_bytes <= 100_000);
+    drop(store);
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert!(!dir.exists());
+}
 
 struct Fixture {
     state: Arc<AppState>,
@@ -39,9 +120,13 @@ impl Drop for Fixture {
 
 fn fixture(label: &str, upstream: Option<&str>, queue_capacity: usize) -> Fixture {
     let dir = unique_temp_dir(&format!("t24-request-history-{label}"));
-    let credential =
-        create_auth_file_json("history-account", "account-24", "upstream-token", upstream);
-    std::fs::write(dir.join("codex-history.json"), credential).expect("credential fixture");
+    let mut credential: Value = serde_json::from_str(&create_auth_file_json(
+        "history-account", "account-24", "upstream-token", upstream,
+    )).unwrap();
+    credential["usage_override"] = Value::String(
+        upstream.unwrap_or("http://127.0.0.1:18899").to_string(),
+    );
+    std::fs::write(dir.join("codex-history.json"), credential.to_string()).expect("credential fixture");
     std::fs::write(
         dir.join("config.yaml"),
         "logging-to-file: false\nremote-management:\n  secret-key: task-15-export-secret\n",
@@ -88,7 +173,7 @@ async fn json(response: Response) -> Value {
     })
 }
 
-async fn spawn_history_upstream() -> tokio::task::JoinHandle<()> {
+async fn spawn_history_upstream() -> (tokio::task::JoinHandle<()>, u16) {
     let sse = concat!(
         "event: response.created\n",
         "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_t24\"}}\n\n",
@@ -109,20 +194,22 @@ async fn spawn_history_upstream() -> tokio::task::JoinHandle<()> {
                 .expect("upstream response")
         }),
     );
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", UPSTREAM_PORT))
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
         .expect("bind t24 upstream");
-    tokio::spawn(async move {
+    let port = listener.local_addr().unwrap().port();
+    let handle = tokio::spawn(async move {
         axum::serve(listener, app)
             .await
             .expect("serve t24 upstream");
-    })
+    });
+    (handle, port)
 }
 
 #[tokio::test]
 async fn streaming_and_nonstreaming_events_match_analytics() {
-    let upstream = spawn_history_upstream().await;
-    let upstream_url = format!("http://127.0.0.1:{UPSTREAM_PORT}");
+    let (upstream, port) = spawn_history_upstream().await;
+    let upstream_url = format!("http://127.0.0.1:{port}");
     let fixture = fixture("analytics", Some(&upstream_url), 64);
 
     for stream in [true, false] {
@@ -217,6 +304,7 @@ async fn streaming_and_nonstreaming_events_match_analytics() {
     assert!(!detail.to_string().contains(API_KEY));
 
     upstream.abort();
+    assert!(upstream.await.unwrap_err().is_cancelled());
 }
 
 #[tokio::test]
@@ -242,6 +330,7 @@ async fn full_channel_is_nonblocking() {
             input_tokens: 1,
             output_tokens: 1,
             cached_input_tokens: 0,
+            cache_write_tokens: 0,
             reasoning_tokens: 0,
             total_tokens: 2,
             latency_ms: 1,
@@ -336,6 +425,7 @@ async fn cancelled_clear_preserves_rows() {
         input_tokens: 1,
         output_tokens: 1,
         cached_input_tokens: 0,
+        cache_write_tokens: 0,
         reasoning_tokens: 0,
         total_tokens: 2,
         latency_ms: 1,
@@ -384,6 +474,7 @@ async fn confirmed_filtered_clear_deletes_only_the_selected_scope() {
             input_tokens: 1,
             output_tokens: 1,
             cached_input_tokens: 0,
+            cache_write_tokens: 0,
             reasoning_tokens: 0,
             total_tokens: 2,
             latency_ms: 1,
@@ -482,6 +573,7 @@ fn enqueue_event(
         input_tokens: 100 + index,
         output_tokens: 20 + index,
         cached_input_tokens: index % 11,
+        cache_write_tokens: 0,
         reasoning_tokens: index % 7,
         total_tokens: 120 + index * 2,
         latency_ms: 50 + index,
@@ -918,6 +1010,7 @@ async fn one_invalid_event_does_not_discard_the_valid_events_in_its_batch() {
         input_tokens: 1,
         output_tokens: 1,
         cached_input_tokens: 0,
+        cache_write_tokens: 0,
         reasoning_tokens: 0,
         total_tokens: 2,
         latency_ms: 1,
@@ -970,6 +1063,7 @@ async fn export_is_bounded_instead_of_returning_every_row() {
             input_tokens: 1,
             output_tokens: 1,
             cached_input_tokens: 0,
+            cache_write_tokens: 0,
             reasoning_tokens: 0,
             total_tokens: 2,
             latency_ms: 1,

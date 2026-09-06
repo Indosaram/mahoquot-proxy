@@ -29,12 +29,12 @@ use crate::telemetry::TelemetryStore;
 #[derive(Debug)]
 pub struct ScopedKeyEntry {
     pub key: Arc<ScopedApiKey>,
-    token_used: AtomicU64,
+    token_used: Arc<AtomicU64>,
 }
 
 impl ScopedKeyEntry {
     fn new(key: ScopedApiKey) -> Self {
-        let token_used = AtomicU64::new(key.token_used);
+        let token_used = Arc::new(AtomicU64::new(key.token_used));
         Self {
             key: Arc::new(key),
             token_used,
@@ -105,12 +105,10 @@ impl ScopedKeyTracker {
         let previous = self.entries.load();
         let mut next = std::collections::HashMap::with_capacity(keys.len());
         for key in keys {
-            let entry = ScopedKeyEntry::new(key.clone());
-            if let Some(existing) = previous.get(&key.key_identifier) {
-                let live = existing.token_used();
-                if live > entry.token_used() {
-                    entry.token_used.store(live, Ordering::Relaxed);
-                }
+            let mut entry = ScopedKeyEntry::new(key.clone());
+            if let Some(existing) = previous.values().find(|entry| entry.key.id == key.id) {
+                entry.token_used = Arc::clone(&existing.token_used);
+                entry.token_used.fetch_max(key.token_used, Ordering::Relaxed);
             }
             next.insert(key.key_identifier.clone(), Arc::new(entry));
         }
@@ -187,13 +185,16 @@ pub struct AppState {
 
 pub(crate) fn adopt_runtime_state(target: &AccountMember, previous: &Arc<AccountMember>) {
     let seq = std::sync::atomic::Ordering::Relaxed;
-    *target
-        .health
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = *previous
-        .health
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let target_health = target.health();
+    if target_health != Health::Disabled {
+        let prev_health = previous.health();
+        if prev_health != Health::Disabled {
+            *target
+                .health
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = prev_health;
+        }
+    }
     *target
         .usage
         .write()
@@ -314,10 +315,11 @@ impl AppState {
         ));
         let pool = runtime.pool();
         catalog.bind_runtime(&runtime);
+        catalog.bind_settings(&settings);
 
-        let runtime_for_snapshot = Arc::clone(&runtime);
+        let catalog_for_snapshot = Arc::clone(&catalog);
         settings.set_snapshot_provider(Arc::new(move || {
-            Arc::clone(&runtime_for_snapshot.composition().registry)
+            catalog_for_snapshot.raw_snapshot()
         }));
         let runtime_for_publisher = Arc::clone(&runtime);
         settings.set_pool_publisher(Arc::new(move |registry| {

@@ -82,6 +82,10 @@ impl SettingsStore {
         self.current.load_full()
     }
 
+    pub(crate) fn composition_lock(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.mutate_lock.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }

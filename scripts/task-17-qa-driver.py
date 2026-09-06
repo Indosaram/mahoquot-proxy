@@ -18,6 +18,8 @@ Exercises:
   - Clean up port 18880, mock ports, and temp directories.
 """
 
+import argparse
+import tomllib
 import http.server
 import json
 import os
@@ -35,12 +37,38 @@ GATEWAY_PORT = 18880
 MOCK_UPSTREAM_PORT = 18881
 MOCK_CATALOG_PORT = 18882
 
-PROXY_ROOT = Path("/Users/indo/code/project/mahoquot-proxy").resolve()
-QUOTIO_ROOT = Path("/Users/indo/code/project/quotio-rs").resolve()
+PROXY_ROOT = Path(__file__).resolve().parents[1]
 GATEWAY_BIN = PROXY_ROOT / "target" / "debug" / "mahoquot-gateway"
 BASE_CATALOG_PATH = PROXY_ROOT / "crates" / "registry" / "catalog" / "models-v1.json"
 TEST_KEY_PATH = PROXY_ROOT / "tests" / "fixtures" / "test-ed25519.key"
 TEST_PUB_PATH = PROXY_ROOT / "tests" / "fixtures" / "test-ed25519.pub"
+
+def parse_roots():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--desktop-root", type=Path,
+                        default=Path(os.environ.get("MAHOQUOT_DESKTOP_DIR",
+                                                    PROXY_ROOT.parent / "mahoquot")))
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Print resolved paths as JSON without executing or writing evidence")
+    args = parser.parse_args()
+    desktop_root = args.desktop_root.expanduser().resolve()
+    for label, root, member, name in (
+        ("proxy", PROXY_ROOT, "crates/gateway", "mahoquot-gateway"),
+        ("desktop", desktop_root, "crates/monitor-ui", "mahoquot-monitor-ui"),
+    ):
+        try:
+            with (root / "Cargo.toml").open("rb") as manifest:
+                workspace = tomllib.load(manifest)
+            with (root / member / "Cargo.toml").open("rb") as manifest:
+                package = tomllib.load(manifest)
+            valid = (member in workspace.get("workspace", {}).get("members", [])
+                     and package.get("package", {}).get("name") == name)
+        except (OSError, ValueError) as exc:
+            parser.error(f"invalid {label} workspace at {root}: {exc}")
+        if not valid:
+            parser.error(f"invalid {label} workspace at {root}: expected {name}")
+    return args, desktop_root
+
 
 outbound_requests = []
 outbound_lock = threading.Lock()
@@ -188,6 +216,21 @@ def format_http_exchange(method, url, headers=None, body=None, response_text="")
     return "\n".join(lines)
 
 def main():
+    args, QUOTIO_ROOT = parse_roots()
+    plan = {
+        "proxy_root": str(PROXY_ROOT),
+        "desktop_root": str(QUOTIO_ROOT),
+        "gateway_bin": str(GATEWAY_BIN),
+        "base_catalog": str(BASE_CATALOG_PATH),
+        "test_key": str(TEST_KEY_PATH),
+        "test_pub": str(TEST_PUB_PATH),
+        "evidence": [str(root / ".omo/evidence/model-registry/task-17-live-surface.http")
+                     for root in (PROXY_ROOT, QUOTIO_ROOT)],
+    }
+    if args.dry_run:
+        print(json.dumps(plan))
+        return
+    print(f"Proxy root: {PROXY_ROOT}\nDesktop root: {QUOTIO_ROOT}")
     print("=== Step 1: Check --help on compiled binary ===")
     help_res = subprocess.run([str(GATEWAY_BIN), "--help"], capture_output=True, text=True)
     assert help_res.returncode == 0, f"--help failed: {help_res.stderr}"

@@ -870,12 +870,18 @@ async fn put_binding(State(state): State<Arc<AppState>>, Json(body): Json<Value>
         account,
         provider,
     };
-    let saved = state.settings.mutate(|settings| {
+    let store = Arc::clone(&state.settings);
+    let stored = binding.clone();
+    let saved = tokio::task::spawn_blocking(move || store.mutate(|settings| {
         settings
             .api_key_bindings
             .retain(|existing| existing.key_identifier != key_identifier);
-        settings.api_key_bindings.push(binding.clone());
-    });
+        settings.api_key_bindings.push(stored);
+    })).await;
+    let saved = match saved {
+        Ok(saved) => saved,
+        Err(error) => return typed_error(StatusCode::INTERNAL_SERVER_ERROR, "binding_save_failed", error),
+    };
     if let Err(error) = saved {
         return typed_error(
             StatusCode::INTERNAL_SERVER_ERROR,

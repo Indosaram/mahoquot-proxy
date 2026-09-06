@@ -22,6 +22,8 @@ use crate::capability::{self, model_of};
 use crate::realtime;
 use crate::relay::{handle_relay, RelayMode};
 use crate::state::AppState;
+use axum::Extension;
+use crate::inbound::ResolvedAuth;
 use crate::static_pages::{CALLBACK_HTML, MANAGEMENT_HTML, ROOT_JSON};
 use crate::v1beta::{self, GeminiAction};
 
@@ -80,14 +82,16 @@ pub async fn oauth_callback() -> Response {
 
 pub async fn images_generations(
     State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<ResolvedAuth>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    image_surface(state, &headers, body).await
+    image_surface(state, &auth, &headers, body).await
 }
 
 pub async fn images_edits(
     State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<ResolvedAuth>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -108,7 +112,7 @@ pub async fn images_edits(
             ),
         };
     }
-    image_surface(state, &headers, body).await
+    image_surface(state, &auth, &headers, body).await
 }
 
 fn multipart_field(text: &str, name: &str) -> Option<String> {
@@ -121,7 +125,7 @@ fn multipart_field(text: &str, name: &str) -> Option<String> {
     Some(value[..end].to_string())
 }
 
-async fn image_surface(state: Arc<AppState>, headers: &HeaderMap, body: Bytes) -> Response {
+async fn image_surface(state: Arc<AppState>, auth: &ResolvedAuth, headers: &HeaderMap, body: Bytes) -> Response {
     let parsed = match parse_body(&body) {
         Ok(v) => v,
         Err(resp) => return *resp,
@@ -144,6 +148,7 @@ async fn image_surface(state: Arc<AppState>, headers: &HeaderMap, body: Bytes) -
     }
     handle_relay(
         state,
+        &auth,
         RelayMode::Image,
         "/v1/images/generations",
         headers,
@@ -338,6 +343,7 @@ pub async fn ws_upgrade(ws: MaybeUpgrade) -> Response {
 /// into chat messages and the reply is re-rendered as a Responses object.
 pub async fn responses(
     State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<ResolvedAuth>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -350,6 +356,7 @@ pub async fn responses(
     if owner_of(&state, &model).as_deref() != Some("google") {
         return handle_relay(
             state,
+            &auth,
             RelayMode::Native,
             CODEX_RESPONSES_PATH,
             &headers,
@@ -365,6 +372,7 @@ pub async fn responses(
     let chat = responses_input_to_chat(&parsed, &model);
     let relayed = handle_relay(
         state,
+        &auth,
         RelayMode::OpenAiCompat,
         "/v1/chat/completions",
         &headers,
@@ -621,6 +629,7 @@ fn chat_to_responses(chat: &Value, model: &str) -> Value {
 /// known non-codex model reaches the "not supported" branch.
 pub async fn responses_compact(
     State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<ResolvedAuth>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -634,6 +643,7 @@ pub async fn responses_compact(
         Some(owner) if owner == "openai" => {
             handle_relay(
                 state,
+                &auth,
                 RelayMode::Native,
                 CODEX_RESPONSES_COMPACT_PATH,
                 &headers,
@@ -656,6 +666,7 @@ pub async fn responses_compact(
 /// returns its own HTML body, which a synthesised JSON error would not match.
 pub async fn alpha_search(
     State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<ResolvedAuth>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -672,6 +683,7 @@ pub async fn alpha_search(
     }
     handle_relay(
         state,
+        &auth,
         RelayMode::Native,
         "/backend-api/codex/alpha/search",
         &headers,
@@ -680,22 +692,30 @@ pub async fn alpha_search(
     .await
 }
 
-pub async fn v1beta_models(State(state): State<Arc<AppState>>) -> Response {
-    Json(v1beta::models_payload(&state.pool.load().models)).into_response()
+pub async fn v1beta_models(State(state): State<Arc<AppState>>, Extension(auth): Extension<ResolvedAuth>) -> Response {
+    let pool = state.pool.load();
+    let models = match auth.identity.scoped() {
+        Some(key) => crate::models_route::scoped_model_entries(&pool, key),
+        None => pool.models.clone(),
+    };
+    Json(v1beta::models_payload(&models)).into_response()
 }
 
 pub async fn v1beta_action(
     State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<ResolvedAuth>,
     Path(action): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let (model, verb) = v1beta::parse_action(&action);
 
-    let Some(entry) = state
-        .pool
-        .load()
-        .models
+    let pool = state.pool.load();
+    let models = match auth.identity.scoped() {
+        Some(key) => crate::models_route::scoped_model_entries(&pool, key),
+        None => pool.models.clone(),
+    };
+    let Some(entry) = models
         .iter()
         .find(|m| m.id == model)
         .cloned()
@@ -727,6 +747,7 @@ pub async fn v1beta_action(
             }
             handle_relay(
                 state,
+                &auth,
                 RelayMode::GeminiNative,
                 "/v1beta/models",
                 &headers,
@@ -753,6 +774,7 @@ pub async fn v1beta_action(
             }
             handle_relay(
                 state,
+                &auth,
                 RelayMode::GeminiCountTokens,
                 "/v1beta/models",
                 &headers,

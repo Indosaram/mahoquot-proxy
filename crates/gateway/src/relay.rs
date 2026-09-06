@@ -58,6 +58,7 @@ struct StreamedOutcome {
     account: Option<String>,
     model: Option<String>,
     key_identifier: Option<String>,
+    scoped_entry: Option<Arc<crate::state::ScopedKeyEntry>>,
     upstream_capture: Option<Arc<std::sync::Mutex<Option<crate::usage::ResponseTokenUsage>>>>,
     status: u16,
     started: std::time::Instant,
@@ -107,6 +108,7 @@ impl StreamCapture {
                 account: outcome.account.as_deref(),
                 model: outcome.model.as_deref(),
                 key_identifier: outcome.key_identifier.as_deref(),
+                scoped_entry: outcome.scoped_entry.as_deref(),
                 status: outcome.status,
                 success: true,
                 elapsed_ms: outcome.started.elapsed().as_millis() as u64,
@@ -136,11 +138,13 @@ fn with_capture(shared: &SharedCapture, f: impl FnOnce(&mut StreamCapture)) {
 struct CountedStream {
     inner: http_body_util::BodyStream<Body>,
     shared: SharedCapture,
+    in_flight: Option<crate::monitor::InFlightGuard>,
 }
 
 impl CountedStream {
-    fn new(body: Body, outcome: StreamedOutcome) -> Self {
+    fn new(body: Body, outcome: StreamedOutcome, in_flight: crate::monitor::InFlightGuard) -> Self {
         Self {
+            in_flight: Some(in_flight),
             inner: http_body_util::BodyStream::new(body),
             shared: SharedCapture::new(std::sync::Mutex::new(StreamCapture {
                 bytes_out: 0,
@@ -172,8 +176,13 @@ impl futures::Stream for CountedStream {
                         return std::task::Poll::Ready(Some(Ok(data.clone())));
                     }
                 }
-                Some(Err(error)) => return std::task::Poll::Ready(Some(Err(error))),
+                Some(Err(error)) => {
+                    self.in_flight.take();
+                    with_capture(&self.shared, StreamCapture::finalize);
+                    return std::task::Poll::Ready(Some(Err(error)));
+                }
                 None => {
+                    self.in_flight.take();
                     with_capture(&self.shared, StreamCapture::finalize);
                     return std::task::Poll::Ready(None);
                 }
@@ -191,6 +200,7 @@ struct OutcomeRecord<'a> {
     account: Option<&'a str>,
     model: Option<&'a str>,
     key_identifier: Option<&'a str>,
+    scoped_entry: Option<&'a crate::state::ScopedKeyEntry>,
     status: u16,
     success: bool,
     elapsed_ms: u64,
@@ -205,14 +215,12 @@ async fn record_request_outcome(state: &AppState, record: OutcomeRecord<'_>) {
     let token_usage = record.token_usage.unwrap_or_default();
     let total_tokens = token_usage.total_tokens();
     if total_tokens > 0 {
-        if let Some(charged) = state
-            .scoped_keys
-            .record_usage(record.key_identifier, total_tokens)
-        {
+        if let Some(entry) = record.scoped_entry {
+            let charged = entry.consume(total_tokens);
             // The atomic is authoritative while the process lives; mirroring it
             // into the settings document is what makes a restart resume from
             // the spent balance instead of handing the allowance back.
-            persist_scoped_usage(state, record.key_identifier, charged).await;
+            persist_scoped_usage(state, &entry.key.id, charged).await;
         }
     }
     state.history.enqueue(crate::request_history::UsageEvent {
@@ -227,6 +235,7 @@ async fn record_request_outcome(state: &AppState, record: OutcomeRecord<'_>) {
         input_tokens: token_usage.input_tokens,
         output_tokens: token_usage.output_tokens,
         cached_input_tokens: token_usage.cached_input_tokens,
+        cache_write_tokens: token_usage.cache_write_tokens,
         reasoning_tokens: token_usage.reasoning_tokens,
         total_tokens: token_usage.total_tokens(),
         latency_ms: record.elapsed_ms,
@@ -274,16 +283,13 @@ async fn record_request_outcome(state: &AppState, record: OutcomeRecord<'_>) {
 ///
 /// Skipped when the persisted value already covers the charge, so a burst of
 /// zero-token or already-recorded outcomes does not turn into a disk write.
-async fn persist_scoped_usage(state: &AppState, key_identifier: Option<&str>, charged: u64) {
-    let Some(identifier) = key_identifier else {
-        return;
-    };
+async fn persist_scoped_usage(state: &AppState, identifier: &str, charged: u64) {
     let already_persisted = state
         .settings
         .current()
         .scoped_api_keys
         .iter()
-        .find(|key| key.key_identifier == identifier)
+        .find(|key| key.id == identifier)
         .map(|key| key.token_used);
     match already_persisted {
         Some(persisted) if persisted >= charged => return,
@@ -298,7 +304,7 @@ async fn persist_scoped_usage(state: &AppState, key_identifier: Option<&str>, ch
             if let Some(key) = document
                 .scoped_api_keys
                 .iter_mut()
-                .find(|key| key.key_identifier == identifier)
+                .find(|key| key.id == identifier)
             {
                 key.token_used = key.token_used.max(charged);
             }
@@ -754,18 +760,45 @@ fn cooldown_deadline_ms(now_ms: i64, retry_after_secs: i64) -> i64 {
     now_ms.saturating_add(bounded.saturating_mul(1000))
 }
 
+pub fn cooldown_deadline_from_headers(headers: &reqwest::header::HeaderMap, now_ms: i64) -> i64 {
+    let now_unix = now_ms / 1000;
+    // Prefer an explicit Retry-After, then a reset timestamp the Codex quota
+    // families report on the same responses (opencodex reset-derived cooldown
+    // source), so the account returns exactly when its window frees instead of
+    // sitting out a fixed 5-minute default.
+    let retry_after_secs = headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|secs| *secs > 0)
+        .or_else(|| {
+            headers
+                .iter()
+                .filter_map(|(name, value)| {
+                    let lower = name.as_str().to_ascii_lowercase();
+                    if !(lower.ends_with("-reset-at") || lower.ends_with("-reset-after-seconds")) {
+                        return None;
+                    }
+                    let secs: i64 = value.to_str().ok()?.trim().parse().ok()?;
+                    let delay = if lower.ends_with("-reset-after-seconds") {
+                        secs
+                    } else {
+                        secs.saturating_sub(now_unix)
+                    };
+                    (delay > 0).then_some(delay)
+                })
+                .min()
+        })
+        .unwrap_or(300);
+    cooldown_deadline_ms(now_ms, retry_after_secs)
+}
+
 async fn record_cooldown(
     resp: reqwest::Response,
     member: &AccountMember,
     status_code: u16,
     state: &AppState,
 ) -> FinalFailure {
-    let retry_after_secs = resp
-        .headers()
-        .get(reqwest::header::RETRY_AFTER)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<i64>().ok())
-        .unwrap_or(300);
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
@@ -773,28 +806,13 @@ async fn record_cooldown(
     member.set_health(Health::Cooldown {
         // Retry-After is upstream-controlled: clamp so a hostile or broken value
         // cannot overflow into a past (or panicking) cooldown deadline.
-        until_unix_ms: cooldown_deadline_ms(now_ms, retry_after_secs),
+        until_unix_ms: cooldown_deadline_from_headers(resp.headers(), now_ms),
     });
     member.record_fail();
     state.metrics.failed_over.fetch_add(1, Ordering::Relaxed);
     state
         .monitor
         .record_error(member.id(), status_code, "upstream error");
-    extract_failure(resp, status_code).await
-}
-
-async fn record_auth_failure(
-    resp: reqwest::Response,
-    member: &AccountMember,
-    status_code: u16,
-    state: &AppState,
-) -> FinalFailure {
-    member.set_health(Health::AuthFailed);
-    member.record_fail();
-    state.metrics.failed_over.fetch_add(1, Ordering::Relaxed);
-    state
-        .monitor
-        .record_error(member.id(), status_code, "auth failed");
     extract_failure(resp, status_code).await
 }
 
@@ -847,7 +865,8 @@ fn is_account_scoped_model_rejection(status_code: u16, body: &[u8]) -> bool {
     if status_code == 402 {
         return true;
     }
-    if status_code != 400 {
+    // Model rejections also arrive as 403s on entitlement-gated shards.
+    if status_code != 400 && status_code != 403 {
         return false;
     }
     let text = String::from_utf8_lossy(body);
@@ -1439,6 +1458,11 @@ fn affinity_key(headers: &HeaderMap) -> Option<String> {
     for name in [
         "x-claude-code-session-id",
         "session_id",
+        // Codex CLI sends the hyphenated form; opencodex binds pool affinity on
+        // session-id + thread-id (and pins subagent fan-out to the parent thread).
+        "session-id",
+        "thread-id",
+        "x-codex-parent-thread-id",
         "x-session-id",
         "conversation_id",
         "x-conversation-id",
@@ -1451,6 +1475,63 @@ fn affinity_key(headers: &HeaderMap) -> Option<String> {
             }
         }
     }
+    None
+}
+
+fn body_affinity_key(body: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let obj = value.as_object()?;
+
+    let extract_val = |v: &serde_json::Value| -> Option<String> {
+        match v {
+            serde_json::Value::String(s) => {
+                let trimmed = s.trim();
+                if !trimmed.is_empty() {
+                    Some(trimmed.to_string())
+                } else {
+                    None
+                }
+            }
+            serde_json::Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        }
+    };
+
+    for field in [
+        "conversation_id",
+        "conversation-id",
+        "thread_id",
+        "thread-id",
+        "session_id",
+        "session-id",
+    ] {
+        if let Some(v) = obj.get(field).and_then(extract_val) {
+            return Some(format!("body-id-{v}"));
+        }
+    }
+
+    if let Some(metadata) = obj.get("metadata").and_then(|m| m.as_object()) {
+        for field in [
+            "thread_id",
+            "thread-id",
+            "conversation_id",
+            "conversation-id",
+            "session_id",
+            "session-id",
+        ] {
+            if let Some(v) = metadata.get(field).and_then(extract_val) {
+                return Some(format!("body-id-{v}"));
+            }
+        }
+    }
+
+    if let Some(user) = obj.get("user").and_then(|v| v.as_str()) {
+        let user = user.trim();
+        if user.starts_with("session_") || user.starts_with("conv_") || user.starts_with("thread_") {
+            return Some(format!("body-id-{user}"));
+        }
+    }
+
     None
 }
 
@@ -1477,6 +1558,7 @@ fn body_prefix_affinity_key(body: &[u8]) -> Option<String> {
 
 pub async fn handle_relay(
     state: Arc<AppState>,
+    auth: &crate::inbound::ResolvedAuth,
     mode: RelayMode,
     req_path: &str,
     headers: &HeaderMap,
@@ -1488,10 +1570,9 @@ pub async fn handle_relay(
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
         .unwrap_or(0);
-    let presented_key = crate::inbound::presented_api_key(headers);
-    let key_identifier = presented_key.map(crate::request_history::stable_key_identifier);
-    let scoped_entry = presented_key.and_then(|k| state.scoped_keys.lookup_raw(k));
-    let scoped_key = scoped_entry.as_ref().map(|e| e.key.clone());
+    let key_identifier = auth.key_identifier.clone();
+    let scoped_key = auth.identity.scoped().cloned();
+    let scoped_entry = scoped_key.as_ref().and_then(|key| state.scoped_keys.get(&key.key_identifier));
 
     // 1. Quota check: if token budget is exhausted, reject with 429.
     if let Some(ref entry) = scoped_entry {
@@ -1505,7 +1586,8 @@ pub async fn handle_relay(
         }
     }
 
-    let binding = crate::management::accounts::binding_for_key(&state, presented_key);
+    let binding = state.settings.current().api_key_bindings.iter()
+        .find(|binding| Some(&binding.key_identifier) == key_identifier.as_ref()).cloned();
     let _in_flight = state.monitor.track_in_flight();
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1587,6 +1669,7 @@ pub async fn handle_relay(
     let mut last_attempted: Option<(&'static str, String)> = None;
     let hint = SessionHint {
         affinity_key: affinity_key(headers)
+            .or_else(|| body_affinity_key(plan.original_body.as_ref()))
             .or_else(|| body_prefix_affinity_key(plan.original_body.as_ref())),
     };
     // Accounts already tried in this request. 5xx and transport failures leave
@@ -1688,10 +1771,10 @@ pub async fn handle_relay(
 
         let mut status_code = resp.status().as_u16();
 
-        if (status_code == 401 || status_code == 403)
-            && state.auth_refresh_enabled
-            && !refreshed_this_account
-        {
+        // Only a 401 earns the refresh-and-replay: a 403 carries a valid
+        // credential that was merely denied (workspace/entitlement/model), so
+        // refreshing it changes nothing (opencodex #1789, 1fa0f6aad).
+        if status_code == 401 && state.auth_refresh_enabled && !refreshed_this_account {
             match state.refresh_member(&member, Some(&member_at)).await {
                 Ok(_) => {
                     match send_upstream(
@@ -1784,6 +1867,7 @@ pub async fn handle_relay(
                                         account: Some(member.id()),
                                         model: plan.model.as_deref(),
                                         key_identifier: key_identifier.as_deref(),
+                                        scoped_entry: scoped_entry.as_deref(),
                                         status: StatusCode::BAD_GATEWAY.as_u16(),
                                         success: false,
                                         elapsed_ms: request_started.elapsed().as_millis() as u64,
@@ -1820,6 +1904,7 @@ pub async fn handle_relay(
                                 account: Some(member.id()),
                                 model: plan.model.as_deref(),
                                 key_identifier: key_identifier.as_deref(),
+                                scoped_entry: scoped_entry.as_deref(),
                                 status: status_code,
                                 success: true,
                                 elapsed_ms: request_started.elapsed().as_millis() as u64,
@@ -1840,12 +1925,13 @@ pub async fn handle_relay(
                         account: Some(member.id().to_string()),
                         model: plan.model.clone(),
                         key_identifier: key_identifier.clone(),
+                        scoped_entry: scoped_entry.clone(),
                         upstream_capture,
                         status: status_code,
                         started: request_started,
                         bytes_in,
                     };
-                    let counted = CountedStream::new(body, outcome);
+                    let counted = CountedStream::new(body, outcome, _in_flight);
                     return Response::from_parts(parts, Body::from_stream(counted));
                 }
                 Err(reason) => {
@@ -1886,13 +1972,13 @@ pub async fn handle_relay(
             continue;
         }
 
-        if status_code == 401 || status_code == 403 {
-            last_failure = Some(record_auth_failure(resp, &member, status_code, &state).await);
-            continue;
-        }
-
         let failure = extract_failure(resp, status_code).await;
 
+        // A 403 is usually a workspace/entitlement or model denial, not a dead
+        // credential (opencodex #1789 / 1fa0f6aad): model-rejection signatures
+        // mark the model unsupported, and any other 403 fails over WITHOUT
+        // quarantining the account — the scheduler's non-auth-failure streak
+        // still benches a persistently denied account.
         if let Some(model) = plan.model.as_deref() {
             if is_account_scoped_model_rejection(status_code, &failure.body) {
                 member.mark_model_unsupported(model);
@@ -1907,6 +1993,32 @@ pub async fn handle_relay(
                 last_failure = Some(failure);
                 continue;
             }
+        }
+
+        if status_code == 403 {
+            member.record_fail();
+            state
+                .scheduler
+                .record_non_auth_failure(member.id(), &state.pool.load().members);
+            state.metrics.failed_over.fetch_add(1, Ordering::Relaxed);
+            state
+                .monitor
+                .record_error(member.id(), status_code, "forbidden denial");
+            last_failure = Some(failure);
+            continue;
+        }
+
+        if status_code == 401 {
+            // The refresh-and-replay above already ran for this account; a
+            // second 401 means the credential is terminally broken.
+            member.set_health(Health::AuthFailed);
+            member.record_fail();
+            state.metrics.failed_over.fetch_add(1, Ordering::Relaxed);
+            state
+                .monitor
+                .record_error(member.id(), status_code, "auth failed");
+            last_failure = Some(failure);
+            continue;
         }
 
         state
@@ -1925,6 +2037,7 @@ pub async fn handle_relay(
                 account: Some(member.id()),
                 model: plan.model.as_deref(),
                 key_identifier: key_identifier.as_deref(),
+                scoped_entry: scoped_entry.as_deref(),
                 status: failure.status.as_u16(),
                 success: false,
                 elapsed_ms: request_started.elapsed().as_millis() as u64,
@@ -1973,6 +2086,7 @@ pub async fn handle_relay(
             account: failure_account.as_deref(),
             model: plan.model.as_deref(),
             key_identifier: key_identifier.as_deref(),
+            scoped_entry: scoped_entry.as_deref(),
             status: response.status().as_u16(),
             success: false,
             elapsed_ms: request_started.elapsed().as_millis() as u64,
@@ -1990,6 +2104,85 @@ pub async fn handle_relay(
 mod routing_tests {
     use super::*;
     use crate::config::GatewayConfig;
+
+    #[test]
+    fn body_affinity_key_extracts_expected_fields() {
+        // Top-level fields
+        assert_eq!(
+            body_affinity_key(br#"{"conversation_id":"c1"}"#).as_deref(),
+            Some("body-id-c1")
+        );
+        assert_eq!(
+            body_affinity_key(br#"{"conversation-id":"c2"}"#).as_deref(),
+            Some("body-id-c2")
+        );
+        assert_eq!(
+            body_affinity_key(br#"{"thread_id":"t1"}"#).as_deref(),
+            Some("body-id-t1")
+        );
+        assert_eq!(
+            body_affinity_key(br#"{"thread-id":"t2"}"#).as_deref(),
+            Some("body-id-t2")
+        );
+        assert_eq!(
+            body_affinity_key(br#"{"session_id":"s1"}"#).as_deref(),
+            Some("body-id-s1")
+        );
+        assert_eq!(
+            body_affinity_key(br#"{"session-id":"s2"}"#).as_deref(),
+            Some("body-id-s2")
+        );
+
+        // Metadata fields
+        assert_eq!(
+            body_affinity_key(br#"{"metadata":{"thread_id":"m-t1"}}"#).as_deref(),
+            Some("body-id-m-t1")
+        );
+        assert_eq!(
+            body_affinity_key(br#"{"metadata":{"thread-id":"m-t2"}}"#).as_deref(),
+            Some("body-id-m-t2")
+        );
+        assert_eq!(
+            body_affinity_key(br#"{"metadata":{"conversation_id":"m-c1"}}"#).as_deref(),
+            Some("body-id-m-c1")
+        );
+        assert_eq!(
+            body_affinity_key(br#"{"metadata":{"conversation-id":"m-c2"}}"#).as_deref(),
+            Some("body-id-m-c2")
+        );
+        assert_eq!(
+            body_affinity_key(br#"{"metadata":{"session_id":"m-s1"}}"#).as_deref(),
+            Some("body-id-m-s1")
+        );
+        assert_eq!(
+            body_affinity_key(br#"{"metadata":{"session-id":"m-s2"}}"#).as_deref(),
+            Some("body-id-m-s2")
+        );
+
+        // User prefix matches
+        assert_eq!(
+            body_affinity_key(br#"{"user":"session_user1"}"#).as_deref(),
+            Some("body-id-session_user1")
+        );
+        assert_eq!(
+            body_affinity_key(br#"{"user":"conv_user2"}"#).as_deref(),
+            Some("body-id-conv_user2")
+        );
+        assert_eq!(
+            body_affinity_key(br#"{"user":"thread_user3"}"#).as_deref(),
+            Some("body-id-thread_user3")
+        );
+
+        // User string that does not match prefixes
+        assert_eq!(body_affinity_key(br#"{"user":"regular_user"}"#), None);
+
+        // Blank, empty, or missing
+        assert_eq!(body_affinity_key(br#"{"conversation_id":""}"#), None);
+        assert_eq!(body_affinity_key(br#"{"conversation_id":"  "}"#), None);
+        assert_eq!(body_affinity_key(br#"{"other_field":"val"}"#), None);
+        assert_eq!(body_affinity_key(b"not json"), None);
+        assert_eq!(body_affinity_key(b"[]"), None);
+    }
 
     #[test]
     fn body_prefix_affinity_skips_bodies_below_the_cacheable_threshold() {

@@ -1881,9 +1881,51 @@ fn auth_url_for(
     json_status(StatusCode::OK, body)
 }
 
-async fn antigravity_auth_url_handler(Query(params): Query<HashMap<String, String>>) -> Response {
+async fn antigravity_auth_url_handler(
+    State(app_state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
     let (url, state, session) = create_antigravity_auth_url(&params);
     register_session(session);
+    if !params.contains_key("redirect_uri") {
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:51121").await {
+            Ok(listener) => listener,
+            Err(error) => {
+                return json_status(
+                    StatusCode::CONFLICT,
+                    json!({
+                        "status": "error",
+                        "error": format!("Antigravity callback port 51121 is unavailable: {error}")
+                    }),
+                );
+            }
+        };
+        let finished = Arc::new(Notify::new());
+        let callback_state = app_state.clone();
+        let callback_finished = finished.clone();
+        let callback_app = Router::new().route(
+            "/oauth-callback",
+            get(move |Query(query): Query<HashMap<String, String>>| {
+                let callback_state = callback_state.clone();
+                let callback_finished = callback_finished.clone();
+                async move {
+                    let response = oauth_callback(
+                        State(callback_state),
+                        Query(query),
+                        axum::body::Bytes::new(),
+                    )
+                    .await;
+                    callback_finished.notify_one();
+                    response
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, callback_app)
+                .with_graceful_shutdown(async move { finished.notified().await })
+                .await;
+        });
+    }
     json_status(
         StatusCode::OK,
         json!({

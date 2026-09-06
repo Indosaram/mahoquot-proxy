@@ -397,6 +397,9 @@ const GEMINI_UNSUPPORTED_SCHEMA_KEYS: &[&str] = &[
     "exclusiveMaximum",
     "patternProperties",
     "propertyNames",
+    "uniqueItems",
+    "minProperties",
+    "maxProperties",
 ];
 
 fn sanitize_gemini_schema(value: &mut Value) {
@@ -489,6 +492,9 @@ pub fn gemini_json_to_openai(body: &Value, model: &str, created: i64) -> Value {
                     .unwrap_or(false);
                 if is_thought {
                     reasoning.push_str(t);
+                    if let Some(sig) = part.get("thoughtSignature").and_then(Value::as_str) {
+                        pending_signature = Some(sig.to_string());
+                    }
                 } else {
                     text.push_str(t);
                     pending_signature = None;
@@ -657,6 +663,9 @@ impl GeminiDecoder {
     }
 
     pub fn decode(&mut self, payload: &[u8], out: &mut Vec<CodexEvent>) {
+        if self.completed {
+            return;
+        }
         let text = match std::str::from_utf8(payload) {
             Ok(t) => t.trim(),
             Err(_) => return,
@@ -669,7 +678,8 @@ impl GeminiDecoder {
             Err(_) => return,
         };
 
-        if let Some(err) = value.get("error") {
+        let response = value.get("response").unwrap_or(&value);
+        if let Some(err) = value.get("error").or_else(|| response.get("error")) {
             let msg = err
                 .get("message")
                 .and_then(Value::as_str)
@@ -680,8 +690,6 @@ impl GeminiDecoder {
             self.completed = true;
             return;
         }
-
-        let response = value.get("response").unwrap_or(&value);
 
         if let Some(id) = response.get("responseId").and_then(Value::as_str) {
             out.push(CodexEvent::Created {
@@ -714,6 +722,7 @@ impl GeminiDecoder {
                     .get("thoughtsTokenCount")
                     .and_then(Value::as_u64)
                     .unwrap_or(0),
+                cache_write_tokens: 0,
             });
         }
 
@@ -832,6 +841,11 @@ mod tests {
                         "type": "object",
                         "properties": {
                             "mode": { "type": "string", "const": "fast", "default": "slow" },
+                            "tags": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "uniqueItems": true
+                            },
                             "nested": {
                                 "type": "object",
                                 "additionalProperties": false,
@@ -851,6 +865,7 @@ mod tests {
         let params = &decl["parameters"];
         assert!(params["properties"]["mode"].get("const").is_none());
         assert!(params["properties"]["mode"].get("default").is_none());
+        assert!(params["properties"]["tags"].get("uniqueItems").is_none());
         assert!(params["properties"]["nested"]
             .get("additionalProperties")
             .is_none());

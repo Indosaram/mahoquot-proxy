@@ -82,26 +82,26 @@ async fn read(state: Arc<AppState>, list: &'static KeyList) -> Response {
     (StatusCode::OK, Json(json!({ list.key: value }))).into_response()
 }
 
-fn mutate(
+async fn mutate(
     state: &Arc<AppState>,
     list: &'static KeyList,
-    edit: impl FnOnce(&mut Vec<String>) -> Result<(), Refusal>,
+    edit: impl FnOnce(&mut Vec<String>) -> Result<(), Refusal> + Send + 'static,
 ) -> Response {
-    scalars::apply_edit(state, |settings| edit((list.field)(settings)))
+    scalars::apply_edit(state, move |settings| edit((list.field)(settings))).await
 }
 
 async fn replace(state: Arc<AppState>, list: &'static KeyList, raw: bytes::Bytes) -> Response {
     let Ok(body) = serde_json::from_slice::<Value>(&raw) else {
         return scalars::refusal_response(Refusal::InvalidBody);
     };
-    mutate(&state, list, |target| lists::replace(target, &body))
+    mutate(&state, list, move |target| lists::replace(target, &body)).await
 }
 
 async fn edit(state: Arc<AppState>, list: &'static KeyList, raw: bytes::Bytes) -> Response {
     let Ok(body) = serde_json::from_slice::<Value>(&raw) else {
         return scalars::refusal_response(Refusal::InvalidBody);
     };
-    mutate(&state, list, |target| lists::edit(target, &body))
+    mutate(&state, list, move |target| lists::edit(target, &body)).await
 }
 
 async fn remove(
@@ -109,9 +109,7 @@ async fn remove(
     list: &'static KeyList,
     params: HashMap<String, String>,
 ) -> Response {
-    let index = params.get("index").map(String::as_str);
-    let value = params.get("value").map(String::as_str);
-    mutate(&state, list, |target| lists::remove(target, index, value))
+    mutate(&state, list, move |target| lists::remove(target, params.get("index").map(String::as_str), params.get("value").map(String::as_str))).await
 }
 
 async fn api_key_usage(State(state): State<Arc<AppState>>) -> Response {

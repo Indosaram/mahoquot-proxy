@@ -357,7 +357,7 @@ pub fn streaming_body(params: StreamingBodyParams) -> Body {
                         (state, upstream_capture),
                     ));
                 }
-                if state.drained {
+                if state.drained || state.renderer.terminated() {
                     return None;
                 }
                 match state.upstream.next().await {
@@ -405,6 +405,7 @@ fn capture_stream_usage(
             input_tokens: usage.prompt_tokens,
             output_tokens: usage.completion_tokens,
             cached_input_tokens: usage.cached_tokens,
+            cache_write_tokens: usage.cache_write_tokens,
             reasoning_tokens: usage.reasoning_tokens,
         });
 }
@@ -430,6 +431,7 @@ pub async fn collect_stream_with_replies(
             input_tokens: completed.prompt_tokens,
             output_tokens: completed.completion_tokens,
             cached_input_tokens: completed.cached_tokens,
+            cache_write_tokens: completed.cache_write_tokens,
             reasoning_tokens: completed.reasoning_tokens,
         }),
         _ => None,

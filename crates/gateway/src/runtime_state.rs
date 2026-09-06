@@ -330,6 +330,14 @@ impl UnifiedRuntimeState {
         &self,
         next_registry: Arc<RegistrySnapshot>,
     ) -> Result<Arc<RuntimeComposition>, anyhow::Error> {
+        self.update_registry_with_commit(next_registry, || Ok(()))
+    }
+
+    pub(crate) fn update_registry_with_commit(
+        &self,
+        next_registry: Arc<RegistrySnapshot>,
+        commit: impl FnOnce() -> anyhow::Result<()>,
+    ) -> Result<Arc<RuntimeComposition>, anyhow::Error> {
         let models_env = self.models_env.clone();
         let pool = Arc::clone(&self.pool);
         let gen_seq = &self.generation_seq;
@@ -343,6 +351,7 @@ impl UnifiedRuntimeState {
                 next_registry,
                 models_env.as_deref(),
             )?;
+            commit()?;
             let arc_candidate = Arc::new(candidate);
             pool.store(Arc::clone(&arc_candidate));
             Ok(arc_candidate)

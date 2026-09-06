@@ -9,10 +9,79 @@ use common::{create_auth_file_json, unique_temp_dir};
 use mahoquot_gateway::{config::GatewayConfig, routes::create_app, state::AppState};
 use mahoquot_types::{Health, PoolMember, Strategy};
 
+async fn bind_fixture_listener() -> tokio::net::TcpListener {
+    for port in 18840..=18899 {
+        match tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await {
+            Ok(listener) => return listener,
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(error) => panic!("fixture bind failed on {port}: {error}"),
+        }
+    }
+    panic!("no available fixture port in 18840-18899");
+}
+
+const NOW_MS: i64 = 1_800_000_000_123;
+
+fn assert_cooldown(headers: &[(&str, &str)], seconds: i64) {
+    let mut map = reqwest::header::HeaderMap::new();
+    for (name, value) in headers {
+        map.insert(
+            reqwest::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+            value.parse().unwrap(),
+        );
+    }
+    assert_eq!(
+        mahoquot_gateway::relay::cooldown_deadline_from_headers(&map, NOW_MS),
+        NOW_MS + seconds * 1000,
+        "headers: {headers:?}"
+    );
+}
+
+#[test]
+fn test_cooldown_relative_reset_after_seconds_header_honored() {
+    for seconds in [42, 600] {
+        assert_cooldown(
+            &[("anthropic-ratelimit-unified-reset-after-seconds", &seconds.to_string())],
+            seconds,
+        );
+    }
+}
+
+#[test]
+fn test_cooldown_absolute_reset_and_mixed_headers() {
+    assert_cooldown(&[("x-ratelimit-reset-at", "1800000060")], 60);
+    assert_cooldown(&[("x-ratelimit-reset-at", "1799999999")], 300);
+    assert_cooldown(
+        &[("x-ratelimit-reset-at", "1800000060"), ("x-ratelimit-reset-after-seconds", "42")],
+        42,
+    );
+    assert_cooldown(
+        &[("retry-after", "90"), ("x-ratelimit-reset-after-seconds", "42")],
+        90,
+    );
+}
+
+#[test]
+fn test_cooldown_invalid_headers_fallback_and_overflow_clamp() {
+    assert_cooldown(&[], 300);
+    for value in ["0", "-1", "invalid", "9223372036854775808"] {
+        assert_cooldown(&[("x-ratelimit-reset-after-seconds", value)], 300);
+    }
+    for name in ["retry-after", "x-ratelimit-reset-at", "x-ratelimit-reset-after-seconds"] {
+        assert_cooldown(&[(name, "9223372036854775807")], 86_400);
+    }
+    assert_eq!(
+        mahoquot_gateway::relay::cooldown_deadline_from_headers(&reqwest::header::HeaderMap::new(), i64::MAX - 1),
+        i64::MAX
+    );
+}
+
 #[tokio::test]
 async fn test_t3_failover() {
+    let mut servers = Vec::new();
+    let mut shutdowns = Vec::new();
     // Given: Account A override always 429, Account B 200 SSE
-    let listener_a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener_a = bind_fixture_listener().await;
     let port_a = listener_a.local_addr().unwrap().port();
     let app_a = Router::new().route(
         common::CODEX_PATH,
@@ -24,11 +93,16 @@ async fn test_t3_failover() {
             )
         }),
     );
-    tokio::spawn(async move {
-        axum::serve(listener_a, app_a).await.unwrap();
-    });
+    let (shutdown, stopped) = tokio::sync::oneshot::channel();
+    shutdowns.push(shutdown);
+    servers.push(tokio::spawn(async move {
+        axum::serve(listener_a, app_a)
+            .with_graceful_shutdown(async { stopped.await.unwrap(); })
+            .await
+            .unwrap();
+    }));
 
-    let listener_b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener_b = bind_fixture_listener().await;
     let port_b = listener_b.local_addr().unwrap().port();
     let app_b = Router::new().route(
         common::CODEX_PATH,
@@ -40,9 +114,14 @@ async fn test_t3_failover() {
             )
         }),
     );
-    tokio::spawn(async move {
-        axum::serve(listener_b, app_b).await.unwrap();
-    });
+    let (shutdown, stopped) = tokio::sync::oneshot::channel();
+    shutdowns.push(shutdown);
+    servers.push(tokio::spawn(async move {
+        axum::serve(listener_b, app_b)
+            .with_graceful_shutdown(async { stopped.await.unwrap(); })
+            .await
+            .unwrap();
+    }));
 
     let temp_dir = unique_temp_dir("qgw-test-t3");
     let json_a = create_auth_file_json(
@@ -78,11 +157,16 @@ async fn test_t3_failover() {
 
     let state = Arc::new(AppState::new(&config).unwrap());
     let app = create_app(state.clone());
-    let gw_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gw_listener = bind_fixture_listener().await;
     let gw_port = gw_listener.local_addr().unwrap().port();
-    tokio::spawn(async move {
-        axum::serve(gw_listener, app).await.unwrap();
-    });
+    let (shutdown, stopped) = tokio::sync::oneshot::channel();
+    shutdowns.push(shutdown);
+    servers.push(tokio::spawn(async move {
+        axum::serve(gw_listener, app)
+            .with_graceful_shutdown(async { stopped.await.unwrap(); })
+            .await
+            .unwrap();
+    }));
 
     let client = reqwest::Client::new();
     let gw_url = format!("http://127.0.0.1:{gw_port}/v1/chat/completions");
@@ -126,13 +210,24 @@ async fn test_t3_failover() {
         acct_a.health()
     );
 
-    std::fs::remove_dir_all(&temp_dir).ok();
+    drop(client);
+    for shutdown in shutdowns {
+        shutdown.send(()).unwrap();
+    }
+    for server in servers {
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await.unwrap().unwrap();
+    }
+    drop(state);
+    std::fs::remove_dir_all(&temp_dir).unwrap();
 }
 
 #[tokio::test]
 async fn test_t3b_final_failure_records_the_attempted_account() {
+    let mut servers = Vec::new();
+    let mut shutdowns = Vec::new();
     // Given: the only available account's upstream always answers 429
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = bind_fixture_listener().await;
     let port = listener.local_addr().unwrap().port();
     let app = Router::new().route(
         common::CODEX_PATH,
@@ -144,9 +239,14 @@ async fn test_t3b_final_failure_records_the_attempted_account() {
             )
         }),
     );
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
+    let (shutdown, stopped) = tokio::sync::oneshot::channel();
+    shutdowns.push(shutdown);
+    servers.push(tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async { stopped.await.unwrap(); })
+            .await
+            .unwrap();
+    }));
 
     let temp_dir = unique_temp_dir("qgw-test-t3b");
     let json = create_auth_file_json(
@@ -174,11 +274,16 @@ async fn test_t3b_final_failure_records_the_attempted_account() {
 
     let state = Arc::new(AppState::new(&config).unwrap());
     let app = create_app(state.clone());
-    let gw_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gw_listener = bind_fixture_listener().await;
     let gw_port = gw_listener.local_addr().unwrap().port();
-    tokio::spawn(async move {
-        axum::serve(gw_listener, app).await.unwrap();
-    });
+    let (shutdown, stopped) = tokio::sync::oneshot::channel();
+    shutdowns.push(shutdown);
+    servers.push(tokio::spawn(async move {
+        axum::serve(gw_listener, app)
+            .with_graceful_shutdown(async { stopped.await.unwrap(); })
+            .await
+            .unwrap();
+    }));
 
     let client = reqwest::Client::new();
     let gw_url = format!("http://127.0.0.1:{gw_port}/v1/chat/completions");
@@ -192,6 +297,8 @@ async fn test_t3b_final_failure_records_the_attempted_account() {
         .await
         .unwrap();
     assert_eq!(res.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+
+    res.bytes().await.unwrap();
 
     // Then: the recorded usage event names the attempted account, not "unknown"
     state.history.flush().unwrap();
@@ -209,26 +316,47 @@ async fn test_t3b_final_failure_records_the_attempted_account() {
     );
     assert_eq!(rows[0].provider, "codex");
 
-    std::fs::remove_dir_all(&temp_dir).ok();
+    drop(client);
+    for shutdown in shutdowns {
+        shutdown.send(()).unwrap();
+    }
+    for server in servers {
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await.unwrap().unwrap();
+    }
+    drop(state);
+    std::fs::remove_dir_all(&temp_dir).unwrap();
 }
 
 #[tokio::test]
 async fn test_t3c_final_failure_attribution_names_the_last_attempted_account() {
-    // Given: account A answers HTTP 500, account B refuses connections
-    let listener_a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut servers = Vec::new();
+    let mut shutdowns = Vec::new();
+    // Given: account A answers HTTP 500, account B closes connections
+    let listener_a = bind_fixture_listener().await;
     let port_a = listener_a.local_addr().unwrap().port();
     let app_a = Router::new().route(
         common::CODEX_PATH,
         post(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "{\"error\":\"boom\"}") }),
     );
-    tokio::spawn(async move {
-        axum::serve(listener_a, app_a).await.unwrap();
-    });
+    let (shutdown, stopped) = tokio::sync::oneshot::channel();
+    shutdowns.push(shutdown);
+    servers.push(tokio::spawn(async move {
+        axum::serve(listener_a, app_a)
+            .with_graceful_shutdown(async { stopped.await.unwrap(); })
+            .await
+            .unwrap();
+    }));
 
-    // A dead port: bind, read the port, drop — connection refused afterwards.
-    let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    // Hold the port and close accepted connections to force a transport failure.
+    let dead = bind_fixture_listener().await;
     let dead_port = dead.local_addr().unwrap().port();
-    drop(dead);
+    let transport_server = tokio::spawn(async move {
+        loop {
+            let (connection, _) = dead.accept().await.unwrap();
+            drop(connection);
+        }
+    });
 
     let temp_dir = unique_temp_dir("qgw-test-t3c");
     for (id, upstream) in [
@@ -261,11 +389,16 @@ async fn test_t3c_final_failure_attribution_names_the_last_attempted_account() {
 
     let state = Arc::new(AppState::new(&config).unwrap());
     let app = create_app(state.clone());
-    let gw_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gw_listener = bind_fixture_listener().await;
     let gw_port = gw_listener.local_addr().unwrap().port();
-    tokio::spawn(async move {
-        axum::serve(gw_listener, app).await.unwrap();
-    });
+    let (shutdown, stopped) = tokio::sync::oneshot::channel();
+    shutdowns.push(shutdown);
+    servers.push(tokio::spawn(async move {
+        axum::serve(gw_listener, app)
+            .with_graceful_shutdown(async { stopped.await.unwrap(); })
+            .await
+            .unwrap();
+    }));
 
     let client = reqwest::Client::new();
     let gw_url = format!("http://127.0.0.1:{gw_port}/v1/chat/completions");
@@ -279,6 +412,8 @@ async fn test_t3c_final_failure_attribution_names_the_last_attempted_account() {
         .await
         .unwrap();
     assert_eq!(res.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+
+    res.bytes().await.unwrap();
 
     // Then: the usage event names B — the last ATTEMPTED account — not A,
     // whose HTTP failure merely produced the final response body.
@@ -296,23 +431,41 @@ async fn test_t3c_final_failure_attribution_names_the_last_attempted_account() {
     );
     assert_eq!(rows[0].provider, "codex");
 
-    std::fs::remove_dir_all(&temp_dir).ok();
+    transport_server.abort();
+    assert!(transport_server.await.unwrap_err().is_cancelled());
+    drop(client);
+    for shutdown in shutdowns {
+        shutdown.send(()).unwrap();
+    }
+    for server in servers {
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await.unwrap().unwrap();
+    }
+    drop(state);
+    std::fs::remove_dir_all(&temp_dir).unwrap();
 }
 
 #[tokio::test]
 async fn server_error_failover_keeps_health_and_moves_to_the_next_account() {
+    let mut servers = Vec::new();
+    let mut shutdowns = Vec::new();
     // Given: Account A (FillFirst order) always answers 500, Account B 200 SSE
-    let listener_a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener_a = bind_fixture_listener().await;
     let port_a = listener_a.local_addr().unwrap().port();
     let app_a = Router::new().route(
         common::CODEX_PATH,
         post(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "{\"error\":\"boom\"}") }),
     );
-    tokio::spawn(async move {
-        axum::serve(listener_a, app_a).await.unwrap();
-    });
+    let (shutdown, stopped) = tokio::sync::oneshot::channel();
+    shutdowns.push(shutdown);
+    servers.push(tokio::spawn(async move {
+        axum::serve(listener_a, app_a)
+            .with_graceful_shutdown(async { stopped.await.unwrap(); })
+            .await
+            .unwrap();
+    }));
 
-    let listener_b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener_b = bind_fixture_listener().await;
     let port_b = listener_b.local_addr().unwrap().port();
     let app_b = Router::new().route(
         common::CODEX_PATH,
@@ -324,9 +477,14 @@ async fn server_error_failover_keeps_health_and_moves_to_the_next_account() {
             )
         }),
     );
-    tokio::spawn(async move {
-        axum::serve(listener_b, app_b).await.unwrap();
-    });
+    let (shutdown, stopped) = tokio::sync::oneshot::channel();
+    shutdowns.push(shutdown);
+    servers.push(tokio::spawn(async move {
+        axum::serve(listener_b, app_b)
+            .with_graceful_shutdown(async { stopped.await.unwrap(); })
+            .await
+            .unwrap();
+    }));
 
     let temp_dir = unique_temp_dir("qgw-test-t3-server-error");
     let json_a = create_auth_file_json(
@@ -362,11 +520,16 @@ async fn server_error_failover_keeps_health_and_moves_to_the_next_account() {
 
     let state = Arc::new(AppState::new(&config).unwrap());
     let app = create_app(state.clone());
-    let gw_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gw_listener = bind_fixture_listener().await;
     let gw_port = gw_listener.local_addr().unwrap().port();
-    tokio::spawn(async move {
-        axum::serve(gw_listener, app).await.unwrap();
-    });
+    let (shutdown, stopped) = tokio::sync::oneshot::channel();
+    shutdowns.push(shutdown);
+    servers.push(tokio::spawn(async move {
+        axum::serve(gw_listener, app)
+            .with_graceful_shutdown(async { stopped.await.unwrap(); })
+            .await
+            .unwrap();
+    }));
 
     let client = reqwest::Client::new();
     let gw_url = format!("http://127.0.0.1:{gw_port}/v1/chat/completions");
@@ -396,5 +559,14 @@ async fn server_error_failover_keeps_health_and_moves_to_the_next_account() {
         acct_a.health()
     );
 
-    std::fs::remove_dir_all(&temp_dir).ok();
+    drop(client);
+    for shutdown in shutdowns {
+        shutdown.send(()).unwrap();
+    }
+    for server in servers {
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await.unwrap().unwrap();
+    }
+    drop(state);
+    std::fs::remove_dir_all(&temp_dir).unwrap();
 }

@@ -213,10 +213,8 @@ async fn task_14_qa_scenario() {
             .expect("gateway server");
     });
 
-    // Brief yield for listener to be active
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5)).build().expect("bounded HTTP client");
     let uri = format!("http://127.0.0.1:{QA_PORT}/v0/management/model-registry");
     let mut http_evidence = String::new();
 
@@ -419,10 +417,11 @@ async fn task_14_qa_scenario() {
 
     // Graceful shutdown of gateway server
     let _ = shutdown_tx.send(());
-    server_task.await.expect("gateway server shut down cleanly");
+    tokio::time::timeout(Duration::from_secs(5), server_task)
+        .await.expect("gateway shutdown deadline").expect("gateway server shut down cleanly");
 
-    // Abort fixture server
     fixture_task.abort();
+    assert!(fixture_task.await.expect_err("fixture cancelled").is_cancelled());
 
     // Verify port 18875 is freed
     let check_listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{QA_PORT}")).await;
@@ -442,15 +441,7 @@ async fn task_14_qa_scenario() {
     )
     .expect("wrote proxy task-14-management.http");
 
-    let quotio_evidence =
-        PathBuf::from("/Users/indo/code/project/quotio-rs/.omo/evidence/model-registry");
-    std::fs::create_dir_all(&quotio_evidence).expect("quotio evidence dir created");
-    std::fs::write(
-        quotio_evidence.join("task-14-management.http"),
-        &http_evidence,
-    )
-    .expect("wrote quotio task-14-management.http");
-
-    // Cleanup temp dir
-    std::fs::remove_dir_all(root).ok();
+    drop(client);
+    drop(state);
+    std::fs::remove_dir_all(root).expect("remove fixture directory");
 }

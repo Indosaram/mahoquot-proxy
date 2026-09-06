@@ -133,7 +133,7 @@ async fn task_11_http_qa_scenario() {
             .unwrap();
     });
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // The bound listener already accepts connections; the first response is readiness.
 
     let completions_url = format!("http://127.0.0.1:{QA_PORT}/v1/chat/completions");
 
@@ -155,6 +155,8 @@ async fn task_11_http_qa_scenario() {
 
     // Execute via curl to directly satisfy requirement 5 invocation
     let curl1_output = tokio::process::Command::new("curl")
+        .kill_on_drop(true)
+        .args(["--max-time", "5"])
         .args([
             "-i",
             &completions_url,
@@ -209,6 +211,8 @@ async fn task_11_http_qa_scenario() {
     http_evidence.push_str("\n\n");
 
     let curl2_output = tokio::process::Command::new("curl")
+        .kill_on_drop(true)
+        .args(["--max-time", "5"])
         .args([
             "-i",
             &completions_url,
@@ -241,17 +245,16 @@ async fn task_11_http_qa_scenario() {
 
     // Shutdown and clean up
     let _ = shutdown_tx.send(());
-    server_handle.await.expect("server gracefully stopped");
+    tokio::time::timeout(Duration::from_secs(5), server_handle)
+        .await.expect("server shutdown deadline").expect("server gracefully stopped");
     upstream_task.abort();
-    std::fs::remove_dir_all(auth_dir).ok();
+    assert!(upstream_task.await.expect_err("upstream cancelled").is_cancelled());
+    drop(state);
+    std::fs::remove_dir_all(auth_dir).expect("remove fixture directory");
 
-    // Write full evidence files to both repositories
     let proxy_evidence_dir =
-        PathBuf::from("/Users/indo/code/project/mahoquot-proxy/.omo/evidence/model-registry");
-    let quotio_evidence_dir =
-        PathBuf::from("/Users/indo/code/project/quotio-rs/.omo/evidence/model-registry");
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.omo/evidence/model-registry");
     std::fs::create_dir_all(&proxy_evidence_dir).expect("proxy evidence dir created");
-    std::fs::create_dir_all(&quotio_evidence_dir).expect("quotio evidence dir created");
 
     std::fs::write(
         proxy_evidence_dir.join("task-11-routing.http"),
@@ -259,9 +262,4 @@ async fn task_11_http_qa_scenario() {
     )
     .expect("wrote proxy task-11-routing.http");
 
-    std::fs::write(
-        quotio_evidence_dir.join("task-11-routing.http"),
-        &http_evidence,
-    )
-    .expect("wrote quotio task-11-routing.http");
 }

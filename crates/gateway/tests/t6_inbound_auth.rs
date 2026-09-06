@@ -39,7 +39,7 @@ async fn authenticated_shutdown_drains_before_server_exit() {
             }
         }),
     );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:18898")
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .unwrap();
     let address = listener.local_addr().unwrap();
@@ -359,6 +359,8 @@ async fn test_inbound_auth_cases() {
             "gpt-5.4",
             "gpt-5.4-mini",
             "gpt-5.3-codex-spark",
+            "gpt-6-astra",
+            "gpt-daybreak-blue-latest",
         ]
     );
 

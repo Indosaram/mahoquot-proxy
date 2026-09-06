@@ -19,7 +19,8 @@ const ACCOUNT_ORDER_FILE: &str = ".mahoquot-account-order.json";
 
 fn is_credential_filename(name: &str) -> bool {
     let lowered = name.to_ascii_lowercase();
-    lowered.ends_with(".json") && name != ACCOUNT_ORDER_FILE && lowered != "telemetry.json"
+    lowered.ends_with(".json") && lowered != ACCOUNT_ORDER_FILE
+        && lowered != "account-order.json" && lowered != "telemetry.json"
 }
 
 fn is_credential_document(value: &Value) -> bool {
@@ -506,7 +507,7 @@ async fn patch_auth_file_status(
             json!({ "error": "disabled is required" }),
         );
     };
-    if name.is_empty() || name.contains('/') || name.contains("..") {
+    if name.is_empty() || name.contains('/') || name.contains("..") || !is_credential_filename(name) {
         return json_status(StatusCode::BAD_REQUEST, json!({ "error": "invalid name" }));
     }
     let dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
@@ -532,7 +533,17 @@ async fn patch_auth_file_status(
             )
         }
     };
-    value["disabled"] = json!(disabled);
+    if !value.is_object() {
+        return json_status(StatusCode::BAD_REQUEST, json!({ "error": "auth file must be a JSON object" }));
+    }
+    let legacy_codex = name.starts_with("codex-")
+        && serde_json::from_value::<mahoquot_providers::CodexAccount>(value.clone()).is_ok();
+    if !is_credential_document(&value) && !legacy_codex {
+        return json_status(StatusCode::BAD_REQUEST, json!({ "error": "invalid credential document" }));
+    }
+    if let Value::Object(fields) = &mut value {
+        fields.insert("disabled".into(), json!(disabled));
+    }
     let rendered = match serde_json::to_string_pretty(&value) {
         Ok(rendered) => rendered,
         Err(error) => {
@@ -553,6 +564,12 @@ async fn patch_auth_file_status(
             StatusCode::INTERNAL_SERVER_ERROR,
             json!({ "error": error.to_string() }),
         );
+    }
+    if !disabled {
+        let state_clone = Arc::clone(&state);
+        tokio::spawn(async move {
+            crate::quota::refresh_all_usage(&state_clone).await;
+        });
     }
     json_status(
         StatusCode::OK,
@@ -1030,6 +1047,75 @@ async fn trae_import(State(state): State<Arc<AppState>>, raw: bytes::Bytes) -> R
     )
 }
 
+async fn discover_provider_models(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Response {
+    let base_url = match body.get("base_url").and_then(Value::as_str) {
+        Some(u) if !u.trim().is_empty() => u.trim().trim_end_matches('/'),
+        _ => return json_status(StatusCode::BAD_REQUEST, json!({"error": "base_url is required"})),
+    };
+    let api_key = body.get("api_key").and_then(Value::as_str).unwrap_or("").trim();
+    let target_url = if base_url.ends_with("/v1") {
+        format!("{base_url}/models")
+    } else {
+        format!("{base_url}/v1/models")
+    };
+    let mut req = state.http_client.get(&target_url);
+    if !api_key.is_empty() {
+        req = req.header(header::AUTHORIZATION, format!("Bearer {api_key}"));
+    }
+    if let Some(headers) = body.get("static_headers").and_then(Value::as_object) {
+        for (k, v) in headers {
+            if let Some(v_str) = v.as_str() {
+                if let (Ok(name), Ok(val)) = (
+                    header::HeaderName::from_bytes(k.as_bytes()),
+                    header::HeaderValue::from_str(v_str),
+                ) {
+                    req = req.header(name, val);
+                }
+            }
+        }
+    }
+    match req.send().await {
+        Ok(resp) if resp.status().is_success() => {
+            let Ok(json) = resp.json::<Value>().await else {
+                return json_status(
+                    StatusCode::BAD_GATEWAY,
+                    json!({"error": "invalid json from upstream models endpoint"}),
+                );
+            };
+            let mut models = Vec::new();
+            if let Some(data) = json.get("data").and_then(Value::as_array) {
+                for item in data {
+                    if let Some(id) = item.get("id").and_then(Value::as_str) {
+                        models.push(id.to_string());
+                    }
+                }
+            } else if let Some(items) = json.get("models").and_then(Value::as_array) {
+                for item in items {
+                    if let Some(id) = item.as_str() {
+                        models.push(id.to_string());
+                    } else if let Some(id) = item.get("id").and_then(Value::as_str) {
+                        models.push(id.to_string());
+                    }
+                }
+            }
+            models.sort();
+            models.dedup();
+            json_status(StatusCode::OK, json!({ "models": models }))
+        }
+        Ok(resp) => json_status(
+            StatusCode::BAD_GATEWAY,
+            json!({ "error": format!("upstream returned status {}", resp.status()) }),
+        ),
+        Err(err) => json_status(
+            StatusCode::BAD_GATEWAY,
+            json!({ "error": format!("failed to reach upstream: {err}") }),
+        ),
+    }
+}
+
 pub fn creds_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route(
@@ -1053,6 +1139,7 @@ pub fn creds_routes() -> Router<Arc<AppState>> {
         .route("/vertex/import", post(vertex_import))
         .route("/command-code/import", post(command_code_import))
         .route("/trae/import-local", post(trae_import))
+        .route("/provider-models/discover", post(discover_provider_models))
         .merge(super::oauth::oauth_routes())
         .route("/oauth-session", delete(super::oauth::cancel_session))
 }
@@ -1239,7 +1326,22 @@ mod tests {
 
 #[cfg(test)]
 mod reserved_file_tests {
-    use super::is_credential_filename;
+    use super::*;
+
+    #[tokio::test]
+    async fn discover_provider_models_requires_base_url() {
+        let root = std::env::temp_dir().join(format!("qgw-test-disc-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let config = crate::config::GatewayConfig {
+            auth_dir: root.clone(),
+            config_path: root.join("config.yaml"),
+            ..Default::default()
+        };
+        let state = Arc::new(AppState::new(&config).unwrap());
+        let resp = discover_provider_models(State(state), Json(json!({}))).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        std::fs::remove_dir_all(&root).ok();
+    }
 
     #[test]
     fn reserved_data_files_are_not_listed_as_credentials() {

@@ -7,6 +7,7 @@ pub struct Usage {
     pub total_tokens: u64,
     pub cached_tokens: u64,
     pub reasoning_tokens: u64,
+    pub cache_write_tokens: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -115,6 +116,10 @@ fn classify(value: &Value) -> Option<CodexEvent> {
             .get("delta")
             .and_then(Value::as_str)
             .map(|d| CodexEvent::TextDelta(d.to_string())),
+        "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => value
+            .get("delta")
+            .and_then(Value::as_str)
+            .map(|d| CodexEvent::ReasoningDelta(d.to_string())),
         "response.output_item.added" => {
             let item = value.get("item")?;
             if item.get("type").and_then(Value::as_str) != Some("function_call") {
@@ -154,11 +159,13 @@ fn classify(value: &Value) -> Option<CodexEvent> {
                 .and_then(|r| r.get("usage"))
                 .map(parse_usage),
         }),
-        "response.failed" | "response.incomplete" => Some(CodexEvent::Failed {
+        "response.failed" | "response.incomplete" | "response.cancelled" => Some(CodexEvent::Failed {
             message: value
                 .get("response")
                 .and_then(|r| r.get("error"))
                 .and_then(|e| e.get("message"))
+                .or_else(|| value.pointer("/response/incomplete_details/reason"))
+                .or_else(|| value.pointer("/response/status"))
                 .and_then(Value::as_str)
                 .unwrap_or("upstream response failed")
                 .to_string(),
@@ -201,5 +208,6 @@ fn parse_usage(usage: &Value) -> Usage {
             .and_then(|d| d.get("reasoning_tokens"))
             .and_then(Value::as_u64)
             .unwrap_or(0),
+        cache_write_tokens: 0,
     }
 }

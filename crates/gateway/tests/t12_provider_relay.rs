@@ -1068,11 +1068,47 @@ async fn relay_persists_aggregate_history_and_redacted_proxy_log() {
 
 #[tokio::test]
 async fn kiro_relays_conversation_state_and_decodes_eventstream() {
-    let (upstream, seen, mock_task) = start_mock(
-        "binary-prefix {\"content\":\"kiro-ok\"}{\"stopReason\":\"END_TURN\"}",
-        "application/vnd.amazon.eventstream",
-    )
-    .await;
+    fn frame(payload: &[u8]) -> Vec<u8> {
+        fn crc(bytes: &[u8]) -> u32 {
+            let mut crc = !0u32;
+            for byte in bytes {
+                crc ^= u32::from(*byte);
+                for _ in 0..8 {
+                    crc = (crc >> 1) ^ (0xedb88320 & (0u32.wrapping_sub(crc & 1)));
+                }
+            }
+            !crc
+        }
+        let mut frame = ((16 + payload.len()) as u32).to_be_bytes().to_vec();
+        frame.extend_from_slice(&0u32.to_be_bytes());
+        frame.extend_from_slice(&crc(&frame).to_be_bytes());
+        frame.extend_from_slice(payload);
+        frame.extend_from_slice(&crc(&frame).to_be_bytes());
+        frame
+    }
+    let mut wire = frame(br#"{"content":"kiro-ok"}"#);
+    wire.extend(frame(br#"{"name":"lookup","toolUseId":"kiro-call","input":"{}"}"#));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let captured = seen.clone();
+    let app = Router::new().fallback(post(move |uri: axum::http::Uri, headers: HeaderMap, body: Bytes| {
+        let captured = captured.clone();
+        let wire = wire.clone();
+        async move {
+            captured.lock().unwrap().push(SeenRequest {path:uri.path().to_string(), headers, body:serde_json::from_slice(&body).unwrap(),raw_body:body.to_vec()});
+            ([("content-type", "application/vnd.amazon.eventstream")], wire)
+        }
+    }));
+    let mut bound = None;
+    for port in 18840..=18899 {
+        match tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await {
+            Ok(listener) => {bound = Some(listener); break;}
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(error) => panic!("fixture bind: {error}"),
+        }
+    }
+    let listener = bound.expect("available fixture port");
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    let mock_task = tokio::spawn(async move {axum::serve(listener, app).await.unwrap();});
     let (gateway, auth_dir, gateway_task) = start_gateway("kiro", &upstream).await;
 
     let response = reqwest::Client::new()

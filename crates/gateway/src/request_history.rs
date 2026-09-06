@@ -19,6 +19,7 @@ const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const DEFAULT_MAX_SIZE_BYTES: u64 = 512 * 1024 * 1024;
 const DEFAULT_PRUNE_CHUNK_SIZE: usize = 500;
+const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimeBucket {
@@ -106,7 +107,7 @@ impl From<&HistoryConfig> for PrunePolicy {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct HistoryTotals {
     pub requests: u64,
     pub successful_requests: u64,
@@ -114,6 +115,8 @@ pub struct HistoryTotals {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_input_tokens: u64,
+    #[serde(rename = "cache-write-tokens", default)]
+    pub cache_write_tokens: u64,
     pub reasoning_tokens: u64,
     pub total_tokens: u64,
     pub total_latency_ms: u64,
@@ -121,7 +124,7 @@ pub struct HistoryTotals {
     pub estimated_cost_usd: f64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UsageEvent {
     pub event_id: String,
     pub occurred_at_ms: i64,
@@ -134,6 +137,8 @@ pub struct UsageEvent {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_input_tokens: u64,
+    #[serde(rename = "cache-write-tokens", default)]
+    pub cache_write_tokens: u64,
     pub reasoning_tokens: u64,
     pub total_tokens: u64,
     pub latency_ms: u64,
@@ -212,7 +217,7 @@ pub struct HistoryQueryResult {
     pub groups: Vec<HistoryGroup>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct HistoryEventRow {
     pub row_id: i64,
     pub event_id: String,
@@ -226,12 +231,16 @@ pub struct HistoryEventRow {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_input_tokens: u64,
+    #[serde(rename = "cache-write-tokens", default)]
+    pub cache_write_tokens: u64,
     pub reasoning_tokens: u64,
     pub total_tokens: u64,
     pub latency_ms: u64,
     pub estimated_cost_usd: f64,
     pub price_version: Option<String>,
 }
+
+pub type HistoryEvent = HistoryEventRow;
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct HistoryEventPage {
@@ -535,6 +544,14 @@ impl RequestHistory {
     }
 
     pub fn open_with_config(path: &Path, config: HistoryConfig) -> HistoryState {
+        Self::open_with_config_and_clock(path, config, unix_time_ms)
+    }
+
+    pub fn open_with_config_and_clock(
+        path: &Path,
+        config: HistoryConfig,
+        clock: impl Fn() -> i64 + Send + 'static,
+    ) -> HistoryState {
         let path = path.to_path_buf();
         let (sender, receiver) = mpsc::channel();
         let (init_sender, init_receiver) = mpsc::sync_channel(1);
@@ -546,7 +563,7 @@ impl RequestHistory {
                 move || match open_connection(&worker_path, &worker_config) {
                     Ok(connection) => {
                         let _ = init_sender.send(Ok(()));
-                        worker_loop(connection, &worker_path, receiver);
+                        worker_loop(connection, &worker_path, receiver, worker_config, clock);
                     }
                     Err(error) => {
                         let _ = init_sender.send(Err(error));
@@ -769,6 +786,7 @@ fn validate_event(event: &UsageEvent) -> Result<(), HistoryError> {
         ("input_tokens", event.input_tokens),
         ("output_tokens", event.output_tokens),
         ("cached_input_tokens", event.cached_input_tokens),
+        ("cache_write_tokens", event.cache_write_tokens),
         ("reasoning_tokens", event.reasoning_tokens),
         ("total_tokens", event.total_tokens),
         ("latency_ms", event.latency_ms),
@@ -845,7 +863,16 @@ fn migrate(connection: &mut Connection) -> Result<(), HistoryError> {
         transaction.pragma_update(None, "user_version", 2)?;
         transaction.commit()?;
     }
+    init_schema(connection);
     Ok(())
+}
+
+pub fn init_schema(conn: &Connection) {
+    conn.execute(
+        "ALTER TABLE usage_events ADD COLUMN cache_write_tokens INTEGER NOT NULL DEFAULT 0;",
+        [],
+    )
+    .ok();
 }
 
 const MIGRATION_V1: &str = r#"
@@ -922,8 +949,33 @@ CREATE INDEX idx_usage_events_key_time ON usage_events(key_identifier, occurred_
 CREATE INDEX idx_usage_events_status_time ON usage_events(status_code, occurred_at_ms);
 "#;
 
-fn worker_loop(mut connection: Connection, path: &Path, receiver: mpsc::Receiver<Command>) {
-    while let Ok(command) = receiver.recv() {
+fn worker_loop(
+    mut connection: Connection,
+    path: &Path,
+    receiver: mpsc::Receiver<Command>,
+    config: HistoryConfig,
+    clock: impl Fn() -> i64,
+) {
+    let mut next_maintenance = clock().saturating_add(MAINTENANCE_INTERVAL.as_millis() as i64);
+    loop {
+        let wait_ms = next_maintenance.saturating_sub(clock()).max(0) as u64;
+        let command = match receiver.recv_timeout(Duration::from_millis(wait_ms)) {
+            Ok(Command::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Ok(command) => Some(command),
+            Err(mpsc::RecvTimeoutError::Timeout) => None,
+        };
+        let now_ms = clock();
+        if now_ms >= next_maintenance {
+            match prune_events(&mut connection, path, now_ms, PrunePolicy::from(&config)) {
+                Ok(result) if !result.size_cap_satisfied => {
+                    tracing::warn!(size_bytes = result.logical_size_bytes, "request history size cap cannot be satisfied");
+                }
+                Ok(_) => {}
+                Err(error) => tracing::warn!(%error, "request history runtime maintenance failed"),
+            }
+            next_maintenance = now_ms.saturating_add(MAINTENANCE_INTERVAL.as_millis() as i64);
+        }
+        let Some(command) = command else { continue };
         match command {
             Command::Insert(event, reply) => {
                 let _ = reply.send(insert_event(&connection, &event));
@@ -1035,9 +1087,9 @@ fn insert_event(connection: &Connection, event: &UsageEvent) -> Result<bool, His
             event_id, occurred_at_ms, account_identifier, provider, model, key_identifier,
             status_code, succeeded, input_tokens, output_tokens, cached_input_tokens,
             reasoning_tokens, total_tokens, latency_ms, created_at_ms,
-            estimated_cost_usd, price_version
+            estimated_cost_usd, price_version, cache_write_tokens
          ) VALUES (
-            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18
          )",
         params![
             event.event_id,
@@ -1057,6 +1109,7 @@ fn insert_event(connection: &Connection, event: &UsageEvent) -> Result<bool, His
             unix_time_ms(),
             estimated_cost_usd,
             price_version,
+            to_sql_i64(event.cache_write_tokens, "cache_write_tokens")?,
         ],
     )?;
     Ok(changed == 1)
@@ -1080,7 +1133,7 @@ const EVENT_SELECT: &str =
     "SELECT e.id, e.event_id, e.occurred_at_ms, e.account_identifier, e.provider, e.model, \
          e.key_identifier, e.status_code, e.succeeded, e.input_tokens, e.output_tokens, \
          e.cached_input_tokens, e.reasoning_tokens, e.total_tokens, e.latency_ms, \
-         e.estimated_cost_usd, e.price_version FROM usage_events e";
+         e.estimated_cost_usd, e.price_version, e.cache_write_tokens FROM usage_events e";
 
 fn read_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryEventRow> {
     Ok(HistoryEventRow {
@@ -1101,6 +1154,7 @@ fn read_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryEventRow> 
         latency_ms: row.get::<_, i64>(14)? as u64,
         estimated_cost_usd: row.get(15)?,
         price_version: row.get(16)?,
+        cache_write_tokens: row.get::<_, i64>(17)? as u64,
     })
 }
 
@@ -1362,6 +1416,7 @@ fn query_history(
             COALESCE(SUM(input_tokens), 0),
             COALESCE(SUM(output_tokens), 0),
             COALESCE(SUM(cached_input_tokens), 0),
+            COALESCE(SUM(cache_write_tokens), 0),
             COALESCE(SUM(reasoning_tokens), 0),
             COALESCE(SUM(total_tokens), 0),
             COALESCE(SUM(latency_ms), 0),
@@ -1391,11 +1446,12 @@ fn read_totals(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryTotals> {
         input_tokens: row.get::<_, i64>(3)? as u64,
         output_tokens: row.get::<_, i64>(4)? as u64,
         cached_input_tokens: row.get::<_, i64>(5)? as u64,
-        reasoning_tokens: row.get::<_, i64>(6)? as u64,
-        total_tokens: row.get::<_, i64>(7)? as u64,
-        total_latency_ms: row.get::<_, i64>(8)? as u64,
-        average_latency_ms: row.get(9)?,
-        estimated_cost_usd: row.get(10)?,
+        cache_write_tokens: row.get::<_, i64>(6)? as u64,
+        reasoning_tokens: row.get::<_, i64>(7)? as u64,
+        total_tokens: row.get::<_, i64>(8)? as u64,
+        total_latency_ms: row.get::<_, i64>(9)? as u64,
+        average_latency_ms: row.get(10)?,
+        estimated_cost_usd: row.get(11)?,
     })
 }
 
@@ -1449,6 +1505,7 @@ fn query_groups(
             COALESCE(SUM(input_tokens), 0),
             COALESCE(SUM(output_tokens), 0),
             COALESCE(SUM(cached_input_tokens), 0),
+            COALESCE(SUM(cache_write_tokens), 0),
             COALESCE(SUM(reasoning_tokens), 0),
             COALESCE(SUM(total_tokens), 0),
             COALESCE(SUM(latency_ms), 0),
@@ -1484,11 +1541,12 @@ fn query_groups(
                 input_tokens: row.get::<_, i64>(totals_start + 3)? as u64,
                 output_tokens: row.get::<_, i64>(totals_start + 4)? as u64,
                 cached_input_tokens: row.get::<_, i64>(totals_start + 5)? as u64,
-                reasoning_tokens: row.get::<_, i64>(totals_start + 6)? as u64,
-                total_tokens: row.get::<_, i64>(totals_start + 7)? as u64,
-                total_latency_ms: row.get::<_, i64>(totals_start + 8)? as u64,
-                average_latency_ms: row.get(totals_start + 9)?,
-                estimated_cost_usd: row.get(totals_start + 10)?,
+                cache_write_tokens: row.get::<_, i64>(totals_start + 6)? as u64,
+                reasoning_tokens: row.get::<_, i64>(totals_start + 7)? as u64,
+                total_tokens: row.get::<_, i64>(totals_start + 8)? as u64,
+                total_latency_ms: row.get::<_, i64>(totals_start + 9)? as u64,
+                average_latency_ms: row.get(totals_start + 10)?,
+                estimated_cost_usd: row.get(totals_start + 11)?,
             },
         })
     })?;
@@ -1833,6 +1891,7 @@ pub mod tests {
             input_tokens: fixture.input_tokens,
             output_tokens: fixture.output_tokens,
             cached_input_tokens: fixture.cached_input_tokens,
+            cache_write_tokens: 0,
             reasoning_tokens: fixture.output_tokens / 2,
             total_tokens: fixture.input_tokens + fixture.output_tokens,
             latency_ms: 125,
@@ -2379,4 +2438,73 @@ mod extended_tests {
             .any(|window| window == secret.as_bytes()));
     }
 
+    #[test]
+    fn history_totals_and_event_serde_cache_write_tokens() {
+        let totals = HistoryTotals {
+            cache_write_tokens: 42,
+            ..Default::default()
+        };
+        let serialized = serde_json::to_string(&totals).unwrap();
+        assert!(serialized.contains("\"cache-write-tokens\":42"));
+        let deserialized: HistoryTotals = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(deserialized.cache_write_tokens, 42);
+
+        let deserialized_default: HistoryTotals =
+            serde_json::from_str(&serde_json::to_string(&HistoryTotals::default()).unwrap())
+                .unwrap();
+        assert_eq!(deserialized_default.cache_write_tokens, 0);
+
+        let event = UsageEvent {
+            event_id: "evt-1".to_string(),
+            occurred_at_ms: 100,
+            account_identifier: "acc".to_string(),
+            provider: "anthropic".to_string(),
+            model: "claude-3-5-sonnet".to_string(),
+            key_identifier: None,
+            status_code: 200,
+            succeeded: true,
+            input_tokens: 100,
+            output_tokens: 50,
+            cached_input_tokens: 20,
+            cache_write_tokens: 30,
+            reasoning_tokens: 0,
+            total_tokens: 150,
+            latency_ms: 200,
+        };
+        let event_json = serde_json::to_string(&event).unwrap();
+        assert!(event_json.contains("\"cache-write-tokens\":30"));
+        let deserialized_event: UsageEvent = serde_json::from_str(&event_json).unwrap();
+        assert_eq!(deserialized_event.cache_write_tokens, 30);
+
+        let row = HistoryEventRow {
+            row_id: 1,
+            event_id: "evt-1".to_string(),
+            occurred_at_ms: 100,
+            account_identifier: "acc".to_string(),
+            provider: "anthropic".to_string(),
+            model: "claude-3-5-sonnet".to_string(),
+            key_identifier: None,
+            status_code: 200,
+            succeeded: true,
+            input_tokens: 100,
+            output_tokens: 50,
+            cached_input_tokens: 20,
+            cache_write_tokens: 30,
+            reasoning_tokens: 0,
+            total_tokens: 150,
+            latency_ms: 200,
+            estimated_cost_usd: 0.001,
+            price_version: None,
+        };
+        let row_json = serde_json::to_string(&row).unwrap();
+        assert!(row_json.contains("\"cache-write-tokens\":30"));
+        let deserialized_row: HistoryEvent = serde_json::from_str(&row_json).unwrap();
+        assert_eq!(deserialized_row.cache_write_tokens, 30);
+
+        let path = TestPath::new("cache-write-totals");
+        let history = ready(&path.0);
+        history.insert(&event).unwrap();
+        let totals = history.totals().unwrap();
+        assert_eq!(totals.cache_write_tokens, 30);
+    }
 }

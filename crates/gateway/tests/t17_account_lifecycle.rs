@@ -1,4 +1,6 @@
-use std::sync::Arc;
+mod common;
+use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+use mahoquot_types::{Health, PoolMember};
 
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
@@ -14,6 +16,7 @@ fn config(auth_dir: std::path::PathBuf) -> GatewayConfig {
         auth_dir: auth_dir.clone(),
         api_keys: ApiKeys::new(vec!["lifecycle-key".to_string()]),
         config_path: auth_dir.join("config.yaml"),
+        auth_refresh_enabled: false,
         ..GatewayConfig::default()
     }
 }
@@ -55,17 +58,31 @@ async fn stats(app: &axum::Router) -> serde_json::Value {
 }
 
 #[tokio::test]
-async fn disabled_credentials_leave_and_rejoin_the_pool() {
+async fn disabled_credentials_preserve_counters_but_cannot_route_or_advertise_models() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let recorded = calls.clone();
+    let upstream = axum::Router::new().route(common::CODEX_PATH, axum::routing::post(move || {
+        recorded.fetch_add(1, Ordering::SeqCst);
+        async { ([(header::CONTENT_TYPE, "text/event-stream")], common::codex_sse("fixture")) }
+    }));
+    let task = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
     let auth_dir = std::env::temp_dir().join(format!("quotio-lifecycle-{}", std::process::id()));
     std::fs::create_dir_all(&auth_dir).expect("auth dir");
+    let mut credential = codex_credential();
+    credential["upstream_override"] = serde_json::json!(base);
+    credential["usage_override"] = serde_json::json!(base);
     std::fs::write(
         auth_dir.join("codex-toggle.json"),
-        serde_json::to_vec_pretty(&codex_credential()).unwrap(),
+        serde_json::to_vec_pretty(&credential).unwrap(),
     )
     .expect("credential");
-    let app = create_app(Arc::new(
+    let state = Arc::new(
         AppState::new(&config(auth_dir.clone())).expect("state"),
-    ));
+    );
+    let app = create_app(state.clone());
+    state.find_member("toggle-me").unwrap().ok_count.store(9, Ordering::Relaxed);
     assert_eq!(stats(&app).await["accounts"].as_array().unwrap().len(), 1);
 
     let disable = app
@@ -84,7 +101,19 @@ async fn disabled_credentials_leave_and_rejoin_the_pool() {
         .await
         .unwrap();
     assert_eq!(disable.status(), StatusCode::OK);
-    assert_eq!(stats(&app).await["accounts"].as_array().unwrap().len(), 0);
+    assert_eq!(stats(&app).await["accounts"].as_array().unwrap().len(), 1);
+    assert_eq!(state.find_member("toggle-me").unwrap().health(), Health::Disabled);
+    assert_eq!(state.find_member("toggle-me").unwrap().ok_count.load(Ordering::Relaxed), 9);
+    assert!(state.scheduler.snapshot().order.is_empty());
+    let models = app.clone().oneshot(Request::builder().uri("/v1/models")
+        .header(header::AUTHORIZATION, "Bearer lifecycle-key").body(Body::empty()).unwrap()).await.unwrap();
+    assert!(!json(models).await["data"].as_array().unwrap().iter().any(|m| m["id"] == "gpt-5.6-sol"));
+    let chat = || Request::builder().method("POST").uri("/v1/chat/completions")
+        .header(header::AUTHORIZATION, "Bearer lifecycle-key").header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"model":"gpt-5.6-sol","stream":true,"messages":[{"role":"user","content":"fixture"}]}"#)).unwrap();
+    let rejected = app.clone().oneshot(chat()).await.unwrap();
+    assert!(matches!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE | StatusCode::BAD_REQUEST));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
 
     let listed = app
         .clone()
@@ -116,6 +145,17 @@ async fn disabled_credentials_leave_and_rejoin_the_pool() {
         .unwrap();
     assert_eq!(enable.status(), StatusCode::OK);
     assert_eq!(stats(&app).await["accounts"].as_array().unwrap().len(), 1);
+    assert_eq!(state.find_member("toggle-me").unwrap().health(), Health::Available);
+    assert_eq!(state.find_member("toggle-me").unwrap().ok_count.load(Ordering::Relaxed), 9);
+    let models = app.clone().oneshot(Request::builder().uri("/v1/models")
+        .header(header::AUTHORIZATION, "Bearer lifecycle-key").body(Body::empty()).unwrap()).await.unwrap();
+    assert!(json(models).await["data"].as_array().unwrap().iter().any(|m| m["id"] == "gpt-5.6-sol"));
+    let routed = app.clone().oneshot(chat()).await.unwrap();
+    assert_eq!(routed.status(), StatusCode::OK);
+    routed.into_body().collect().await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
     std::fs::remove_dir_all(auth_dir).ok();
 }
 
@@ -211,5 +251,6 @@ async fn vertex_import_exchanges_service_account_and_joins_google_pool() {
     let accounts = stats(&app).await;
     assert_eq!(accounts["accounts"][0]["provider"], "google-vertex");
     token_task.abort();
+    assert!(token_task.await.unwrap_err().is_cancelled());
     std::fs::remove_dir_all(auth_dir).ok();
 }

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
-use mahoquot_types::{Health, PoolMember};
+use mahoquot_types::PoolMember;
 use serde::{Deserialize, Serialize};
 
 use crate::account::AccountMember;
@@ -269,14 +269,21 @@ impl SchedulerRegistry {
             .iter()
             .map(|member| {
                 let usage = member.usage_snapshot();
-                let window = if usage.primary.used_percent.is_some() {
-                    &usage.primary
-                } else {
-                    &usage.secondary
-                };
-                let remaining = window
-                    .used_percent
-                    .map(|used| (100.0 - used).clamp(0.0, 100.0).round() as u8);
+                // The account is as constrained as its MOST-consumed window
+                // (opencodex #3029): a freshly-reset 5-hour burst window must
+                // not make a nearly-exhausted weekly window look selectable.
+                let mut remaining: Option<u8> = None;
+                let mut reset_at_unix: Option<i64> = None;
+                for window in [&usage.primary, &usage.secondary] {
+                    let Some(used) = window.used_percent else {
+                        continue;
+                    };
+                    let left = (100.0 - used).clamp(0.0, 100.0).round() as u8;
+                    if remaining.is_none_or(|best| left < best) {
+                        remaining = Some(left);
+                        reset_at_unix = window.reset_at_unix;
+                    }
+                }
                 if remaining.is_some_and(|value| value <= EXHAUSTION_ENTER_PERCENT) {
                     runtime
                         .exhausted_since_unix
@@ -294,7 +301,7 @@ impl SchedulerRegistry {
                 (
                     member.id.as_str(),
                     remaining,
-                    window.reset_at_unix,
+                    reset_at_unix,
                     member.health(),
                     runtime.exhausted_since_unix.get(&member.id).copied(),
                     runtime
@@ -312,7 +319,7 @@ impl SchedulerRegistry {
             .map(
                 |(id, remaining, reset, health, exhausted_since, failures)| Candidate {
                     key: id,
-                    manually_disabled: !matches!(health, Health::Available)
+                    manually_disabled: !health.is_available(now * 1000)
                         || *failures >= 3
                         || exhausted_since
                             .is_some_and(|since| now.saturating_sub(since) < MINIMUM_HOLD_SECS),

@@ -816,11 +816,12 @@ async fn test_antigravity_oauth_flow_end_to_end() {
 
     // 1. Request antigravity auth URL
     let start_uri = format!(
-        "/v0/management/antigravity-auth-url?auth_url={}&token_url={}&userinfo_url={}&load_url={}",
+        "/v0/management/antigravity-auth-url?auth_url={}&token_url={}&userinfo_url={}&load_url={}&redirect_uri={}",
         url_encode(auth_endpoint),
         url_encode(&token_url),
         url_encode(&userinfo_url),
-        url_encode(&load_url)
+        url_encode(&load_url),
+        url_encode("http://localhost:51121/oauth-callback")
     );
     let start = app
         .clone()
@@ -981,8 +982,9 @@ async fn test_antigravity_oauth_malformed_token_response_fails_cleanly() {
         .oneshot(
             Request::builder()
                 .uri(format!(
-                    "/v0/management/antigravity-auth-url?token_url={}",
-                    url_encode(&token_url)
+                    "/v0/management/antigravity-auth-url?token_url={}&redirect_uri={}",
+                    url_encode(&token_url),
+                    url_encode("http://localhost:51121/oauth-callback")
                 ))
                 .header(header::AUTHORIZATION, format!("Bearer {API_KEY}"))
                 .body(Body::empty())
@@ -1023,6 +1025,36 @@ async fn test_antigravity_oauth_malformed_token_response_fails_cleanly() {
     assert_eq!(status_json["status"], "error");
 
     mock_task.abort();
+    std::fs::remove_dir_all(auth_dir).ok();
+}
+
+#[tokio::test]
+async fn test_antigravity_oauth_reports_unavailable_default_callback_port() {
+    let occupied = match tokio::net::TcpListener::bind("127.0.0.1:51121").await {
+        Ok(listener) => listener,
+        Err(_) => return,
+    };
+    let auth_dir = unique_temp_dir("qg-t13-ag-port-conflict");
+    let config = GatewayConfig {
+        auth_dir: auth_dir.clone(),
+        api_keys: mahoquot_gateway::inbound::ApiKeys::new(vec![API_KEY.to_string()]),
+        config_path: auth_dir.join("config.yaml"),
+        ..GatewayConfig::default()
+    };
+    let app = create_app(Arc::new(AppState::new(&config).unwrap()));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v0/management/antigravity-auth-url")
+                .header(header::AUTHORIZATION, format!("Bearer {API_KEY}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    drop(occupied);
     std::fs::remove_dir_all(auth_dir).ok();
 }
 
