@@ -954,7 +954,7 @@ impl RegistrySnapshot {
                         .then_with(|| a.provider_id.cmp(&b.provider_id))
                 });
                 open_bindings
-            } else if !open_providers.is_empty() {
+            } else if descriptor.bindings.is_empty() && !open_providers.is_empty() {
                 // No bindings on descriptor, but open provider registered
                 let mut synthesized = Vec::new();
                 for pid in &open_providers {

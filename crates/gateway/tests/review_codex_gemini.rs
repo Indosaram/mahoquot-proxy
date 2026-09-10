@@ -530,9 +530,10 @@ fn codex_incomplete_preserves_machine_reason() {
     parser.push(b"data: {\"type\":\"response.incomplete\",\"response\":{\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n", &mut events);
     assert_eq!(
         events,
-        vec![CodexEvent::Failed {
-            message: "max_output_tokens".into()
-        }]
+        vec![
+            CodexEvent::OutputLimitReached,
+            CodexEvent::Completed { usage: None }
+        ]
     );
 }
 

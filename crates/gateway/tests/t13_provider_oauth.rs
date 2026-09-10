@@ -275,9 +275,9 @@ async fn test_anthropic_oauth_flow_end_to_end() {
     assert!(auth_url.contains("client_id="));
     assert!(auth_url.contains("user%3Ainference"));
 
-    // 4. Public callback token exchange
+    // 4. Public callback token exchange on port 54545
     let callback_url = format!(
-        "http://127.0.0.1:{gateway_port}/v0/management/oauth-callback?code=anthropic_code_test_1&state={state_token}"
+        "http://127.0.0.1:54545/callback?code=anthropic_code_test_1&state={state_token}"
     );
     let callback_resp = client.get(&callback_url).send().await.unwrap();
     assert_eq!(callback_resp.status(), StatusCode::OK);
@@ -489,7 +489,9 @@ async fn test_oauth_session_cancellation() {
 
     let client = reqwest::Client::new();
 
-    let start_url = format!("http://127.0.0.1:{gateway_port}/v0/management/anthropic-auth-url");
+    let start_url = format!(
+        "http://127.0.0.1:{gateway_port}/v0/management/anthropic-auth-url?redirect_uri=http%3A%2F%2F127.0.0.1%3A18899%2Fcallback"
+    );
     let start_resp = client
         .get(&start_url)
         .bearer_auth(API_KEY)

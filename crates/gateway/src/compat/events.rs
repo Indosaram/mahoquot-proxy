@@ -29,6 +29,7 @@ pub enum CodexEvent {
         output_index: u64,
         delta: String,
     },
+    OutputLimitReached,
     Completed {
         usage: Option<Usage>,
     },
@@ -40,6 +41,8 @@ pub enum CodexEvent {
 #[derive(Default)]
 pub struct SseParser {
     buf: Vec<u8>,
+    data: Vec<u8>,
+    after_cr: bool,
 }
 
 impl SseParser {
@@ -60,24 +63,42 @@ impl SseParser {
     }
 
     pub fn push_raw_data(&mut self, chunk: &[u8], out: &mut Vec<Vec<u8>>) {
-        self.buf.extend_from_slice(chunk);
-        while let Some(pos) = self.buf.iter().position(|b| *b == b'\n') {
-            let line: Vec<u8> = self.buf.drain(..=pos).collect();
-            let line = strip_eol(&line);
-            if let Some(payload) = line.strip_prefix(b"data: ") {
-                out.push(payload.to_vec());
+        for &byte in chunk {
+            if self.after_cr && byte == b'\n' {
+                self.after_cr = false;
+                continue;
+            }
+            self.after_cr = byte == b'\r';
+            if byte == b'\r' || byte == b'\n' {
+                let line = std::mem::take(&mut self.buf);
+                self.consume_line(&line, out);
+            } else {
+                self.buf.push(byte);
             }
         }
     }
 
     pub fn finish_raw_data(&mut self, out: &mut Vec<Vec<u8>>) {
-        if self.buf.is_empty() {
-            return;
+        if !self.buf.is_empty() {
+            let line = std::mem::take(&mut self.buf);
+            self.consume_line(&line, out);
         }
-        let line: Vec<u8> = std::mem::take(&mut self.buf);
-        let line = strip_eol(&line);
-        if let Some(payload) = line.strip_prefix(b"data: ") {
-            out.push(payload.to_vec());
+        self.consume_line(b"", out);
+        self.after_cr = false;
+    }
+
+    fn consume_line(&mut self, line: &[u8], out: &mut Vec<Vec<u8>>) {
+        if line.is_empty() {
+            if !self.data.is_empty() {
+                self.data.pop();
+                out.push(std::mem::take(&mut self.data));
+            }
+        } else if let Some(payload) = line.strip_prefix(b"data:") {
+            self.data
+                .extend_from_slice(payload.strip_prefix(b" ").unwrap_or(payload));
+            self.data.push(b'\n');
+        } else if line == b"data" {
+            self.data.push(b'\n');
         }
     }
 
@@ -88,18 +109,21 @@ impl SseParser {
         let Ok(value) = serde_json::from_slice::<Value>(payload) else {
             return;
         };
+        if value.get("type").and_then(Value::as_str) == Some("response.incomplete")
+            && value.pointer("/response/error").is_none_or(Value::is_null)
+            && value.pointer("/response/incomplete_details/reason").and_then(Value::as_str)
+                == Some("max_output_tokens")
+        {
+            out.push(CodexEvent::OutputLimitReached);
+            out.push(CodexEvent::Completed {
+                usage: value.pointer("/response/usage").map(parse_usage),
+            });
+            return;
+        }
         if let Some(event) = classify(&value) {
             out.push(event);
         }
     }
-}
-
-fn strip_eol(line: &[u8]) -> &[u8] {
-    let mut end = line.len();
-    while end > 0 && (line[end - 1] == b'\n' || line[end - 1] == b'\r') {
-        end -= 1;
-    }
-    &line[..end]
 }
 
 fn classify(value: &Value) -> Option<CodexEvent> {

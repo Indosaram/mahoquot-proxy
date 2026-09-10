@@ -527,8 +527,11 @@ pub fn anthropic_response(
             CodexEvent::TextDelta(t) => text.push_str(&t),
             CodexEvent::ReasoningSignature(sig) => reasoning_signature = Some(sig),
             CodexEvent::Completed { usage: u } => usage = u,
+            CodexEvent::OutputLimitReached => finish = "length",
             CodexEvent::ToolCallBegin { call_id, name, .. } => {
-                finish = "tool_calls";
+                if finish != "length" {
+                    finish = "tool_calls";
+                }
                 tool_calls.push((call_id, name, String::new()));
             }
             CodexEvent::ToolArgsDelta { delta, .. } => {

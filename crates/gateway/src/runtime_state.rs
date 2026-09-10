@@ -61,39 +61,43 @@ impl PoolSnapshot {
     }
 
     pub fn routable_accounts_for_model(&self, model: &str) -> Vec<Arc<AccountMember>> {
-        let model_id = ModelId::new(model).ok();
+        let (prefix, _) = crate::relay::parse_model_prefix(model);
+        let Ok(resolved) = crate::relay::resolve_model(self, model) else {
+            return Vec::new();
+        };
         self.members
             .iter()
             .filter(|m| {
-                if m.supports_model(model) {
-                    return true;
-                }
-                if let Some(ref mid) = model_id {
-                    if let Some(desc) = self.registry.get_model(mid) {
-                        for prov_id in desc.bindings.keys() {
-                            let matches = match prov_id.as_str() {
-                                "antigravity" => m.kind() == ProviderKind::Antigravity,
-                                "claude" => m.kind() == ProviderKind::Claude,
-                                "cursor" => m.kind() == ProviderKind::Cursor,
-                                "kiro" => m.kind() == ProviderKind::Kiro,
-                                "vertex" => m.kind() == ProviderKind::Vertex,
-                                "zcode" => m.kind() == ProviderKind::Zcode,
-                                "codex" => m.kind() == ProviderKind::Codex,
-                                other => m.provider_name() == other,
-                            };
-                            if matches {
-                                let unsupported = m
-                                    .unsupported_models
-                                    .read()
-                                    .unwrap_or_else(|p| p.into_inner());
-                                if !unsupported.iter().any(|u| u == model) {
-                                    return true;
-                                }
-                            }
-                        }
+                match prefix {
+                    Some(crate::relay::ModelPrefix::Anthropic)
+                        if m.kind() != ProviderKind::Claude || m.is_nekos_relay() =>
+                    {
+                        return false;
                     }
+                    Some(crate::relay::ModelPrefix::Nekos)
+                        if m.kind() != ProviderKind::Claude || !m.is_nekos_relay() =>
+                    {
+                        return false;
+                    }
+                    _ => {}
                 }
-                false
+                resolved.eligible_bindings.iter().any(|binding| {
+                    if ProviderId::canonical(m.provider_name()).ok().as_ref()
+                        != Some(&binding.provider_id)
+                    {
+                        return false;
+                    }
+                    let canonical = resolved.canonical_id.as_str();
+                    let upstream = binding.effective_upstream_id(&resolved.canonical_id);
+                    let unsupported = m.unsupported_models.read().unwrap_or_else(|p| p.into_inner());
+                    if unsupported.iter().any(|id| id == model || id == canonical || id == upstream) {
+                        return false;
+                    }
+                    m.generic_models().is_none_or(|(_, models)| {
+                        models.is_empty()
+                            || models.iter().any(|id| id == model || id == canonical || id == upstream)
+                    })
+                })
             })
             .cloned()
             .collect()
@@ -204,6 +208,7 @@ pub fn compute_candidate_composition(
     let registry = Arc::new(effective_registry);
 
     let models = crate::models_route::project_model_entries(&registry, &members);
+    let models = crate::models_route::expand_prefixed_models(models, &members);
 
     Ok(RuntimeComposition::new(
         generation, members, models, registry,

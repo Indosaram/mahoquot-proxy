@@ -806,6 +806,9 @@ impl GeminiDecoder {
             .and_then(Value::as_str)
             .is_some()
         {
+            if candidate.get("finishReason").and_then(Value::as_str) == Some("MAX_TOKENS") {
+                out.push(CodexEvent::OutputLimitReached);
+            }
             out.push(CodexEvent::Completed {
                 usage: self.usage.take(),
             });

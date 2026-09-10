@@ -405,12 +405,9 @@ async fn try_claude_usage(state: &AppState, member: &Arc<AccountMember>) -> Resu
                 cost_usd: totals.total_cost_usd,
             },
         );
-        member.set_usage(crate::usage::AccountUsage {
-            plan_type: Some("relay".into()),
-            totals: Some(totals),
-            windows: crate::usage::window_deltas(&samples, now),
-            ..crate::usage::AccountUsage::default()
-        });
+        member.set_usage(crate::usage::parse_relay_account_usage(
+            &payload, totals, samples, now,
+        ));
         return Ok(());
     }
     let token = member.access_token();

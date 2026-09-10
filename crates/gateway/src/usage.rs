@@ -1355,6 +1355,128 @@ pub fn parse_relay_usage(payload: &serde_json::Value) -> Option<RelayUsageTotals
     })
 }
 
+/// One entry of the relay usage/self `limits[]` array.
+///
+/// Live nekos shape: `{limit_type: "cost_usd", limit_window: "3h",
+/// used_percent: 0.8, reset_at: "2026-09-09T10:17:04.331725"}`.
+/// `used_percent` is already a percent (0.8 == 0.8% used), and `reset_at`
+/// is a bare naive UTC timestamp with fractional seconds and no suffix.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+struct RelayLimit {
+    #[serde(default)]
+    limit_type: Option<String>,
+    #[serde(default)]
+    limit_window: Option<String>,
+    #[serde(default)]
+    used_percent: Option<f64>,
+    #[serde(default)]
+    reset_at: Option<String>,
+}
+
+/// Parses the bare naive UTC timestamps the relay emits (`reset_at` has no
+/// `Z` suffix and carries fractional seconds). Fractional part is dropped;
+/// sub-second precision never drives a quota display or rotation decision.
+fn parse_naive_unix(raw: &str) -> Option<i64> {
+    let trimmed = raw.trim();
+    let base = trimmed.split_once('.').map_or(trimmed, |(head, _)| head);
+    parse_rfc3339_unix(&format!("{base}Z"))
+}
+
+fn relay_limit_minutes(window: &str) -> Option<i64> {
+    match window {
+        "3h" => Some(180),
+        "daily" => Some(1440),
+        "weekly" => Some(10_080),
+        _ => None,
+    }
+}
+
+fn relay_limit_label(window: &str) -> &str {
+    match window {
+        "3h" => "3h",
+        "daily" => "Daily",
+        "weekly" => "Weekly",
+        other => other,
+    }
+}
+
+/// Builds the full account usage snapshot from a relay usage/self payload:
+/// cumulative totals plus one quota bucket per `limits[]` entry. Buckets
+/// land in the `groups` list the console already renders; the flat
+/// primary/secondary pair follows the shared convention (primary = shortest
+/// window, secondary = longest) so rotation and scheduler logic keep working.
+pub fn parse_relay_account_usage(
+    payload: &serde_json::Value,
+    totals: RelayUsageTotals,
+    samples: Vec<UsageSample>,
+    now_unix: i64,
+) -> AccountUsage {
+    let mut buckets: Vec<QuotaBucket> = payload
+        .get("limits")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| serde_json::from_value::<RelayLimit>(entry.clone()).ok())
+        .filter_map(|limit| {
+            let window = limit.limit_window?;
+            relay_limit_minutes(&window)?;
+            Some(QuotaBucket {
+                bucket_id: Some(format!(
+                    "{}-{}",
+                    limit.limit_type.as_deref().unwrap_or("limit"),
+                    window
+                )),
+                display_name: Some(relay_limit_label(&window).to_string()),
+                window: Some(window),
+                used_percent: limit.used_percent.map(|p| p.clamp(0.0, 100.0)),
+                reset_at_unix: limit.reset_at.as_deref().and_then(parse_naive_unix),
+            })
+        })
+        .collect();
+    // Unknown windows sort last so a future new window never displaces the
+    // known 3h/daily/weekly order the flat pair below relies on.
+    buckets.sort_by_key(|b| match b.window.as_deref() {
+        Some("3h") => 0,
+        Some("daily") => 1,
+        Some("weekly") => 2,
+        _ => 3,
+    });
+    let window_of = |name: &str| -> QuotaWindow {
+        buckets
+            .iter()
+            .find(|b| b.window.as_deref() == Some(name))
+            .map(|b| QuotaWindow {
+                used_percent: b.used_percent,
+                window_minutes: b.window.as_deref().and_then(relay_limit_minutes),
+                reset_after_seconds: None,
+                reset_at_unix: b.reset_at_unix,
+                limit_name: b.display_name.clone(),
+            })
+            .unwrap_or_default()
+    };
+    let primary = window_of("3h");
+    let secondary = window_of("weekly");
+    let groups = if buckets.is_empty() {
+        Vec::new()
+    } else {
+        vec![QuotaGroup {
+            display_name: Some("Relay limits".to_string()),
+            models: None,
+            buckets,
+        }]
+    };
+    AccountUsage {
+        plan_type: Some("relay".into()),
+        primary,
+        secondary,
+        groups,
+        totals: Some(totals),
+        windows: window_deltas(&samples, now_unix),
+        observed_at_unix: Some(now_unix),
+        ..Default::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2008,6 +2130,67 @@ mod tests {
         assert_eq!(totals.tokens, 1_184_368_836);
         assert_eq!(totals.cached_input_tokens, Some(1_177_706_909));
         assert_eq!(totals.total_cost_usd, Some(3990.364061));
+    }
+
+    #[test]
+    fn the_relay_limits_array_becomes_quota_windows() {
+        // given the live payload shape from claude.nekos.me /v1/usage/self:
+        // counters plus a cost_usd limits[] array with bare naive reset_at
+        let payload: serde_json::Value = serde_json::from_str(
+            r#"{"request_count":17341,"total_tokens":2903400679,
+                "cached_input_tokens":2888484909,"total_cost_usd":7747.432589,
+                "limits":[
+                 {"limit_type":"cost_usd","limit_window":"3h",
+                  "max_value":831250000,"current_value":6654738,
+                  "remaining_value":824595262,"used_percent":0.8,
+                  "model_filter":null,"reset_at":"2026-09-09T10:17:04.331725"},
+                 {"limit_type":"cost_usd","limit_window":"daily",
+                  "max_value":1330000000,"current_value":458263175,
+                  "remaining_value":871736825,"used_percent":34.46,
+                  "model_filter":null,"reset_at":"2026-09-09T10:17:04.331725"},
+                 {"limit_type":"cost_usd","limit_window":"weekly",
+                  "max_value":3990000000,"current_value":3758043805,
+                  "remaining_value":231956195,"used_percent":94.19,
+                  "model_filter":null,"reset_at":"2026-09-10T10:17:04.331725"}]}"#,
+        )
+        .unwrap();
+        let totals = parse_relay_usage(&payload).expect("totals");
+        // when the full snapshot is built
+        let usage = parse_relay_account_usage(&payload, totals, Vec::new(), 1_787_900_000);
+        // then the counters survive and each limit becomes a rendered bucket
+        assert_eq!(usage.totals, Some(totals));
+        assert_eq!(usage.groups.len(), 1);
+        assert_eq!(usage.groups[0].buckets.len(), 3);
+        let weekly = usage.groups[0]
+            .buckets
+            .iter()
+            .find(|b| b.window.as_deref() == Some("weekly"))
+            .expect("weekly bucket");
+        assert!((weekly.used_percent.unwrap() - 94.19).abs() < 1e-6);
+        assert_eq!(weekly.reset_at_unix, Some(1_789_035_424)); // 2026-09-10T10:17:04Z naive UTC
+        // and the flat pair follows the shared short/long convention so the
+        // scheduler and rotation logic read truthful windows
+        assert_eq!(usage.primary.window_minutes, Some(180));
+        assert!((usage.primary.used_percent.unwrap() - 0.8).abs() < 1e-6);
+        assert_eq!(usage.secondary.window_minutes, Some(10_080));
+        assert!((usage.secondary.used_percent.unwrap() - 94.19).abs() < 1e-6);
+        assert!(usage.is_known());
+    }
+
+    #[test]
+    fn relay_limits_tolerate_missing_or_unknown_windows() {
+        // given a payload with no limits array at all
+        let payload: serde_json::Value = serde_json::from_str(
+            r#"{"request_count":1,"total_tokens":2}"#,
+        )
+        .unwrap();
+        let totals = parse_relay_usage(&payload).expect("totals");
+        // when the snapshot is built
+        let usage = parse_relay_account_usage(&payload, totals, Vec::new(), 7);
+        // then totals still land but there is nothing to render as quota
+        assert!(usage.groups.is_empty());
+        assert!(usage.primary.is_empty());
+        assert!(usage.secondary.is_empty());
     }
 
     #[test]

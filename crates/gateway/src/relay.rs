@@ -597,17 +597,26 @@ fn resolve_target(
             member.kind(),
             crate::account::ProviderKind::Claude | crate::account::ProviderKind::Zcode
         ) {
-            let body = if plan.mode == RelayMode::Anthropic {
-                body_with_model(&plan.original_body, upstream_model)
+            let mut anthropic_val: serde_json::Value = if plan.mode == RelayMode::Anthropic {
+                let bytes = body_with_model(&plan.original_body, upstream_model);
+                serde_json::from_slice(&bytes).unwrap_or_else(|_| serde_json::json!({}))
             } else {
                 let openai = openai_body_with_model(plan, upstream_model).ok_or_else(|| {
                     "Anthropic provider requires an OpenAI-shaped request".to_string()
                 })?;
-                Bytes::from(
-                    serde_json::to_vec(&compat::claude::openai_to_anthropic(&openai)?)
-                        .map_err(|e| e.to_string())?,
-                )
+                compat::claude::openai_to_anthropic(&openai)?
             };
+
+            if member.kind() == crate::account::ProviderKind::Claude
+                && !member.is_nekos_relay()
+                && member.relay_api_key().is_none()
+            {
+                compat::claude::ensure_claude_code_system_instruction(&mut anthropic_val);
+            }
+
+            let body = Bytes::from(
+                serde_json::to_vec(&anthropic_val).map_err(|e| e.to_string())?,
+            );
             return Ok(UpstreamTarget {
                 url: crate::url::build_provider_url(
                     member.kind(),
@@ -852,6 +861,7 @@ fn body_response(status: StatusCode, content_type: Option<&str>, body: Bytes) ->
 
 fn json_error(status: StatusCode, message: &str) -> Response {
     let payload = serde_json::json!({
+        "type": "error",
         "error": {"message": message, "type": "invalid_request_error"}
     });
     body_response(
@@ -1020,6 +1030,85 @@ fn account_declares_binding_model(
         })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelPrefix {
+    Anthropic,
+    Nekos,
+}
+
+pub fn parse_model_prefix(model: &str) -> (Option<ModelPrefix>, &str) {
+    if let Some(stripped) = model
+        .strip_prefix("anthropic-")
+        .or_else(|| model.strip_prefix("anthropic/"))
+    {
+        (Some(ModelPrefix::Anthropic), stripped)
+    } else if let Some(stripped) = model
+        .strip_prefix("nekos-")
+        .or_else(|| model.strip_prefix("nekos/"))
+    {
+        (Some(ModelPrefix::Nekos), stripped)
+    } else {
+        (None, model)
+    }
+}
+
+pub(crate) fn resolve_model(
+    pool: &crate::state::PoolSnapshot,
+    requested_model: &str,
+) -> Result<mahoquot_registry::ResolvedModel, mahoquot_registry::RegistryError> {
+    let (_, base_model) = parse_model_prefix(requested_model);
+    let base_id = mahoquot_registry::ModelId::new(base_model)?;
+    if pool.registry.aliases().contains_key(&base_id) {
+        return pool.registry.resolve(base_model);
+    }
+    let resolved_model_id = if pool.registry.models().contains_key(&base_id) {
+        base_model
+    } else if base_model.starts_with("claude-") {
+        let mut dated_models = pool.registry.models().keys().filter(|id| {
+            id.as_str()
+                .strip_prefix(base_model)
+                .and_then(|suffix| suffix.strip_prefix('-'))
+                .is_some_and(|date| date.len() == 8 && date.bytes().all(|b| b.is_ascii_digit()))
+        });
+        match (dated_models.next(), dated_models.next()) {
+            (Some(target), None) => target.as_str(),
+            _ => base_model,
+        }
+    } else {
+        base_model
+    };
+    let canonical_id = mahoquot_registry::ModelId::new(resolved_model_id)?;
+    if pool.registry.exclusions().contains(&mahoquot_registry::ModelExclusionRule {
+        model_id: canonical_id.clone(),
+        provider_id: None,
+    }) {
+        return Err(mahoquot_registry::RegistryError::ModelExcluded { model_id: canonical_id });
+    }
+    if resolved_model_id.starts_with("claude-")
+        && !pool.registry.models().contains_key(&canonical_id)
+    {
+        if pool.registry.exclusions().contains(&mahoquot_registry::ModelExclusionRule {
+            model_id: canonical_id.clone(),
+            provider_id: Some(ProviderId::claude()),
+        }) {
+            return Err(mahoquot_registry::RegistryError::UnknownModel(canonical_id));
+        }
+        Ok(mahoquot_registry::ResolvedModel {
+            canonical_id,
+            descriptor: None,
+            eligible_bindings: vec![mahoquot_registry::ProviderBinding::new(
+                mahoquot_registry::ProviderId::claude(),
+                mahoquot_registry::ProviderPolicy::Closed,
+                mahoquot_registry::CatalogSource::EmbeddedFallback,
+            )],
+            effective_capabilities: std::collections::BTreeSet::new(),
+            source: mahoquot_registry::CatalogSource::EmbeddedFallback,
+        })
+    } else {
+        pool.registry.resolve(resolved_model_id)
+    }
+}
+
 fn resolve_route(
     pool: &crate::state::PoolSnapshot,
     requested_model: Option<&str>,
@@ -1028,7 +1117,7 @@ fn resolve_route(
     let Some(requested_model) = requested_model else {
         return Ok(None);
     };
-    let resolved = pool.registry.resolve(requested_model)?;
+    let resolved = resolve_model(pool, requested_model)?;
     let provider_classes = resolved
         .eligible_bindings
         .into_iter()
@@ -1080,6 +1169,7 @@ fn eligible_indices(
             .collect();
     };
     let requested_model = requested_model.unwrap_or(&route.canonical_model);
+    let (prefix, _) = parse_model_prefix(requested_model);
     let mut eligible = Vec::new();
     for provider in &route.provider_classes {
         let indices: Vec<usize> = pool
@@ -1090,6 +1180,19 @@ fn eligible_indices(
             .filter(|(_, member)| state.scheduler.permits(member.id()))
             .filter(|(_, member)| member_matches_api_key_binding(member, api_key_binding))
             .filter(|(_, member)| crate::models_route::member_matches_scope(member, scoped_key))
+            .filter(|(_, member)| {
+                match prefix {
+                    Some(ModelPrefix::Anthropic) => {
+                        member.kind() == crate::account::ProviderKind::Claude
+                            && !member.is_nekos_relay()
+                    }
+                    Some(ModelPrefix::Nekos) => {
+                        member.kind() == crate::account::ProviderKind::Claude
+                            && member.is_nekos_relay()
+                    }
+                    None => true,
+                }
+            })
             .filter(|(_, member)| {
                 member_provider_id(member).as_ref() == Some(&provider.binding.provider_id)
             })
@@ -2279,6 +2382,68 @@ mod routing_tests {
     }
 
     #[test]
+    fn explicit_alias_wins_over_a_longer_catalog_model_name() {
+        // Given: an operator alias that happens to prefix another model name.
+        let (state, auth_dir) = six_provider_state();
+        let mut pool = (*state.pool.load_full()).clone();
+        let mut registry = (*pool.registry).clone();
+        registry.aliases.insert(
+            mahoquot_registry::ModelId::new("claude-sonnet").unwrap(),
+            mahoquot_registry::ModelAliasRule {
+                alias: mahoquot_registry::ModelId::new("claude-sonnet").unwrap(),
+                target: mahoquot_registry::ModelId::new("claude-3-7-sonnet-20250219").unwrap(),
+                provider_id: None,
+            },
+        );
+        pool.registry = Arc::new(registry);
+
+        // When: resolving the explicit alias.
+        let route = resolve_route(&pool, Some("claude-sonnet"), None).unwrap().unwrap();
+
+        // Then: shorthand matching must not override the configured target.
+        assert_eq!(route.canonical_model, "claude-3-7-sonnet-20250219");
+        std::fs::remove_dir_all(auth_dir).unwrap();
+    }
+
+    #[test]
+    fn prefixed_requests_cannot_bypass_model_exclusions() {
+        // Given: both a known and a future Claude model explicitly excluded.
+        let (state, auth_dir) = six_provider_state();
+        let mut pool = (*state.pool.load_full()).clone();
+        let mut registry = (*pool.registry).clone();
+        for model in ["claude-3-7-sonnet-20250219", "claude-opus-5"] {
+            registry.exclusions.insert(mahoquot_registry::ModelExclusionRule {
+                model_id: mahoquot_registry::ModelId::new(model).unwrap(),
+                provider_id: None,
+            });
+        }
+        pool.registry = Arc::new(registry);
+
+        // When: clients address either model through an official prefix.
+        for model in ["anthropic-claude-3-7-sonnet-20250219", "anthropic-claude-opus-5"] {
+            let result = resolve_route(&pool, Some(model), None);
+
+            // Then: a fallback cannot erase the explicit exclusion.
+            assert!(matches!(result, Err(mahoquot_registry::RegistryError::ModelExcluded { .. })));
+        }
+        std::fs::remove_dir_all(auth_dir).unwrap();
+    }
+
+    #[test]
+    fn unrelated_model_prefix_does_not_select_a_catalog_variant() {
+        // Given: Codex accepts unknown model IDs verbatim.
+        let (state, auth_dir) = six_provider_state();
+        let pool = state.pool.load_full();
+
+        // When: an ID is a prefix of several catalog models but is not an alias.
+        let route = resolve_route(&pool, Some("gpt"), None).unwrap().unwrap();
+
+        // Then: do not silently substitute a different model.
+        assert_eq!(route.canonical_model, "gpt");
+        std::fs::remove_dir_all(auth_dir).unwrap();
+    }
+
+    #[test]
     fn resolved_routes_preserve_virtual_ids_and_provider_upstream_ids() {
         let (state, auth_dir) = six_provider_state();
         let pool = state.pool.load_full();
@@ -2490,6 +2655,106 @@ mod routing_tests {
                 "model {model} was routed outside its resolved binding"
             );
         }
+
+        std::fs::remove_dir_all(auth_dir).ok();
+    }
+
+    #[test]
+    fn anthropic_and_nekos_prefix_routes_exclusively_to_official_vs_relay_accounts() {
+        let official_cred = r#"{
+            "type": "claude",
+            "email": "sookyoung91@gmail.com",
+            "identity_slug": "claude-official",
+            "access_token": "token1",
+            "refresh_token": "refresh1",
+            "expired": "2099-01-01T00:00:00Z"
+        }"#;
+        let nekos_cred = r#"{
+            "type": "claude",
+            "email": "claude-ccapi",
+            "identity_slug": "claude-ccapi",
+            "api_key": "sk-clb-secret",
+            "upstream_override": "https://ccapi.labs.mengmota.com/anthropic",
+            "usage_override": "https://claude.nekos.me",
+            "plan": "opus-standard"
+        }"#;
+        let (state, auth_dir) = state_with_credentials(
+            "prefix-routing",
+            &[
+                ("claude-official.json", official_cred.to_string()),
+                ("claude-ccapi.json", nekos_cred.to_string()),
+            ],
+        );
+        let pool = state.pool.load_full();
+        assert_eq!(pool.members.len(), 2);
+
+        let official_idx = pool.members.iter().position(|m| !m.is_nekos_relay()).unwrap();
+        let nekos_idx = pool.members.iter().position(|m| m.is_nekos_relay()).unwrap();
+        assert_ne!(official_idx, nekos_idx);
+
+        // 1. anthropic- prefixed model resolves and routes ONLY to official
+        let route = resolve_route(&pool, Some("anthropic-claude-3-7-sonnet-20250219"), None)
+            .unwrap()
+            .unwrap();
+        let eligible = eligible_indices(&pool, Some(&route), Some("anthropic-claude-3-7-sonnet-20250219"), 0, None, None, &state);
+        assert_eq!(eligible, vec![official_idx]);
+
+        // 2. anthropic/ slash-prefixed model routes ONLY to official
+        let route = resolve_route(&pool, Some("anthropic/claude-3-7-sonnet-20250219"), None)
+            .unwrap()
+            .unwrap();
+        let eligible = eligible_indices(&pool, Some(&route), Some("anthropic/claude-3-7-sonnet-20250219"), 0, None, None, &state);
+        assert_eq!(eligible, vec![official_idx]);
+
+        // 3. nekos- prefixed model resolves and routes ONLY to nekos
+        let route = resolve_route(&pool, Some("nekos-claude-3-7-sonnet-20250219"), None)
+            .unwrap()
+            .unwrap();
+        let eligible = eligible_indices(&pool, Some(&route), Some("nekos-claude-3-7-sonnet-20250219"), 0, None, None, &state);
+        assert_eq!(eligible, vec![nekos_idx]);
+
+        // 4. nekos/ slash-prefixed model routes ONLY to nekos
+        let route = resolve_route(&pool, Some("nekos/claude-3-7-sonnet-20250219"), None)
+            .unwrap()
+            .unwrap();
+        let eligible = eligible_indices(&pool, Some(&route), Some("nekos/claude-3-7-sonnet-20250219"), 0, None, None, &state);
+        assert_eq!(eligible, vec![nekos_idx]);
+
+        // 5. Bare unprefixed model routes to BOTH accounts
+        let route = resolve_route(&pool, Some("claude-3-7-sonnet-20250219"), None)
+            .unwrap()
+            .unwrap();
+        let mut eligible = eligible_indices(&pool, Some(&route), Some("claude-3-7-sonnet-20250219"), 0, None, None, &state);
+        eligible.sort();
+        let mut expected = vec![official_idx, nekos_idx];
+        expected.sort();
+        assert_eq!(eligible, expected);
+
+        // 6. Date-less shorthand models also resolve properly
+        let route = resolve_route(&pool, Some("anthropic-claude-3-7-sonnet"), None)
+            .unwrap()
+            .unwrap();
+        let eligible = eligible_indices(&pool, Some(&route), Some("anthropic-claude-3-7-sonnet"), 0, None, None, &state);
+        assert_eq!(eligible, vec![official_idx]);
+
+        let route = resolve_route(&pool, Some("nekos-claude-3-7-sonnet"), None)
+            .unwrap()
+            .unwrap();
+        let eligible = eligible_indices(&pool, Some(&route), Some("nekos-claude-3-7-sonnet"), 0, None, None, &state);
+        assert_eq!(eligible, vec![nekos_idx]);
+
+        // 7. Uncataloged future Claude models (e.g. claude-opus-5) route cleanly
+        let route = resolve_route(&pool, Some("anthropic-claude-opus-5"), None)
+            .unwrap()
+            .unwrap();
+        let eligible = eligible_indices(&pool, Some(&route), Some("anthropic-claude-opus-5"), 0, None, None, &state);
+        assert_eq!(eligible, vec![official_idx]);
+
+        let route = resolve_route(&pool, Some("nekos-claude-opus-5"), None)
+            .unwrap()
+            .unwrap();
+        let eligible = eligible_indices(&pool, Some(&route), Some("nekos-claude-opus-5"), 0, None, None, &state);
+        assert_eq!(eligible, vec![nekos_idx]);
 
         std::fs::remove_dir_all(auth_dir).ok();
     }

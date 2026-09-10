@@ -89,6 +89,9 @@ impl AnthropicDecoder {
                 _ => {}
             },
             Some("message_delta") => {
+                if value.pointer("/delta/stop_reason").and_then(Value::as_str) == Some("max_tokens") {
+                    out.push(CodexEvent::OutputLimitReached);
+                }
                 self.output_tokens = value["usage"]["output_tokens"].as_u64().unwrap_or(0);
             }
             Some("message_stop") => {
@@ -467,6 +470,40 @@ fn openai_content_to_anthropic(part: &Value) -> Value {
     })
 }
 
+pub const CLAUDE_CODE_SYSTEM_INSTRUCTION: &str =
+    "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
+
+/// Ensure the Claude Code OAuth system instruction is present as the first system entry.
+pub fn ensure_claude_code_system_instruction(body: &mut Value) {
+    match body.get_mut("system") {
+        Some(Value::Array(arr)) => {
+            let already_has = arr.iter().any(|item| {
+                item.get("text")
+                    .and_then(Value::as_str)
+                    .map(|t| t.contains(CLAUDE_CODE_SYSTEM_INSTRUCTION))
+                    .unwrap_or(false)
+            });
+            if !already_has {
+                arr.insert(
+                    0,
+                    json!({ "type": "text", "text": CLAUDE_CODE_SYSTEM_INSTRUCTION }),
+                );
+            }
+        }
+        Some(Value::String(s)) => {
+            if !s.contains(CLAUDE_CODE_SYSTEM_INSTRUCTION) {
+                *s = format!("{CLAUDE_CODE_SYSTEM_INSTRUCTION}\n\n{s}");
+            }
+        }
+        None | Some(Value::Null) => {
+            body["system"] = Value::Array(vec![
+                json!({ "type": "text", "text": CLAUDE_CODE_SYSTEM_INSTRUCTION }),
+            ]);
+        }
+        _ => {}
+    }
+}
+
 fn anthropic_tool_name(name: &str) -> String {
     const BUILTINS: [&str; 4] = ["web_search", "code_execution", "text_editor", "computer"];
     if name.starts_with("custom_") || BUILTINS.contains(&name) {
@@ -548,7 +585,11 @@ pub fn anthropic_json_to_openai(body: &Value, model: &str, created: i64) -> Valu
         "choices": [{
             "index": 0,
             "message": message,
-            "finish_reason": if body["stop_reason"] == "tool_use" { "tool_calls" } else { "stop" },
+            "finish_reason": match body["stop_reason"].as_str() {
+                Some("max_tokens") => "length",
+                Some("tool_use") => "tool_calls",
+                _ => "stop",
+            },
         }],
         "usage": usage,
     })
@@ -707,8 +748,11 @@ pub fn render_anthropic_stream(
             CodexEvent::Completed { usage: u } => {
                 usage = u.clone();
             }
+            CodexEvent::OutputLimitReached => finish = "length".to_string(),
             CodexEvent::ToolCallBegin { .. } | CodexEvent::ToolArgsDelta { .. } => {
-                finish = "tool_calls".to_string();
+                if finish != "length" {
+                    finish = "tool_calls".to_string();
+                }
             }
             _ => {}
         }
@@ -748,6 +792,7 @@ pub struct AnthropicStreamRenderer {
     next_content_index: u64,
     current_tool_index: Option<u64>,
     thinking_index: Option<u64>,
+    output_limit_reached: bool,
 }
 
 impl AnthropicStreamRenderer {
@@ -762,6 +807,7 @@ impl AnthropicStreamRenderer {
             next_content_index: 0,
             current_tool_index: None,
             thinking_index: None,
+            output_limit_reached: false,
         }
     }
 
@@ -877,11 +923,14 @@ impl AnthropicStreamRenderer {
                     json!({"type":"content_block_delta","index":index,"delta":{"type":"input_json_delta","partial_json":delta}}),
                 ));
             }
+            CodexEvent::OutputLimitReached => self.output_limit_reached = true,
             CodexEvent::Completed { usage } => {
                 self.close_thinking(&mut out);
                 self.close_text(&mut out);
                 self.close_open_tool(&mut out);
-                let stop = if self.tool_index > 0 {
+                let stop = if self.output_limit_reached {
+                    "max_tokens"
+                } else if self.tool_index > 0 {
                     "tool_use"
                 } else {
                     "end_turn"
@@ -1427,5 +1476,37 @@ mod openai_to_anthropic_tests {
         let out = openai_to_anthropic(&body).expect("translates");
         let messages = out["messages"].as_array().expect("messages array");
         assert_eq!(messages.len(), 1, "empty message not dropped: {messages:?}");
+    }
+
+    #[test]
+    fn test_ensure_claude_code_system_instruction() {
+        use super::{ensure_claude_code_system_instruction, CLAUDE_CODE_SYSTEM_INSTRUCTION};
+
+        // Case 1: Empty / missing system
+        let mut body = json!({"messages": []});
+        ensure_claude_code_system_instruction(&mut body);
+        let sys = body["system"].as_array().unwrap();
+        assert_eq!(sys.len(), 1);
+        assert_eq!(sys[0]["text"], CLAUDE_CODE_SYSTEM_INSTRUCTION);
+
+        // Case 2: String system
+        let mut body = json!({"system": "You are helpful."});
+        ensure_claude_code_system_instruction(&mut body);
+        let s = body["system"].as_str().unwrap();
+        assert!(s.starts_with(CLAUDE_CODE_SYSTEM_INSTRUCTION));
+        assert!(s.ends_with("You are helpful."));
+
+        // Case 3: Array system
+        let mut body = json!({"system": [{"type": "text", "text": "Original prompt"}]});
+        ensure_claude_code_system_instruction(&mut body);
+        let arr = body["system"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["text"], CLAUDE_CODE_SYSTEM_INSTRUCTION);
+        assert_eq!(arr[1]["text"], "Original prompt");
+
+        // Case 4: Already present, should not duplicate
+        ensure_claude_code_system_instruction(&mut body);
+        let arr2 = body["system"].as_array().unwrap();
+        assert_eq!(arr2.len(), 2);
     }
 }

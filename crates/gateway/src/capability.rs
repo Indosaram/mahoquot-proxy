@@ -63,6 +63,20 @@ fn generic_account_allows(member: &AccountMember, requested: &str, canonical: &s
 }
 
 fn member_is_dynamically_allowed(member: &AccountMember, requested: &str, canonical: &str) -> bool {
+    let (prefix, _) = crate::relay::parse_model_prefix(requested);
+    match prefix {
+        Some(crate::relay::ModelPrefix::Anthropic)
+            if member.kind() != ProviderKind::Claude || member.is_nekos_relay() =>
+        {
+            return false;
+        }
+        Some(crate::relay::ModelPrefix::Nekos)
+            if member.kind() != ProviderKind::Claude || !member.is_nekos_relay() =>
+        {
+            return false;
+        }
+        _ => {}
+    }
     if !generic_account_allows(member, requested, canonical) {
         return false;
     }
@@ -83,7 +97,7 @@ pub fn resolve_registry_capability(
     requested: &str,
     capability: ModelCapability,
 ) -> Option<ResolvedModel> {
-    let mut resolved = pool.registry.resolve(requested).ok()?;
+    let mut resolved = crate::relay::resolve_model(pool, requested).ok()?;
     resolved
         .eligible_bindings
         .retain(|binding| binding.capabilities.contains(&capability));

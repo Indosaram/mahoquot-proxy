@@ -81,11 +81,29 @@ impl ProviderKind {
                     && !model.starts_with("cursor-")
                     && !model.starts_with("cursor/")
                     && !model.starts_with("kiro/")
+                    && !model.starts_with("anthropic-")
+                    && !model.starts_with("anthropic/")
+                    && !model.starts_with("nekos-")
+                    && !model.starts_with("nekos/")
                     && model != "auto-kiro"
                     && !mahoquot_providers::is_vertex_model(model)
             }
             ProviderKind::Antigravity => is_antigravity_model(model),
-            ProviderKind::Claude => mahoquot_providers::is_claude_model(model),
+            ProviderKind::Claude => {
+                if let Some(stripped) = model
+                    .strip_prefix("anthropic-")
+                    .or_else(|| model.strip_prefix("anthropic/"))
+                {
+                    mahoquot_providers::is_claude_model(stripped) || stripped.starts_with("claude-")
+                } else if let Some(stripped) = model
+                    .strip_prefix("nekos-")
+                    .or_else(|| model.strip_prefix("nekos/"))
+                {
+                    mahoquot_providers::is_claude_model(stripped) || stripped.starts_with("claude-")
+                } else {
+                    mahoquot_providers::is_claude_model(model) || model.starts_with("claude-")
+                }
+            }
             ProviderKind::Cursor => {
                 model.starts_with("cursor/") || mahoquot_providers::is_cursor_model(model)
             }
@@ -450,10 +468,19 @@ impl ProviderAccount {
             Self::Claude(a) => {
                 let mut headers = match &a.api_key {
                     Some(key) => vec![("x-api-key".to_string(), key.clone())],
-                    None => vec![(
-                        "authorization".to_string(),
-                        format!("Bearer {}", a.access_token),
-                    )],
+                    None => vec![
+                        (
+                            "authorization".to_string(),
+                            format!("Bearer {}", a.access_token),
+                        ),
+                        ("user-agent".to_string(), "@anthropic-ai/sdk/0.74.0".to_string()),
+                        ("x-app".to_string(), "cli".to_string()),
+                        ("x-stainless-lang".to_string(), "js".to_string()),
+                        ("x-stainless-package-version".to_string(), "0.74.0".to_string()),
+                        ("x-stainless-os".to_string(), "macos".to_string()),
+                        ("x-stainless-arch".to_string(), "arm64".to_string()),
+                        ("x-stainless-runtime".to_string(), "node".to_string()),
+                    ],
                 };
                 headers.extend(vec![
                     (
@@ -718,14 +745,28 @@ impl AccountMember {
     /// The registered relay plan label, only when `upstream_override` identifies
     /// the hidden nekos/ccapi shared-relay surface.
     pub fn relay_plan(&self) -> Option<String> {
-        let target = self.upstream_override.as_deref()?.to_ascii_lowercase();
-        if !target.contains("nekos") && !target.contains("ccapi") {
+        if !self.is_nekos_relay() {
             return None;
         }
         self.inner
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .relay_plan()
+    }
+
+    /// Whether this member is a third-party relay (nekos / ccapi) rather than
+    /// direct upstream.
+    pub fn is_nekos_relay(&self) -> bool {
+        self.upstream_override
+            .as_deref()
+            .into_iter()
+            .chain(self.usage_override.as_deref())
+            .filter_map(|target| reqwest::Url::parse(target).ok())
+            .any(|target| {
+                target.host_str().is_some_and(|host| {
+                    host.split('.').any(|label| matches!(label, "nekos" | "ccapi"))
+                })
+            })
     }
 
     pub fn set_usage(&self, usage: crate::usage::AccountUsage) {
@@ -892,6 +933,26 @@ impl AccountMember {
                 ProviderAccount::Generic(account) => {
                     account.models.is_empty()
                         || account.models.iter().any(|candidate| candidate == model)
+                }
+                ProviderAccount::Claude(_) => {
+                    if let Some(stripped) = model
+                        .strip_prefix("anthropic-")
+                        .or_else(|| model.strip_prefix("anthropic/"))
+                    {
+                        !self.is_nekos_relay()
+                            && (mahoquot_providers::is_claude_model(stripped)
+                                || stripped.starts_with("claude-"))
+                    } else if let Some(stripped) = model
+                        .strip_prefix("nekos-")
+                        .or_else(|| model.strip_prefix("nekos/"))
+                    {
+                        self.is_nekos_relay()
+                            && (mahoquot_providers::is_claude_model(stripped)
+                                || stripped.starts_with("claude-"))
+                    } else {
+                        mahoquot_providers::is_claude_model(model)
+                            || model.starts_with("claude-")
+                    }
                 }
                 account => account.kind().serves_model(model),
             }

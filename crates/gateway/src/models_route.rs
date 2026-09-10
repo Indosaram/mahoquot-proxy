@@ -207,6 +207,49 @@ pub fn allow_list_admits(allow_list: &[String], candidate: &str) -> bool {
             .any(|allowed| allowed == "*" || allowed == candidate)
 }
 
+pub fn expand_prefixed_models(
+    entries: Vec<ModelEntry>,
+    members: &[std::sync::Arc<AccountMember>],
+) -> Vec<ModelEntry> {
+    let has_official_claude = members
+        .iter()
+        .any(|m| m.kind() == ProviderKind::Claude && !m.is_nekos_relay() && !m.is_manually_disabled());
+    let has_nekos_claude = members
+        .iter()
+        .any(|m| m.kind() == ProviderKind::Claude && m.is_nekos_relay() && !m.is_manually_disabled());
+
+    if !has_official_claude && !has_nekos_claude {
+        return entries;
+    }
+
+    let mut result = entries.clone();
+    for entry in &entries {
+        if mahoquot_providers::is_claude_model(&entry.id) || entry.id.starts_with("claude-") {
+            if has_official_claude {
+                result.push(ModelEntry {
+                    id: format!("anthropic/{}", entry.id),
+                    owned_by: "anthropic".to_string(),
+                });
+                result.push(ModelEntry {
+                    id: format!("anthropic-{}", entry.id),
+                    owned_by: "anthropic".to_string(),
+                });
+            }
+            if has_nekos_claude {
+                result.push(ModelEntry {
+                    id: format!("nekos/{}", entry.id),
+                    owned_by: "nekos".to_string(),
+                });
+                result.push(ModelEntry {
+                    id: format!("nekos-{}", entry.id),
+                    owned_by: "nekos".to_string(),
+                });
+            }
+        }
+    }
+    result
+}
+
 /// The catalog a scoped key may see: models served by the accounts it is
 /// allowed to route to, narrowed further by its `allowed_models` list.
 ///
@@ -231,6 +274,7 @@ pub fn scoped_model_entries(
     }
 
     let visible = project_model_entries(&pool.registry, &permitted);
+    let visible = expand_prefixed_models(visible, &permitted);
     // Keep the published entry order and any account-contributed models that
     // projection alone would not reproduce.
     let mut entries: Vec<ModelEntry> = pool
@@ -1135,5 +1179,72 @@ mod tests {
             let resolved = reg.resolve(&entry.id).expect("must resolve in registry");
             assert!(!resolved.eligible_bindings.is_empty());
         }
+    }
+
+    #[test]
+    fn test_expand_prefixed_models_for_anthropic_and_nekos() {
+        let official = Arc::new(AccountMember::for_test_with_id(
+            "claude-official",
+            ProviderAccount::Claude(
+                serde_json::from_value(serde_json::json!({
+                    "type": "claude",
+                    "email": "official@anthropic.com",
+                }))
+                .unwrap(),
+            ),
+        ));
+
+        let mut nekos_member = AccountMember::for_test_with_id(
+            "claude-ccapi",
+            ProviderAccount::Claude(
+                serde_json::from_value(serde_json::json!({
+                    "type": "claude",
+                    "email": "nekos@ccapi.com",
+                }))
+                .unwrap(),
+            ),
+        );
+        nekos_member.upstream_override =
+            Some("https://ccapi.labs.mengmota.com/anthropic".to_string());
+        let nekos = Arc::new(nekos_member);
+
+        let base_entries = vec![
+            ModelEntry {
+                id: "claude-3-7-sonnet-20250219".to_string(),
+                owned_by: "anthropic".to_string(),
+            },
+            ModelEntry {
+                id: "gpt-4o".to_string(),
+                owned_by: "openai".to_string(),
+            },
+        ];
+
+        // 1. Both official and nekos active -> both prefixes generated
+        let expanded = expand_prefixed_models(
+            base_entries.clone(),
+            &[official.clone(), nekos.clone()],
+        );
+        let ids: Vec<&str> = expanded.iter().map(|e| e.id.as_str()).collect();
+        assert!(ids.contains(&"claude-3-7-sonnet-20250219"));
+        assert!(ids.contains(&"anthropic-claude-3-7-sonnet-20250219"));
+        assert!(ids.contains(&"anthropic/claude-3-7-sonnet-20250219"));
+        assert!(ids.contains(&"nekos-claude-3-7-sonnet-20250219"));
+        assert!(ids.contains(&"nekos/claude-3-7-sonnet-20250219"));
+        assert!(!ids.contains(&"anthropic-gpt-4o"));
+        assert!(!ids.contains(&"nekos-gpt-4o"));
+
+        // 2. Only official active -> only anthropic prefixes generated
+        let expanded = expand_prefixed_models(base_entries.clone(), &[official]);
+        let ids: Vec<&str> = expanded.iter().map(|e| e.id.as_str()).collect();
+        assert!(ids.contains(&"anthropic-claude-3-7-sonnet-20250219"));
+        assert!(ids.contains(&"anthropic/claude-3-7-sonnet-20250219"));
+        assert!(!ids.contains(&"nekos-claude-3-7-sonnet-20250219"));
+
+        // 3. Only nekos active -> only nekos prefixes generated
+        let expanded = expand_prefixed_models(base_entries, &[nekos]);
+        let ids: Vec<&str> = expanded.iter().map(|e| e.id.as_str()).collect();
+        assert!(!ids.contains(&"anthropic-claude-3-7-sonnet-20250219"));
+        assert!(ids.contains(&"nekos-claude-3-7-sonnet-20250219"));
+        assert!(ids.contains(&"nekos/claude-3-7-sonnet-20250219"));
     }
 }

@@ -41,6 +41,7 @@ pub struct GeminiChunkRenderer {
     /// the growing argument string until the call closes (the next begin or
     /// the terminal event); text and reasoning deltas stream out immediately.
     open_calls: Vec<ToolAccumulator>,
+    output_limit_reached: bool,
 }
 
 impl GeminiChunkRenderer {
@@ -50,6 +51,7 @@ impl GeminiChunkRenderer {
             model,
             terminated: false,
             open_calls: Vec::new(),
+            output_limit_reached: false,
         }
     }
 
@@ -148,11 +150,15 @@ impl GeminiChunkRenderer {
                 }
                 Vec::new()
             }
+            CodexEvent::OutputLimitReached => {
+                self.output_limit_reached = true;
+                Vec::new()
+            }
             CodexEvent::Completed { usage } => {
                 self.terminated = true;
                 let mut out = Vec::new();
                 self.close_open_calls(&mut out);
-                out.push(self.frame_for(json!([]), Some("STOP"), usage.as_ref()));
+                out.push(self.frame_for(json!([]), Some(if self.output_limit_reached { "MAX_TOKENS" } else { "STOP" }), usage.as_ref()));
                 out
             }
             CodexEvent::Failed { message } => {
@@ -184,6 +190,7 @@ pub struct ChunkRenderer {
     include_usage: bool,
     role_sent: bool,
     saw_tool_call: bool,
+    output_limit_reached: bool,
     terminated: bool,
     tool_slots: Vec<u64>,
 }
@@ -197,6 +204,7 @@ impl ChunkRenderer {
             include_usage,
             role_sent: false,
             saw_tool_call: false,
+            output_limit_reached: false,
             terminated: false,
             tool_slots: Vec::new(),
         }
@@ -290,9 +298,12 @@ impl ChunkRenderer {
                     None,
                 ));
             }
+            CodexEvent::OutputLimitReached => self.output_limit_reached = true,
             CodexEvent::Completed { usage } => {
                 self.role_prelude(&mut out);
-                let reason = if self.saw_tool_call {
+                let reason = if self.output_limit_reached {
+                    "length"
+                } else if self.saw_tool_call {
                     "tool_calls"
                 } else {
                     "stop"
@@ -360,6 +371,7 @@ pub struct Aggregator {
     tools: Vec<ToolAccumulator>,
     usage: Option<Usage>,
     failure: Option<String>,
+    output_limit_reached: bool,
 }
 
 impl Aggregator {
@@ -375,6 +387,7 @@ impl Aggregator {
             tools: Vec::new(),
             usage: None,
             failure: None,
+            output_limit_reached: false,
         }
     }
 
@@ -412,6 +425,7 @@ impl Aggregator {
             }
             CodexEvent::ReasoningSignature(sig) => self.reasoning_signature = Some(sig),
             CodexEvent::Completed { usage } => self.usage = usage,
+            CodexEvent::OutputLimitReached => self.output_limit_reached = true,
             CodexEvent::Failed { message } => self.failure = Some(message),
         }
     }
@@ -428,7 +442,7 @@ impl Aggregator {
             "object": "text_completion",
             "created": self.created,
             "model": self.model,
-            "choices": [{"index": 0, "text": self.text, "finish_reason": "stop"}],
+            "choices": [{"index": 0, "text": self.text, "finish_reason": if self.output_limit_reached { "length" } else { "stop" }}],
         });
         if let Some(usage) = self.usage.as_ref() {
             payload["usage"] = usage_value(usage);
@@ -468,7 +482,7 @@ impl Aggregator {
         let mut payload = json!({
             "candidates": [{
                 "content": {"role": "model", "parts": parts},
-                "finishReason": "STOP",
+                "finishReason": if self.output_limit_reached { "MAX_TOKENS" } else { "STOP" },
                 "index": 0,
             }],
             "modelVersion": self.model,
@@ -493,9 +507,7 @@ impl Aggregator {
         if !self.text.is_empty() {
             message["content"] = Value::String(self.text);
         }
-        let finish_reason = if self.tools.is_empty() {
-            "stop"
-        } else {
+        if !self.tools.is_empty() {
             message["tool_calls"] = Value::Array(
                 self.tools
                     .iter()
@@ -508,6 +520,12 @@ impl Aggregator {
                     })
                     .collect(),
             );
+        }
+        let finish_reason = if self.output_limit_reached {
+            "length"
+        } else if self.tools.is_empty() {
+            "stop"
+        } else {
             "tool_calls"
         };
 

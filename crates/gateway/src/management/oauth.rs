@@ -44,7 +44,7 @@ const ANTIGRAVITY_DEFAULT_DAILY_URL: &str =
 const ANTIGRAVITY_DEFAULT_REDIRECT: &str = "http://localhost:51121/oauth-callback";
 const ANTIGRAVITY_SCOPES: &str = "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/cclog https://www.googleapis.com/auth/experimentsandconfigs";
 
-const PROVIDERS: &[(&str, &str, bool)] = &[("anthropic", CLAUDE_DEFAULT_AUTH_URL, false)];
+const PROVIDERS: &[(&str, &str, bool)] = &[];
 
 pub fn create_antigravity_auth_url(
     params: &HashMap<String, String>,
@@ -1781,7 +1781,9 @@ pub async fn oauth_callback(
                     .write()
                     .unwrap()
                     .insert(session.state.clone(), session);
-            } else if session.provider == "anthropic" && session.status == SessionStatus::Pending {
+            } else if session.provider == "anthropic"
+                && matches!(session.status, SessionStatus::Pending | SessionStatus::Failed(_))
+            {
                 let auth_dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
                 let exchange_res = exchange_anthropic_code(
                     &state.http_client,
@@ -1798,7 +1800,12 @@ pub async fn oauth_callback(
                             eprintln!("pool rescan failed after anthropic onboarding: {error}");
                         }
                     }
-                    Err(err) => session.status = SessionStatus::Failed(err),
+                    Err(err) => {
+                        session.status = SessionStatus::Failed(err.clone());
+                        SESSIONS.write().unwrap().insert(session.state.clone(), session);
+                        return json_status(StatusCode::BAD_REQUEST,
+                            json!({"status":"error","error":err}));
+                    }
                 }
 
                 let mut sessions = SESSIONS.write().unwrap();
@@ -1840,6 +1847,104 @@ pub async fn oauth_callback(
         crate::static_pages::CALLBACK_HTML,
     )
         .into_response()
+}
+
+async fn anthropic_auth_url_handler(
+    State(app_state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let (url, state, session) = create_anthropic_auth_url(&params);
+    if !params.contains_key("redirect_uri") {
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:54545").await {
+            Ok(listener) => listener,
+            Err(error) => {
+                return json_status(
+                    StatusCode::CONFLICT,
+                    json!({
+                        "status": "error",
+                        "error": format!("Anthropic callback port 54545 is unavailable: {error}")
+                    }),
+                );
+            }
+        };
+        {
+            let finished = Arc::new(Notify::new());
+            let callback_state1 = app_state.clone();
+            let callback_finished1 = finished.clone();
+            let expected_state1 = state.clone();
+            let callback_state2 = app_state.clone();
+            let callback_finished2 = finished.clone();
+            let expected_state2 = state.clone();
+            let callback_app = Router::new()
+                .route(
+                    "/callback",
+                    get(move |Query(query): Query<HashMap<String, String>>| {
+                        let callback_state = callback_state1.clone();
+                        let callback_finished = callback_finished1.clone();
+                        let expected_state = expected_state1.clone();
+                        async move {
+                            if query.get("state") != Some(&expected_state)
+                                || !query.get("code").is_some_and(|code| !code.is_empty())
+                            {
+                                return json_status(StatusCode::BAD_REQUEST,
+                                    json!({"status":"error","error":"Invalid Anthropic OAuth callback"}));
+                            }
+                            let response = oauth_callback(
+                                State(callback_state),
+                                Query(query),
+                                axum::body::Bytes::new(),
+                            )
+                            .await;
+                            if response.status().is_success() {
+                                callback_finished.notify_one();
+                            }
+                            response
+                        }
+                    }),
+                )
+                .route(
+                    "/oauth-callback",
+                    get(move |Query(query): Query<HashMap<String, String>>| {
+                        let callback_state = callback_state2.clone();
+                        let callback_finished = callback_finished2.clone();
+                        let expected_state = expected_state2.clone();
+                        async move {
+                            if query.get("state") != Some(&expected_state)
+                                || !query.get("code").is_some_and(|code| !code.is_empty())
+                            {
+                                return json_status(StatusCode::BAD_REQUEST,
+                                    json!({"status":"error","error":"Invalid Anthropic OAuth callback"}));
+                            }
+                            let response = oauth_callback(
+                                State(callback_state),
+                                Query(query),
+                                axum::body::Bytes::new(),
+                            )
+                            .await;
+                            if response.status().is_success() {
+                                callback_finished.notify_one();
+                            }
+                            response
+                        }
+                    }),
+                );
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, callback_app)
+                    .with_graceful_shutdown(async move {
+                        tokio::select! {
+                            _ = finished.notified() => {}
+                            _ = tokio::time::sleep(tokio::time::Duration::from_secs(300)) => {}
+                        }
+                    })
+                    .await;
+            });
+        }
+    }
+    register_session(session);
+    json_status(
+        StatusCode::OK,
+        json!({ "url": url, "state": state, "provider": "anthropic", "status": "ok" }),
+    )
 }
 
 fn auth_url_for(
@@ -2093,13 +2198,11 @@ fn create_zcode_auth_url(params: &HashMap<String, String>) -> (String, String, O
     (url, state, session)
 }
 
-async fn exchange_zcode_callback(
+async fn exchange_zcode_code(
     state: &AppState,
     session: &mut OAuthSession,
-    callback_url: &str,
+    code: &str,
 ) -> Result<(), String> {
-    let code = mahoquot_providers::zcode::extract_callback_code(callback_url, &session.state)?;
-
     let broker_url = if session.token_url.is_empty() {
         mahoquot_providers::zcode::ZCODE_OAUTH_BROKER_TOKEN_URL.to_string()
     } else {
@@ -2302,7 +2405,16 @@ async fn zcode_callback_handler(
         );
     }
 
-    match exchange_zcode_callback(&app_state, &mut session, &callback_url).await {
+    let code = match mahoquot_providers::zcode::parse_zcode_input(&callback_url, &session.state) {
+        Ok(mahoquot_providers::zcode::ZcodeInput::AuthorizationUrl(url)) => {
+            session.status = SessionStatus::Pending;
+            register_session(session);
+            return json_status(StatusCode::OK, json!({ "status": "pending", "url": url, "provider": "zcode" }));
+        }
+        Ok(mahoquot_providers::zcode::ZcodeInput::AuthorizationCode(code)) => code,
+        Err(error) => return json_status(StatusCode::BAD_REQUEST, json!({ "status": "error", "error": error })),
+    };
+    match exchange_zcode_code(&app_state, &mut session, &code).await {
         Ok(()) => {
             register_session(session);
             json_status(
@@ -2349,6 +2461,7 @@ pub fn oauth_routes() -> Router<Arc<AppState>> {
         .route("/get-auth-status", get(auth_status))
         .route("/codex-auth-url", get(codex_auth_url_handler))
         .route("/cursor-auth-url", get(cursor_auth_url_handler))
+        .route("/anthropic-auth-url", get(anthropic_auth_url_handler))
         .route("/antigravity-auth-url", get(antigravity_auth_url_handler))
         .route("/xai-auth-url", get(xai_auth_url_handler))
         .route("/command-code-auth-url", get(command_code_auth_url_handler))
@@ -2402,6 +2515,7 @@ mod tests {
             .map(|r| r.split_once(' ').expect("pair").1.to_string())
             .collect();
         let explicit = [
+            "anthropic",
             "codex",
             "cursor",
             "xai",

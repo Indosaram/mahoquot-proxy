@@ -398,13 +398,14 @@ async fn count_tokens_handler(State(state): State<Arc<AppState>>, Extension(auth
             return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error":{"type":"permission_error"}}))).into_response();
         }
     }
-    if crate::capability::resolve_for_capability(
-        &snapshot,
-        model,
-        mahoquot_registry::ModelCapability::CountTokens,
-    )
-    .is_none()
-    {
+    let is_supported = crate::capability::resolve_for_capability(
+            &snapshot,
+            model,
+            mahoquot_registry::ModelCapability::CountTokens,
+        )
+        .is_some();
+
+    if !is_supported {
         return (
             StatusCode::BAD_REQUEST,
             Json(crate::capability::count_tokens_error(model)),

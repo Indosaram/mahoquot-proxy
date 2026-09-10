@@ -100,33 +100,91 @@ fn form_encode(value: &str) -> String {
 /// implementation does, and return the authorization code. The state must
 /// match the session that generated the authorize URL.
 pub fn extract_callback_code(callback_url: &str, expected_state: &str) -> Result<String, String> {
-    let input = callback_url.trim();
-    if input.is_empty() {
-        return Err("GLM ZCode authorization callback URL is required".to_string());
+    match parse_zcode_input(callback_url, expected_state)? {
+        ZcodeInput::AuthorizationCode(code) => Ok(code),
+        ZcodeInput::AuthorizationUrl(_) => Err("ZCode authorization is waiting for browser approval".to_string()),
     }
-    let Some((scheme, rest)) = input.split_once("://") else {
-        return Err("GLM ZCode requires the complete zcode:// callback URL".to_string());
-    };
-    if scheme != "zcode" {
-        return Err("GLM ZCode callback URL is invalid".to_string());
-    }
-    let (authority, query) = rest
-        .split_once('?')
-        .ok_or_else(|| "GLM ZCode callback URL is invalid".to_string())?;
-    let (host, path) = authority
-        .split_once('/')
-        .ok_or_else(|| "GLM ZCode callback URL is invalid".to_string())?;
-    if host != "oauth" || path != "callback" {
-        return Err("GLM ZCode callback URL is invalid".to_string());
-    }
+}
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum ZcodeInput {
+    AuthorizationCode(String),
+    AuthorizationUrl(String),
+}
+
+pub fn parse_zcode_input(input: &str, expected_state: &str) -> Result<ZcodeInput, String> {
+    let input = input.trim();
+    if input.is_empty() || expected_state.is_empty() {
+        return Err("ZCode callback and login state are required".to_string());
+    }
+    let normalized = if input.starts_with("code=") || input.starts_with("?code=") {
+        format!("zcode://oauth/callback?{}", input.trim_start_matches('?'))
+    } else {
+        input.to_string()
+    };
+    let mut url = match reqwest::Url::parse(&normalized) {
+        Ok(url) => url,
+        Err(_) if input.len() >= 4 && input.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"-_.+/=~".contains(&byte)) => {
+            return Ok(ZcodeInput::AuthorizationCode(input.to_string()));
+        }
+        Err(_) => return Err("ZCode callback must be a URL, code=...&state=... query, or an authorization code".to_string()),
+    };
+    if url.scheme() == "zcode" {
+        if !url.host_str().is_some_and(|host| host.eq_ignore_ascii_case("oauth"))
+            || !url.path().eq_ignore_ascii_case("/callback")
+            || !url.username().is_empty() || url.password().is_some() || url.port().is_some()
+        {
+            return Err("ZCode callback must use zcode://oauth/callback".to_string());
+        }
+        if url.query().is_none() {
+            let fragment = url.fragment().map(str::to_string);
+            url.set_query(fragment.as_deref());
+            url.set_fragment(None);
+        }
+        return callback_code_from_url(&url, expected_state).map(ZcodeInput::AuthorizationCode);
+    }
+    if url.scheme() != "https" || url.host_str() != Some("chat.z.ai")
+        || !matches!(url.path(), "/auth/oauth/authorize" | "/api/oauth/authorize")
+        || !url.username().is_empty() || url.password().is_some() || url.port().is_some()
+    {
+        return Err("ZCode sign-in URL must be the chat.z.ai authorization page".to_string());
+    }
+    if url.query_pairs().any(|(key, _)| key == "code") {
+        return callback_code_from_url(&url, expected_state).map(ZcodeInput::AuthorizationCode);
+    }
+    let states: Vec<_> = url.query_pairs().filter(|(key, _)| key == "state").map(|(_, value)| value).collect();
+    if states.len() > 1 {
+        return Err("GLM ZCode callback state did not match".to_string());
+    }
+    let redirects: Vec<_> = url.query_pairs().filter(|(key, _)| key == "redirect_uri").map(|(_, value)| value).collect();
+    if redirects.len() == 1 {
+        if let Ok(inner) = reqwest::Url::parse(&redirects[0]) {
+            if inner.scheme() == "zcode" && (inner.query().is_some() || inner.fragment().is_some()) {
+                if states.first().is_some_and(|state| state != expected_state) {
+                    return Err("GLM ZCode callback state did not match".to_string());
+                }
+                return parse_zcode_input(&redirects[0], expected_state);
+            }
+        }
+    }
+    for (key, expected) in [
+        ("client_id", ZCODE_OAUTH_CLIENT_ID),
+        ("response_type", "code"),
+        ("redirect_uri", ZCODE_OAUTH_REDIRECT_URI),
+    ] {
+        let mut values = url.query_pairs().filter(|(name, _)| name == key);
+        if !values.next().is_some_and(|(_, value)| value == expected) || values.next().is_some() {
+            return Err(format!("ZCode authorization URL has invalid {key}"));
+        }
+    }
+    Ok(ZcodeInput::AuthorizationUrl(zcode_authorize_url(expected_state)))
+}
+
+fn callback_code_from_url(callback: &reqwest::Url, expected_state: &str) -> Result<String, String> {
     let mut code = None;
     let mut state = None;
-    for pair in query.split('&') {
-        let Some((key, value)) = pair.split_once('=') else {
-            continue;
-        };
-        match key {
+    for (key, value) in callback.query_pairs() {
+        match key.as_ref() {
             "code" if value.is_empty() => {
                 return Err(
                     "GLM ZCode callback URL must contain exactly one non-empty code and state"

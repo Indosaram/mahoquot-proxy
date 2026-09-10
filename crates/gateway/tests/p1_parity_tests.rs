@@ -328,6 +328,33 @@ async fn test_auth_urls_endpoint_family() {
     let temp_dir = unique_temp_dir("p1-test-authurls");
     std::fs::create_dir_all(&temp_dir).unwrap();
     let app = setup_app(&temp_dir);
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = hits.clone();
+    let mock = axum::Router::new().route(
+        "/device/start",
+        axum::routing::post(move || {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async {
+                axum::Json(json!({
+                    "device_code": "local-device",
+                    "user_code": "LOCAL-CODE",
+                    "verification_uri": "https://example.test/device",
+                    "expires_in": 900,
+                    "interval": 0
+                }))
+            }
+        }),
+    );
+    let mut listener = None;
+    for port in 18840..=18899 {
+        if let Ok(bound) = tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+            listener = Some(bound);
+            break;
+        }
+    }
+    let listener = listener.expect("available local test port");
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let mock_task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
 
     for provider_endpoint in &[
         "/v0/management/anthropic-auth-url",
@@ -338,7 +365,9 @@ async fn test_auth_urls_endpoint_family() {
     ] {
         let req = Request::builder()
             .method("GET")
-            .uri(*provider_endpoint)
+            .uri(format!(
+                "{provider_endpoint}?redirect_uri={base}/callback&device_url={base}/device/start&token_url={base}/token"
+            ))
             .header(header::AUTHORIZATION, format!("Bearer {TEST_KEY}"))
             .body(Body::empty())
             .expect("request");
@@ -361,6 +390,9 @@ async fn test_auth_urls_endpoint_family() {
         );
     }
 
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    mock_task.abort();
+    let _ = mock_task.await;
     std::fs::remove_dir_all(temp_dir).ok();
 }
 
