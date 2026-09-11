@@ -178,6 +178,29 @@ fn default_log_size_mb() -> i64 {
     1024
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderProxyPolicy {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "yes")]
+    pub sticky: bool,
+    #[serde(rename = "ttl-secs", default)]
+    pub ttl_secs: u64,
+    #[serde(default)]
+    pub url: String,
+}
+
+impl Default for ProviderProxyPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sticky: true,
+            ttl_secs: 0,
+            url: String::new(),
+        }
+    }
+}
+
 /// Size at which the active log rolls into a numbered segment. Segments are
 /// deleted whole, so this is also the granularity of the total cap.
 fn default_log_segment_mb() -> i64 {
@@ -220,6 +243,8 @@ pub struct Settings {
     pub request_log: bool,
     #[serde(rename = "proxy-url", default)]
     pub proxy_url: String,
+    #[serde(rename = "proxy-providers", default)]
+    pub proxy_providers: std::collections::BTreeMap<String, ProviderProxyPolicy>,
     #[serde(rename = "request-retry", default)]
     pub request_retry: i64,
     #[serde(rename = "max-retry-credentials", default = "default_max_retry")]
@@ -330,6 +355,7 @@ impl Default for Settings {
             usage_statistics_enabled: false,
             request_log: false,
             proxy_url: String::new(),
+            proxy_providers: std::collections::BTreeMap::new(),
             request_retry: 0,
             max_retry_credentials: default_max_retry(),
             max_retry_interval: 0,

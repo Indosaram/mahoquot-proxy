@@ -158,6 +158,11 @@ pub struct AppState {
     pub catalog: Arc<crate::registry::CatalogManager>,
     pub models_env: Option<String>,
     pub http_client: reqwest::Client,
+    /// Never proxied. Serves providers left out of an active `proxy-providers`
+    /// allowlist, so a per-provider proxy cannot capture everyone else's egress.
+    pub direct_client: reqwest::Client,
+    pub proxy_runtime: Arc<arc_swap::ArcSwap<crate::proxy_policy::ProxyRuntime>>,
+    pub proxy_clients: Arc<std::sync::Mutex<std::collections::HashMap<String, reqwest::Client>>>,
     pub metrics: Arc<GatewayMetrics>,
     pub monitor: Arc<MonitorState>,
     pub api_keys: Arc<ApiKeys>,
@@ -219,11 +224,6 @@ impl AppState {
     pub fn new(config: &GatewayConfig) -> anyhow::Result<Self> {
         let members = load_account_members(&config.auth_dir)?;
 
-        let http_client = reqwest::Client::builder()
-            .tcp_nodelay(true)
-            .build()
-            .map_err(|e| anyhow::anyhow!("failed to build reqwest client: {}", e))?;
-
         let router = Router::new(config.strategy);
         let metrics = Arc::new(GatewayMetrics::default());
         let monitor = Arc::new(MonitorState::default());
@@ -233,6 +233,27 @@ impl AppState {
             config.config_path.clone(),
             config.as_settings(),
         )?);
+
+        let initial_settings = settings.current();
+        let base_proxy = crate::proxy_policy::base_proxy_url(&initial_settings);
+        let http_client = crate::proxy_policy::build_http_client(base_proxy)
+            .map_err(|e| anyhow::anyhow!("failed to build reqwest client: {}", e))?;
+        let direct_client = crate::proxy_policy::build_http_client(None)
+            .map_err(|e| anyhow::anyhow!("failed to build reqwest client: {}", e))?;
+
+        let proxy_runtime = Arc::new(arc_swap::ArcSwap::from_pointee(
+            crate::proxy_policy::ProxyRuntime::from_settings(&initial_settings),
+        ));
+        let proxy_clients = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+
+        let proxy_runtime_obs = Arc::clone(&proxy_runtime);
+        let proxy_clients_obs = Arc::clone(&proxy_clients);
+        settings.add_observer(Arc::new(move |published| {
+            proxy_runtime_obs.store(Arc::new(crate::proxy_policy::ProxyRuntime::from_settings(published)));
+            if let Ok(mut clients) = proxy_clients_obs.lock() {
+                clients.clear();
+            }
+        }));
         let scoped_keys = Arc::new(ScopedKeyTracker::new(&settings.current().scoped_api_keys));
         // Every published settings document rebuilds the index, so a key that
         // is revoked or re-scoped through the management API takes effect on
@@ -344,6 +365,9 @@ impl AppState {
             pool,
             models_env: config.models_env.clone(),
             http_client,
+            direct_client,
+            proxy_runtime,
+            proxy_clients,
             metrics,
             monitor,
             api_keys,
@@ -420,13 +444,56 @@ impl AppState {
         member: &AccountMember,
         presented_token: Option<&str>,
     ) -> Result<bool, mahoquot_providers::refresh_exec::RefreshError> {
+        let client = self.client_for_member(member);
         let did_refresh = member
-            .refresh(&self.http_client, &self.refresh_url, presented_token)
+            .refresh(&client, &self.refresh_url, presented_token)
             .await?;
         if did_refresh {
             self.refreshed.fetch_add(1, Ordering::Relaxed);
         }
         Ok(did_refresh)
+    }
+
+    pub fn client_for_member(&self, member: &AccountMember) -> reqwest::Client {
+        self.client_for_target(&member.provider_name(), member.id())
+    }
+
+    pub fn client_for_target(&self, provider_name: &str, member_id: &str) -> reqwest::Client {
+        let runtime = self.proxy_runtime.load();
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let Some(proxy_url) = runtime.session_proxy_url(provider_name, member_id, now_unix) else {
+            // Toggling a provider on at runtime must not retroactively proxy
+            // the providers that were never opted in.
+            return if runtime.scoped_routing_active() {
+                self.direct_client.clone()
+            } else {
+                self.http_client.clone()
+            };
+        };
+
+        let cache_key = format!("{provider_name}|{member_id}|{proxy_url}");
+        {
+            let clients = self.proxy_clients.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(client) = clients.get(&cache_key) {
+                return client.clone();
+            }
+        }
+
+        match crate::proxy_policy::build_http_client(Some(&proxy_url)) {
+            Ok(client) => {
+                let mut clients = self.proxy_clients.lock().unwrap_or_else(|p| p.into_inner());
+                clients.insert(cache_key, client.clone());
+                client
+            }
+            Err(err) => {
+                tracing::warn!("failed to build proxy client ({proxy_url}): {err}; falling back to default client");
+                self.http_client.clone()
+            }
+        }
     }
 
     pub fn get_stats(&self) -> AdminStatsResponse {

@@ -161,6 +161,26 @@ pub const SCALARS: &[Scalar] = &[
         }),
     },
     Scalar {
+        path: "/proxy-providers",
+        key: "proxy-providers",
+        read: |s| json!(s.proxy_providers),
+        write: |s, b| {
+            let candidate = b
+                .get("value")
+                .or_else(|| b.get("items"))
+                .or_else(|| b.get("proxy-providers"))
+                .unwrap_or(b);
+            let map: std::collections::BTreeMap<String, super::settings::ProviderProxyPolicy> =
+                serde_json::from_value(candidate.clone()).map_err(|_| Refusal::InvalidBody)?;
+            s.proxy_providers = map;
+            Ok(())
+        },
+        clear: Some(|s, _| {
+            s.proxy_providers.clear();
+            Ok(())
+        }),
+    },
+    Scalar {
         path: "/routing/strategy",
         key: "strategy",
         read: |s| {
