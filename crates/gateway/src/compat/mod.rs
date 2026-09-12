@@ -76,6 +76,7 @@ pub mod render;
 pub mod request;
 pub mod responses;
 pub mod signature_ledger;
+mod tool_schema;
 
 use std::collections::VecDeque;
 use std::pin::Pin;

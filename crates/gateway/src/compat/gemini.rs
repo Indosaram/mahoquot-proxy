@@ -304,6 +304,10 @@ pub fn gemini_to_openai(req: &Value, model: &str) -> Result<Value, String> {
 }
 
 pub fn openai_to_gemini(body: &Value) -> Result<Value, String> {
+    openai_to_gemini_inner(body, false)
+}
+
+fn openai_to_gemini_inner(body: &Value, claude_tools: bool) -> Result<Value, String> {
     let model = body
         .get("model")
         .and_then(Value::as_str)
@@ -574,17 +578,28 @@ pub fn openai_to_gemini(body: &Value) -> Result<Value, String> {
     if let Some(tools) = body.get("tools").and_then(Value::as_array) {
         let decls: Vec<Value> = tools
             .iter()
-            .filter_map(|t| t.get("function"))
-            .map(|f| {
-                let mut parameters = f.get("parameters").cloned().unwrap_or_else(|| json!({}));
-                sanitize_gemini_schema(&mut parameters);
-                json!({
+            .enumerate()
+            .filter_map(|(index, t)| t.get("function").map(|f| (index, f)))
+            .map(|(index, f)| {
+                let mut parameters = if claude_tools {
+                    super::tool_schema::antigravity_claude_schema(f.get("parameters"))
+                        .map_err(|error| format!("tools[{index}].function.parameters: {error}"))?
+                } else {
+                    f.get("parameters").cloned().unwrap_or_else(|| json!({}))
+                };
+                if claude_tools {
+                    sanitize_claude_schema_for_gemini(&mut parameters)
+                        .map_err(|error| format!("tools[{index}].function.parameters: {error}"))?;
+                } else {
+                    sanitize_gemini_schema(&mut parameters);
+                }
+                Ok(json!({
                     "name": f.get("name").and_then(Value::as_str).unwrap_or(""),
                     "description": f.get("description").and_then(Value::as_str).unwrap_or(""),
                     "parameters": parameters,
-                })
+                }))
             })
-            .collect();
+            .collect::<Result<Vec<_>, String>>()?;
         if !decls.is_empty() {
             request.insert(
                 "tools".to_string(),
@@ -639,13 +654,43 @@ fn sanitize_gemini_schema(value: &mut Value) {
     }
 }
 
+// Unlike the legacy Gemini JSON walk, visit only schema positions: a tool may
+// legitimately have a property named "const", "$defs", or "additionalProperties".
+fn sanitize_claude_schema_for_gemini(value: &mut Value) -> Result<(), String> {
+    if *value == Value::Bool(true) {
+        *value = json!({});
+    }
+    let map = value
+        .as_object_mut()
+        .ok_or("Antigravity requires object-valued schema nodes")?;
+    if let Some(constant) = map.remove("const") {
+        if map
+            .get("enum")
+            .and_then(Value::as_array)
+            .is_some_and(|values| !values.contains(&constant))
+        {
+            return Err("tool schema const conflicts with enum".into());
+        }
+        map.insert("enum".into(), json!([constant]));
+    }
+    for key in GEMINI_UNSUPPORTED_SCHEMA_KEYS {
+        map.remove(*key);
+    }
+    if let Some(one) = map.remove("oneOf") {
+        map.entry("anyOf").or_insert(one);
+    }
+    super::tool_schema::visit_schema_children(map, &mut sanitize_claude_schema_for_gemini)
+}
+
 pub fn openai_to_antigravity(body: &Value, project_id: &str) -> Result<Value, String> {
     let model = body
         .get("model")
         .and_then(Value::as_str)
         .ok_or_else(|| "missing model".to_string())?;
 
-    let request = openai_to_gemini(body)?;
+    // Antigravity uses Gemini's wire format even when its actual validator is
+    // Anthropic. Keep this repair out of native Gemini and non-Claude models.
+    let request = openai_to_gemini_inner(body, model.starts_with("claude-"))?;
 
     Ok(json!({
         "model": model,

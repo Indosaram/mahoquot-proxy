@@ -402,16 +402,19 @@ pub fn openai_to_anthropic(body: &Value) -> Result<Value, String> {
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|tool| tool.get("function"))
-        .map(|function| {
+        .enumerate()
+        .filter_map(|(index, tool)| tool.get("function").map(|function| (index, function)))
+        .map(|(index, function)| {
             let name = anthropic_tool_name(function["name"].as_str().unwrap_or("tool"));
-            json!({
+            let schema = super::tool_schema::anthropic_schema(function.get("parameters"))
+                .map_err(|error| format!("tools[{index}].function.parameters: {error}"))?;
+            Ok(json!({
                 "name": name,
                 "description": function["description"],
-                "input_schema": function.get("parameters").cloned().unwrap_or_else(|| json!({"type":"object"})),
-            })
+                "input_schema": schema,
+            }))
         })
-        .collect();
+        .collect::<Result<Vec<_>, String>>()?;
     // Anthropic-style upstreams require max_tokens, but OpenAI-agent clients
     // often omit it. A small default truncates reasoning models mid-response
     // (thinking burns the output budget, so a tool_use block arrives cut off
