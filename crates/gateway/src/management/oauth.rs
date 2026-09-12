@@ -457,12 +457,15 @@ async fn exchange_xai_code(
         .get("email")
         .and_then(Value::as_str)
         .unwrap_or("xai-account");
+    let models =
+        fetch_credential_models(&state.http_client, "https://api.x.ai/v1", access_token, "xai")
+            .await?;
     let credential = json!({
         "type":"generic", "provider":"xai", "label":email, "adapter":"openai-chat",
         "base_url":"https://api.x.ai/v1", "api_key":access_token, "auth_mode":"oauth",
         "refresh_token":body.get("refresh_token"), "expired":expiry_from_token_body(&body),
         "token_url":session.token_url, "client_id":session.challenge,
-        "models":session.uuid.split(',').collect::<Vec<_>>(), "disabled":false
+        "models":models, "disabled":false
     });
     let auth_dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
     let rendered = serde_json::to_string_pretty(&credential).map_err(|error| error.to_string())?;
@@ -481,9 +484,46 @@ pub(crate) struct DeviceProvider {
     pub(crate) device_url: &'static str,
     pub(crate) token_url: &'static str,
     pub(crate) base_url: &'static str,
-    pub(crate) models: &'static [&'static str],
     pub(crate) camel_case_poll: bool,
     pub(crate) scope: Option<&'static str>,
+}
+
+/// Reads the account's model catalogue from the provider it just authenticated
+/// against.
+///
+/// A credential must never carry a baked-in model list: a static list invents
+/// models the account may not actually have, and it rots silently the moment
+/// upstream changes its lineup. The catalogue is the provider's to declare, so
+/// an unreachable or empty one fails the flow instead of falling back to a
+/// guess.
+async fn fetch_credential_models(
+    client: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    provider: &str,
+) -> Result<Vec<String>, String> {
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let response = client
+        .get(&url)
+        .header("authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .map_err(|error| format!("{provider} model catalog unreachable: {error}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!(
+            "{provider} model catalog rejected the token ({status})"
+        ));
+    }
+    let parsed: Value = response
+        .json()
+        .await
+        .map_err(|error| format!("{provider} model catalog is not JSON: {error}"))?;
+    let ids = crate::management::creds::model_ids_from_catalog(&parsed);
+    if ids.is_empty() {
+        return Err(format!("{provider} returned an empty model catalog"));
+    }
+    Ok(ids)
 }
 
 pub(crate) fn device_provider(provider: &str) -> Option<DeviceProvider> {
@@ -493,7 +533,6 @@ pub(crate) fn device_provider(provider: &str) -> Option<DeviceProvider> {
             device_url: "https://auth.kimi.com/api/oauth/device_authorization",
             token_url: "https://auth.kimi.com/api/oauth/token",
             base_url: "https://api.kimi.com/coding/v1",
-            models: &["k3", "k3[1m]", "kimi-k2.7-code", "kimi-k2.6", "kimi-k2.5"],
             camel_case_poll: false,
             scope: None,
         }),
@@ -502,12 +541,6 @@ pub(crate) fn device_provider(provider: &str) -> Option<DeviceProvider> {
             device_url: "https://openapi.qoder.sh/api/v1/deviceToken/register",
             token_url: "https://openapi.qoder.sh/api/v1/deviceToken/poll",
             base_url: "https://openapi.qoder.sh/api/v1",
-            models: &[
-                "qwen3.8-max",
-                "qwen3.7-max",
-                "qwen3.7-plus",
-                "qwen3.6-flash",
-            ],
             camel_case_poll: true,
             scope: None,
         }),
@@ -516,12 +549,6 @@ pub(crate) fn device_provider(provider: &str) -> Option<DeviceProvider> {
             device_url: "https://portal.nousresearch.com/api/oauth/device/code",
             token_url: "https://portal.nousresearch.com/api/oauth/token",
             base_url: "https://inference-api.nousresearch.com/v1",
-            models: &[
-                "tencent/hy3:free",
-                "poolside/laguna-s-2.1:free",
-                "stepfun/step-3.7-flash:free",
-                "poolside/laguna-xs-2.1:free",
-            ],
             camel_case_poll: false,
             scope: Some("inference:invoke"),
         }),
@@ -530,7 +557,6 @@ pub(crate) fn device_provider(provider: &str) -> Option<DeviceProvider> {
             device_url: "https://github.com/login/device/code",
             token_url: "https://github.com/login/oauth/access_token",
             base_url: "https://api.github.com/copilot_internal/v2/token",
-            models: &["gpt-4o", "gpt-4.1", "gpt-5.3-codex", "gpt-5.4", "gpt-5.5"],
             camel_case_poll: false,
             scope: Some("read:user"),
         }),
@@ -926,11 +952,7 @@ async fn start_device_session(
                 } else {
                     Vec::new()
                 };
-            if !catalog_models.is_empty() {
-                catalog_models.join(",")
-            } else {
-                spec.models.join(",")
-            }
+            catalog_models.join(",")
         },
         status: SessionStatus::Pending,
         created_at: Instant::now(),
@@ -1021,6 +1043,13 @@ async fn poll_device_session(
             .unwrap_or("https://api.githubcopilot.com")
             .to_string();
     }
+    let models = fetch_credential_models(
+        &state.http_client,
+        &upstream_base,
+        &access_token,
+        &session.provider,
+    )
+    .await?;
     let email = body
         .get("email")
         .and_then(Value::as_str)
@@ -1037,7 +1066,7 @@ async fn poll_device_session(
         "expired": expiry_from_token_body(&body),
         "token_url": session.token_url,
         "client_id": session.challenge,
-        "models": session.uuid.split(',').collect::<Vec<_>>(),
+        "models": models,
         "disabled": false,
     });
     let auth_dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
@@ -1615,11 +1644,8 @@ async fn exchange_command_code_callback(
         &session.challenge
     };
 
-    let models: Vec<&str> = if session.uuid.is_empty() {
-        vec!["deepseek/deepseek-v4-flash"]
-    } else {
-        session.uuid.split(',').collect()
-    };
+    let models =
+        fetch_credential_models(&state.http_client, base_url, api_key, "command-code").await?;
 
     let credential = json!({
         "type": "generic",

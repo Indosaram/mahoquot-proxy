@@ -813,10 +813,6 @@ mod tests {
         );
         assert_eq!(kimi.token_url, "https://auth.kimi.com/api/oauth/token");
         assert_eq!(kimi.base_url, "https://api.kimi.com/coding/v1");
-        assert_eq!(
-            kimi.models,
-            ["k3", "k3[1m]", "kimi-k2.7-code", "kimi-k2.6", "kimi-k2.5"]
-        );
         assert!(!kimi.camel_case_poll);
         assert_eq!(kimi.scope, None);
 
@@ -832,15 +828,6 @@ mod tests {
             "https://openapi.qoder.sh/api/v1/deviceToken/poll"
         );
         assert_eq!(qwen.base_url, "https://openapi.qoder.sh/api/v1");
-        assert_eq!(
-            qwen.models,
-            [
-                "qwen3.8-max",
-                "qwen3.7-max",
-                "qwen3.7-plus",
-                "qwen3.6-flash"
-            ]
-        );
         assert!(qwen.camel_case_poll);
         assert_eq!(qwen.scope, None);
 
@@ -856,15 +843,6 @@ mod tests {
             "https://portal.nousresearch.com/api/oauth/token"
         );
         assert_eq!(nous.base_url, "https://inference-api.nousresearch.com/v1");
-        assert_eq!(
-            nous.models,
-            [
-                "tencent/hy3:free",
-                "poolside/laguna-s-2.1:free",
-                "stepfun/step-3.7-flash:free",
-                "poolside/laguna-xs-2.1:free"
-            ]
-        );
         assert!(!nous.camel_case_poll);
         assert_eq!(nous.scope, Some("inference:invoke"));
 
@@ -880,10 +858,6 @@ mod tests {
         assert_eq!(
             copilot.base_url,
             "https://api.github.com/copilot_internal/v2/token"
-        );
-        assert_eq!(
-            copilot.models,
-            ["gpt-4o", "gpt-4.1", "gpt-5.3-codex", "gpt-5.4", "gpt-5.5"]
         );
         assert!(!copilot.camel_case_poll);
         assert_eq!(copilot.scope, Some("read:user"));

@@ -1004,15 +1004,23 @@ async fn cline_import(State(state): State<Arc<AppState>>) -> Response {
         .and_then(Value::as_str)
         .unwrap_or("");
     let label = if !email.is_empty() { email } else { "Cline" };
-    // Probe the token once before it becomes a stored account file.
+    // Probe the token once before it becomes a stored account file, and take the
+    // advertised catalogue from that same response. The model list belongs to the
+    // provider: hardcoding it here silently invents capabilities the account may
+    // not have and goes stale the moment upstream changes its lineup.
     let probe = state
         .http_client
         .get("https://api.cline.bot/api/v1/models")
         .header(header::AUTHORIZATION, format!("Bearer {access}"))
         .send()
         .await;
-    match probe {
-        Ok(response) if response.status().is_success() => {}
+    let models: Vec<String> = match probe {
+        Ok(response) if response.status().is_success() => {
+            match models_from_catalog("cline", response).await {
+                Ok(ids) => ids,
+                Err(rejection) => return rejection,
+            }
+        }
         Ok(response) => {
             return json_status(
                 StatusCode::UNAUTHORIZED,
@@ -1025,18 +1033,14 @@ async fn cline_import(State(state): State<Arc<AppState>>) -> Response {
                 json!({"error": format!("cline upstream unreachable: {error}"), "status": "error"}),
             )
         }
-    }
+    };
     let credential = json!({"type":"generic","provider":"cline","label":label,"email":email,
         "adapter":"openai-chat","auth_mode":"oauth",
         "base_url":"https://api.cline.bot/api/v1",
         "api_key":access,"refresh_token":refresh,"expired":expired,
         "token_url":"https://api.cline.bot/api/v1/auth/refresh",
         "account_id":account_id,
-        "models":["z-ai/glm-5.3-flash","z-ai/glm-5.3",
-            "meta/muse-spark-1.3-contributor","meta/muse-spark-1.3",
-            "meta/muse-spark-1.2-contributor","meta/muse-spark-1.2",
-            "deepseek/deepseek-v4-flash","upstage/solar-pro4",
-            "meituan/longcat-2.0","poolside/laguna-s-2.1"],
+        "models":models,
         "disabled":false});
     let dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
     // Filename prefix must be `generic-`: `classify_credential` dispatches
@@ -1318,6 +1322,59 @@ async fn devin_import_cli(State(state): State<Arc<AppState>>, raw: bytes::Bytes)
     )
 }
 
+/// Reads an OpenAI-style `{"data":[{"id":..}]}` catalogue out of a successful
+/// `/models` probe.
+///
+/// The model list belongs to the provider. Hardcoding one here would invent
+/// capabilities an account may not actually have and would rot silently the
+/// moment upstream changes its lineup, so an unreadable or empty catalogue is
+/// surfaced as an error instead of being papered over with a static default.
+/// Extracts model ids from an OpenAI-style `{"data":[{"id":..}]}` catalogue.
+///
+/// Shared with the OAuth device flows so every provider reads its catalogue the
+/// same way, whatever error idiom the caller uses.
+pub(crate) fn model_ids_from_catalog(parsed: &Value) -> Vec<String> {
+    parsed
+        .get("data")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| entry.get("id").and_then(Value::as_str))
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+async fn models_from_catalog(
+    provider: &str,
+    response: reqwest::Response,
+) -> Result<Vec<String>, Response> {
+    let body = response.bytes().await.map_err(|error| {
+        json_status(
+            StatusCode::BAD_GATEWAY,
+            json!({"error": format!("{provider} model catalog unreadable: {error}"), "status": "error"}),
+        )
+    })?;
+    let parsed: Value = serde_json::from_slice(&body).map_err(|error| {
+        json_status(
+            StatusCode::BAD_GATEWAY,
+            json!({"error": format!("{provider} model catalog is not JSON: {error}"), "status": "error"}),
+        )
+    })?;
+    let ids = model_ids_from_catalog(&parsed);
+    if ids.is_empty() {
+        return Err(json_status(
+            StatusCode::BAD_GATEWAY,
+            json!({"error": format!("{provider} returned an empty model catalog"), "status": "error"}),
+        ));
+    }
+    Ok(ids)
+}
+
 async fn command_code_import(
     State(state): State<Arc<AppState>>,
     Json(body): Json<Value>,
@@ -1345,8 +1402,13 @@ async fn command_code_import(
         .header(header::AUTHORIZATION, format!("Bearer {api_key}"))
         .send()
         .await;
-    match verification {
-        Ok(response) if response.status().is_success() => {}
+    let models: Vec<String> = match verification {
+        Ok(response) if response.status().is_success() => {
+            match models_from_catalog("command-code", response).await {
+                Ok(ids) => ids,
+                Err(rejection) => return rejection,
+            }
+        }
         Ok(response) => {
             return json_status(
                 StatusCode::UNAUTHORIZED,
@@ -1359,10 +1421,10 @@ async fn command_code_import(
                 json!({"error": format!("credential verification unreachable: {error}"), "status": "error"}),
             )
         }
-    }
+    };
     let credential = json!({"type":"generic","provider":"command-code","label":label,"adapter":"openai-chat",
         "base_url":base_url,"api_key":api_key,
-        "models":["deepseek/deepseek-v4-flash"],"disabled":false});
+        "models":models,"disabled":false});
     let dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
     // Name the file after the credential, not the process: a PID-derived name
     // makes a second import in the same process overwrite the first account.
@@ -1791,5 +1853,62 @@ mod reserved_file_tests {
         assert!(!is_credential_filename("config.yaml"));
         assert!(is_credential_filename("codex-1.json"));
         assert!(!is_credential_filename(".mahoquot-account-order.json"));
+    }
+
+    #[test]
+    fn catalog_ids_are_read_from_the_provider_payload() {
+        let payload = serde_json::json!({
+            "object": "list",
+            "data": [
+                {"id": "z-ai/glm-5.3-flash", "object": "model"},
+                {"id": "  deepseek/deepseek-v4.1-flash  ", "object": "model"},
+                {"id": "upstage/solar-pro4"}
+            ]
+        });
+        assert_eq!(
+            model_ids_from_catalog(&payload),
+            vec![
+                "z-ai/glm-5.3-flash".to_string(),
+                "deepseek/deepseek-v4.1-flash".to_string(),
+                "upstage/solar-pro4".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn catalog_parsing_drops_unusable_entries() {
+        // Blank and non-string ids carry no routing meaning, and an entry
+        // without an `id` is not a model at all.
+        let payload = serde_json::json!({
+            "data": [
+                {"id": ""},
+                {"id": "   "},
+                {"id": 42},
+                {"object": "model"},
+                {"id": "kept/model"}
+            ]
+        });
+        assert_eq!(
+            model_ids_from_catalog(&payload),
+            vec!["kept/model".to_string()]
+        );
+    }
+
+    #[test]
+    fn catalog_parsing_yields_nothing_for_malformed_payloads() {
+        // An empty result is what makes the callers reject the credential
+        // instead of silently storing a guessed model list, so the shapes that
+        // must produce it are pinned here.
+        for payload in [
+            serde_json::json!({}),
+            serde_json::json!({"data": []}),
+            serde_json::json!({"data": "not-an-array"}),
+            serde_json::json!({"models": [{"id": "wrong-key"}]}),
+        ] {
+            assert!(
+                model_ids_from_catalog(&payload).is_empty(),
+                "expected no ids from {payload}"
+            );
+        }
     }
 }
