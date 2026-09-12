@@ -21,9 +21,11 @@ pub enum ProviderKind {
     Kiro,
     Zcode,
     Vertex,
+    Devin,
     Generic,
 }
 
+#[derive(Clone)]
 pub enum ProviderAccount {
     Codex(CodexAccount),
     Antigravity(AntigravityAccount),
@@ -32,6 +34,7 @@ pub enum ProviderAccount {
     Kiro(KiroAccount),
     Zcode(ZcodeAccount),
     Vertex(VertexAccount),
+    Devin(mahoquot_providers::DevinAccount),
     Generic(GenericAccount),
 }
 
@@ -42,6 +45,8 @@ pub struct GenericAccount {
     pub provider: String,
     #[serde(default)]
     pub label: String,
+    #[serde(default)]
+    pub email: String,
     pub adapter: String,
     pub base_url: String,
     #[serde(default)]
@@ -87,6 +92,9 @@ impl ProviderKind {
                     && !model.starts_with("nekos/")
                     && model != "auto-kiro"
                     && !mahoquot_providers::is_vertex_model(model)
+                    && !model.starts_with("devin-")
+                    && !model.starts_with("devin/")
+                    && model != "devin"
             }
             ProviderKind::Antigravity => is_antigravity_model(model),
             ProviderKind::Claude => {
@@ -115,6 +123,7 @@ impl ProviderKind {
             }
             ProviderKind::Zcode => mahoquot_providers::is_zcode_model(model),
             ProviderKind::Vertex => mahoquot_providers::is_vertex_model(model),
+            ProviderKind::Devin => false,
             ProviderKind::Generic => true,
         }
     }
@@ -128,6 +137,7 @@ impl ProviderKind {
             ProviderKind::Kiro => "kiro",
             ProviderKind::Zcode => "zcode",
             ProviderKind::Vertex => "google-vertex",
+            ProviderKind::Devin => "devin",
             ProviderKind::Generic => "generic",
         }
     }
@@ -141,6 +151,7 @@ impl ProviderKind {
             "kiro" => Some(Self::Kiro),
             "zcode" => Some(Self::Zcode),
             "vertex" | "google-vertex" => Some(Self::Vertex),
+            "devin" => Some(Self::Devin),
             "generic" => Some(Self::Generic),
             _ => None,
         }
@@ -255,6 +266,7 @@ mod provider_kind_contract_tests {
             identity_slug: "slug-generic-empty".to_string(),
             provider: "open-generic".to_string(),
             label: "Open Generic".to_string(),
+            email: String::new(),
             adapter: "openai-chat".to_string(),
             base_url: "https://example.com".to_string(),
             api_key: "k".to_string(),
@@ -278,6 +290,7 @@ mod provider_kind_contract_tests {
             identity_slug: "slug-generic-rest".to_string(),
             provider: "restricted-generic".to_string(),
             label: "Restricted Generic".to_string(),
+            email: String::new(),
             adapter: "openai-chat".to_string(),
             base_url: "https://example.com".to_string(),
             api_key: "k".to_string(),
@@ -374,6 +387,7 @@ impl ProviderAccount {
             Self::Kiro(_) => ProviderKind::Kiro,
             Self::Zcode(_) => ProviderKind::Zcode,
             Self::Vertex(_) => ProviderKind::Vertex,
+            Self::Devin(_) => ProviderKind::Devin,
             Self::Generic(_) => ProviderKind::Generic,
         }
     }
@@ -390,6 +404,7 @@ impl ProviderAccount {
             Self::Kiro(a) => a.access_token.clone(),
             Self::Zcode(a) => a.access_token.clone(),
             Self::Vertex(a) => a.access_token.clone(),
+            Self::Devin(a) => a.access_token.clone(),
             Self::Generic(a) => a.api_key.clone(),
         }
     }
@@ -427,6 +442,7 @@ impl ProviderAccount {
             Self::Kiro(a) => a.refresh_token.clone(),
             Self::Zcode(a) => a.refresh_token.clone(),
             Self::Vertex(_) => String::new(),
+            Self::Devin(_) => String::new(),
             Self::Generic(a) => a.refresh_token.clone(),
         }
     }
@@ -451,11 +467,17 @@ impl ProviderAccount {
                 !mahoquot_providers::zcode::is_provisioned_api_key(&a.access_token)
                     && expired_at_is_past(&a.expired, now_unix)
             }
+            // Cline CLI login (WorkOS OAuth) carries a short-lived JWT and a
+            // server-side refresh; expiry gates re-auth like other OAuth.
+            Self::Generic(a) if a.provider == "cline" => {
+                expired_at_is_past(&a.expired, now_unix)
+            }
             Self::Vertex(a) => a.is_expired(now_unix),
+            Self::Devin(_) => false,
             // A MiMo Free account holds a bootstrap JWT rather than a pasted
             // key, so it expires and re-bootstraps like an OAuth credential.
             Self::Generic(a) => {
-                (a.auth_mode == "oauth" || a.adapter == "mimo-free")
+                (a.auth_mode == "oauth" || a.adapter == "mimo-free" || a.provider == "cline")
                     && expired_at_is_past(&a.expired, now_unix)
             }
         }
@@ -566,6 +588,17 @@ impl ProviderAccount {
                 ),
             ],
             Self::Vertex(a) => a.build_upstream_headers(),
+            Self::Devin(a) => vec![
+                (
+                    "authorization".to_string(),
+                    format!("Basic {}-{}", a.access_token, a.access_token),
+                ),
+                (
+                    "content-type".to_string(),
+                    "application/connect+proto".to_string(),
+                ),
+                ("connect-protocol-version".to_string(), "1".to_string()),
+            ],
             Self::Generic(a) => {
                 let mut headers =
                     vec![("content-type".to_string(), "application/json".to_string())];
@@ -647,6 +680,9 @@ impl ProviderAccount {
                     )
                 }
             },
+            Self::Generic(a) if a.provider == "cline" => {
+                mahoquot_providers::build_cline_refresh_request(&a.refresh_token)
+            }
             Self::Generic(a) if matches!(a.provider.as_str(), "xai" | "kimi") => {
                 mahoquot_providers::RefreshRequest {
                     url: a.token_url.clone(),
@@ -670,15 +706,17 @@ pub struct AccountMember {
     pub id: String,
     pub file_path: PathBuf,
     pub inner: RwLock<ProviderAccount>,
-    pub health: RwLock<Health>,
+    pub health: Arc<RwLock<Health>>,
     pub upstream_override: Option<String>,
     /// Usage-polling-only base; falls back to `upstream_override` when unset.
     pub usage_override: Option<String>,
-    pub ok_count: AtomicU64,
-    pub fail_count: AtomicU64,
-    pub refresh_lock: tokio::sync::Mutex<()>,
-    pub unsupported_models: RwLock<Vec<String>>,
-    pub usage: RwLock<crate::usage::AccountUsage>,
+    pub ok_count: Arc<AtomicU64>,
+    pub fail_count: Arc<AtomicU64>,
+    pub refresh_lock: Arc<tokio::sync::Mutex<()>>,
+    pub unsupported_models: Arc<RwLock<Vec<String>>>,
+    pub usage: Arc<RwLock<crate::usage::AccountUsage>>,
+    pub devin_catalog: arc_swap::ArcSwapOption<crate::devin_catalog::DevinAccountCatalogState>,
+    pub devin_discovery_seq: Arc<AtomicU64>,
 }
 
 impl PoolMember for AccountMember {
@@ -715,14 +753,16 @@ impl AccountMember {
             id: id.into(),
             file_path: PathBuf::from("/dev/null"),
             inner: RwLock::new(inner),
-            health: RwLock::new(Health::Available),
+            health: Arc::new(RwLock::new(Health::Available)),
             upstream_override: None,
             usage_override: None,
-            ok_count: AtomicU64::new(0),
-            fail_count: AtomicU64::new(0),
-            refresh_lock: tokio::sync::Mutex::new(()),
-            unsupported_models: RwLock::new(Vec::new()),
-            usage: RwLock::new(Default::default()),
+            ok_count: Arc::new(AtomicU64::new(0)),
+            fail_count: Arc::new(AtomicU64::new(0)),
+            refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
+            unsupported_models: Arc::new(RwLock::new(Vec::new())),
+            usage: Arc::new(RwLock::new(Default::default())),
+            devin_catalog: arc_swap::ArcSwapOption::empty(),
+            devin_discovery_seq: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -832,6 +872,169 @@ impl AccountMember {
         }
     }
 
+    pub fn devin_models(&self) -> Option<Vec<String>> {
+        if self.kind() != ProviderKind::Devin {
+            return None;
+        }
+        if self.is_manually_disabled() {
+            return Some(Vec::new());
+        }
+        let cat = self.devin_catalog.load();
+        let catalog = cat.as_ref()?;
+        if catalog.has_succeeded {
+            Some(catalog.models.iter().map(|m| m.public_id.clone()).collect())
+        } else {
+            None
+        }
+    }
+
+    pub fn devin_discovered_models(&self) -> Option<Vec<crate::devin_catalog::DiscoveredDevinModel>> {
+        if self.kind() != ProviderKind::Devin {
+            return None;
+        }
+        if self.is_manually_disabled() {
+            return Some(Vec::new());
+        }
+        let cat = self.devin_catalog.load();
+        let catalog = cat.as_ref()?;
+        if catalog.has_succeeded {
+            Some(catalog.models.clone())
+        } else {
+            None
+        }
+    }
+
+    pub fn devin_catalog_state(&self) -> Option<Arc<crate::devin_catalog::DevinAccountCatalogState>> {
+        self.devin_catalog.load_full()
+    }
+
+    pub fn set_devin_catalog_state(&self, state: Arc<crate::devin_catalog::DevinAccountCatalogState>) {
+        self.devin_catalog.store(Some(state));
+    }
+
+    pub fn clone_for_snapshot(
+        &self,
+        new_catalog: Option<Arc<crate::devin_catalog::DevinAccountCatalogState>>,
+    ) -> Self {
+        Self {
+            id: self.id.clone(),
+            file_path: self.file_path.clone(),
+            inner: RwLock::new(self.inner.read().unwrap_or_else(|p| p.into_inner()).clone()),
+            health: Arc::clone(&self.health),
+            upstream_override: self.upstream_override.clone(),
+            usage_override: self.usage_override.clone(),
+            ok_count: Arc::clone(&self.ok_count),
+            fail_count: Arc::clone(&self.fail_count),
+            refresh_lock: Arc::clone(&self.refresh_lock),
+            unsupported_models: Arc::clone(&self.unsupported_models),
+            usage: Arc::clone(&self.usage),
+            devin_catalog: arc_swap::ArcSwapOption::new(new_catalog),
+            devin_discovery_seq: Arc::clone(&self.devin_discovery_seq),
+        }
+    }
+
+    /// Returns the effective upstream base URL for this account member.
+    pub fn effective_base_url(&self) -> String {
+        if let Some(ref override_url) = self.upstream_override {
+            return override_url.clone();
+        }
+        let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
+        match &*inner {
+            ProviderAccount::Devin(a) => a.api_server_url.clone(),
+            ProviderAccount::Generic(a) => a.base_url.clone(),
+            ProviderAccount::Cursor(_) => mahoquot_providers::CURSOR_UPSTREAM_BASE.to_string(),
+            ProviderAccount::Zcode(_) => mahoquot_providers::ZCODE_API_BASE.to_string(),
+            ProviderAccount::Claude(_) => "https://api.anthropic.com".to_string(),
+            ProviderAccount::Codex(_) => "https://api.openai.com".to_string(),
+            ProviderAccount::Antigravity(_) => "https://api.antigravity.dev".to_string(),
+            ProviderAccount::Kiro(_) => "https://api.kiro.dev".to_string(),
+            ProviderAccount::Vertex(_) => "https://api.vertex.dev".to_string(),
+        }
+    }
+
+    /// Returns true if `self` and `other` represent the exact same credential identity:
+    /// matching account ID, provider kind, access token / secret, and effective upstream base URL.
+    ///
+    /// If an account token is reused but points to a different endpoint, or if credentials were
+    /// replaced / rotated, this returns false so runtime state and router feedback are not conflated.
+    pub fn same_credential_identity(&self, other: &Self) -> bool {
+        if self.id != other.id || self.kind() != other.kind() {
+            return false;
+        }
+        if self.access_token() != other.access_token() {
+            return false;
+        }
+        if self.effective_base_url() != other.effective_base_url() {
+            return false;
+        }
+        true
+    }
+
+    /// Returns true if `self` and `other` share the exact underlying mutable runtime cells
+    /// (`ok_count`, `fail_count`, `health`).
+    pub fn shares_runtime_identity(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.ok_count, &other.ok_count)
+            && Arc::ptr_eq(&self.fail_count, &other.fail_count)
+            && Arc::ptr_eq(&self.health, &other.health)
+    }
+
+    pub fn supports_devin_model(&self, requested: &str, canonical: &str, upstream: &str) -> bool {
+        if self.kind() != ProviderKind::Devin || self.is_manually_disabled() {
+            return false;
+        }
+        let unsupported = self.unsupported_models.read().unwrap_or_else(|p| p.into_inner());
+        if unsupported.iter().any(|m| m == requested || m == canonical || m == upstream) {
+            return false;
+        }
+        let cat = self.devin_catalog.load();
+        match &*cat {
+            Some(catalog) => catalog.models.iter().any(|m| {
+                m.public_id == requested
+                    || m.public_id == canonical
+                    || m.model_uid == upstream
+                    || m.model_uid == requested
+            }),
+            None => false,
+        }
+    }
+
+    pub fn devin_upstream_model_uid(&self, model: &str) -> Option<String> {
+        if self.kind() != ProviderKind::Devin {
+            return None;
+        }
+        let cat = self.devin_catalog.load();
+        let catalog = cat.as_ref()?;
+        catalog.models.iter().find_map(|m| {
+            if m.public_id == model || m.model_uid == model {
+                Some(m.model_uid.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn devin_model_supports_vision(&self, model: &str) -> bool {
+        if self.kind() != ProviderKind::Devin {
+            return false;
+        }
+        let cat = self.devin_catalog.load();
+        let Some(catalog) = cat.as_ref() else {
+            return false;
+        };
+        catalog.models.iter().any(|m| {
+            (m.public_id == model || m.model_uid == model) && m.supports_images
+        })
+    }
+
+    pub fn devin_model_metadata(&self, model: &str) -> Option<crate::devin_catalog::DiscoveredDevinModel> {
+        if self.kind() != ProviderKind::Devin {
+            return None;
+        }
+        let cat = self.devin_catalog.load();
+        let catalog = cat.as_ref()?;
+        catalog.models.iter().find(|m| m.public_id == model || m.model_uid == model).cloned()
+    }
+
     pub fn project_id(&self) -> Option<String> {
         self.inner
             .read()
@@ -887,6 +1090,7 @@ impl AccountMember {
             ProviderAccount::Kiro(a) => Some(a.email.clone()),
             ProviderAccount::Zcode(a) => Some(a.email.clone()),
             ProviderAccount::Vertex(a) => Some(a.email.clone()),
+            ProviderAccount::Devin(a) => a.email.clone(),
             ProviderAccount::Generic(_) => None,
         }
     }
@@ -919,6 +1123,7 @@ impl AccountMember {
             ProviderAccount::Kiro(account) => account.disabled,
             ProviderAccount::Vertex(account) => account.disabled,
             ProviderAccount::Zcode(account) => account.disabled,
+            ProviderAccount::Devin(account) => account.disabled,
             ProviderAccount::Codex(_) => false,
         }
     }
@@ -933,6 +1138,15 @@ impl AccountMember {
                 ProviderAccount::Generic(account) => {
                     account.models.is_empty()
                         || account.models.iter().any(|candidate| candidate == model)
+                }
+                ProviderAccount::Devin(_) => {
+                    let upstream = model.strip_prefix("devin/").unwrap_or(model);
+                    let canonical = if model.starts_with("devin/") {
+                        model.to_string()
+                    } else {
+                        format!("devin/{model}")
+                    };
+                    self.supports_devin_model(model, &canonical, upstream)
                 }
                 ProviderAccount::Claude(_) => {
                     if let Some(stripped) = model
@@ -1081,6 +1295,27 @@ impl AccountMember {
                 }
                 ProviderAccount::Vertex(account)
             }
+            ProviderKind::Devin => {
+                let content = std::fs::read_to_string(&self.file_path)?;
+                let value: serde_json::Value =
+                    serde_json::from_str(&content).map_err(|e| LoadError::Parse {
+                        path: self.file_path.clone(),
+                        msg: e.to_string(),
+                    })?;
+                let mut devin: mahoquot_providers::DevinAccount =
+                    serde_json::from_value(value).map_err(|_| LoadError::Parse {
+                        path: self.file_path.clone(),
+                        msg: "invalid devin credential format".to_string(),
+                    })?;
+                if devin.identity_slug.is_empty() {
+                    devin.identity_slug = self.id.clone();
+                }
+                let validated = devin.validate().map_err(|e| LoadError::Parse {
+                    path: self.file_path.clone(),
+                    msg: format!("invalid Devin account: {e}"),
+                })?;
+                ProviderAccount::Devin(validated)
+            }
             other => {
                 let content = std::fs::read_to_string(&self.file_path)?;
                 let value: serde_json::Value =
@@ -1115,7 +1350,7 @@ impl AccountMember {
     ) -> Result<bool, RefreshError> {
         // Relay keys are static; there is nothing to refresh and the token
         // endpoint would only reject the empty grant.
-        if self.relay_api_key().is_some() {
+        if self.relay_api_key().is_some() || self.kind() == ProviderKind::Devin {
             return Ok(false);
         }
         let _guard = self.refresh_lock.lock().await;
@@ -1173,6 +1408,10 @@ impl AccountMember {
             let (bootstrap_url, client_id) = self.ensure_mimo_client_id()?;
             mahoquot_providers::execute_mimo_bootstrap(client, &bootstrap_url, &client_id, now_unix)
                 .await?
+        } else if self.kind() == ProviderKind::Generic
+            && self.provider_name() == "cline"
+        {
+            mahoquot_providers::execute_cline_refresh(client, &self.refresh_token()).await?
         } else if self.kind() == ProviderKind::Zcode {
             let base = self
                 .upstream_override
@@ -1217,6 +1456,7 @@ fn provider_account_from_value(
         ProviderKind::Kiro => ProviderAccount::Kiro(serde_json::from_value(value)?),
         ProviderKind::Zcode => ProviderAccount::Zcode(serde_json::from_value(value)?),
         ProviderKind::Vertex => ProviderAccount::Vertex(serde_json::from_value(value)?),
+        ProviderKind::Devin => ProviderAccount::Devin(serde_json::from_value(value)?),
         ProviderKind::Generic => ProviderAccount::Generic(serde_json::from_value(value)?),
     })
 }
@@ -1230,6 +1470,7 @@ fn set_identity_slug(account: &mut ProviderAccount, slug: String) {
         ProviderAccount::Kiro(a) => a.identity_slug = slug,
         ProviderAccount::Zcode(a) => a.identity_slug = slug,
         ProviderAccount::Vertex(a) => a.identity_slug = slug,
+        ProviderAccount::Devin(a) => a.identity_slug = slug,
         ProviderAccount::Generic(a) => a.identity_slug = slug,
     }
 }
@@ -1243,6 +1484,7 @@ fn identity_slug_of(account: &ProviderAccount) -> &str {
         ProviderAccount::Kiro(a) => &a.identity_slug,
         ProviderAccount::Zcode(a) => &a.identity_slug,
         ProviderAccount::Vertex(a) => &a.identity_slug,
+        ProviderAccount::Devin(a) => &a.identity_slug,
         ProviderAccount::Generic(a) => &a.identity_slug,
     }
 }
@@ -1374,6 +1616,7 @@ fn classify_credential(file_path: &Path, declared_type: &str) -> Option<Provider
         ProviderKind::Kiro,
         ProviderKind::Zcode,
         ProviderKind::Vertex,
+        ProviderKind::Devin,
         ProviderKind::Generic,
     ] {
         if name.starts_with(&format!("{}-", kind.as_str()))
@@ -1470,12 +1713,12 @@ pub fn load_account_members(auth_dir: &Path) -> anyhow::Result<Vec<Arc<AccountMe
         let upstream_override = value
             .get("upstream_override")
             .and_then(|v| v.as_str())
-            .or_else(|| {
-                if kind == ProviderKind::Generic {
-                    value.get("base_url").and_then(|v| v.as_str())
-                } else {
-                    None
-                }
+            .or_else(|| match kind {
+                ProviderKind::Generic => value.get("base_url").and_then(|v| v.as_str()),
+                ProviderKind::Devin => value.get("api_server_url").and_then(|v| v.as_str()),
+                ProviderKind::Codex | ProviderKind::Antigravity | ProviderKind::Claude
+                | ProviderKind::Cursor | ProviderKind::Kiro | ProviderKind::Zcode
+                | ProviderKind::Vertex => None,
             })
             .map(str::to_string);
 
@@ -1487,12 +1730,21 @@ pub fn load_account_members(auth_dir: &Path) -> anyhow::Result<Vec<Arc<AccountMe
         let mut inner = match provider_account_from_value(kind, value) {
             Ok(inner) => inner,
             Err(e) => {
-                tracing::warn!(
-                    path = ?file_path,
-                    provider = kind.as_str(),
-                    error = %e,
-                    "skipping credential that does not match its provider schema"
-                );
+                if kind == ProviderKind::Devin {
+                    tracing::warn!(
+                        path = ?file_path,
+                        provider = kind.as_str(),
+                        error = "invalid devin credential format",
+                        "skipping credential that does not match its provider schema"
+                    );
+                } else {
+                    tracing::warn!(
+                        path = ?file_path,
+                        provider = kind.as_str(),
+                        error = %e,
+                        "skipping credential that does not match its provider schema"
+                    );
+                }
                 continue;
             }
         };
@@ -1501,13 +1753,53 @@ pub fn load_account_members(auth_dir: &Path) -> anyhow::Result<Vec<Arc<AccountMe
         if identity_slug.is_empty()
             || (kind == ProviderKind::Antigravity && identity_slug == kind.as_str())
         {
-            let slug = file_path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(mahoquot_providers::derive_antigravity_slug_from_filename)
-                .filter(|_| kind == ProviderKind::Antigravity)
-                .unwrap_or_else(|| derive_identity_slug(&file_path));
+            let slug = if kind == ProviderKind::Generic {
+                if let ProviderAccount::Generic(ref g) = inner {
+                    if g.provider == "cline" && !g.email.is_empty() {
+                        format!("cline-{}", g.email)
+                    } else if !g.label.is_empty() && g.label != "generic" && !g.label.starts_with("generic-") {
+                        g.label.clone()
+                    } else {
+                        derive_identity_slug(&file_path)
+                    }
+                } else {
+                    derive_identity_slug(&file_path)
+                }
+            } else if kind == ProviderKind::Devin {
+                file_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| name.strip_prefix("devin-"))
+                    .map(|name| name.strip_suffix(".json").unwrap_or(name))
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| derive_identity_slug(&file_path))
+            } else {
+                file_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(mahoquot_providers::derive_antigravity_slug_from_filename)
+                    .filter(|_| kind == ProviderKind::Antigravity)
+                    .unwrap_or_else(|| derive_identity_slug(&file_path))
+            };
             set_identity_slug(&mut inner, slug);
+        }
+
+        if let ProviderAccount::Devin(devin_acct) = inner {
+            match devin_acct.validate() {
+                Ok(validated) => {
+                    inner = ProviderAccount::Devin(validated);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        path = ?file_path,
+                        provider = "devin",
+                        error = %err,
+                        "skipping invalid Devin credential"
+                    );
+                    continue;
+                }
+            }
         }
 
         let slug = identity_slug_of(&inner).to_string();
@@ -1526,18 +1818,20 @@ pub fn load_account_members(auth_dir: &Path) -> anyhow::Result<Vec<Arc<AccountMe
             id,
             file_path,
             inner: RwLock::new(inner),
-            health: RwLock::new(if is_disabled {
+            health: Arc::new(RwLock::new(if is_disabled {
                 Health::Disabled
             } else {
                 Health::Available
-            }),
+            })),
             upstream_override,
             usage_override,
-            ok_count: AtomicU64::new(0),
-            fail_count: AtomicU64::new(0),
-            refresh_lock: tokio::sync::Mutex::new(()),
-            unsupported_models: RwLock::new(Vec::new()),
-            usage: RwLock::new(Default::default()),
+            ok_count: Arc::new(AtomicU64::new(0)),
+            fail_count: Arc::new(AtomicU64::new(0)),
+            refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
+            unsupported_models: Arc::new(RwLock::new(Vec::new())),
+            usage: Arc::new(RwLock::new(Default::default())),
+            devin_catalog: arc_swap::ArcSwapOption::empty(),
+            devin_discovery_seq: Arc::new(AtomicU64::new(0)),
         }));
     }
 

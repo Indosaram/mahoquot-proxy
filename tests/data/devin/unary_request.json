@@ -1,0 +1,59 @@
+{
+  "fixture": "unary_request",
+  "classification": "positive",
+  "description": "Unary GetCascadeModelConfigsRequest, unframed protobuf body, application/proto.",
+  "rpc": "exa.api_server_pb.ApiServerService/GetCascadeModelConfigs",
+  "content_type": "application/proto",
+  "headers": {
+    "Authorization": "Basic dummy-token-dummy-token",
+    "Connect-Protocol-Version": "1"
+  },
+  "encoding": "unframed-proto",
+  "hex": "0a0d1a0b64756d6d792d746f6b656e",
+  "fields": [
+    {
+      "field": 1,
+      "wire_type": 2,
+      "message": "ExaCodeiumCommonPb_Metadata",
+      "subfields": [
+        {
+          "field": 3,
+          "wire_type": 2,
+          "name": "api_key",
+          "value": "dummy-token"
+        }
+      ]
+    }
+  ],
+  "tag_checks": [
+    {
+      "path": "field1.tag",
+      "hex": "0a"
+    },
+    {
+      "path": "field1.len",
+      "hex": "0d",
+      "len": 13
+    },
+    {
+      "path": "metadata.field3.tag",
+      "hex": "1a"
+    },
+    {
+      "path": "metadata.field3.len",
+      "hex": "0b",
+      "len": 11
+    },
+    {
+      "path": "api_key.value",
+      "hex": "64756d6d792d746f6b656e",
+      "ascii": "dummy-token"
+    }
+  ],
+  "provenance": {
+    "reference": "https://github.com/Arborsm/dsh-plugin-devin-bridge",
+    "commit": "ced035dd2f43b2dbf37a25c8a47b8ae1c1cc47f4",
+    "license": "MIT, Copyright (c) 2026 Arborsm",
+    "note": "Golden bytes independently hand-specified from the proto field numbers in src/proto/devin.proto at the pinned commit; not produced by any production encoder. All credentials are synthetic dummies."
+  }
+}

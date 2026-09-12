@@ -88,6 +88,221 @@ fn build_thinking_config(model: &str, body: &Value) -> Option<Value> {
     }
 }
 
+fn extract_text_from_parts(parts: Option<&Value>) -> String {
+    let mut text = String::new();
+    if let Some(arr) = parts.and_then(Value::as_array) {
+        for p in arr {
+            if let Some(t) = p.get("text").and_then(Value::as_str) {
+                text.push_str(t);
+            }
+        }
+    }
+    text
+}
+
+pub fn gemini_to_openai(req: &Value, model: &str) -> Result<Value, String> {
+    let mut out_messages = Vec::new();
+
+    // 1. System instructions
+    if let Some(sys) = req
+        .get("systemInstruction")
+        .or_else(|| req.get("system_instruction"))
+    {
+        let text = extract_text_from_parts(sys.get("parts"));
+        if !text.is_empty() {
+            out_messages.push(json!({
+                "role": "system",
+                "content": text
+            }));
+        }
+    }
+
+    // 2. Contents
+    if let Some(contents) = req.get("contents").and_then(Value::as_array) {
+        for turn in contents {
+            let role_str = turn.get("role").and_then(Value::as_str).unwrap_or("user");
+            let is_model = role_str == "model" || role_str == "assistant";
+
+            let mut text_parts = Vec::new();
+            let mut reasoning_parts = Vec::new();
+            let mut reasoning_sig: Option<String> = None;
+            let mut tool_calls = Vec::new();
+            let mut tool_results = Vec::new();
+
+            if let Some(parts) = turn.get("parts").and_then(Value::as_array) {
+                for part in parts {
+                    if let Some(sig) = part
+                        .get("thoughtSignature")
+                        .or_else(|| part.get("thought_signature"))
+                        .and_then(Value::as_str)
+                    {
+                        reasoning_sig = Some(sig.to_string());
+                    }
+                    if let Some(text) = part.get("text").and_then(Value::as_str) {
+                        if part.get("thought").and_then(Value::as_bool) == Some(true) {
+                            reasoning_parts.push(text.to_string());
+                        } else {
+                            text_parts.push(text.to_string());
+                        }
+                    }
+                    if let Some(call) = part
+                        .get("functionCall")
+                        .or_else(|| part.get("function_call"))
+                    {
+                        let name = call.get("name").and_then(Value::as_str).unwrap_or("");
+                        let args = call.get("args").cloned().unwrap_or_else(|| json!({}));
+                        let call_id = call
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .filter(|id| !id.is_empty())
+                            .map(str::to_string)
+                            .unwrap_or_else(|| signature_ledger::synthetic_call_id(name));
+                        if let Some(ref sig) = reasoning_sig {
+                            signature_ledger::remember(&call_id, name, &args.to_string(), sig);
+                        }
+                        tool_calls.push(json!({
+                            "id": call_id,
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": args.to_string()
+                            }
+                        }));
+                    }
+                    if let Some(resp) = part
+                        .get("functionResponse")
+                        .or_else(|| part.get("function_response"))
+                    {
+                        let name = resp.get("name").and_then(Value::as_str).unwrap_or("");
+                        let response = resp.get("response").cloned().unwrap_or_else(|| json!({}));
+                        let explicit_id = resp
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .filter(|id| !id.is_empty());
+                        let call_id = explicit_id
+                            .map(str::to_string)
+                            .unwrap_or_else(|| signature_ledger::synthetic_call_id(name));
+                        tool_results.push(json!({
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "content": serde_json::to_string(&response).unwrap_or_default()
+                        }));
+                    }
+                }
+            }
+
+            if is_model {
+                let mut m = serde_json::Map::new();
+                m.insert("role".to_string(), json!("assistant"));
+                m.insert("content".to_string(), json!(text_parts.join("")));
+                if !tool_calls.is_empty() {
+                    m.insert("tool_calls".to_string(), Value::Array(tool_calls));
+                }
+                if !reasoning_parts.is_empty() {
+                    m.insert(
+                        "reasoning_content".to_string(),
+                        json!(reasoning_parts.join("")),
+                    );
+                }
+                if let Some(sig) = reasoning_sig {
+                    m.insert("reasoning_signature".to_string(), json!(sig));
+                }
+                out_messages.push(Value::Object(m));
+            } else {
+                if !text_parts.is_empty() {
+                    out_messages.push(json!({
+                        "role": "user",
+                        "content": text_parts.join("")
+                    }));
+                }
+                out_messages.extend(tool_results);
+            }
+        }
+    }
+
+    let mut out = serde_json::Map::new();
+    out.insert("model".to_string(), json!(model));
+    out.insert("messages".to_string(), Value::Array(out_messages));
+
+    // Tools
+    if let Some(tools_arr) = req.get("tools").and_then(Value::as_array) {
+        let mut out_tools = Vec::new();
+        for t in tools_arr {
+            if let Some(funcs) = t
+                .get("functionDeclarations")
+                .or_else(|| t.get("function_declarations"))
+                .and_then(Value::as_array)
+            {
+                for func in funcs {
+                    let name = func.get("name").and_then(Value::as_str).unwrap_or("");
+                    let desc = func.get("description").and_then(Value::as_str).unwrap_or("");
+                    let params = func
+                        .get("parameters")
+                        .cloned()
+                        .unwrap_or_else(|| json!({"type": "object"}));
+                    out_tools.push(json!({
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "description": desc,
+                            "parameters": params
+                        }
+                    }));
+                }
+            }
+        }
+        if !out_tools.is_empty() {
+            out.insert("tools".to_string(), Value::Array(out_tools));
+        }
+    }
+
+    // Tool config
+    if let Some(cfg) = req
+        .pointer("/toolConfig/functionCallingConfig/mode")
+        .or_else(|| req.pointer("/tool_config/function_calling_config/mode"))
+        .and_then(Value::as_str)
+    {
+        match cfg {
+            "AUTO" | "auto" => {
+                out.insert("tool_choice".to_string(), json!("auto"));
+            }
+            "NONE" | "none" => {
+                out.insert("tool_choice".to_string(), json!("none"));
+            }
+            "ANY" | "any" => {
+                out.insert("tool_choice".to_string(), json!("required"));
+            }
+            _ => {}
+        }
+    }
+
+    // Generation config
+    if let Some(gen_cfg) = req
+        .get("generationConfig")
+        .or_else(|| req.get("generation_config"))
+    {
+        if let Some(t) = gen_cfg.get("temperature").and_then(Value::as_f64) {
+            out.insert("temperature".to_string(), json!(t));
+        }
+        if let Some(p) = gen_cfg
+            .get("topP")
+            .or_else(|| gen_cfg.get("top_p"))
+            .and_then(Value::as_f64)
+        {
+            out.insert("top_p".to_string(), json!(p));
+        }
+        if let Some(m) = gen_cfg
+            .get("maxOutputTokens")
+            .or_else(|| gen_cfg.get("max_output_tokens"))
+            .and_then(Value::as_i64)
+        {
+            out.insert("max_tokens".to_string(), json!(m));
+        }
+    }
+
+    Ok(Value::Object(out))
+}
+
 pub fn openai_to_gemini(body: &Value) -> Result<Value, String> {
     let model = body
         .get("model")

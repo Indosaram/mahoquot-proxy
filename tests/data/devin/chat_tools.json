@@ -1,0 +1,112 @@
+{
+  "fixture": "chat_tools",
+  "classification": "positive",
+  "description": "Interleaved tool call deltas across frames: two active calls (call_001, call_002) with explicit IDs on all continuation chunks so attachment is unambiguous without guessing; stop reason 10 (FUNCTION_CALL) in the last data frame.",
+  "rpc": "exa.api_server_pb.ApiServerService/GetChatMessage",
+  "content_type": "application/connect+proto",
+  "encoding": "connect-framed-proto",
+  "frames": [
+    {
+      "flag": 0,
+      "hex": "0a09726573702d3030303132220a0863616c6c5f303031120b6765745f776561746865721a097b2263697479223a22"
+    },
+    {
+      "flag": 0,
+      "hex": "0a09726573702d30303031321d0a0863616c6c5f30303212086765745f74696d651a077b22747a223a22"
+    },
+    {
+      "flag": 0,
+      "hex": "0a09726573702d3030303132130a0863616c6c5f3030311a0753656f756c227d"
+    },
+    {
+      "flag": 0,
+      "hex": "0a09726573702d3030303132110a0863616c6c5f3030321a054b5354227d"
+    },
+    {
+      "flag": 0,
+      "hex": "0a09726573702d303030311a05446f6e652e280aba0107676c6d2d352d32"
+    }
+  ],
+  "end_stream": {
+    "error": null,
+    "hasSyncPoints": false
+  },
+  "framed_hex": "000000002f0a09726573702d3030303132220a0863616c6c5f303031120b6765745f776561746865721a097b2263697479223a22000000002a0a09726573702d30303031321d0a0863616c6c5f30303212086765745f74696d651a077b22747a223a2200000000200a09726573702d3030303132130a0863616c6c5f3030311a0753656f756c227d000000001e0a09726573702d3030303132110a0863616c6c5f3030321a054b5354227d000000001e0a09726573702d303030311a05446f6e652e280aba0107676c6d2d352d3202000000247b226572726f72223a6e756c6c2c2268617353796e63506f696e7473223a66616c73657d",
+  "fields": [
+    {
+      "frame": 0,
+      "field": 6,
+      "call": "call_001",
+      "name": "get_weather",
+      "args": "{\"city\":\"",
+      "tool_tags": {
+        "1": "0a",
+        "2": "12",
+        "3": "1a"
+      }
+    },
+    {
+      "frame": 1,
+      "field": 6,
+      "call": "call_002",
+      "name": "get_time",
+      "args": "{\"tz\":\""
+    },
+    {
+      "frame": 2,
+      "field": 6,
+      "call": "call_001",
+      "args": "Seoul\"}",
+      "note": "Explicit call_001 ID prevents ambiguity when multiple calls are active"
+    },
+    {
+      "frame": 3,
+      "field": 6,
+      "call": "call_002",
+      "args": "KST\"}",
+      "note": "Explicit call_002 ID prevents ambiguity when multiple calls are active"
+    },
+    {
+      "frame": 4,
+      "field5": "stop_reason=10 (FUNCTION_CALL)",
+      "field23": "actual_model_uid=glm-5-2"
+    }
+  ],
+  "tag_checks": [
+    {
+      "path": "frame0.field6.tag",
+      "hex": "32",
+      "len": 34
+    },
+    {
+      "path": "frame1.field6.tag",
+      "hex": "32",
+      "len": 29
+    },
+    {
+      "path": "frame2.field6.tag",
+      "hex": "32",
+      "len": 19
+    },
+    {
+      "path": "frame3.field6.tag",
+      "hex": "32",
+      "len": 17
+    },
+    {
+      "path": "frame4.field23.tag",
+      "hex": "ba01",
+      "len": 7
+    },
+    {
+      "path": "end_stream.flag",
+      "hex": "02"
+    }
+  ],
+  "provenance": {
+    "reference": "https://github.com/Arborsm/dsh-plugin-devin-bridge",
+    "commit": "ced035dd2f43b2dbf37a25c8a47b8ae1c1cc47f4",
+    "license": "MIT, Copyright (c) 2026 Arborsm",
+    "note": "Golden bytes independently hand-specified from the proto field numbers in src/proto/devin.proto at the pinned commit; not produced by any production encoder. All credentials are synthetic dummies."
+  }
+}

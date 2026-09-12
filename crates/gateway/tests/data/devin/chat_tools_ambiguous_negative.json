@@ -1,0 +1,54 @@
+{
+  "fixture": "chat_tools_ambiguous_negative",
+  "classification": "negative",
+  "description": "Negative rejection fixture: two tool calls (call_001 and call_002) are concurrently active, and an incoming tool delta arrives with NO id. Attaching it by guessing the last-call or first-call is forbidden; conformant decoders must reject ambiguous ID-less deltas when multiple calls exist as a protocol error.",
+  "rpc": "exa.api_server_pb.ApiServerService/GetChatMessage",
+  "content_type": "application/connect+proto",
+  "encoding": "connect-framed-proto",
+  "frames": [
+    {
+      "flag": 0,
+      "hex": "0a09726573702d3030303132220a0863616c6c5f303031120b6765745f776561746865721a097b2263697479223a22"
+    },
+    {
+      "flag": 0,
+      "hex": "0a09726573702d30303031321d0a0863616c6c5f30303212086765745f74696d651a077b22747a223a22"
+    },
+    {
+      "flag": 0,
+      "hex": "0a09726573702d3030303132091a0753656f756c227d"
+    }
+  ],
+  "framed_hex": "000000002f0a09726573702d3030303132220a0863616c6c5f303031120b6765745f776561746865721a097b2263697479223a22000000002a0a09726573702d30303031321d0a0863616c6c5f30303212086765745f74696d651a077b22747a223a2200000000160a09726573702d3030303132091a0753656f756c227d",
+  "expected_rejection": {
+    "reason": "ambiguous_id_less_delta_with_multiple_active_calls",
+    "active_calls": [
+      "call_001",
+      "call_002"
+    ],
+    "offending_frame": 2
+  },
+  "tag_checks": [
+    {
+      "path": "frame0.field6.tag",
+      "hex": "32",
+      "len": 34
+    },
+    {
+      "path": "frame1.field6.tag",
+      "hex": "32",
+      "len": 29
+    },
+    {
+      "path": "frame2.field6.tag",
+      "hex": "32",
+      "len": 9
+    }
+  ],
+  "provenance": {
+    "reference": "https://github.com/Arborsm/dsh-plugin-devin-bridge",
+    "commit": "ced035dd2f43b2dbf37a25c8a47b8ae1c1cc47f4",
+    "license": "MIT, Copyright (c) 2026 Arborsm",
+    "note": "Negative fixture demonstrating that ID-less deltas with multiple active calls cannot be resolved deterministically and must be rejected."
+  }
+}

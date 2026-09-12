@@ -37,6 +37,7 @@ fn is_credential_document(value: &Value) -> bool {
                 | "generic"
                 | "vertex"
                 | "google-vertex"
+                | "devin"
                 | "monitor"
         )
     )
@@ -104,6 +105,41 @@ fn describe(dir: &std::path::Path, name: &str) -> Option<Value> {
                 .unwrap_or_else(|| json!(kind));
             entry["account"] = json!(email);
             entry["account_type"] = json!("oauth");
+            if let Some(slug) = parsed.get("identity_slug").and_then(Value::as_str) {
+                if !slug.trim().is_empty() {
+                    entry["identity_slug"] = json!(slug.trim());
+                    entry["identity"] = json!(slug.trim());
+                }
+            }
+            if kind == "devin" {
+                entry["account_type"] = json!("token");
+                let slug = parsed
+                    .get("identity_slug")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| {
+                        name.strip_prefix("devin-")
+                            .unwrap_or(name)
+                            .strip_suffix(".json")
+                            .unwrap_or(name)
+                            .to_string()
+                    });
+                entry["identity_slug"] = json!(&slug);
+                entry["identity"] = json!(&slug);
+                entry["account"] = json!(&slug);
+                if entry["label"] == name.trim_end_matches(".json") {
+                    entry["label"] = json!(&slug);
+                }
+            }
+            if let Some(lbl) = parsed.get("label").and_then(Value::as_str) {
+                if !lbl.trim().is_empty() && lbl != "generic" {
+                    entry["label"] = json!(lbl);
+                }
+            } else if !email.is_empty() {
+                entry["label"] = json!(email);
+            }
             let disabled = parsed
                 .get("disabled")
                 .and_then(Value::as_bool)
@@ -238,9 +274,23 @@ async fn create_auth_file(State(state): State<Arc<AppState>>, raw: bytes::Bytes)
     if name.is_empty() || name.contains('/') || name.contains("..") {
         return json_status(StatusCode::BAD_REQUEST, json!({ "error": "invalid name" }));
     }
-    let content = body.get("content").cloned().unwrap_or(Value::Null);
+    let mut content = body.get("content").cloned().unwrap_or(Value::Null);
     if let Err(error) = validate_provider_credential(&content) {
         return json_status(StatusCode::BAD_REQUEST, json!({ "error": error }));
+    }
+    if content.get("type").and_then(Value::as_str) == Some("devin") {
+        let devin_account: mahoquot_providers::DevinAccount = match serde_json::from_value(content.clone()) {
+            Ok(acct) => acct,
+            Err(_) => return json_status(StatusCode::BAD_REQUEST, json!({ "error": "invalid devin credential format" })),
+        };
+        let validated = match devin_account.validate() {
+            Ok(acct) => acct,
+            Err(e) => return json_status(StatusCode::BAD_REQUEST, json!({ "error": format!("invalid devin credential: {e}") })),
+        };
+        content = match serde_json::to_value(&validated) {
+            Ok(v) => v,
+            Err(e) => return json_status(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": format!("failed to serialize normalized devin credential: {e}") })),
+        };
     }
     let dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
     if let Err(err) = std::fs::create_dir_all(&dir) {
@@ -330,6 +380,13 @@ pub(crate) fn validate_provider_credential(content: &Value) -> Result<(), String
         }
         "vertex" | "google-vertex" => {
             required_string(content, "project_id")?;
+        }
+        "devin" => {
+            let account: mahoquot_providers::DevinAccount = serde_json::from_value(content.clone())
+                .map_err(|_| "invalid devin credential format".to_string())?;
+            account
+                .validate()
+                .map_err(|e| format!("invalid devin credential: {e}"))?;
         }
         "monitor" => {
             required_string(content, "provider")?;
@@ -883,6 +940,384 @@ async fn vertex_import(State(state): State<Arc<AppState>>, raw: bytes::Bytes) ->
     )
 }
 
+/// Cline CLI login import. Reads the WorkOS OAuth session the `cline`
+/// CLI wrote to `~/.cline/data/settings/providers.json` (`tokenSource:
+/// "oauth"`) and stores it as an `auth_mode: "oauth"` generic account:
+/// the short-lived `workos:` JWT goes in `api_key`, the rotated
+/// `refreshToken` in `refresh_token`, expiry in `expired`. The account
+/// refreshes server-side via `POST /api/v1/auth/refresh` (see
+/// `execute_cline_refresh`), like the CLI itself. Verified live 2026-09-10:
+/// the OAuth token calls free models (`z-ai/glm-5.3-flash`) that a static
+/// API key cannot touch (403 ENTITLEMENT_ERROR).
+async fn cline_import(State(state): State<Arc<AppState>>) -> Response {
+    let path = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default()
+        .join(".cline/data/settings/providers.json");
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(value) => value,
+        Err(error) => {
+            return json_status(
+                StatusCode::NOT_FOUND,
+                json!({"error":format!("cline CLI login not found at {}: {error} (run `cline auth` first)", path.display())}),
+            )
+        }
+    };
+    let providers: Value = match serde_json::from_str(&raw) {
+        Ok(value) => value,
+        Err(error) => {
+            return json_status(StatusCode::BAD_REQUEST, json!({"error":error.to_string()}))
+        }
+    };
+    let cline = providers
+        .get("providers")
+        .and_then(|p| p.get("cline"))
+        .unwrap_or(&Value::Null);
+    if cline.get("tokenSource").and_then(Value::as_str) != Some("oauth") {
+        return json_status(
+            StatusCode::BAD_REQUEST,
+            json!({"error":"cline CLI is not OAuth-logged-in (tokenSource != oauth); run `cline auth` first"}),
+        );
+    }
+    let settings = cline.get("settings").unwrap_or(&Value::Null);
+    let auth = settings.get("auth").unwrap_or(&Value::Null);
+    let (Some(access), Some(refresh)) = (
+        auth.get("accessToken").and_then(Value::as_str).filter(|v| !v.is_empty()),
+        auth.get("refreshToken").and_then(Value::as_str).filter(|v| !v.is_empty()),
+    ) else {
+        return json_status(
+            StatusCode::BAD_REQUEST,
+            json!({"error":"cline OAuth tokens missing in providers.json"}),
+        );
+    };
+    let expired_ms = auth.get("expiresAt").and_then(Value::as_i64).unwrap_or(0);
+    let expired = if expired_ms > 0 {
+        mahoquot_providers::format_expired_rfc3339(expired_ms.div_euclid(1000))
+    } else {
+        String::new()
+    };
+    let account_id = auth.get("accountId").and_then(Value::as_str).unwrap_or("");
+    let email = auth
+        .get("metadata")
+        .and_then(|m| m.get("userInfo"))
+        .and_then(|u| u.get("email"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let label = if !email.is_empty() { email } else { "Cline" };
+    // Probe the token once before it becomes a stored account file.
+    let probe = state
+        .http_client
+        .get("https://api.cline.bot/api/v1/models")
+        .header(header::AUTHORIZATION, format!("Bearer {access}"))
+        .send()
+        .await;
+    match probe {
+        Ok(response) if response.status().is_success() => {}
+        Ok(response) => {
+            return json_status(
+                StatusCode::UNAUTHORIZED,
+                json!({"error": format!("cline OAuth token rejected by upstream: {}", response.status()), "status": "error"}),
+            )
+        }
+        Err(error) => {
+            return json_status(
+                StatusCode::BAD_GATEWAY,
+                json!({"error": format!("cline upstream unreachable: {error}"), "status": "error"}),
+            )
+        }
+    }
+    let credential = json!({"type":"generic","provider":"cline","label":label,"email":email,
+        "adapter":"openai-chat","auth_mode":"oauth",
+        "base_url":"https://api.cline.bot/api/v1",
+        "api_key":access,"refresh_token":refresh,"expired":expired,
+        "token_url":"https://api.cline.bot/api/v1/auth/refresh",
+        "account_id":account_id,
+        "models":["z-ai/glm-5.3-flash","z-ai/glm-5.3",
+            "meta/muse-spark-1.3-contributor","meta/muse-spark-1.3",
+            "meta/muse-spark-1.2-contributor","meta/muse-spark-1.2",
+            "deepseek/deepseek-v4-flash","upstage/solar-pro4",
+            "meituan/longcat-2.0","poolside/laguna-s-2.1"],
+        "disabled":false});
+    let dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
+    // Filename prefix must be `generic-`: `classify_credential` dispatches
+    // on the `generic-` name prefix (ProviderKind::Generic.as_str), and a
+    // `generic-cline-` name would miss every prefix and fall through to
+    // `from_type_str("generic")` only by luck of the declared type.
+    let path = dir.join(format!(
+        "generic-cline-oauth-{}.json",
+        crate::request_history::stable_key_identifier(account_id),
+    ));
+    let rendered = match serde_json::to_string_pretty(&credential) {
+        Ok(value) => value,
+        Err(error) => {
+            return json_status(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error":error.to_string()}),
+            )
+        }
+    };
+    if let Err(error) = write_credential_atomically(&path, rendered.as_bytes()) {
+        return json_status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"error":error.to_string()}),
+        );
+    }
+    if let Err(error) = state.rescan_pool() {
+        return json_status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"error":error.to_string()}),
+        );
+    }
+    json_status(
+        StatusCode::OK,
+        json!({"status":"ok","name":path.file_name().unwrap_or_default()}),
+    )
+}
+
+/// Devin CLI login import. Reads the session token written by Devin CLI
+/// (`credentials.toml` / `windsurf_api_key`) and stores it as a normalized
+/// `devin` account in the gateway's auth directory.
+///
+/// Security boundary:
+/// - Rejects arbitrary file paths in the request body; resolution is strictly
+///   governed on the proxy host via DEVIN_CREDENTIALS_PATH -> XDG_DATA_HOME -> ~/.local/share.
+/// - The source TOML file is never modified or removed.
+/// - Persistence is atomic; blocking file I/O is offloaded via `spawn_blocking`.
+/// - Secret tokens are never echoed back in success responses or error diagnostics.
+async fn devin_import_cli(State(state): State<Arc<AppState>>, raw: bytes::Bytes) -> Response {
+    let mut identity: Option<String> = None;
+    let mut label: Option<String> = None;
+
+    if !raw.is_empty() {
+        let body: Value = match serde_json::from_slice(&raw) {
+            Ok(val) => val,
+            Err(err) => {
+                return json_status(
+                    StatusCode::BAD_REQUEST,
+                    json!({ "error": format!("invalid request json: {err}") }),
+                );
+            }
+        };
+
+        let Some(obj) = body.as_object() else {
+            return json_status(
+                StatusCode::BAD_REQUEST,
+                json!({ "error": "request body must be a JSON object" }),
+            );
+        };
+
+        // Reject arbitrary file path fields strictly with dedicated message
+        for key in ["path", "file_path", "file", "filepath", "credentials_path", "source_path"] {
+            if obj.contains_key(key) {
+                return json_status(
+                    StatusCode::BAD_REQUEST,
+                    json!({ "error": "arbitrary file paths are not accepted; CLI credentials are resolved on the proxy host" }),
+                );
+            }
+        }
+
+        // Strict allowlist: only identity, identity_slug, and label are permitted
+        for key in obj.keys() {
+            if key != "identity" && key != "identity_slug" && key != "label" {
+                return json_status(
+                    StatusCode::BAD_REQUEST,
+                    json!({ "error": format!("unknown field `{key}`; only `identity` and `label` (with `identity_slug` alias) are accepted") }),
+                );
+            }
+        }
+
+        let explicit_identity = match obj.get("identity") {
+            Some(Value::String(s)) => {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    return json_status(
+                        StatusCode::BAD_REQUEST,
+                        json!({ "error": "explicit empty `identity` is not allowed" }),
+                    );
+                }
+                Some(trimmed.to_string())
+            }
+            Some(_) => {
+                return json_status(
+                    StatusCode::BAD_REQUEST,
+                    json!({ "error": "`identity` must be a string" }),
+                );
+            }
+            None => None,
+        };
+
+        let explicit_slug = match obj.get("identity_slug") {
+            Some(Value::String(s)) => {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    return json_status(
+                        StatusCode::BAD_REQUEST,
+                        json!({ "error": "explicit empty `identity_slug` is not allowed" }),
+                    );
+                }
+                Some(trimmed.to_string())
+            }
+            Some(_) => {
+                return json_status(
+                    StatusCode::BAD_REQUEST,
+                    json!({ "error": "`identity_slug` must be a string" }),
+                );
+            }
+            None => None,
+        };
+
+        match (explicit_identity, explicit_slug) {
+            (Some(id), Some(slug)) => {
+                if id != slug {
+                    return json_status(
+                        StatusCode::BAD_REQUEST,
+                        json!({ "error": format!("conflicting alias values: identity `{id}` != identity_slug `{slug}`") }),
+                    );
+                }
+                identity = Some(id);
+            }
+            (Some(id), None) => identity = Some(id),
+            (None, Some(slug)) => identity = Some(slug),
+            (None, None) => identity = None,
+        }
+
+        if let Some(lbl_val) = obj.get("label") {
+            match lbl_val {
+                Value::String(s) => {
+                    let trimmed = s.trim();
+                    if !trimmed.is_empty() {
+                        label = Some(trimmed.to_string());
+                    }
+                }
+                _ => {
+                    return json_status(
+                        StatusCode::BAD_REQUEST,
+                        json!({ "error": "`label` must be a string" }),
+                    );
+                }
+            }
+        }
+    }
+
+    let slug = match identity {
+        Some(explicit) => explicit,
+        None => "devin".to_string(),
+    };
+
+    // Validate identity slug strictly BEFORE reading CLI or touching filesystem
+    if let Err(err) = mahoquot_providers::devin::validate_identity_slug(&slug) {
+        return json_status(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": format!("invalid identity: {err}") }),
+        );
+    }
+
+    let auth_dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
+    let filename = format!("devin-{slug}.json");
+    let target_path = auth_dir.join(&filename);
+
+    if target_path.parent() != Some(auth_dir.as_path()) {
+        return json_status(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "invalid target path" }),
+        );
+    }
+
+    let import_task = tokio::task::spawn_blocking(move || {
+        let explicit = std::env::var_os(mahoquot_providers::devin::DEVIN_CREDENTIALS_PATH_ENV)
+            .map(std::path::PathBuf::from);
+        let xdg = std::env::var_os("XDG_DATA_HOME").map(std::path::PathBuf::from);
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        let cli_path = mahoquot_providers::devin::resolve_credentials_path(
+            explicit.as_deref(),
+            xdg.as_deref(),
+            home.as_deref(),
+        );
+
+        let bytes = match std::fs::read(&cli_path) {
+            Ok(b) => b,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    format!(
+                        "Devin CLI credentials not found on proxy host at {} (run `devin auth login` first)",
+                        cli_path.display()
+                    ),
+                ));
+            }
+            Err(err) => {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed reading Devin CLI credentials at {}: {err}", cli_path.display()),
+                ));
+            }
+        };
+
+        let cli = mahoquot_providers::devin::parse_cli_credentials(&bytes, &cli_path)
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("failed parsing Devin CLI credentials: {e}")))?;
+
+        let existing_disabled = std::fs::read_to_string(&target_path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            .and_then(|v| v.get("disabled").and_then(Value::as_bool))
+            .unwrap_or(false);
+
+        let existing_label = std::fs::read_to_string(&target_path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            .and_then(|v| v.get("label").and_then(Value::as_str).map(str::to_string));
+
+        let effective_label = label.or(existing_label);
+
+        let mut account = mahoquot_providers::devin::DevinAccount::from_cli(
+            cli,
+            slug.clone(),
+            effective_label,
+        )
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid Devin account: {e}")))?;
+
+        if existing_disabled {
+            account.disabled = true;
+        }
+
+        let validated = account
+            .validate()
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid Devin account: {e}")))?;
+
+        let rendered = serde_json::to_string_pretty(&validated)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("failed serializing Devin account: {e}")))?;
+
+        mahoquot_providers::credential_file::write_credential_atomically(&target_path, rendered.as_bytes())
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("failed saving Devin account: {e}")))?;
+
+        Ok((filename, slug))
+    })
+    .await;
+
+    let (filename, slug) = match import_task {
+        Ok(Ok(result)) => result,
+        Ok(Err((status, err_msg))) => return json_status(status, json!({ "error": err_msg })),
+        Err(join_err) => {
+            return json_status(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({ "error": format!("import task failed: {join_err}") }),
+            );
+        }
+    };
+
+    if let Err(error) = state.rescan_pool() {
+        return json_status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({ "error": format!("pool rescan failed: {error}") }),
+        );
+    }
+
+    json_status(
+        StatusCode::OK,
+        json!({ "status": "ok", "name": filename, "identity_slug": slug }),
+    )
+}
+
 async fn command_code_import(
     State(state): State<Arc<AppState>>,
     Json(body): Json<Value>,
@@ -1137,9 +1572,15 @@ pub fn creds_routes() -> Router<Arc<AppState>> {
         )
         .route("/model-definitions/{channel}", get(model_definitions))
         .route("/vertex/import", post(vertex_import))
+        .route("/cline/import", post(cline_import))
+        .route("/devin/import-cli", post(devin_import_cli))
         .route("/command-code/import", post(command_code_import))
         .route("/trae/import-local", post(trae_import))
         .route("/provider-models/discover", post(discover_provider_models))
+        .route(
+            "/auth-files/delete",
+            post(delete_auth_file).delete(delete_auth_file),
+        )
         .merge(super::oauth::oauth_routes())
         .route("/oauth-session", delete(super::oauth::cancel_session))
 }

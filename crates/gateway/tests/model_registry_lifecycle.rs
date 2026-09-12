@@ -160,6 +160,7 @@ fn test_member(id: &str, provider: &str, models: Vec<String>) -> Arc<AccountMemb
         identity_slug: id.to_string(),
         provider: provider.to_string(),
         label: id.to_string(),
+        email: String::new(),
         adapter: "chat".to_string(),
         base_url: "http://127.0.0.1:18899".to_string(),
         api_key: "key".to_string(),

@@ -46,6 +46,92 @@ pub async fn execute_refresh(
     execute_refresh_spec(client, url, &req_spec).await
 }
 
+/// Cline WorkOS refresh: same transport as `execute_refresh_spec` but the
+/// rotated pair arrives nested under `data` (`{data:{accessToken,
+/// refreshToken}}`) and there is no `expires_in` — the sibling `expiresAt`
+/// RFC3339 field carries expiry. `refresh_url_override` exists only for
+/// tests (mock server target); production always passes `None` and hits
+/// `CLINE_REFRESH_URL`. Hoists `data` to the top level, maps
+/// camelCase, then derives `expires_in` from `expiresAt` so the shared
+/// `Tokens` shape and `apply_refresh_to_file` stamping keep working.
+pub async fn execute_cline_refresh(
+    client: &reqwest::Client,
+    refresh_token: &str,
+) -> Result<Tokens, RefreshError> {
+    execute_cline_refresh_to(client, refresh_token, None).await
+}
+
+pub async fn execute_cline_refresh_to(
+    client: &reqwest::Client,
+    refresh_token: &str,
+    refresh_url_override: Option<&str>,
+) -> Result<Tokens, RefreshError> {
+    let req_spec = crate::refresh::build_cline_refresh_request(refresh_token);
+    let url = refresh_url_override
+        .map(str::to_string)
+        .unwrap_or(req_spec.url.clone());
+    let request = client.post(url).json(
+        req_spec
+            .json_body
+            .as_ref()
+            .unwrap_or(&serde_json::Value::Null),
+    );
+    let resp = request.send().await?;
+    let status = resp.status();
+    let body = resp.text().await?;
+    if !status.is_success() {
+        return Err(RefreshError::Status {
+            code: status.as_u16(),
+            body,
+        });
+    }
+    let mut value: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| RefreshError::Parse(e.to_string()))?;
+    if let Some(data) = value.get("data").cloned() {
+        value = data;
+    }
+    let expires_in = value
+        .get("expiresAt")
+        .and_then(|v| v.as_str())
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.timestamp() - chrono::Utc::now().timestamp())
+        .filter(|secs| *secs > 0);
+    let mut json_str = serde_json::to_string(&value).map_err(|e| RefreshError::Parse(e.to_string()))?;
+    // Re-attach the `workos:` scheme the server strips: the CLI stores
+    // `workos:eyJ...` and sends it back verbatim, and the bare JWT alone
+    // is rejected with 401 re-authenticate. Verified live 2026-09-10.
+    // NOTE: `parse_refresh_response` maps camelCase (`accessToken`) but
+    // the prefix check must run on the camelCase key — snake_case
+    // `access_token` does not exist yet at this point.
+    if let Ok(mut obj) = serde_json::from_str::<serde_json::Value>(&json_str) {
+        if let Some(map) = obj.as_object_mut() {
+            if let Some(tok) = map.get("accessToken").and_then(|v| v.as_str()) {
+                if !tok.starts_with("workos:") {
+                    map.insert(
+                        "accessToken".to_string(),
+                        serde_json::Value::String(format!("workos:{tok}")),
+                    );
+                    json_str = serde_json::to_string(&obj)
+                        .map_err(|e| RefreshError::Parse(e.to_string()))?;
+                }
+            }
+        }
+    }
+    if let Some(secs) = expires_in {
+        let mut obj: serde_json::Value =
+            serde_json::from_str(&json_str).map_err(|e| RefreshError::Parse(e.to_string()))?;
+        if let Some(map) = obj.as_object_mut() {
+            map.insert(
+                "expires_in".to_string(),
+                serde_json::Value::Number(secs.into()),
+            );
+        }
+        json_str =
+            serde_json::to_string(&obj).map_err(|e| RefreshError::Parse(e.to_string()))?;
+    }
+    crate::refresh::parse_refresh_response(&json_str).map_err(RefreshError::Parse)
+}
+
 pub async fn execute_refresh_spec(
     client: &reqwest::Client,
     url: &str,
@@ -309,6 +395,54 @@ mod tests {
         assert_eq!(tokens.access_token, "new-at");
         assert_eq!(tokens.refresh_token.as_deref(), Some("new-rt"));
         assert_eq!(tokens.expires_in, Some(3600));
+    }
+
+    #[tokio::test]
+    async fn execute_cline_refresh_hoists_nested_data() {
+        // Cline nests the rotated pair under `data` and reports expiry as
+        // RFC3339 `expiresAt` instead of `expires_in`; the executor must
+        // hoist and derive so `apply_refresh_to_file` keeps working.
+        let app = Router::new().route(
+            "/api/v1/auth/refresh",
+            post(|body: String| async move {
+                assert!(body.contains("refresh_token"));
+                assert!(body.contains("refreshToken"));
+                (
+                    axum::http::StatusCode::OK,
+                    [("content-type", "application/json")],
+                    r#"{"data":{"accessToken":"new-at","refreshToken":"new-rt","expiresAt":"2030-01-01T00:00:00Z"}}"#,
+                )
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        // Exercise the real executor against the mock: nested `data`,
+        // `workos:` re-attach, `expiresAt` derive are all asserted.
+        let client = reqwest::Client::new();
+        let tokens = crate::refresh_exec::execute_cline_refresh_to(
+            &client,
+            "old-rt",
+            Some(&format!("http://{addr}/api/v1/auth/refresh")),
+        )
+        .await
+        .expect("cline refresh against mock");
+        assert_eq!(tokens.access_token, "workos:new-at");
+        assert_eq!(tokens.refresh_token.as_deref(), Some("new-rt"));
+        assert!(tokens.expires_in.unwrap_or(0) > 0);
+
+        // Builder shape: JSON grant, cline endpoint.
+        let spec = crate::refresh::build_cline_refresh_request("old-rt");
+        assert_eq!(spec.url, crate::refresh::CLINE_REFRESH_URL);
+        let payload = spec.json_body.expect("cline refresh is JSON");
+        assert_eq!(
+            payload.get("refreshToken").and_then(|v| v.as_str()),
+            Some("old-rt")
+        );
     }
 
     #[tokio::test]

@@ -1,0 +1,34 @@
+{
+  "fixture": "chat_utf8_malformed_negative",
+  "classification": "negative",
+  "description": "Malformed protobuf frame: delta_text contains incomplete UTF-8 bytes (eab080eb = 가 + 1 byte of 나) split mid-codepoint. Protobuf string fields require valid UTF-8. A conformant decoder must reject this frame as a fatal UTF-8 error rather than attempting concatenation across invalid strings.",
+  "rpc": "exa.api_server_pb.ApiServerService/GetChatMessage",
+  "content_type": "application/connect+proto",
+  "encoding": "connect-framed-proto",
+  "frames": [
+    {
+      "flag": 0,
+      "hex": "0a09726573702d303030311a04eab080eb",
+      "len": 17
+    }
+  ],
+  "framed_hex": "00000000110a09726573702d303030311a04eab080eb",
+  "expected_rejection": {
+    "reason": "invalid_utf8_in_protobuf_string",
+    "field": 3,
+    "malformed_bytes_hex": "eab080eb"
+  },
+  "tag_checks": [
+    {
+      "path": "frame0.field3.tag",
+      "hex": "1a",
+      "len": 4
+    }
+  ],
+  "provenance": {
+    "reference": "https://github.com/Arborsm/dsh-plugin-devin-bridge",
+    "commit": "ced035dd2f43b2dbf37a25c8a47b8ae1c1cc47f4",
+    "license": "MIT, Copyright (c) 2026 Arborsm",
+    "note": "Negative fixture preserving previously split UTF-8 bytes to verify mandatory rejection of invalid UTF-8 in protobuf strings."
+  }
+}

@@ -48,6 +48,7 @@ fn member_matches_provider_binding(
         ProviderKind::Kiro => provider_id.as_str() == "kiro",
         ProviderKind::Vertex => provider_id.as_str() == "vertex",
         ProviderKind::Zcode => provider_id.as_str() == "zcode",
+        ProviderKind::Devin => provider_id.as_str() == "devin",
         ProviderKind::Generic => member.provider_name() == provider_id.as_str(),
     };
 
@@ -66,7 +67,22 @@ fn member_matches_provider_binding(
         }
     }
 
+    if member.kind() == ProviderKind::Devin {
+        let upstream = binding.effective_upstream_id(model_id);
+        return member.supports_devin_model(model_id.as_str(), model_id.as_str(), upstream);
+    }
+
     true
+}
+
+/// Returns true if any active Devin account member has stale or uninitialized model discovery.
+pub fn has_stale_devin_members(members: &[std::sync::Arc<AccountMember>], now_unix: u64) -> bool {
+    members.iter().any(|m| {
+        m.kind() == ProviderKind::Devin
+            && !m.is_manually_disabled()
+            && m.devin_catalog_state()
+                .is_none_or(|cat| cat.is_stale(now_unix))
+    })
 }
 
 pub fn project_model_entries(
@@ -609,6 +625,7 @@ mod tests {
                 identity_slug: "slug-empty".to_string(),
                 provider: "custom-empty".to_string(),
                 label: "Custom Empty".to_string(),
+                email: String::new(),
                 adapter: "openai-chat".to_string(),
                 base_url: "https://api.empty.com/v1".to_string(),
                 api_key: "k1".to_string(),
@@ -631,6 +648,7 @@ mod tests {
                 identity_slug: "slug-pop".to_string(),
                 provider: "custom-provider-a".to_string(),
                 label: "Custom A".to_string(),
+                email: String::new(),
                 adapter: "openai-chat".to_string(),
                 base_url: "https://api.a.com/v1".to_string(),
                 api_key: "k2".to_string(),
@@ -658,6 +676,7 @@ mod tests {
                 identity_slug: "slug-overlap".to_string(),
                 provider: "custom-provider-b".to_string(),
                 label: "Custom B".to_string(),
+                email: String::new(),
                 adapter: "openai-chat".to_string(),
                 base_url: "https://api.b.com/v1".to_string(),
                 api_key: "k3".to_string(),
@@ -1246,5 +1265,39 @@ mod tests {
         assert!(!ids.contains(&"anthropic-claude-3-7-sonnet-20250219"));
         assert!(ids.contains(&"nekos-claude-3-7-sonnet-20250219"));
         assert!(ids.contains(&"nekos/claude-3-7-sonnet-20250219"));
+    }
+
+    #[test]
+    fn test_has_stale_devin_members_evaluation() {
+        let devin_acc: mahoquot_providers::devin::DevinAccount = serde_json::from_value(json!({
+            "identity_slug": "devin-stale-check",
+            "access_token": "tok",
+            "api_server_url": "https://api.devin.com",
+            "type": "devin",
+            "disabled": false,
+        }))
+        .unwrap();
+        let member = Arc::new(AccountMember::for_test_with_id(
+            "devin-stale-check",
+            ProviderAccount::Devin(devin_acc),
+        ));
+
+        let now_unix = 1726000000;
+
+        // 1. Uninitialized catalog state -> considered stale
+        assert!(has_stale_devin_members(std::slice::from_ref(&member), now_unix));
+
+        // 2. Fresh catalog state -> not stale
+        let key = crate::devin_catalog::DevinCacheKey::new("devin-stale-check", "tok", "https://api.devin.com");
+        let fresh_cat = Arc::new(crate::devin_catalog::DevinAccountCatalogState::new_success(
+            key.clone(),
+            vec![],
+            now_unix,
+        ));
+        member.set_devin_catalog_state(fresh_cat);
+        assert!(!has_stale_devin_members(std::slice::from_ref(&member), now_unix));
+
+        // 3. Expired catalog state (now_unix + 301s) -> stale
+        assert!(has_stale_devin_members(std::slice::from_ref(&member), now_unix + 301));
     }
 }

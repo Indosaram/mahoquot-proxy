@@ -1,0 +1,77 @@
+{
+  "fixture": "unary_response",
+  "classification": "positive",
+  "description": "Unary GetCascadeModelConfigsResponse, unframed protobuf body, application/proto. Two ClientModelConfig entries (glm-5-2, swe-1-7); values are synthetic observations.",
+  "rpc": "exa.api_server_pb.ApiServerService/GetCascadeModelConfigs",
+  "content_type": "application/proto",
+  "headers": {
+    "Connect-Protocol-Version": "1"
+  },
+  "encoding": "unframed-proto",
+  "hex": "0a1c0a07474c4d2d352e32280138019001c09a0cb20107676c6d2d352d320a1a0a075357452d312e3728019001f0fe0fb201077377652d312d37",
+  "fields": [
+    {
+      "field": 1,
+      "wire_type": 2,
+      "repeated": true,
+      "message": "ExaCodeiumCommonPb_ClientModelConfig",
+      "entries": [
+        {
+          "field": 1,
+          "label": "GLM-5.2",
+          "field5": "supports_images=true",
+          "field7": "is_premium=true",
+          "field18": "max_tokens=200000 (synthetic; not a confirmed server limit)",
+          "field22": "model_uid=glm-5-2"
+        },
+        {
+          "field": 1,
+          "label": "SWE-1.7",
+          "field5": "supports_images=true",
+          "field18": "max_tokens=262000 (synthetic)",
+          "field22": "model_uid=swe-1-7"
+        }
+      ]
+    }
+  ],
+  "tag_checks": [
+    {
+      "path": "entry1.field18.tag",
+      "hex": "9001",
+      "value": 200000
+    },
+    {
+      "path": "entry1.field22.tag",
+      "hex": "b201",
+      "len": 7,
+      "value": "glm-5-2"
+    },
+    {
+      "path": "entry2.field18.tag",
+      "hex": "9001",
+      "value": 262000
+    },
+    {
+      "path": "entry2.field22.tag",
+      "hex": "b201",
+      "len": 7,
+      "value": "swe-1-7"
+    },
+    {
+      "path": "entry1.len",
+      "hex": "1c",
+      "len": 28
+    },
+    {
+      "path": "entry2.len",
+      "hex": "1a",
+      "len": 26
+    }
+  ],
+  "provenance": {
+    "reference": "https://github.com/Arborsm/dsh-plugin-devin-bridge",
+    "commit": "ced035dd2f43b2dbf37a25c8a47b8ae1c1cc47f4",
+    "license": "MIT, Copyright (c) 2026 Arborsm",
+    "note": "Golden bytes independently hand-specified from the proto field numbers in src/proto/devin.proto at the pinned commit; not produced by any production encoder. All credentials are synthetic dummies."
+  }
+}

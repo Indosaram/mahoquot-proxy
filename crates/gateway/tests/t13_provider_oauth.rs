@@ -926,6 +926,7 @@ async fn test_antigravity_oauth_flow_end_to_end() {
             | ProviderAccount::Kiro(_)
             | ProviderAccount::Zcode(_)
             | ProviderAccount::Vertex(_)
+            | ProviderAccount::Devin(_)
             | ProviderAccount::Generic(_) => false,
         }
     });

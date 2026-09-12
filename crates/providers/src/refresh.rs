@@ -2,6 +2,7 @@ pub const REFRESH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 pub const REFRESH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const CLAUDE_REFRESH_TOKEN_URL: &str = "https://api.anthropic.com/v1/oauth/token";
 pub const CLAUDE_REFRESH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+pub const CLINE_REFRESH_URL: &str = "https://api.cline.bot/api/v1/auth/refresh";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefreshRequest {
@@ -123,6 +124,26 @@ pub fn build_kiro_idc_refresh_request(
             "grantType": "refresh_token",
             "clientId": client_id,
             "clientSecret": client_secret,
+            "refreshToken": refresh_token,
+        })),
+        headers: Vec::new(),
+    }
+}
+
+/// Cline CLI login (WorkOS OAuth) refresh. The CLI stores
+/// `providers.json` auth as `{accessToken, refreshToken, expiresAt}` and
+/// refreshes server-side via `POST /api/v1/auth/refresh` with
+/// `{"grantType":"refresh_token","refreshToken"}`; the response nests the
+/// rotated pair under `data` (`{data:{accessToken, refreshToken}}`).
+/// Unlike the form-based OAuth grants, `parse_refresh_response` only reads
+/// the top level, so this path needs its own executor (see
+/// `execute_cline_refresh`). Verified live 2026-09-10.
+pub fn build_cline_refresh_request(refresh_token: &str) -> RefreshRequest {
+    RefreshRequest {
+        url: CLINE_REFRESH_URL.to_string(),
+        form_fields: Vec::new(),
+        json_body: Some(serde_json::json!({
+            "grantType": "refresh_token",
             "refreshToken": refresh_token,
         })),
         headers: Vec::new(),

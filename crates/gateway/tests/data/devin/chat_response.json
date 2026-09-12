@@ -1,0 +1,232 @@
+{
+  "fixture": "chat_response",
+  "classification": "positive",
+  "description": "GetChatMessageResponse server stream: text delta, complete Korean UTF-8 per frame, thinking, signature, redaction, interleaved tool calls with explicit IDs, usage snapshot, stop reason 10 with actual_model_uid, EndStreamResponse JSON.",
+  "rpc": "exa.api_server_pb.ApiServerService/GetChatMessage",
+  "content_type": "application/connect+proto",
+  "headers": {
+    "Connect-Protocol-Version": "1"
+  },
+  "encoding": "connect-framed-proto",
+  "frames": [
+    {
+      "flag": 0,
+      "hex": "0a09726573702d303030311a0748656c6c6f2c20"
+    },
+    {
+      "flag": 0,
+      "hex": "0a09726573702d303030311a03eab080"
+    },
+    {
+      "flag": 0,
+      "hex": "0a09726573702d303030311a03eb8298"
+    },
+    {
+      "flag": 0,
+      "hex": "0a09726573702d303030314a13506c616e6e696e6720746865207265706c792e"
+    },
+    {
+      "flag": 0,
+      "hex": "0a09726573702d30303031520f7369672d6f70617175652d30303031"
+    },
+    {
+      "flag": 0,
+      "hex": "0a09726573702d303030315801"
+    },
+    {
+      "flag": 0,
+      "hex": "0a09726573702d3030303132220a0863616c6c5f303031120b6765745f776561746865721a097b2263697479223a2232130a0863616c6c5f3030311a0753656f756c227d321d0a0863616c6c5f30303212086765745f74696d651a077b22747a223a2232110a0863616c6c5f3030321a054b5354227d"
+    },
+    {
+      "flag": 0,
+      "hex": "0a09726573702d303030313a11100c1822200728054a07676c6d2d352d32"
+    },
+    {
+      "flag": 0,
+      "hex": "0a09726573702d303030311a05446f6e652e280aba0107676c6d2d352d32"
+    }
+  ],
+  "end_stream": {
+    "error": null,
+    "hasSyncPoints": false
+  },
+  "framed_hex": "00000000140a09726573702d303030311a0748656c6c6f2c2000000000100a09726573702d303030311a03eab08000000000100a09726573702d303030311a03eb829800000000200a09726573702d303030314a13506c616e6e696e6720746865207265706c792e000000001c0a09726573702d30303031520f7369672d6f70617175652d30303031000000000d0a09726573702d30303031580100000000760a09726573702d3030303132220a0863616c6c5f303031120b6765745f776561746865721a097b2263697479223a2232130a0863616c6c5f3030311a0753656f756c227d321d0a0863616c6c5f30303212086765745f74696d651a077b22747a223a2232110a0863616c6c5f3030321a054b5354227d000000001e0a09726573702d303030313a11100c1822200728054a07676c6d2d352d32000000001e0a09726573702d303030311a05446f6e652e280aba0107676c6d2d352d3202000000247b226572726f72223a6e756c6c2c2268617353796e63506f696e7473223a66616c73657d",
+  "fields": [
+    {
+      "frame": 0,
+      "field": 1,
+      "message_id": "resp-0001",
+      "field3": "delta_text='Hello, '",
+      "tag3": "1a"
+    },
+    {
+      "frame": 1,
+      "field": 3,
+      "text": "가",
+      "note": "delta_text complete valid UTF-8 string '가' (U+AC00)"
+    },
+    {
+      "frame": 2,
+      "field": 3,
+      "text": "나",
+      "note": "delta_text complete valid UTF-8 string '나' (U+B098)"
+    },
+    {
+      "frame": 3,
+      "field": 9,
+      "delta_thinking": "Planning the reply.",
+      "tag9": "4a"
+    },
+    {
+      "frame": 4,
+      "field": 10,
+      "delta_signature": "sig-opaque-0001 (opaque, preserved verbatim)",
+      "tag10": "52"
+    },
+    {
+      "frame": 5,
+      "field": 11,
+      "thinking_redacted": true,
+      "tag11": "5801"
+    },
+    {
+      "frame": 6,
+      "field": 6,
+      "repeated": true,
+      "message": "ChatToolCall",
+      "interleaved": true,
+      "entries": [
+        {
+          "delta": 1,
+          "field1": "call_001",
+          "field2": "get_weather",
+          "field3": "{\"city\":\""
+        },
+        {
+          "delta": 2,
+          "field1": "call_001",
+          "field3": "Seoul\"}"
+        },
+        {
+          "delta": 3,
+          "field1": "call_002",
+          "field2": "get_time",
+          "field3": "{\"tz\":\""
+        },
+        {
+          "delta": 4,
+          "field1": "call_002",
+          "field3": "KST\"}"
+        }
+      ]
+    },
+    {
+      "frame": 7,
+      "field": 7,
+      "message": "ModelUsageStats",
+      "subfields": [
+        {
+          "field": 2,
+          "input_tokens": 12
+        },
+        {
+          "field": 3,
+          "output_tokens": 34
+        },
+        {
+          "field": 4,
+          "cache_write_tokens": 7
+        },
+        {
+          "field": 5,
+          "cache_read_tokens": 5
+        },
+        {
+          "field": 9,
+          "model_uid": "glm-5-2"
+        }
+      ],
+      "note": "Authoritative usage snapshot; do not accumulate repeated frames."
+    },
+    {
+      "frame": 8,
+      "field3": "delta_text='Done.'",
+      "field5": "stop_reason=10 (FUNCTION_CALL)",
+      "field23": "actual_model_uid=glm-5-2",
+      "tag23": "ba01"
+    }
+  ],
+  "tag_checks": [
+    {
+      "path": "frame0.field3.tag",
+      "hex": "1a",
+      "len": 7
+    },
+    {
+      "path": "frame1.field3.tag",
+      "hex": "1a",
+      "len": 3
+    },
+    {
+      "path": "frame2.field3.tag",
+      "hex": "1a",
+      "len": 3
+    },
+    {
+      "path": "frame3.field9.tag",
+      "hex": "4a",
+      "len": 19
+    },
+    {
+      "path": "frame4.field10.tag",
+      "hex": "52",
+      "len": 15
+    },
+    {
+      "path": "frame5.field11.tag",
+      "hex": "58",
+      "value": 1
+    },
+    {
+      "path": "usage.field2.tag",
+      "hex": "10",
+      "value": 12
+    },
+    {
+      "path": "usage.field3.tag",
+      "hex": "18",
+      "value": 34
+    },
+    {
+      "path": "usage.field4.tag",
+      "hex": "20",
+      "value": 7
+    },
+    {
+      "path": "usage.field5.tag",
+      "hex": "28",
+      "value": 5
+    },
+    {
+      "path": "usage.field9.tag",
+      "hex": "4a",
+      "len": 7,
+      "value": "glm-5-2"
+    },
+    {
+      "path": "final.field23.tag",
+      "hex": "ba01",
+      "len": 7
+    },
+    {
+      "path": "end_stream.flag",
+      "hex": "02"
+    }
+  ],
+  "provenance": {
+    "reference": "https://github.com/Arborsm/dsh-plugin-devin-bridge",
+    "commit": "ced035dd2f43b2dbf37a25c8a47b8ae1c1cc47f4",
+    "license": "MIT, Copyright (c) 2026 Arborsm",
+    "note": "Golden bytes independently hand-specified from the proto field numbers in src/proto/devin.proto at the pinned commit; not produced by any production encoder. All credentials are synthetic dummies."
+  }
+}

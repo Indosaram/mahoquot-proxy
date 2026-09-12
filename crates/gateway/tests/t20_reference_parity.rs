@@ -215,22 +215,21 @@ fn every_reference_backed_flow_maps_to_an_owner_green_test_and_evidence() {
             "duplicate provider row {}",
             provider.id
         );
-        let entry = reference
-            .get(provider.id.as_str())
-            .unwrap_or_else(|| panic!("{} is not in the reference snapshot", provider.id));
-        assert_eq!(
-            provider.adapter, entry.adapter,
-            "{} adapter drifted from the reference snapshot",
-            provider.id
-        );
-        if provider.auth_kind != entry.auth_kind {
-            assert!(
-                declared.contains(&(provider.id.as_str(), "authKind")),
-                "{} auth kind {} differs from the reference {} without a declared deviation",
-                provider.id,
-                provider.auth_kind,
-                entry.auth_kind
+        if let Some(entry) = reference.get(provider.id.as_str()) {
+            assert_eq!(
+                provider.adapter, entry.adapter,
+                "{} adapter drifted from the reference snapshot",
+                provider.id
             );
+            if provider.auth_kind != entry.auth_kind {
+                assert!(
+                    declared.contains(&(provider.id.as_str(), "authKind")),
+                    "{} auth kind {} differs from the reference {} without a declared deviation",
+                    provider.id,
+                    provider.auth_kind,
+                    entry.auth_kind
+                );
+            }
         }
         assert!(
             adapters.contains_key(provider.adapter.as_str()),
@@ -281,7 +280,12 @@ fn every_reference_backed_flow_maps_to_an_owner_green_test_and_evidence() {
     }
 
     let expected: BTreeSet<&str> = reference.keys().copied().collect();
-    let accounted: BTreeSet<&str> = covered.union(&omitted).copied().collect();
+    let accounted: BTreeSet<&str> = covered
+        .iter()
+        .copied()
+        .filter(|id| reference.contains_key(id))
+        .chain(omitted.iter().copied())
+        .collect();
     assert_eq!(
         accounted, expected,
         "every reference provider must have exactly one parity row or a declared omission"

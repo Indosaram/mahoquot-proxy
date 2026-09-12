@@ -1,0 +1,142 @@
+{
+  "fixture": "chat_request",
+  "classification": "positive",
+  "description": "Framed Connect streaming GetChatMessageRequest: flag 0x00, 4-byte BE length (191 bytes), metadata, prompt, Korean user turn, configuration, model UID glm-5-2.",
+  "rpc": "exa.api_server_pb.ApiServerService/GetChatMessage",
+  "content_type": "application/connect+proto",
+  "headers": {
+    "Authorization": "Basic dummy-token-dummy-token",
+    "Connect-Protocol-Version": "1",
+    "Content-Type": "application/connect+proto",
+    "Accept": "application/connect+proto"
+  },
+  "encoding": "connect-framed-proto",
+  "framed_hex": "00000000bf0a3c0a0663686973656c1209333030302e322e31371a0b64756d6d792d746f6b656e2202656e2a0377696e3a09333030302e322e3137620663686973656c121c596f752061726520612068656c7066756c20617373697374616e742e1a450a086d73672d3030303110011a37ec9588eb8595ed9598ec84b8ec9a942c20ed959c20eca48420ec868ceab09ceba5bc20ec9e91ec84b1ed95b420eca3bcec84b8ec9a942e3805420e080110802029666666666666e63faa0107676c6d2d352d32",
+  "fields": [
+    {
+      "field": 1,
+      "wire_type": 2,
+      "message": "ExaCodeiumCommonPb_Metadata",
+      "subfields": [
+        {
+          "field": 1,
+          "ide_name": "chisel"
+        },
+        {
+          "field": 2,
+          "extension_version": "3000.2.17"
+        },
+        {
+          "field": 3,
+          "api_key": "dummy-token"
+        },
+        {
+          "field": 4,
+          "locale": "en"
+        },
+        {
+          "field": 5,
+          "os": "win"
+        },
+        {
+          "field": 7,
+          "ide_version": "3000.2.17"
+        },
+        {
+          "field": 12,
+          "extension_name": "chisel"
+        }
+      ],
+      "note": "Reference also sets field 31 (f) to 366 random hex bytes; omitted from this fixture as documented noise."
+    },
+    {
+      "field": 2,
+      "wire_type": 2,
+      "prompt": "You are a helpful assistant.",
+      "role": "system/developer instructions"
+    },
+    {
+      "field": 3,
+      "wire_type": 2,
+      "repeated": true,
+      "message": "ChatMessagePrompt",
+      "entries": [
+        {
+          "field": 1,
+          "message_id": "msg-0001",
+          "field2": "source=1 (USER)",
+          "field3": "prompt=<Korean UTF-8> 안녕하세요, 한 줄 소개를 작성해 주세요."
+        }
+      ]
+    },
+    {
+      "field": 7,
+      "wire_type": 0,
+      "request_type": 5,
+      "enum": "CHAT_MESSAGE_REQUEST_TYPE_CASCADE"
+    },
+    {
+      "field": 8,
+      "wire_type": 2,
+      "message": "CompletionConfiguration",
+      "subfields": [
+        {
+          "field": 1,
+          "num_completions": 1
+        },
+        {
+          "field": 2,
+          "max_tokens": 4096
+        },
+        {
+          "field": 5,
+          "temperature_double": 0.7,
+          "wire_type": 1
+        }
+      ]
+    },
+    {
+      "field": 21,
+      "wire_type": 2,
+      "chat_model_uid": "glm-5-2"
+    }
+  ],
+  "tag_checks": [
+    {
+      "path": "frame.flag",
+      "hex": "00"
+    },
+    {
+      "path": "frame.len_be",
+      "hex": "000000bf",
+      "len": 191
+    },
+    {
+      "path": "metadata.field12.tag",
+      "hex": "62",
+      "len": 6
+    },
+    {
+      "path": "request_type.field7.tag",
+      "hex": "38",
+      "value": 5
+    },
+    {
+      "path": "configuration.field5.tag",
+      "hex": "29",
+      "double_bytes": "666666666666e63f"
+    },
+    {
+      "path": "chat_model_uid.field21.tag",
+      "hex": "aa01",
+      "len": 7,
+      "value": "glm-5-2"
+    }
+  ],
+  "provenance": {
+    "reference": "https://github.com/Arborsm/dsh-plugin-devin-bridge",
+    "commit": "ced035dd2f43b2dbf37a25c8a47b8ae1c1cc47f4",
+    "license": "MIT, Copyright (c) 2026 Arborsm",
+    "note": "Golden bytes independently hand-specified from the proto field numbers in src/proto/devin.proto at the pinned commit; not produced by any production encoder. All credentials are synthetic dummies."
+  }
+}

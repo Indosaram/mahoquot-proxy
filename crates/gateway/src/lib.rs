@@ -3,6 +3,7 @@ pub mod capability;
 pub mod compat;
 pub mod config;
 pub mod cp_routes;
+pub mod devin_catalog;
 pub mod inbound;
 pub mod management;
 pub mod metrics;

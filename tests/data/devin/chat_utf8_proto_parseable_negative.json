@@ -1,0 +1,34 @@
+{
+  "fixture": "chat_utf8_proto_parseable_negative",
+  "classification": "negative",
+  "rpc": "exa.api_server_pb.ApiServerService/GetChatMessage",
+  "content_type": "application/connect+proto",
+  "encoding": "connect-framed-proto",
+  "description": "Negative rejection fixture: delta_text (field 3) contains bytes [0x08, 0x80, 0x01], which parse as a valid protobuf submessage (field 1 = varint 128) but constitute malformed UTF-8 (0x80 is an invalid UTF-8 byte). Demonstrates that decoders must not use parse-success heuristics to bypass UTF-8 string validation.",
+  "provenance": {
+    "reference": "https://github.com/Arborsm/dsh-plugin-devin-bridge",
+    "commit": "ced035dd2f43b2dbf37a25c8a47b8ae1c1cc47f4",
+    "license": "MIT, Copyright (c) 2026 Arborsm",
+    "note": "Negative fixture demonstrating rejection of invalid UTF-8 strings that syntactically mimic valid protobuf submessages."
+  },
+  "framed_hex": "00000000100a09726573702d303030311a03088001",
+  "frames": [
+    {
+      "flag": 0,
+      "len": 16,
+      "hex": "0a09726573702d303030311a03088001"
+    }
+  ],
+  "tag_checks": [
+    {
+      "path": "frame0.field3.tag",
+      "hex": "1a",
+      "len": 3
+    }
+  ],
+  "expected_rejection": {
+    "reason": "invalid_utf8_in_protobuf_string_parseable_as_submessage",
+    "field": 3,
+    "malformed_bytes_hex": "088001"
+  }
+}

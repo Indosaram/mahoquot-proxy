@@ -249,3 +249,15 @@ Five endpoints across different functional areas were spot-checked against the a
 - **Rust Parity**: Exact route path and verb; handles call termination on active sessions.
 - **Result**: `same-path` confirmed.
 
+---
+
+## 6. Mahoquot Extension Routes
+
+The following endpoints extend upstream CLIProxyAPI functionality for local CLI provider integrations and desktop management parity. Upstream CLIProxyAPI baseline (`docs/baseline/cliproxy-endpoints.txt`) remains the historical 114-endpoint inventory and is preserved without modification.
+
+| Endpoint | Cluster | Classification | Tier | Handler | Implementation & Contract Notes |
+| --- | --- | --- | :---: | --- | --- |
+| `POST /v0/management/devin/import-cli` | Auth & Identity | `extension` | P1 | `creds::devin_import_cli` (`crates/gateway/src/management/creds.rs`) | Host Devin CLI credential import (`credentials.toml`). Accepts JSON `{ "identity"?: string, "identity_slug"?: string, "label"?: string }`. Label may be empty string; identity must be non-empty valid slug (`identity` and `identity_slug` alias each other; conflicting values rejected). Resolves exclusively on proxy host (`DEVIN_CREDENTIALS_PATH` -> `XDG_DATA_HOME` -> `~/.local/share/devin/credentials.toml`). Target written atomically as `devin-<identity_slug>.json`. Source TOML untouched. Returns `{ "status": "ok", "name": "devin-<identity_slug>.json", "identity_slug": "<identity_slug>" }`. |
+| `POST /v0/management/devin/models/refresh` | Model Registry & Discovery | `extension` | P4 | `registry::refresh_devin_models` (`crates/gateway/src/management/registry.rs`) | Account-scoped Devin model discovery over Connect RPC (`GetCascadeModelConfigs`), update 5-minute discovery cache, and publish an atomic `PoolSnapshot` generation. Optional query `?identity_slug=...` or JSON body `{ "identity_slug"?: string }`. Returns `{ "status": "ok", "outcome": "success", "models": [...], "accounts": [...], "generation": N }`. |
+
+

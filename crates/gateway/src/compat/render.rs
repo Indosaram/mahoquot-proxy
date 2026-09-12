@@ -83,12 +83,37 @@ impl GeminiChunkRenderer {
 
     /// Emit every closed call as a functionCall part, restoring its arguments.
     fn close_open_calls(&mut self, out: &mut Vec<Bytes>) {
+        if self.terminated {
+            return;
+        }
         for tool in std::mem::take(&mut self.open_calls) {
-            let parsed: Value = if tool.arguments.is_empty() {
-                json!({})
+            let parsed_obj = if tool.arguments.trim().is_empty() {
+                Some(json!({}))
             } else {
-                serde_json::from_str(&tool.arguments).unwrap_or_else(|_| json!({}))
+                match serde_json::from_str::<Value>(&tool.arguments) {
+                    Ok(Value::Object(map)) => Some(Value::Object(map)),
+                    _ => None,
+                }
             };
+
+            let Some(parsed) = parsed_obj else {
+                if self.output_limit_reached {
+                    // Truncated due to output limit: do not emit invalid functionCall args as success,
+                    // and do not emit error frame. Skip this incomplete call.
+                    continue;
+                }
+                self.terminated = true;
+                self.open_calls.clear();
+                out.push(frame(&json!({
+                    "error": {
+                        "code": 400,
+                        "message": format!("invalid functionCall arguments for tool '{}': must be a JSON object", tool.name),
+                        "status": "INVALID_ARGUMENT",
+                    }
+                })));
+                return;
+            };
+
             let mut part = json!({"functionCall":{"id":tool.call_id,"name":tool.name,"args":parsed}});
             if let Some(signature) =
                 super::signature_ledger::recall(&tool.call_id, &tool.name, &parsed.to_string())
@@ -111,10 +136,7 @@ impl GeminiChunkRenderer {
                 Vec::new()
             }
             CodexEvent::TextDelta(text) => {
-                let mut out = Vec::new();
-                self.close_open_calls(&mut out);
-                out.push(self.frame_for(json!([{"text": text}]), None, None));
-                out
+                vec![self.frame_for(json!([{"text": text}]), None, None)]
             }
             CodexEvent::ReasoningDelta(text) => {
                 vec![self.frame_for(json!([{"text": text, "thought": true}]), None, None)]
@@ -122,20 +144,29 @@ impl GeminiChunkRenderer {
             CodexEvent::ReasoningSignature(sig) => {
                 vec![self.frame_for(json!([{"thoughtSignature": sig}]), None, None)]
             }
+            // Gemini has no redacted-thinking wire shape; the marker is state.
+            CodexEvent::ReasoningRedacted => Vec::new(),
             CodexEvent::ToolCallBegin {
                 output_index,
                 call_id,
                 name,
             } => {
-                let mut out = Vec::new();
-                self.close_open_calls(&mut out);
-                self.open_calls.push(ToolAccumulator {
-                    output_index,
-                    call_id,
-                    name,
-                    arguments: String::new(),
-                });
-                out
+                if let Some(tool) = self
+                    .open_calls
+                    .iter_mut()
+                    .find(|tool| tool.output_index == output_index)
+                {
+                    tool.call_id = call_id;
+                    tool.name = name;
+                } else {
+                    self.open_calls.push(ToolAccumulator {
+                        output_index,
+                        call_id,
+                        name,
+                        arguments: String::new(),
+                    });
+                }
+                Vec::new()
             }
             CodexEvent::ToolArgsDelta {
                 output_index,
@@ -155,9 +186,12 @@ impl GeminiChunkRenderer {
                 Vec::new()
             }
             CodexEvent::Completed { usage } => {
-                self.terminated = true;
                 let mut out = Vec::new();
                 self.close_open_calls(&mut out);
+                if self.terminated {
+                    return out;
+                }
+                self.terminated = true;
                 out.push(self.frame_for(json!([]), Some(if self.output_limit_reached { "MAX_TOKENS" } else { "STOP" }), usage.as_ref()));
                 out
             }
@@ -175,10 +209,14 @@ impl GeminiChunkRenderer {
         if self.terminated {
             return Vec::new();
         }
-        self.terminated = true;
         let mut out = Vec::new();
         self.close_open_calls(&mut out);
-        out.push(self.frame_for(json!([]), Some("STOP"), None));
+        if self.terminated {
+            return out;
+        }
+        self.terminated = true;
+        let finish = if self.output_limit_reached { "MAX_TOKENS" } else { "STOP" };
+        out.push(self.frame_for(json!([]), Some(finish), None));
         out
     }
 }
@@ -266,6 +304,8 @@ impl ChunkRenderer {
                 out.push(self.chunk(json!({"reasoning_content": text}), None));
             }
             CodexEvent::ReasoningSignature(_) => {}
+            // Redaction is a state marker with no chat.completion delta shape.
+            CodexEvent::ReasoningRedacted => {}
             CodexEvent::ToolCallBegin {
                 output_index,
                 call_id,
@@ -424,6 +464,9 @@ impl Aggregator {
                 }
             }
             CodexEvent::ReasoningSignature(sig) => self.reasoning_signature = Some(sig),
+            // Kept in native_events for surfaces that can express redaction;
+            // the aggregate itself has no redacted-thinking shape.
+            CodexEvent::ReasoningRedacted => {}
             CodexEvent::Completed { usage } => self.usage = usage,
             CodexEvent::OutputLimitReached => self.output_limit_reached = true,
             CodexEvent::Failed { message } => self.failure = Some(message),
@@ -497,6 +540,12 @@ impl Aggregator {
             });
         }
         payload
+    }
+
+    /// Canonical OpenAI Responses shape for the `/v1/responses` surface,
+    /// converting accumulated native events into a Responses JSON object.
+    pub fn into_responses(self) -> Result<Value, String> {
+        super::responses::responses_response(&self.native_events, &self.model, self.created)
     }
 
     pub fn into_completion(self) -> Value {

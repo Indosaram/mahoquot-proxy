@@ -46,7 +46,7 @@ fn parse_body(body: &Bytes) -> Result<Value, Box<Response>> {
     })
 }
 
-fn owner_of(state: &AppState, model: &str) -> Option<String> {
+pub(crate) fn owner_of(state: &AppState, model: &str) -> Option<String> {
     state
         .pool
         .load()
@@ -148,7 +148,7 @@ async fn image_surface(state: Arc<AppState>, auth: &ResolvedAuth, headers: &Head
     }
     handle_relay(
         state,
-        &auth,
+        auth,
         RelayMode::Image,
         "/v1/images/generations",
         headers,
@@ -352,6 +352,18 @@ pub async fn responses(
         Err(resp) => return *resp,
     };
     let model = model_of(&parsed).to_string();
+
+    if owner_of(&state, &model).as_deref() == Some("devin") {
+        return handle_relay(
+            state,
+            &auth,
+            RelayMode::Responses,
+            "/v1/responses",
+            &headers,
+            body,
+        )
+        .await;
+    }
 
     if owner_of(&state, &model).as_deref() != Some("google") {
         return handle_relay(
@@ -715,12 +727,19 @@ pub async fn v1beta_action(
         Some(key) => crate::models_route::scoped_model_entries(&pool, key),
         None => pool.models.clone(),
     };
-    let Some(entry) = models
-        .iter()
-        .find(|m| m.id == model)
-        .cloned()
-    else {
-        return json_status(StatusCode::NOT_FOUND, v1beta::model_not_found(&model));
+    let entry = match models.iter().find(|m| m.id == model).cloned() {
+        Some(e) => e,
+        None => {
+            if pool.registry().resolve(&model).is_ok() {
+                let owner = owner_of(&state, &model).unwrap_or_else(|| "devin".to_string());
+                crate::models_route::ModelEntry {
+                    id: model.clone(),
+                    owned_by: owner,
+                }
+            } else {
+                return json_status(StatusCode::NOT_FOUND, v1beta::model_not_found(&model));
+            }
+        }
     };
 
     let Some(verb) = verb else {

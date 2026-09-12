@@ -434,6 +434,42 @@
         "needle": "unimplemented_pluginhost_routes_are_not_advertised_as_handlers"
       },
       "evidence": ".omo/ulw-loop/opencodex-cliproxy-auth-proxy/evidence/aistudio-pluginhost-green.txt"
+    },
+    {
+      "id": "auth-devin-cli",
+      "surface": "auth",
+      "disposition": "included",
+      "reference": {
+        "path": "dsh-plugin-devin-bridge/src/adapter/credentials.ts",
+        "needle": "credentials.toml"
+      },
+      "owner": {
+        "path": "crates/gateway/src/management/creds.rs",
+        "needle": "devin_import_cli"
+      },
+      "green_test": {
+        "path": "crates/gateway/tests/devin_credentials.rs",
+        "needle": "test_cli_import_resolved_on_proxy_host_atomic_and_unchanged_source"
+      },
+      "evidence": ".omo/evidence/devin/p1-credentials.md"
+    },
+    {
+      "id": "auth-devin-token",
+      "surface": "auth",
+      "disposition": "included",
+      "reference": {
+        "path": "dsh-plugin-devin-bridge/src/adapter/transport.ts",
+        "needle": "Basic "
+      },
+      "owner": {
+        "path": "crates/gateway/src/management/creds.rs",
+        "needle": "DevinAccount"
+      },
+      "green_test": {
+        "path": "crates/gateway/tests/devin_credentials.rs",
+        "needle": "test_manual_auth_file_upload_and_stable_identity_replacement"
+      },
+      "evidence": ".omo/evidence/devin/p1-credentials.md"
     }
   ],
   "adapters": [
@@ -542,6 +578,18 @@
       "green_test": {
         "path": "crates/gateway/tests/t8_openai_compat.rs",
         "needle": "test_t8_responses_compact_relays_to_codex_upstream"
+      },
+      "coverage": "full"
+    },
+    {
+      "id": "devin",
+      "owner": {
+        "path": "crates/gateway/src/compat/devin.rs",
+        "needle": "DevinDecoder"
+      },
+      "green_test": {
+        "path": "crates/gateway/tests/devin_wire.rs",
+        "needle": "minimal_request_matches_independent_wire_vector"
       },
       "coverage": "full"
     }
@@ -1100,6 +1148,16 @@
       "adapter": "openai-chat",
       "auth_kind": "key",
       "coverage": "adapter"
+    },
+    {
+      "id": "devin",
+      "adapter": "devin",
+      "auth_kind": "local",
+      "coverage": "dedicated",
+      "green_test": {
+        "path": "crates/gateway/tests/devin_credentials.rs",
+        "needle": "test_manual_auth_file_upload_and_stable_identity_replacement"
+      }
     }
   ]
 }

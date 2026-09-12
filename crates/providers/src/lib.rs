@@ -11,6 +11,7 @@ pub mod claude;
 pub mod codex;
 pub mod credential_file;
 pub mod cursor;
+pub mod devin;
 pub mod kiro;
 pub mod mimo;
 pub mod refresh;
@@ -44,6 +45,13 @@ pub use cursor::{
     CURSOR_UPSTREAM_BASE,
 };
 #[allow(deprecated)]
+pub use devin::{
+    load_devin_account, parse_cli_credentials, resolve_credentials_path, sanitize_toml_error,
+    sanitize_url_for_debug, validate_api_server_url, validate_identity_slug, DevinAccount,
+    DevinCliCredentials, DevinCredentialsError, DEVIN_CLI_TOKEN_KEY, DEVIN_CREDENTIALS_FILE,
+    DEVIN_CREDENTIALS_PATH_ENV, DEVIN_DEFAULT_API_SERVER_URL, DEVIN_TYPE,
+};
+#[allow(deprecated)]
 pub use kiro::{
     is_kiro_model, kiro_generate_url, kiro_refresh_url, list_kiro_auth_files, KiroAccount,
     KiroAuthMode, KIRO_API_HOST_TEMPLATE, KIRO_DEFAULT_REGION, KIRO_GENERATE_PATH,
@@ -54,11 +62,12 @@ pub use mimo::{
     MIMO_SYSTEM_MARKER, MIMO_USER_AGENT,
 };
 pub use refresh::{
-    build_antigravity_refresh_request, build_claude_refresh_request, build_cursor_refresh_request,
-    build_kiro_idc_refresh_request, build_kiro_social_refresh_request, build_refresh_request,
-    parse_refresh_response, RefreshRequest, Tokens, REFRESH_CLIENT_ID, REFRESH_TOKEN_URL,
+    build_antigravity_refresh_request, build_claude_refresh_request, build_cline_refresh_request,
+    build_cursor_refresh_request, build_kiro_idc_refresh_request, build_kiro_social_refresh_request,
+    build_refresh_request, parse_refresh_response, RefreshRequest, Tokens, CLINE_REFRESH_URL,
+    REFRESH_CLIENT_ID, REFRESH_TOKEN_URL,
 };
-pub use refresh_exec::format_expired_rfc3339;
+pub use refresh_exec::{execute_cline_refresh, execute_cline_refresh_to, format_expired_rfc3339};
 #[allow(deprecated)]
 pub use vertex::{
     build_vertex_jwt_assertion, derive_vertex_slug_from_filename, execute_vertex_refresh,

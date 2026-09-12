@@ -3519,6 +3519,7 @@
     "claude": "closed",
     "codex": "open",
     "cursor": "closed",
+    "devin": "discovered",
     "github-copilot": "discovered",
     "kimi": "discovered",
     "kiro": "closed",

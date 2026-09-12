@@ -109,6 +109,10 @@ impl ProviderId {
         Self("cursor".to_string())
     }
 
+    pub fn devin() -> Self {
+        Self("devin".to_string())
+    }
+
     pub fn kiro() -> Self {
         Self("kiro".to_string())
     }
@@ -995,9 +999,23 @@ impl RegistrySnapshot {
                 source: primary_source,
             })
         } else {
-            // Model not explicitly in catalog: only Open providers can serve unclaimed models
+            // Model not explicitly in catalog: only Open providers can serve unclaimed models,
+            // and a registered non-Open provider's namespace (e.g. `devin/<uid>`) must never be
+            // stolen by an Open fallback — unknown ids there are typed UnknownModel errors.
             if open_providers.is_empty() {
-                return Err(RegistryError::UnknownModel(canonical_id));
+                return Err(RegistryError::UnknownModel(canonical_id.clone()));
+            }
+
+            if let Some((_, owner_policy)) = self.providers.iter().find_map(|(pid, policy)| {
+                if canonical_id.as_str().starts_with(&format!("{pid}/")) {
+                    Some((pid, *policy))
+                } else {
+                    None
+                }
+            }) {
+                if owner_policy != ProviderPolicy::Open {
+                    return Err(RegistryError::UnknownModel(canonical_id.clone()));
+                }
             }
 
             let mut eligible_bindings = Vec::new();
@@ -1215,7 +1233,9 @@ impl RegistrySnapshot {
         for rule in aliases {
             if let Some(previous) = local_aliases.insert(rule.alias.clone(), rule) {
                 if previous != rule {
-                    return Err(RegistryError::DuplicateAlias { alias: rule.alias.clone() });
+                    return Err(RegistryError::DuplicateAlias {
+                        alias: rule.alias.clone(),
+                    });
                 }
             }
             ModelId::new(rule.alias.as_str())?;

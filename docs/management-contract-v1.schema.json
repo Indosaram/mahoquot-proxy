@@ -373,6 +373,159 @@
     "GET /v0/management/prices": "crates/gateway/src/management/contracts.rs",
     "PUT /v0/management/prices/{model}": "crates/gateway/src/management/contracts.rs",
     "GET /v0/management/model-registry": "crates/gateway/src/management/registry.rs",
-    "POST /v0/management/model-registry": "crates/gateway/src/management/registry.rs"
+    "POST /v0/management/model-registry": "crates/gateway/src/management/registry.rs",
+    "POST /v0/management/devin/import-cli": "crates/gateway/src/management/creds.rs",
+    "POST /v0/management/devin/models/refresh": "crates/gateway/src/management/registry.rs"
+  },
+  "$defs": {
+    "devin-import-cli": {
+      "type": "object",
+      "description": "POST /v0/management/devin/import-cli contract",
+      "properties": {
+        "request": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "identity": {
+              "type": "string",
+              "minLength": 1
+            },
+            "identity_slug": {
+              "type": "string",
+              "minLength": 1
+            },
+            "label": {
+              "type": "string"
+            }
+          }
+        },
+        "response": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "ok"
+            },
+            "name": {
+              "type": "string",
+              "pattern": "^devin-.+\\.json$"
+            },
+            "identity_slug": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "status",
+            "name",
+            "identity_slug"
+          ]
+        }
+      },
+      "required": [
+        "request",
+        "response"
+      ]
+    },
+    "devin-models-refresh": {
+      "type": "object",
+      "description": "POST /v0/management/devin/models/refresh contract",
+      "properties": {
+        "request": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "identity": {
+              "type": "string"
+            },
+            "identity_slug": {
+              "type": "string"
+            }
+          }
+        },
+        "response": {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string"
+            },
+            "outcome": {
+              "type": "string",
+              "enum": [
+                "success",
+                "error",
+                "never"
+              ]
+            },
+            "models": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "error": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "accounts": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "identity_slug": {
+                    "type": "string"
+                  },
+                  "status": {
+                    "type": "string"
+                  },
+                  "models": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "stale": {
+                    "type": "boolean"
+                  },
+                  "last_refresh_at": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "error": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "identity_slug",
+                  "status",
+                  "models",
+                  "stale"
+                ]
+              }
+            },
+            "generation": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "status",
+            "accounts",
+            "generation"
+          ]
+        }
+      },
+      "required": [
+        "request",
+        "response"
+      ]
+    }
   }
 }

@@ -254,7 +254,7 @@ async fn models_handler(
     // A scoped key must not learn about models it could never route to, so the
     // catalog is narrowed to its own providers, accounts and model allow list.
     let models = match scoped_key {
-        Some(scoped) => crate::models_route::scoped_model_entries(&pool, &scoped),
+        Some(scoped) => crate::models_route::scoped_model_entries(&pool, scoped),
         None => pool.models.clone(),
     };
 
@@ -437,6 +437,19 @@ async fn completions_handler(
         }
     };
 
+    if parsed.get("tools").is_some() || parsed.get("functions").is_some() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "message": "tools and functions are not supported on legacy completions",
+                    "type": "invalid_request_error"
+                }
+            })),
+        )
+            .into_response();
+    }
+
     let prompt = parsed
         .get("prompt")
         .and_then(|p| match p {
@@ -478,10 +491,20 @@ async fn codex_responses_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let mode = if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&body) {
+        let model = crate::capability::model_of(&parsed);
+        if crate::cp_routes::owner_of(&state, model).as_deref() == Some("devin") {
+            RelayMode::Responses
+        } else {
+            RelayMode::Native
+        }
+    } else {
+        RelayMode::Native
+    };
     handle_relay(
         state,
         &auth,
-        RelayMode::Native,
+        mode,
         "/backend-api/codex/responses",
         &headers,
         body,

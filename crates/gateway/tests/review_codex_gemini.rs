@@ -210,6 +210,7 @@ async fn terminal_stream_drops_upstream_without_waiting_for_eof() {
                 cursor_reply: None,
             },
             upstream_capture: None,
+            devin_outcome: None,
         });
         let raw = tokio::time::timeout(
             std::time::Duration::from_secs(2),

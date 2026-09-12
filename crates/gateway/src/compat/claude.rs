@@ -153,6 +153,9 @@ pub fn anthropic_to_openai(body: &Value) -> Result<Value, String> {
         let mut text_parts: Vec<String> = Vec::new();
         let mut tool_calls: Vec<Value> = Vec::new();
         let mut tool_results: Vec<Value> = Vec::new();
+        let mut thinking_parts: Vec<String> = Vec::new();
+        let mut signature: Option<String> = None;
+        let mut redacted = false;
 
         match content {
             Some(Value::String(s)) => text_parts.push(s.clone()),
@@ -162,6 +165,20 @@ pub fn anthropic_to_openai(body: &Value) -> Result<Value, String> {
                         Some("text") => {
                             if let Some(t) = block.get("text").and_then(Value::as_str) {
                                 text_parts.push(t.to_string());
+                            }
+                        }
+                        Some("thinking") => {
+                            if let Some(th) = block.get("thinking").and_then(Value::as_str) {
+                                thinking_parts.push(th.to_string());
+                            }
+                            if let Some(sig) = block.get("signature").and_then(Value::as_str) {
+                                signature = Some(sig.to_string());
+                            }
+                        }
+                        Some("redacted_thinking") => {
+                            redacted = true;
+                            if let Some(data) = block.get("data").and_then(Value::as_str) {
+                                signature = Some(data.to_string());
                             }
                         }
                         Some("tool_use") => {
@@ -193,11 +210,16 @@ pub fn anthropic_to_openai(body: &Value) -> Result<Value, String> {
                                     _ => None,
                                 })
                                 .unwrap_or_default();
-                            tool_results.push(json!({
+                            let is_error = block.get("is_error").and_then(Value::as_bool);
+                            let mut tr = json!({
                                 "role": "tool",
                                 "tool_call_id": id,
                                 "content": text
-                            }));
+                            });
+                            if let Some(err) = is_error {
+                                tr["is_error"] = json!(err);
+                            }
+                            tool_results.push(tr);
                         }
                         _ => {}
                     }
@@ -206,7 +228,32 @@ pub fn anthropic_to_openai(body: &Value) -> Result<Value, String> {
             _ => {}
         }
 
-        if !tool_calls.is_empty() {
+        if role == "assistant"
+            && (!tool_calls.is_empty()
+                || !thinking_parts.is_empty()
+                || signature.is_some()
+                || redacted)
+        {
+            let mut m = Map::new();
+            m.insert("role".to_string(), json!("assistant"));
+            m.insert("content".to_string(), json!(text_parts.join("")));
+            if !tool_calls.is_empty() {
+                m.insert("tool_calls".to_string(), Value::Array(tool_calls));
+            }
+            if !thinking_parts.is_empty() {
+                m.insert(
+                    "reasoning_content".to_string(),
+                    json!(thinking_parts.join("")),
+                );
+            }
+            if let Some(sig) = signature {
+                m.insert("reasoning_signature".to_string(), json!(sig));
+            }
+            if redacted {
+                m.insert("reasoning_redacted".to_string(), json!(true));
+            }
+            out_messages.push(Value::Object(m));
+        } else if !tool_calls.is_empty() {
             let mut m = Map::new();
             m.insert("role".to_string(), json!("assistant"));
             m.insert("content".to_string(), json!(text_parts.join("")));
@@ -628,10 +675,37 @@ pub fn messages_payload(
     usage: Option<&Usage>,
     reasoning_signature: Option<&str>,
 ) -> Value {
+    messages_payload_full(
+        id,
+        model,
+        text,
+        tool_calls,
+        finish,
+        usage,
+        None,
+        reasoning_signature,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // payload mirrors upstream messages shape
+pub fn messages_payload_full(
+    id: &str,
+    model: &str,
+    text: &str,
+    tool_calls: &[(String, String, String)],
+    finish: &str,
+    usage: Option<&Usage>,
+    thinking: Option<&str>,
+    reasoning_signature: Option<&str>,
+) -> Value {
     let mut content: Vec<Value> = Vec::new();
     // Anthropic orders the thinking block ahead of the visible answer.
-    if let Some(sig) = reasoning_signature {
-        content.push(json!({ "type": "thinking", "thinking": "", "signature": sig }));
+    if thinking.is_some() || reasoning_signature.is_some() {
+        let mut b = json!({ "type": "thinking", "thinking": thinking.unwrap_or("") });
+        if let Some(sig) = reasoning_signature {
+            b["signature"] = json!(sig);
+        }
+        content.push(b);
     }
     if !text.is_empty() {
         content.push(json!({ "type": "text", "text": text }));
@@ -790,7 +864,8 @@ pub struct AnthropicStreamRenderer {
     terminated: bool,
     tool_index: u64,
     next_content_index: u64,
-    current_tool_index: Option<u64>,
+    tool_indices: std::collections::BTreeMap<u64, u64>,
+    closed_tools: std::collections::HashSet<u64>,
     thinking_index: Option<u64>,
     output_limit_reached: bool,
 }
@@ -805,7 +880,8 @@ impl AnthropicStreamRenderer {
             terminated: false,
             tool_index: 0,
             next_content_index: 0,
-            current_tool_index: None,
+            tool_indices: std::collections::BTreeMap::new(),
+            closed_tools: std::collections::HashSet::new(),
             thinking_index: None,
             output_limit_reached: false,
         }
@@ -851,12 +927,14 @@ impl AnthropicStreamRenderer {
         }
     }
 
-    fn close_open_tool(&mut self, out: &mut Vec<bytes::Bytes>) {
-        if let Some(index) = self.current_tool_index.take() {
-            out.push(Self::frame(
-                "content_block_stop",
-                json!({"type":"content_block_stop","index":index}),
-            ));
+    fn close_open_tools(&mut self, out: &mut Vec<bytes::Bytes>) {
+        for (output_index, index) in &self.tool_indices {
+            if self.closed_tools.insert(*output_index) {
+                out.push(Self::frame(
+                    "content_block_stop",
+                    json!({"type":"content_block_stop","index":index}),
+                ));
+            }
         }
     }
 
@@ -871,7 +949,7 @@ impl AnthropicStreamRenderer {
             }
             CodexEvent::TextDelta(text) => {
                 self.close_thinking(&mut out);
-                self.close_open_tool(&mut out);
+                self.close_open_tools(&mut out);
                 let index = if let Some(index) = self.current_text_index {
                     index
                 } else {
@@ -903,21 +981,23 @@ impl AnthropicStreamRenderer {
                     json!({"type":"content_block_delta","index":index,"delta":{"type":"signature_delta","signature":signature}}),
                 ));
             }
-            CodexEvent::ToolCallBegin { call_id, name, .. } => {
+            // Redacted reasoning has no Anthropic wire representation without
+            // upstream redacted data; the marker only keeps the state explicit.
+            CodexEvent::ReasoningRedacted => {}
+            CodexEvent::ToolCallBegin { call_id, name, output_index } => {
                 self.close_thinking(&mut out);
                 self.close_text(&mut out);
-                self.close_open_tool(&mut out);
                 let index = self.next_content_index;
                 self.next_content_index += 1;
                 self.tool_index += 1;
-                self.current_tool_index = Some(index);
+                self.tool_indices.insert(output_index, index);
                 out.push(Self::frame(
                     "content_block_start",
                     json!({"type":"content_block_start","index":index,"content_block":{"type":"tool_use","id":call_id,"name":name,"input":{}}}),
                 ));
             }
-            CodexEvent::ToolArgsDelta { delta, .. } => {
-                let index = self.current_tool_index.unwrap_or(1);
+            CodexEvent::ToolArgsDelta { delta, output_index } => {
+                let index = self.tool_indices.get(&output_index).copied().unwrap_or(1);
                 out.push(Self::frame(
                     "content_block_delta",
                     json!({"type":"content_block_delta","index":index,"delta":{"type":"input_json_delta","partial_json":delta}}),
@@ -927,7 +1007,7 @@ impl AnthropicStreamRenderer {
             CodexEvent::Completed { usage } => {
                 self.close_thinking(&mut out);
                 self.close_text(&mut out);
-                self.close_open_tool(&mut out);
+                self.close_open_tools(&mut out);
                 let stop = if self.output_limit_reached {
                     "max_tokens"
                 } else if self.tool_index > 0 {
@@ -957,7 +1037,7 @@ impl AnthropicStreamRenderer {
         if let Some(index) = self.thinking_index {
             return index;
         }
-        self.close_open_tool(out);
+        self.close_open_tools(out);
         self.close_text(out);
         let index = self.next_content_index;
         self.next_content_index += 1;

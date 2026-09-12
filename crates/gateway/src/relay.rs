@@ -33,6 +33,8 @@ pub enum RelayMode {
     /// Image generation is relayed without chat translation after a binding
     /// capability gate selects a provider-specific image binding.
     Image,
+    /// OpenAI Responses API surface.
+    Responses,
 }
 
 struct FinalFailure {
@@ -48,18 +50,34 @@ fn now_unix_secs() -> i64 {
         .unwrap_or(0)
 }
 
-/// Everything needed to finalize a streamed request record once the response
-/// body has been fully delivered (or abandoned by a client disconnect).
+pub fn subscribe_finalizer(
+    state: &AppState,
+    account_or_event: &str,
+) -> tokio::sync::mpsc::Receiver<()> {
+    state.subscribe_finalizer(account_or_event)
+}
+
+fn get_preflight_deadline(headers: &HeaderMap) -> std::time::Duration {
+    let ms = headers
+        .get("x-test-preflight-deadline-ms")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(10_000);
+    std::time::Duration::from_millis(ms)
+}
+
 struct StreamedOutcome {
     state: Arc<AppState>,
+    member: Arc<AccountMember>,
+    credential_token: String,
     event_id: String,
     occurred_at_ms: i64,
     provider: String,
-    account: Option<String>,
     model: Option<String>,
     key_identifier: Option<String>,
     scoped_entry: Option<Arc<crate::state::ScopedKeyEntry>>,
     upstream_capture: Option<Arc<std::sync::Mutex<Option<crate::usage::ResponseTokenUsage>>>>,
+    devin_outcome: Option<Arc<std::sync::Mutex<Option<compat::devin::DevinOutcome>>>>,
     status: u16,
     started: std::time::Instant,
     bytes_in: usize,
@@ -100,17 +118,118 @@ impl StreamCapture {
         let tokens = token_usage.map(crate::usage::ResponseTokenUsage::total_tokens);
         let bytes_out = self.bytes_out;
         let state = outcome.state;
+
+        let mut success = true;
+        let mut status = outcome.status;
+
+        if outcome.provider == "devin" {
+            // Defect 1: Default to failure unless verified EOF terminal success!
+            success = false;
+            let mut terminal_success = false;
+            let mut connect_error = None;
+
+            // Find matching member in current pool ONLY IF it has the exact same credential and runtime identity!
+            // (Preserves same-credential mutable runtime identity across catalog generations,
+            // while rotated credentials are never contaminated).
+            let current_pool_member = state
+                .pool
+                .load()
+                .members
+                .iter()
+                .find(|m| {
+                    m.id() == outcome.member.id()
+                        && m.access_token() == outcome.credential_token
+                        && (Arc::ptr_eq(&outcome.member, m) || outcome.member.shares_runtime_identity(m))
+                })
+                .cloned();
+
+            if let Some(cell) = outcome.devin_outcome.as_ref() {
+                let guard = cell.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(devin) = guard.as_ref() {
+                    if let Some(ref code) = devin.error_code {
+                        connect_error = Some((code.clone(), devin.error_message.clone()));
+                    } else if devin.terminated {
+                        terminal_success = true;
+                    }
+                }
+            }
+
+            if terminal_success {
+                success = true;
+                outcome.member.record_ok();
+                if let Some(ref current) = current_pool_member {
+                    if !Arc::ptr_eq(&outcome.member.ok_count, &current.ok_count) {
+                        current.record_ok();
+                    }
+                    state.monitor.clear_error(current.id());
+                    state.scheduler.record_success(current.id(), &state.pool.load().members);
+                    state.router.feedback(current.id(), Outcome::Success);
+                }
+                state.metrics.served.fetch_add(1, Ordering::Relaxed);
+            } else if let Some((code, msg)) = connect_error {
+                // Connect error in EndStream: fail exactly once, preserve status and health
+                status = connect_code_to_http_status(&code).as_u16();
+                outcome.member.record_fail();
+                if let Some(ref current) = current_pool_member {
+                    if !Arc::ptr_eq(&outcome.member.fail_count, &current.fail_count) {
+                        current.record_fail();
+                    }
+                    state.monitor.record_error(
+                        current.id(),
+                        status,
+                        msg.as_deref().unwrap_or("upstream error"),
+                    );
+                    if code == "resource_exhausted" {
+                        let now_ms = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
+                            .unwrap_or(0);
+                        let until = cooldown_deadline_ms(now_ms, 300);
+                        current.set_health(Health::Cooldown { until_unix_ms: until });
+                    } else if code == "unauthenticated" {
+                        current.set_health(Health::AuthFailed);
+                    }
+                }
+                if code == "resource_exhausted" {
+                    let now_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
+                        .unwrap_or(0);
+                    let until = cooldown_deadline_ms(now_ms, 300);
+                    outcome.member.set_health(Health::Cooldown { until_unix_ms: until });
+                } else if code == "unauthenticated" {
+                    outcome.member.set_health(Health::AuthFailed);
+                }
+            } else {
+                // Client cancellation / premature disconnect / incomplete stream
+                outcome.member.record_fail();
+                if let Some(ref current) = current_pool_member {
+                    if !Arc::ptr_eq(&outcome.member.fail_count, &current.fail_count) {
+                        current.record_fail();
+                    }
+                    state.monitor.record_error(
+                        current.id(),
+                        if status == 200 { 499 } else { status },
+                        "stream terminated prematurely or canceled by client",
+                    );
+                }
+                if status == 200 {
+                    status = 499;
+                }
+            }
+        }
+
         tokio::spawn(async move {
             let record = OutcomeRecord {
                 event_id: &outcome.event_id,
                 occurred_at_ms: outcome.occurred_at_ms,
                 provider: &outcome.provider,
-                account: outcome.account.as_deref(),
+                account: Some(outcome.member.id()),
                 model: outcome.model.as_deref(),
                 key_identifier: outcome.key_identifier.as_deref(),
                 scoped_entry: outcome.scoped_entry.as_deref(),
-                status: outcome.status,
-                success: true,
+                status,
+                success,
                 elapsed_ms: outcome.started.elapsed().as_millis() as u64,
                 bytes_in: outcome.bytes_in,
                 bytes_out,
@@ -118,6 +237,7 @@ impl StreamCapture {
                 token_usage,
             };
             record_request_outcome(&state, record).await;
+            state.notify_finalizer(Some(outcome.member.id()), &outcome.event_id);
         });
     }
 }
@@ -335,6 +455,7 @@ struct UpstreamTarget {
     url: String,
     body: Bytes,
     protocol: compat::Protocol,
+    headers: Option<Vec<(String, String)>>,
 }
 
 struct UpstreamExchange {
@@ -382,7 +503,9 @@ fn openai_body_with_model(plan: &RelayPlan, model: &str) -> Option<serde_json::V
 }
 
 fn resolve_target(
+    pool: &crate::state::PoolSnapshot,
     member: &AccountMember,
+    selected_token: &str,
     plan: &RelayPlan,
     upstream_model: &str,
 ) -> Result<UpstreamTarget, String> {
@@ -392,6 +515,7 @@ fn resolve_target(
             url: crate::url::join_provider_path(base, &plan.upstream_path),
             body: body_with_model(&plan.original_body, upstream_model),
             protocol: compat::Protocol::Codex,
+            headers: None,
         });
     }
 
@@ -416,13 +540,63 @@ fn resolve_target(
             ),
             body: Bytes::from(wrapped.to_string()),
             protocol: compat::Protocol::Antigravity,
+            headers: None,
         });
     }
 
     if plan.mode == RelayMode::GeminiNative {
+        if member.kind() == crate::account::ProviderKind::Devin {
+            let openai_body = openai_body_with_model(plan, upstream_model)
+                .ok_or_else(|| "Devin requires an OpenAI-shaped request".to_string())?;
+            let token = selected_token.to_string();
+            let chat_model_uid = upstream_model
+                .strip_prefix("devin/")
+                .unwrap_or(upstream_model)
+                .to_string();
+            let supports_vision = pool.devin_model_supports_vision(member.id(), &chat_model_uid);
+            let params = compat::devin::DevinRequestParams {
+                token: token.clone(),
+                chat_model_uid,
+                supports_vision,
+                trajectory_id: uuid::Uuid::new_v4().to_string(),
+                cascade_id: uuid::Uuid::new_v4().to_string(),
+                execution_id: uuid::Uuid::new_v4().to_string(),
+                fingerprint: "0123456789abcdef0123456789abcdef".to_string(),
+            };
+            let mut id_counter = 0u64;
+            let mut new_id = || {
+                id_counter += 1;
+                format!("{}-{}", uuid::Uuid::new_v4(), id_counter)
+            };
+            let wire = compat::devin::build_chat_request(&openai_body, &params, &mut new_id)
+                .map_err(|e| format!("failed to build Devin request: {e}"))?;
+            let framed = compat::devin::frame_data(&wire);
+            let url = crate::url::build_provider_url(
+                member.kind(),
+                member.upstream_override.as_deref(),
+                "/exa.api_server_pb.ApiServerService/GetChatMessage",
+            );
+            return Ok(UpstreamTarget {
+                url,
+                body: Bytes::from(framed),
+                protocol: compat::Protocol::Devin,
+                headers: Some(vec![
+                    (
+                        "authorization".to_string(),
+                        compat::devin::authorization_header(&token),
+                    ),
+                    (
+                        "content-type".to_string(),
+                        compat::devin::STREAM_CONTENT_TYPE.to_string(),
+                    ),
+                    ("connect-protocol-version".to_string(), "1".to_string()),
+                ]),
+            });
+        }
+
         // The client already speaks Gemini, so only the envelope is added.
         if member.kind() != crate::account::ProviderKind::Antigravity {
-            return Err("gemini-native requests need an antigravity account".to_string());
+            return Err("gemini-native requests need an antigravity or devin account".to_string());
         }
         let project = member
             .project_id()
@@ -440,10 +614,62 @@ fn resolve_target(
             url: crate::url::build_antigravity_url(member.upstream_override.as_deref()),
             body: Bytes::from(wrapped.to_string()),
             protocol: compat::Protocol::Antigravity,
+            headers: None,
         });
     }
 
     if member.kind() != crate::account::ProviderKind::Antigravity {
+        if member.kind() == crate::account::ProviderKind::Devin {
+            if matches!(plan.mode, RelayMode::Native) {
+                return Err("Devin does not support native/responses relay mode yet".to_string());
+            }
+            let openai_body = openai_body_with_model(plan, upstream_model)
+                .ok_or_else(|| "Devin requires an OpenAI-shaped request".to_string())?;
+            let token = selected_token.to_string();
+            let chat_model_uid = upstream_model
+                .strip_prefix("devin/")
+                .unwrap_or(upstream_model)
+                .to_string();
+            let supports_vision = pool.devin_model_supports_vision(member.id(), &chat_model_uid);
+            let params = compat::devin::DevinRequestParams {
+                token: token.clone(),
+                chat_model_uid,
+                supports_vision,
+                trajectory_id: uuid::Uuid::new_v4().to_string(),
+                cascade_id: uuid::Uuid::new_v4().to_string(),
+                execution_id: uuid::Uuid::new_v4().to_string(),
+                fingerprint: "0123456789abcdef0123456789abcdef".to_string(),
+            };
+            let mut id_counter = 0u64;
+            let mut new_id = || {
+                id_counter += 1;
+                format!("{}-{}", uuid::Uuid::new_v4(), id_counter)
+            };
+            let wire = compat::devin::build_chat_request(&openai_body, &params, &mut new_id)
+                .map_err(|e| format!("failed to build Devin request: {e}"))?;
+            let framed = compat::devin::frame_data(&wire);
+            let url = crate::url::build_provider_url(
+                member.kind(),
+                member.upstream_override.as_deref(),
+                "/exa.api_server_pb.ApiServerService/GetChatMessage",
+            );
+            return Ok(UpstreamTarget {
+                url,
+                body: Bytes::from(framed),
+                protocol: compat::Protocol::Devin,
+                headers: Some(vec![
+                    (
+                        "authorization".to_string(),
+                        compat::devin::authorization_header(&token),
+                    ),
+                    (
+                        "content-type".to_string(),
+                        compat::devin::STREAM_CONTENT_TYPE.to_string(),
+                    ),
+                    ("connect-protocol-version".to_string(), "1".to_string()),
+                ]),
+            });
+        }
         if member.kind() == crate::account::ProviderKind::Vertex {
             let openai = openai_body_with_model(plan, upstream_model)
                 .ok_or_else(|| "Vertex requires an OpenAI-shaped request".to_string())?;
@@ -470,6 +696,7 @@ fn resolve_target(
                 ),
                 body: Bytes::from(compat::gemini::openai_to_gemini(&openai)?.to_string()),
                 protocol: compat::Protocol::Antigravity,
+                headers: None,
             });
         }
         if member.kind() == crate::account::ProviderKind::Generic {
@@ -497,6 +724,7 @@ fn resolve_target(
                     ),
                     body: Bytes::from(compat::gemini::openai_to_gemini(&openai_body)?.to_string()),
                     protocol: compat::Protocol::Antigravity,
+                    headers: None,
                 });
             }
             if adapter == "anthropic" {
@@ -511,6 +739,7 @@ fn resolve_target(
                             .map_err(|error| error.to_string())?,
                     ),
                     protocol: compat::Protocol::Anthropic,
+                    headers: None,
                 });
             }
             if adapter == "mimo-free" {
@@ -527,6 +756,7 @@ fn resolve_target(
                     url: endpoint,
                     body: Bytes::from(body.to_string()),
                     protocol: compat::Protocol::Codex,
+                    headers: None,
                 });
             }
             if adapter == "openai-responses" || adapter == "azure-openai" {
@@ -547,6 +777,7 @@ fn resolve_target(
                     url,
                     body: plan.body.clone(),
                     protocol: compat::Protocol::Codex,
+                    headers: None,
                 });
             }
             return Ok(UpstreamTarget {
@@ -557,6 +788,7 @@ fn resolve_target(
                 ),
                 body: body_with_model(&plan.original_body, upstream_model),
                 protocol: compat::Protocol::Codex,
+                headers: None,
             });
         }
         if member.kind() == crate::account::ProviderKind::Cursor {
@@ -570,6 +802,7 @@ fn resolve_target(
                 ),
                 body: Bytes::from(compat::cursor::openai_to_cursor_connect(&openai)?),
                 protocol: compat::Protocol::Cursor,
+                headers: None,
             });
         }
         if member.kind() == crate::account::ProviderKind::Kiro {
@@ -591,6 +824,7 @@ fn resolve_target(
                     .map_err(|e| e.to_string())?,
                 ),
                 protocol: compat::Protocol::Kiro,
+                headers: None,
             });
         }
         if matches!(
@@ -625,6 +859,7 @@ fn resolve_target(
                 ),
                 body,
                 protocol: compat::Protocol::Anthropic,
+                headers: None,
             });
         }
         return Ok(UpstreamTarget {
@@ -635,6 +870,7 @@ fn resolve_target(
             ),
             body: body_with_model(&plan.body, upstream_model),
             protocol: compat::Protocol::Codex,
+            headers: None,
         });
     }
 
@@ -649,9 +885,49 @@ fn resolve_target(
         url: crate::url::build_antigravity_url(member.upstream_override.as_deref()),
         body: Bytes::from(translated.to_string()),
         protocol: compat::Protocol::Antigravity,
+        headers: None,
     })
 }
 
+#[derive(Debug)]
+enum UpstreamSendError {
+    Reqwest(reqwest::Error),
+    DevinClient(crate::proxy_policy::DevinClientBuildError),
+}
+
+impl std::fmt::Display for UpstreamSendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Reqwest(e) => write!(f, "{e}"),
+            Self::DevinClient(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for UpstreamSendError {}
+
+impl From<reqwest::Error> for UpstreamSendError {
+    fn from(e: reqwest::Error) -> Self {
+        Self::Reqwest(e)
+    }
+}
+
+impl From<crate::proxy_policy::DevinClientBuildError> for UpstreamSendError {
+    fn from(e: crate::proxy_policy::DevinClientBuildError) -> Self {
+        Self::DevinClient(e)
+    }
+}
+
+impl UpstreamSendError {
+    fn is_ambiguous(&self) -> bool {
+        match self {
+            Self::Reqwest(e) => e.is_timeout() || e.is_connect() || e.is_request(),
+            Self::DevinClient(_) => false,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn send_upstream(
     state: &AppState,
     target_url: &str,
@@ -660,9 +936,22 @@ async fn send_upstream(
     body_bytes: &Bytes,
     protocol: compat::Protocol,
     accept: Option<&str>,
-) -> Result<UpstreamExchange, reqwest::Error> {
-    let mut req_builder = state.http_client.post(target_url);
-    let mut member_headers = member.build_upstream_headers();
+    custom_headers: Option<&[(String, String)]>,
+) -> Result<UpstreamExchange, UpstreamSendError> {
+    let client = if member.kind() == crate::account::ProviderKind::Devin {
+        state.try_devin_client_for_member(member)?
+    } else {
+        state.client_for_member(member)
+    };
+    let mut req_builder = client.post(target_url);
+    if protocol == compat::Protocol::Devin {
+        req_builder = req_builder.version(reqwest::Version::HTTP_11);
+    }
+    let mut member_headers = if let Some(custom) = custom_headers {
+        custom.to_vec()
+    } else {
+        member.build_upstream_headers()
+    };
 
     // If client provided anthropic-beta headers, merge them with member headers
     // so client-requested beta features (e.g. prompt-caching, output-128k) are preserved.
@@ -687,14 +976,21 @@ async fn send_upstream(
     for (name, val) in member_headers {
         req_builder = req_builder.header(name, val);
     }
-    if let Some(accept) = accept {
-        req_builder = req_builder.header(header::ACCEPT, accept);
-    }
-    if let Some(ct) = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-    {
-        req_builder = req_builder.header(header::CONTENT_TYPE.as_str(), ct);
+    if protocol == compat::Protocol::Devin {
+        req_builder = req_builder.header(
+            header::ACCEPT,
+            accept.unwrap_or(compat::devin::STREAM_CONTENT_TYPE),
+        );
+    } else {
+        if let Some(accept) = accept {
+            req_builder = req_builder.header(header::ACCEPT, accept);
+        }
+        if let Some(ct) = headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+        {
+            req_builder = req_builder.header(header::CONTENT_TYPE.as_str(), ct);
+        }
     }
     let req_start = std::time::Instant::now();
     let (resp, cursor_reply) = if protocol == compat::Protocol::Cursor {
@@ -800,6 +1096,74 @@ pub fn cooldown_deadline_from_headers(headers: &reqwest::header::HeaderMap, now_
         })
         .unwrap_or(300);
     cooldown_deadline_ms(now_ms, retry_after_secs)
+}
+
+/// Parses a Cline `INFERENCE_CAP_ERROR` 429 response:
+/// `{"error":{"code":"INFERENCE_CAP_ERROR","message":"Error 429: Daily free limit reached on model z-ai/glm-5.3-flash. Try again in 8h 48m"}}`
+/// Returns `Some((model_slug, reset_seconds))`.
+fn parse_cline_cap_error(body: &[u8]) -> Option<(String, i64)> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let message = value.get("error")?.get("message")?.as_str()?;
+    let prefix = "Daily free limit reached on model ";
+    let pos = message.find(prefix)?;
+    let remainder = &message[pos + prefix.len()..];
+    let try_again_prefix = ". Try again in ";
+    let try_pos = remainder.find(try_again_prefix)?;
+    let model = remainder[..try_pos].trim().to_string();
+    let time_str = remainder[try_pos + try_again_prefix.len()..].trim();
+
+    let mut hours = 0i64;
+    let mut mins = 0i64;
+    for part in time_str.split_whitespace() {
+        if let Some(h) = part.strip_suffix('h') {
+            if let Ok(val) = h.parse::<i64>() {
+                hours = val;
+            }
+        } else if let Some(m) = part.strip_suffix('m') {
+            if let Ok(val) = m.parse::<i64>() {
+                mins = val;
+            }
+        }
+    }
+    let total_secs = hours * 3600 + mins * 60;
+    Some((model, if total_secs > 0 { total_secs } else { 300 }))
+}
+
+/// Updates the member's `AccountUsage` with a QuotaGroup bucket representing the Cline model limit.
+fn record_cline_quota_bucket(member: &AccountMember, model: &str, reset_seconds: i64, now_unix: i64) {
+    let reset_at_unix = now_unix + reset_seconds;
+    let mut usage = member.usage_snapshot();
+    let group_name = "Cline Free Limits".to_string();
+    let bucket_label = format!("{model} (Daily limit)");
+
+    let group = match usage.groups.iter_mut().find(|g| g.display_name.as_deref() == Some(&group_name)) {
+        Some(g) => g,
+        None => {
+            usage.groups.push(crate::usage::QuotaGroup {
+                display_name: Some(group_name.clone()),
+                models: Some("Cline Free Models".to_string()),
+                buckets: Vec::new(),
+            });
+            usage.groups.last_mut().unwrap()
+        }
+    };
+
+    if let Some(bucket) = group.buckets.iter_mut().find(|b| b.bucket_id.as_deref() == Some(model)) {
+        bucket.used_percent = Some(100.0);
+        bucket.reset_at_unix = Some(reset_at_unix);
+        bucket.display_name = Some(bucket_label);
+    } else {
+        group.buckets.push(crate::usage::QuotaBucket {
+            bucket_id: Some(model.to_string()),
+            display_name: Some(bucket_label),
+            window: Some("Daily".to_string()),
+            used_percent: Some(100.0),
+            reset_at_unix: Some(reset_at_unix),
+        });
+    }
+
+    usage.observed_at_unix = Some(now_unix);
+    member.set_usage(usage);
 }
 
 async fn record_cooldown(
@@ -932,14 +1296,39 @@ fn build_plan(mode: RelayMode, req_path: &str, body_bytes: Bytes) -> Result<Rela
                 .get("stream")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
+            let model = compat::extract_model(&body_bytes);
+            let openai_body = model
+                .as_deref()
+                .and_then(|m| compat::gemini::gemini_to_openai(&gemini, m).ok());
             Ok(RelayPlan {
                 upstream_path: req_path.to_string(),
-                model: compat::extract_model(&body_bytes),
+                model,
                 body: body_bytes.clone(),
                 mode,
                 client_stream: stream,
                 include_usage: false,
-                openai_body: None,
+                openai_body,
+                original_body: body_bytes.clone(),
+            })
+        }
+        RelayMode::Responses => {
+            let responses_req: serde_json::Value = serde_json::from_slice(&body_bytes)
+                .map_err(|e| format!("invalid responses request: {e}"))?;
+            let stream = responses_req
+                .get("stream")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let openai = compat::responses::responses_to_openai(&responses_req)
+                .map_err(|e| e.to_string())?;
+            let model = compat::extract_model(&body_bytes);
+            Ok(RelayPlan {
+                upstream_path: req_path.to_string(),
+                model,
+                body: body_bytes.clone(),
+                mode,
+                client_stream: stream,
+                include_usage: false,
+                openai_body: Some(openai),
                 original_body: body_bytes.clone(),
             })
         }
@@ -965,6 +1354,7 @@ fn reply_shape(mode: RelayMode) -> compat::ReplyShape {
     match mode {
         RelayMode::GeminiNative => compat::ReplyShape::Gemini,
         RelayMode::LegacyCompletions => compat::ReplyShape::TextCompletion,
+        RelayMode::Responses => compat::ReplyShape::Responses,
         _ => compat::ReplyShape::Chat,
     }
 }
@@ -995,6 +1385,7 @@ fn member_provider_id(member: &AccountMember) -> Option<ProviderId> {
         crate::account::ProviderKind::Kiro => ProviderId::kiro(),
         crate::account::ProviderKind::Zcode => ProviderId::zcode(),
         crate::account::ProviderKind::Vertex => ProviderId::vertex(),
+        crate::account::ProviderKind::Devin => ProviderId::devin(),
         crate::account::ProviderKind::Generic => {
             ProviderId::canonical(member.provider_name()).ok()?
         }
@@ -1003,6 +1394,7 @@ fn member_provider_id(member: &AccountMember) -> Option<ProviderId> {
 }
 
 fn account_declares_binding_model(
+    pool: &crate::state::PoolSnapshot,
     member: &AccountMember,
     requested_model: &str,
     canonical_model: &str,
@@ -1018,6 +1410,12 @@ fn account_declares_binding_model(
         return false;
     }
     drop(unsupported);
+
+    if member.kind() == crate::account::ProviderKind::Devin {
+        return pool.is_devin_model_eligible(member.id(), requested_model)
+            || pool.is_devin_model_eligible(member.id(), canonical_model)
+            || pool.is_devin_model_eligible(member.id(), &provider.upstream_model);
+    }
 
     let Some((_, models)) = member.generic_models() else {
         return true;
@@ -1198,6 +1596,7 @@ fn eligible_indices(
             })
             .filter(|(_, member)| {
                 account_declares_binding_model(
+                    pool,
                     member,
                     requested_model,
                     &route.canonical_model,
@@ -1307,6 +1706,7 @@ fn capture_usage(member: &AccountMember, headers: &HeaderMap) {
         .unwrap_or(0);
     let usage = match member.kind() {
         crate::account::ProviderKind::Claude => parse_claude_headers(&map, now),
+        crate::account::ProviderKind::Devin => crate::usage::AccountUsage::default(),
         _ => parse_codex_headers(&map, now),
     };
     if usage.observed_at_unix.is_some() {
@@ -1350,10 +1750,169 @@ mod usage_capture_tests {
     }
 }
 
+pub fn connect_code_to_http_status(code: &str) -> StatusCode {
+    match code {
+        "canceled" => StatusCode::REQUEST_TIMEOUT,
+        "invalid_argument" | "failed_precondition" | "out_of_range" => StatusCode::BAD_REQUEST,
+        "deadline_exceeded" => StatusCode::GATEWAY_TIMEOUT,
+        "not_found" => StatusCode::NOT_FOUND,
+        "already_exists" | "aborted" => StatusCode::CONFLICT,
+        "permission_denied" => StatusCode::FORBIDDEN,
+        "resource_exhausted" => StatusCode::TOO_MANY_REQUESTS,
+        "unimplemented" => StatusCode::NOT_IMPLEMENTED,
+        "unavailable" => StatusCode::SERVICE_UNAVAILABLE,
+        "unauthenticated" => StatusCode::UNAUTHORIZED,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+async fn acquire_devin_first_frame(
+    resp: reqwest::Response,
+) -> Result<(Bytes, compat::UpstreamStream), String> {
+    use futures::StreamExt;
+    let mut stream: compat::UpstreamStream = Box::pin(resp.bytes_stream());
+
+    // 1. Read chunks until we have at least 5 bytes for the Connect header.
+    let mut header_buf = [0u8; 5];
+    let mut header_len = 0;
+    let mut first_chunk_rem: Option<Bytes> = None;
+
+    while header_len < 5 {
+        let chunk = match stream.next().await {
+            Some(Ok(c)) => c,
+            Some(Err(_)) => return Err("upstream connection error during preflight".to_string()),
+            None => {
+                return Err("connect stream ended with truncated header during preflight".to_string())
+            }
+        };
+
+        if chunk.is_empty() {
+            continue;
+        }
+
+        let needed = 5 - header_len;
+        if chunk.len() >= needed {
+            header_buf[header_len..5].copy_from_slice(&chunk[..needed]);
+            let rem = chunk.slice(needed..);
+            if !rem.is_empty() {
+                first_chunk_rem = Some(rem);
+            }
+            break;
+        } else {
+            header_buf[header_len..header_len + chunk.len()].copy_from_slice(&chunk);
+            header_len += chunk.len();
+        }
+    }
+
+    let flags = header_buf[0];
+    let payload_len = u32::from_be_bytes(header_buf[1..5].try_into().unwrap()) as usize;
+    if payload_len > compat::devin::MAX_FRAME_SIZE {
+        return Err(format!(
+            "connect frame too large: {payload_len} bytes > {}",
+            compat::devin::MAX_FRAME_SIZE
+        ));
+    }
+
+    let required_frame_len = 5 + payload_len;
+
+    // Buffer ONLY the first declared frame; preserve remainder as Bytes slices zero-copy
+    let (first_frame_bytes, stream) = match first_chunk_rem {
+        Some(rem) if rem.len() >= payload_len => {
+            let mut frame_buf = bytes::BytesMut::with_capacity(required_frame_len);
+            frame_buf.extend_from_slice(&header_buf);
+            frame_buf.extend_from_slice(&rem[..payload_len]);
+            let trailing = rem.slice(payload_len..);
+            let s: compat::UpstreamStream = if trailing.is_empty() {
+                stream
+            } else {
+                Box::pin(futures::stream::once(async move { Ok(trailing) }).chain(stream))
+            };
+            (frame_buf.freeze(), s)
+        }
+        Some(rem) => {
+            let mut frame_buf = bytes::BytesMut::with_capacity(required_frame_len);
+            frame_buf.extend_from_slice(&header_buf);
+            frame_buf.extend_from_slice(&rem);
+            let mut s = stream;
+            while frame_buf.len() < required_frame_len {
+                let chunk = match s.next().await {
+                    Some(Ok(c)) => c,
+                    Some(Err(_)) => return Err("upstream connection error during preflight".to_string()),
+                    None => {
+                        return Err("connect stream ended with truncated frame during preflight".to_string())
+                    }
+                };
+                let needed = required_frame_len - frame_buf.len();
+                if chunk.len() <= needed {
+                    frame_buf.extend_from_slice(&chunk);
+                } else {
+                    frame_buf.extend_from_slice(&chunk[..needed]);
+                    let trailing = chunk.slice(needed..);
+                    s = Box::pin(futures::stream::once(async move { Ok(trailing) }).chain(s));
+                    break;
+                }
+            }
+            (frame_buf.freeze(), s)
+        }
+        None => {
+            let mut frame_buf = bytes::BytesMut::with_capacity(required_frame_len);
+            frame_buf.extend_from_slice(&header_buf);
+            let mut s = stream;
+            while frame_buf.len() < required_frame_len {
+                let chunk = match s.next().await {
+                    Some(Ok(c)) => c,
+                    Some(Err(_)) => return Err("upstream connection error during preflight".to_string()),
+                    None => {
+                        return Err("connect stream ended with truncated frame during preflight".to_string())
+                    }
+                };
+                let needed = required_frame_len - frame_buf.len();
+                if chunk.len() <= needed {
+                    frame_buf.extend_from_slice(&chunk);
+                } else {
+                    frame_buf.extend_from_slice(&chunk[..needed]);
+                    let trailing = chunk.slice(needed..);
+                    s = Box::pin(futures::stream::once(async move { Ok(trailing) }).chain(s));
+                    break;
+                }
+            }
+            (frame_buf.freeze(), s)
+        }
+    };
+
+    // Validate the first frame using the accepted DevinDecoder
+    let mut decoder = compat::devin::DevinDecoder::new();
+    let mut events = Vec::new();
+    decoder.decode(&first_frame_bytes, &mut events);
+
+    if flags == 2 {
+        // First frame is terminal EndStream: decode finish to capture error or completion
+        decoder.finish(&mut events);
+        if let Some(ref code) = decoder.outcome().error_code {
+            let desc = decoder
+                .outcome()
+                .error_message
+                .as_deref()
+                .unwrap_or("upstream error");
+            return Err(format!("{code}: {desc}"));
+        }
+    }
+
+    for event in &events {
+        if let compat::events::CodexEvent::Failed { message } = event {
+            return Err(message.clone());
+        }
+    }
+
+    Ok((first_frame_bytes, stream))
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn finish_success(
     state: &AppState,
     member: &AccountMember,
     plan: &RelayPlan,
+    headers: &HeaderMap,
     resp: reqwest::Response,
     status_code: u16,
     created: i64,
@@ -1361,12 +1920,26 @@ async fn finish_success(
 ) -> Result<Response, String> {
     let protocol = session.protocol;
     let content_type = content_type_of(&resp);
-    capture_usage(member, resp.headers());
-    state.monitor.clear_error(member.id());
-    state.monitor.clear_error(member.id());
-    state
-        .scheduler
-        .record_success(member.id(), &state.pool.load().members);
+    if protocol == compat::Protocol::Devin {
+        let is_valid_ct = content_type
+            .as_deref()
+            .map(|ct| ct.split(';').next().unwrap_or("").trim() == compat::devin::STREAM_CONTENT_TYPE)
+            .unwrap_or(false);
+        if !is_valid_ct {
+            let actual = content_type.as_deref().unwrap_or("missing");
+            return Err(format!(
+                "invalid content-type for Devin Connect stream: expected {}, got {}",
+                compat::devin::STREAM_CONTENT_TYPE,
+                actual
+            ));
+        }
+    } else {
+        capture_usage(member, resp.headers());
+        state.monitor.clear_error(member.id());
+        state
+            .scheduler
+            .record_success(member.id(), &state.pool.load().members);
+    }
 
     // Generic accounts relay verbatim only when the upstream speaks the same
     // wire as the client. The google and anthropic adapters do not, so they
@@ -1393,6 +1966,9 @@ async fn finish_success(
         plan.mode,
         RelayMode::Native | RelayMode::Image | RelayMode::GeminiCountTokens
     ) {
+        if member.kind() == crate::account::ProviderKind::Devin {
+            return Err("Devin does not support native/responses relay mode yet".to_string());
+        }
         if content_type
             .as_deref()
             .is_some_and(|ct| ct.trim_start().starts_with("text/html"))
@@ -1465,13 +2041,26 @@ async fn finish_success(
         ));
     }
 
-    let (first, stream) = compat::open_stream(resp, protocol).await?;
+    let (first, stream) = if protocol == compat::Protocol::Devin {
+        tokio::time::timeout(
+            get_preflight_deadline(headers),
+            acquire_devin_first_frame(resp),
+        )
+        .await
+        .map_err(|_| "upstream request timed out during preflight".to_string())??
+    } else {
+        compat::open_stream(resp, protocol).await?
+    };
     let model = plan.model.clone().unwrap_or_default();
 
     if plan.mode == RelayMode::Anthropic && plan.client_stream {
-        member.record_ok();
-        state.metrics.served.fetch_add(1, Ordering::Relaxed);
-        state.router.feedback(member.id(), Outcome::Success);
+        let devin_outcome = (protocol == compat::Protocol::Devin)
+            .then(|| Arc::new(std::sync::Mutex::new(None)));
+        if protocol != compat::Protocol::Devin {
+            member.record_ok();
+            state.metrics.served.fetch_add(1, Ordering::Relaxed);
+            state.router.feedback(member.id(), Outcome::Success);
+        }
         let upstream_capture = Arc::new(std::sync::Mutex::new(None));
         let body = compat::streaming_body(compat::StreamingBodyParams {
             first,
@@ -1482,6 +2071,7 @@ async fn finish_success(
             shape: compat::ReplyShape::Anthropic,
             session,
             upstream_capture: Some(Arc::clone(&upstream_capture)),
+            devin_outcome: devin_outcome.as_ref().map(Arc::clone),
         });
         let mut response = Response::builder()
             .status(StatusCode::OK)
@@ -1492,27 +2082,54 @@ async fn finish_success(
                 (StatusCode::INTERNAL_SERVER_ERROR, "failed to build body").into_response()
             });
         response.extensions_mut().insert(upstream_capture);
+        if let Some(cell) = devin_outcome {
+            response.extensions_mut().insert(cell);
+        }
         return Ok(response);
     }
 
     if plan.mode == RelayMode::Anthropic {
-        let raw = compat::collect_stream(first, stream).await?;
+        let (raw, upstream_usage, devin_outcome) =
+            compat::collect_stream_with_replies(first, stream, session).await?;
+        if protocol == compat::Protocol::Devin {
+            if let Some(devin) = devin_outcome {
+                if let Some(code) = devin.error_code {
+                    return Err(format!(
+                        "{code}: {}",
+                        devin.error_message.as_deref().unwrap_or("unknown upstream error")
+                    ));
+                }
+                if !devin.terminated {
+                    return Err("connect stream ended without EndStream frame".to_string());
+                }
+            }
+        }
         member.record_ok();
         state.metrics.served.fetch_add(1, Ordering::Relaxed);
         state.router.feedback(member.id(), Outcome::Success);
-        return Ok(compat::anthropic_response(
+        let mut response = compat::anthropic_response(
             &raw,
             &model,
             created,
             protocol,
             plan.client_stream,
-        ));
+        );
+        if let Some(usage) = upstream_usage {
+            response
+                .extensions_mut()
+                .insert(Arc::new(std::sync::Mutex::new(Some(usage))));
+        }
+        return Ok(response);
     }
 
     if plan.client_stream {
-        member.record_ok();
-        state.metrics.served.fetch_add(1, Ordering::Relaxed);
-        state.router.feedback(member.id(), Outcome::Success);
+        let devin_outcome = (protocol == compat::Protocol::Devin)
+            .then(|| Arc::new(std::sync::Mutex::new(None)));
+        if protocol != compat::Protocol::Devin {
+            member.record_ok();
+            state.metrics.served.fetch_add(1, Ordering::Relaxed);
+            state.router.feedback(member.id(), Outcome::Success);
+        }
         let upstream_capture = Arc::new(std::sync::Mutex::new(None));
         let body = compat::streaming_body(compat::StreamingBodyParams {
             first,
@@ -1523,6 +2140,7 @@ async fn finish_success(
             shape: reply_shape(plan.mode),
             session,
             upstream_capture: Some(Arc::clone(&upstream_capture)),
+            devin_outcome: devin_outcome.as_ref().map(Arc::clone),
         });
         let mut response = Response::builder()
             .status(StatusCode::OK)
@@ -1533,14 +2151,60 @@ async fn finish_success(
                 (StatusCode::INTERNAL_SERVER_ERROR, "failed to build body").into_response()
             });
         response.extensions_mut().insert(upstream_capture);
+        if let Some(cell) = devin_outcome {
+            response.extensions_mut().insert(cell);
+        }
         return Ok(response);
     }
 
-    let (raw, upstream_usage) = compat::collect_stream_with_replies(first, stream, session).await?;
+    let (raw, upstream_usage, devin_outcome) =
+        compat::collect_stream_with_replies(first, stream, session).await?;
+    if protocol == compat::Protocol::Devin {
+        if let Some(devin) = devin_outcome {
+            if let Some(code) = devin.error_code {
+                return Err(format!(
+                    "{code}: {}",
+                    devin.error_message.as_deref().unwrap_or("unknown upstream error")
+                ));
+            }
+            if !devin.terminated {
+                return Err("connect stream ended without EndStream frame".to_string());
+            }
+        }
+    }
     let completion = compat::aggregate(&raw, model, created, protocol, reply_shape(plan.mode))?;
-    member.record_ok();
-    state.metrics.served.fetch_add(1, Ordering::Relaxed);
-    state.router.feedback(member.id(), Outcome::Success);
+    if protocol == compat::Protocol::Devin {
+        let current_pool_member = state
+            .pool
+            .load()
+            .members
+            .iter()
+            .find(|m| {
+                m.id() == member.id()
+                    && m.access_token() == member.access_token()
+                    && member.shares_runtime_identity(m)
+            })
+            .cloned();
+
+        member.record_ok();
+        if let Some(ref current) = current_pool_member {
+            if !Arc::ptr_eq(&member.ok_count, &current.ok_count) {
+                current.record_ok();
+            }
+            state.monitor.clear_error(current.id());
+            state.scheduler.record_success(current.id(), &state.pool.load().members);
+            state.router.feedback(current.id(), Outcome::Success);
+        }
+        state.metrics.served.fetch_add(1, Ordering::Relaxed);
+    } else {
+        member.record_ok();
+        state.metrics.served.fetch_add(1, Ordering::Relaxed);
+        state.router.feedback(member.id(), Outcome::Success);
+        state.monitor.clear_error(member.id());
+        state
+            .scheduler
+            .record_success(member.id(), &state.pool.load().members);
+    }
     let mut response = body_response(
         StatusCode::OK,
         Some("application/json"),
@@ -1831,7 +2495,7 @@ pub async fn handle_relay(
             .map(|provider| provider.upstream_model.as_str())
             .or(plan.model.as_deref())
             .unwrap_or_default();
-        let target = match resolve_target(&member, &plan, upstream_model) {
+        let target = match resolve_target(&pool, &member, &member_at, &plan, upstream_model) {
             Ok(t) => t,
             Err(message) => return json_error(StatusCode::BAD_REQUEST, &message),
         };
@@ -1853,6 +2517,7 @@ pub async fn handle_relay(
             &target.body,
             target.protocol,
             accept,
+            target.headers.as_deref(),
         )
         .await
         {
@@ -1866,6 +2531,12 @@ pub async fn handle_relay(
                 state
                     .monitor
                     .record_error(member.id(), 502, &format!("request error: {e}"));
+                if member.kind() == crate::account::ProviderKind::Devin && e.is_ambiguous() {
+                    return json_error(
+                        StatusCode::GATEWAY_TIMEOUT,
+                        &format!("ambiguous upstream request error: {e}"),
+                    );
+                }
                 continue;
             }
         };
@@ -1888,6 +2559,7 @@ pub async fn handle_relay(
                         &target.body,
                         target.protocol,
                         accept,
+                        target.headers.as_deref(),
                     )
                     .await
                     {
@@ -1936,6 +2608,7 @@ pub async fn handle_relay(
                 &state,
                 &member,
                 &plan,
+                headers,
                 resp,
                 status_code,
                 created,
@@ -1951,6 +2624,9 @@ pub async fn handle_relay(
                         .extensions_mut()
                         .remove::<Arc<std::sync::Mutex<Option<crate::usage::ResponseTokenUsage>>>>(
                         );
+                    let devin_outcome = response
+                        .extensions_mut()
+                        .remove::<Arc<std::sync::Mutex<Option<compat::devin::DevinOutcome>>>>();
                     let (parts, body) = response.into_parts();
                     let bytes_in = plan.original_body.len();
                     // A buffered body is already fully in memory: finalize the
@@ -2020,16 +2696,19 @@ pub async fn handle_relay(
                         .await;
                         return Response::from_parts(parts, Body::from(bytes));
                     }
+                    let credential_token = member.access_token();
                     let outcome = StreamedOutcome {
                         state: Arc::clone(&state),
+                        member: Arc::clone(&member),
+                        credential_token,
                         event_id: event_id.clone(),
                         occurred_at_ms,
                         provider: member.kind().as_str().to_string(),
-                        account: Some(member.id().to_string()),
                         model: plan.model.clone(),
                         key_identifier: key_identifier.clone(),
                         scoped_entry: scoped_entry.clone(),
                         upstream_capture,
+                        devin_outcome,
                         status: status_code,
                         started: request_started,
                         bytes_in,
@@ -2038,24 +2717,67 @@ pub async fn handle_relay(
                     return Response::from_parts(parts, Body::from_stream(counted));
                 }
                 Err(reason) => {
+                    let (mapped_status, code, description) =
+                        if let Some((c, d)) = reason.split_once(": ") {
+                            if let Some(norm) = compat::devin::normalize_connect_code(c) {
+                                (connect_code_to_http_status(norm), norm, d)
+                            } else {
+                                (StatusCode::BAD_GATEWAY, "unknown", reason.as_str())
+                            }
+                        } else {
+                            (StatusCode::BAD_GATEWAY, "unknown", reason.as_str())
+                        };
+
                     member.record_fail();
                     state.metrics.failed_over.fetch_add(1, Ordering::Relaxed);
-                    state.monitor.record_error(member.id(), 502, &reason);
+                    state
+                        .monitor
+                        .record_error(member.id(), mapped_status.as_u16(), description);
+
+                    if code == "resource_exhausted" {
+                        let now_ms = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
+                            .unwrap_or(0);
+                        member.set_health(Health::Cooldown {
+                            until_unix_ms: cooldown_deadline_ms(now_ms, 300),
+                        });
+                    } else if code == "unauthenticated" {
+                        member.set_health(Health::AuthFailed);
+                    } else {
+                        state
+                            .scheduler
+                            .record_non_auth_failure(member.id(), &state.pool.load().members);
+                    }
+
                     last_failure = Some(FinalFailure {
-                        status: StatusCode::BAD_GATEWAY,
+                        status: mapped_status,
                         content_type: Some("application/json".to_string()),
                         body: Bytes::from(
-                            serde_json::json!({"error": {"message": reason, "type": "upstream_error"}})
+                            serde_json::json!({"error": {"message": description, "type": "upstream_error", "code": code}})
                                 .to_string(),
                         ),
                     });
+                    if member.kind() == crate::account::ProviderKind::Devin
+                        && (reason.contains("ended without EndStream")
+                            || reason.contains("truncated")
+                            || reason.contains("ambiguous"))
+                    {
+                        break;
+                    }
                     continue;
                 }
             }
         }
 
         if status_code == 429 {
-            last_failure = Some(record_cooldown(resp, &member, status_code, &state).await);
+            let failure = record_cooldown(resp, &member, status_code, &state).await;
+            if member.provider_name() == "cline" {
+                if let Some((model, reset_secs)) = parse_cline_cap_error(&failure.body) {
+                    record_cline_quota_bucket(&member, &model, reset_secs, now_unix);
+                }
+            }
+            last_failure = Some(failure);
             continue;
         }
 

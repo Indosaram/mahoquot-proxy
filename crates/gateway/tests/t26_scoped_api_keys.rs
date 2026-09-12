@@ -172,7 +172,7 @@ async fn reconcile_carries_live_usage_across_a_settings_republish() {
 #[test]
 fn rotation_shares_stable_id_counter_with_in_flight_request() {
     let key = scoped_key(true, None);
-    let tracker = mahoquot_gateway::state::ScopedKeyTracker::new(&[key.clone()]);
+    let tracker = mahoquot_gateway::state::ScopedKeyTracker::new(std::slice::from_ref(&key));
     let in_flight = tracker.lookup_raw(SCOPED_RAW).unwrap();
     in_flight.consume(450);
     let mut rotated = key;

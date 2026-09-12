@@ -552,6 +552,70 @@ pub fn parse_kiro_usage_summary(body: &serde_json::Value, now_unix: i64) -> Acco
     }
 }
 
+/// Parse ClinePass's public `users/me/plan/usage-limits` payload.
+///
+/// Contract: `{success:true, data:{limits:[{type, percentUsed, resetsAt}]}}`
+/// with one row per `five_hour` / `weekly` / `monthly` window, `percentUsed`
+/// on 0..100, and an optional RFC3339 `resetsAt`. One bucket per window
+/// inside a single "ClinePass" group so the existing grouped-quota UI
+/// renders it; `primary`/`secondary` follow the repo convention (short 5h
+/// window first, weekly second). Unknown window types are skipped so a new
+/// upstream window cannot break the reading, while a present-but-wrong field
+/// is a broken response and yields `None`.
+pub fn parse_clinepass_usage_summary(body: &serde_json::Value, now_unix: i64) -> Option<AccountUsage> {
+    if body.get("success").and_then(|v| v.as_bool()) != Some(true) {
+        return None;
+    }
+    let limits = body.get("data")?.get("limits")?.as_array()?;
+    let mut buckets = Vec::new();
+    for limit in limits {
+        let window = limit.get("type").and_then(|v| v.as_str())?;
+        let label = match window {
+            "five_hour" => "5-hour",
+            "weekly" => "Weekly",
+            "monthly" => "Monthly",
+            _ => continue,
+        };
+        let percent = limit.get("percentUsed").and_then(|v| v.as_f64())?;
+        let reset = match limit.get("resetsAt") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(raw) => Some(parse_offset_datetime_unix(raw.as_str()?)?),
+        };
+        let mut bucket = usage_bucket(label, percent, reset, now_unix);
+        bucket.bucket_id = Some(window.to_string());
+        bucket.window = Some(window.to_string());
+        buckets.push(bucket);
+    }
+    if buckets.is_empty() {
+        return None;
+    }
+    let flat = |window: &str, minutes: i64| -> QuotaWindow {
+        buckets
+            .iter()
+            .find(|bucket| bucket.window.as_deref() == Some(window))
+            .map(|bucket| QuotaWindow {
+                used_percent: bucket.used_percent,
+                window_minutes: Some(minutes),
+                reset_after_seconds: None,
+                reset_at_unix: bucket.reset_at_unix,
+                limit_name: bucket.display_name.clone(),
+            })
+            .unwrap_or_default()
+    };
+    Some(AccountUsage {
+        plan_type: Some("ClinePass".to_string()),
+        primary: flat("five_hour", 300),
+        secondary: flat("weekly", 10_080),
+        groups: vec![QuotaGroup {
+            display_name: Some("ClinePass".to_string()),
+            models: None,
+            buckets,
+        }],
+        observed_at_unix: Some(now_unix),
+        ..Default::default()
+    })
+}
+
 /// One `balances[]` entry lifted out of a ZCode desktop log line.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ZcodeBalanceEntry {
@@ -1534,6 +1598,43 @@ mod tests {
     fn extract_reads_openai_usage_from_tail_json() {
         let body = br#"{"id":"x","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#;
         assert_eq!(extract_total_tokens(body, body), Some(15));
+    }
+
+    #[test]
+    fn clinepass_usage_limits_normalize_to_three_windows() {
+        let now = 1_800_000_000;
+        let body = serde_json::json!({
+            "success": true,
+            "data": { "limits": [
+                {"type": "five_hour", "percentUsed": 40.0, "resetsAt": "2026-09-01T05:00:00Z"},
+                {"type": "weekly", "percentUsed": 12.5, "resetsAt": "2026-09-07T00:00:00Z"},
+                {"type": "monthly", "percentUsed": 3.0, "resetsAt": null}
+            ]}
+        });
+        let usage = parse_clinepass_usage_summary(&body, now).expect("clinepass usage");
+        assert_eq!(usage.plan_type.as_deref(), Some("ClinePass"));
+        assert_eq!(usage.groups.len(), 1);
+        assert_eq!(usage.groups[0].buckets.len(), 3);
+        assert_eq!(usage.groups[0].buckets[0].display_name.as_deref(), Some("5-hour"));
+        assert_eq!(usage.groups[0].buckets[0].used_percent, Some(40.0));
+        assert_eq!(usage.primary.window_minutes, Some(300));
+        assert_eq!(usage.primary.used_percent, Some(40.0));
+        assert_eq!(usage.secondary.window_minutes, Some(10_080));
+        assert_eq!(usage.secondary.used_percent, Some(12.5));
+        assert_eq!(usage.observed_at_unix, Some(now));
+    }
+
+    #[test]
+    fn clinepass_rejects_failed_or_malformed_payloads() {
+        let now = 1_800_000_000;
+        assert!(parse_clinepass_usage_summary(&serde_json::json!({"success": false, "data": {"limits": []}}), now).is_none());
+        assert!(parse_clinepass_usage_summary(&serde_json::json!({"success": true, "data": {"limits": []}}), now).is_none());
+        assert!(parse_clinepass_usage_summary(
+            &serde_json::json!({"success": true, "data": {"limits": [{"type": "five_hour"}]}}),
+            now
+        ).is_none());
+        let unknown_only = serde_json::json!({"success": true, "data": {"limits": [{"type": "yearly", "percentUsed": 1.0}]}});
+        assert!(parse_clinepass_usage_summary(&unknown_only, now).is_none());
     }
 
     #[test]

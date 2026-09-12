@@ -69,7 +69,8 @@ fn warmup_request(member: &AccountMember) -> Option<WarmupRequest> {
         | ProviderAccount::Kiro(_)
         | ProviderAccount::Zcode(_)
         | ProviderAccount::Generic(_)
-        | ProviderAccount::Vertex(_) => None,
+        | ProviderAccount::Vertex(_)
+        | ProviderAccount::Devin(_) => None,
     }
 }
 
@@ -96,9 +97,9 @@ pub async fn warm_account(state: &Arc<AppState>, member: &Arc<AccountMember>) ->
         };
     };
 
+    let client = state.client_for_member(member);
     let send = |token: String| {
-        let mut req = state
-            .http_client
+        let mut req = client
             .post(&url)
             .header("Authorization", format!("Bearer {token}"))
             .header("Content-Type", "application/json")
@@ -126,7 +127,7 @@ pub async fn warm_account(state: &Arc<AppState>, member: &Arc<AccountMember>) ->
     // the account's real state instead of a stale-credential 401.
     if resp.status() == reqwest::StatusCode::UNAUTHORIZED
         && member
-            .refresh(&state.http_client, &state.refresh_url, Some(&token))
+            .refresh(&client, &state.refresh_url, Some(&token))
             .await
             .is_ok()
     {

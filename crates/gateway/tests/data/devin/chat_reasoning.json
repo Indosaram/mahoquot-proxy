@@ -1,0 +1,90 @@
+{
+  "fixture": "chat_reasoning",
+  "classification": "positive",
+  "description": "Text/thinking/signature/redaction sequence: thinking delta, opaque signature, thinking_redacted=true, then a text delta after reasoning.",
+  "rpc": "exa.api_server_pb.ApiServerService/GetChatMessage",
+  "content_type": "application/connect+proto",
+  "encoding": "connect-framed-proto",
+  "frames": [
+    {
+      "flag": 0,
+      "hex": "0a09726573702d303030314a13506c616e6e696e6720746865207265706c792e"
+    },
+    {
+      "flag": 0,
+      "hex": "0a09726573702d30303031520f7369672d6f70617175652d30303031"
+    },
+    {
+      "flag": 0,
+      "hex": "0a09726573702d303030315801"
+    },
+    {
+      "flag": 0,
+      "hex": "0a09726573702d303030311a0748656c6c6f2c20"
+    }
+  ],
+  "end_stream": {
+    "error": null,
+    "hasSyncPoints": false
+  },
+  "framed_hex": "00000000200a09726573702d303030314a13506c616e6e696e6720746865207265706c792e000000001c0a09726573702d30303031520f7369672d6f70617175652d30303031000000000d0a09726573702d30303031580100000000140a09726573702d303030311a0748656c6c6f2c2002000000247b226572726f72223a6e756c6c2c2268617353796e63506f696e7473223a66616c73657d",
+  "fields": [
+    {
+      "frame": 0,
+      "field": 9,
+      "delta_thinking": "Planning the reply.",
+      "tag9": "4a"
+    },
+    {
+      "frame": 1,
+      "field": 10,
+      "delta_signature": "sig-opaque-0001",
+      "tag10": "52",
+      "note": "opaque signature; preserved verbatim, never interpreted"
+    },
+    {
+      "frame": 2,
+      "field": 11,
+      "thinking_redacted": true,
+      "tag11": "5801"
+    },
+    {
+      "frame": 3,
+      "field": 3,
+      "delta_text": "Hello, ",
+      "tag3": "1a"
+    }
+  ],
+  "tag_checks": [
+    {
+      "path": "frame0.field9.tag",
+      "hex": "4a",
+      "len": 19
+    },
+    {
+      "path": "frame1.field10.tag",
+      "hex": "52",
+      "len": 15
+    },
+    {
+      "path": "frame2.field11.tag",
+      "hex": "58",
+      "value": 1
+    },
+    {
+      "path": "frame3.field3.tag",
+      "hex": "1a",
+      "len": 7
+    },
+    {
+      "path": "end_stream.flag",
+      "hex": "02"
+    }
+  ],
+  "provenance": {
+    "reference": "https://github.com/Arborsm/dsh-plugin-devin-bridge",
+    "commit": "ced035dd2f43b2dbf37a25c8a47b8ae1c1cc47f4",
+    "license": "MIT, Copyright (c) 2026 Arborsm",
+    "note": "Golden bytes independently hand-specified from the proto field numbers in src/proto/devin.proto at the pinned commit; not produced by any production encoder. All credentials are synthetic dummies."
+  }
+}

@@ -5,8 +5,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::account::{AccountMember, ProviderKind};
 use crate::state::AppState;
 use crate::usage::{
-    parse_cursor_usage_summary, parse_kiro_usage_summary, ResetCredit, WhamResetCreditList,
-    WhamUsage,
+    parse_clinepass_usage_summary, parse_cursor_usage_summary, parse_kiro_usage_summary,
+    ResetCredit, WhamResetCreditList, WhamUsage,
 };
 
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
@@ -21,6 +21,9 @@ const CLAUDE_API_BASE: &str = "https://api.anthropic.com";
 const CLAUDE_USAGE_PATH: &str = "/api/oauth/usage";
 const CURSOR_USAGE_URL: &str = "https://api2.cursor.sh/auth/usage-summary";
 const KIRO_USAGE_URL: &str = "https://q.us-east-1.amazonaws.com/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST";
+/// ClinePass subscription quota. The account's own API key is the bearer
+/// credential; there is no local login file to read and no OAuth to refresh.
+const CLINEPASS_USAGE_URL: &str = "https://api.cline.bot/api/v1/users/me/plan/usage-limits";
 /// Undocumented and version-dated: the endpoint is gated on this exact beta
 /// header, and a new date means the payload can change without notice.
 const CLAUDE_OAUTH_BETA: &str = "oauth-2025-04-20";
@@ -222,7 +225,8 @@ async fn refresh_account_usage_inner(
                 .as_deref()
                 .map(|base| format!("{}/auth/usage-summary", base.trim_end_matches('/')))
                 .unwrap_or_else(|| CURSOR_USAGE_URL.to_string());
-            refresh_json_usage(member, &state.http_client, &url, parse_cursor_usage_summary).await
+            let client = state.client_for_member(member);
+            refresh_json_usage(member, &client, &url, parse_cursor_usage_summary).await
         }
         ProviderKind::Kiro => {
             let url = member
@@ -230,12 +234,52 @@ async fn refresh_account_usage_inner(
                 .as_deref()
                 .map(|base| format!("{}/getUsageLimits", base.trim_end_matches('/')))
                 .unwrap_or_else(|| KIRO_USAGE_URL.to_string());
-            refresh_json_usage(member, &state.http_client, &url, parse_kiro_usage_summary).await
+            let client = state.client_for_member(member);
+            refresh_json_usage(member, &client, &url, parse_kiro_usage_summary).await
         }
         ProviderKind::Zcode => refresh_zcode_usage(state, member).await,
         ProviderKind::Vertex => Err(QuotaError::Unsupported),
-        ProviderKind::Generic => Err(QuotaError::Unsupported),
+        ProviderKind::Devin => Err(QuotaError::Unsupported),
+        ProviderKind::Generic => refresh_generic_usage(state, member).await,
     }
+}
+
+/// Generic accounts expose no per-provider quota API, except ClinePass: a
+/// `cline-pass` account on the canonical Cline endpoint reports the three
+/// subscription windows (5-hour / weekly / monthly) from `usage-limits` with
+/// the account's own API key as bearer auth. Everything else stays
+/// Unsupported so the UI renders "unknown" instead of a fake 0%.
+async fn refresh_generic_usage(
+    state: &AppState,
+    member: &Arc<AccountMember>,
+) -> Result<(), QuotaError> {
+    let (provider, models) = match member.generic_models() {
+        Some(profile) => profile,
+        None => return Err(QuotaError::Unsupported),
+    };
+    let is_clinepass = provider.eq_ignore_ascii_case("cline-pass")
+        || models
+            .iter()
+            .any(|model: &String| model.to_ascii_lowercase().starts_with("cline-pass/"));
+    if !is_clinepass {
+        return Err(QuotaError::Unsupported);
+    }
+    let base: String = member
+        .usage_override
+        .clone()
+        .or_else(|| member.upstream_override.clone())
+        .or_else(|| member.generic_base_url())
+        .unwrap_or_default();
+    let url = if base.trim_end_matches('/').ends_with("api.cline.bot/api/v1") {
+        CLINEPASS_USAGE_URL.to_string()
+    } else {
+        return Err(QuotaError::Unsupported);
+    };
+    let client = state.client_for_member(member);
+    refresh_json_usage(member, &client, &url, |body, now| {
+        parse_clinepass_usage_summary(body, now).unwrap_or_default()
+    })
+    .await
 }
 
 /// ZCode quota comes from the ZCode desktop app itself: it polls its own
@@ -368,8 +412,8 @@ async fn try_claude_usage(state: &AppState, member: &Arc<AccountMember>) -> Resu
                 "relay account has no upstream_override".into(),
             ));
         }
-        let resp = state
-            .http_client
+        let client = state.client_for_member(member);
+        let resp = client
             .get(format!("{base}/v1/usage/self"))
             .header("x-api-key", key)
             .header("anthropic-version", "2023-06-01")
@@ -420,8 +464,8 @@ async fn try_claude_usage(state: &AppState, member: &Arc<AccountMember>) -> Resu
         .unwrap_or(CLAUDE_API_BASE)
         .trim_end_matches('/');
 
-    let resp = state
-        .http_client
+    let client = state.client_for_member(member);
+    let resp = client
         .get(format!("{base}{CLAUDE_USAGE_PATH}"))
         .header("Authorization", format!("Bearer {token}"))
         .header("anthropic-beta", CLAUDE_OAUTH_BETA)
@@ -510,8 +554,8 @@ async fn try_antigravity_quota(
     let url = mahoquot_providers::antigravity_quota_summary_url(
         mahoquot_providers::ANTIGRAVITY_UPSTREAM_BASE,
     );
-    let resp = state
-        .http_client
+    let client = state.client_for_member(member);
+    let resp = client
         .post(&url)
         .header("Authorization", format!("Bearer {token}"))
         .header("User-Agent", mahoquot_providers::ANTIGRAVITY_USER_AGENT)
@@ -556,8 +600,7 @@ async fn try_antigravity_quota(
 
     // Fetch plan tier from loadCodeAssist using the same token
     let load_url = format!("{}/v1internal:loadCodeAssist", mahoquot_providers::ANTIGRAVITY_LOAD_BASE);
-    if let Ok(load_resp) = state
-        .http_client
+    if let Ok(load_resp) = client
         .post(&load_url)
         .header("Authorization", format!("Bearer {token}"))
         .header("User-Agent", mahoquot_providers::ANTIGRAVITY_USER_AGENT)
@@ -613,8 +656,8 @@ async fn refresh_codex_usage(
         .as_deref()
         .map(|base| format!("{}/backend-api/wham/usage", base.trim_end_matches('/')))
         .unwrap_or_else(|| CODEX_USAGE_URL.to_string());
-    let mut req = state
-        .http_client
+    let client = state.client_for_member(member);
+    let mut req = client
         .get(usage_url)
         .header("Authorization", format!("Bearer {token}"))
         .header("Accept", "application/json")
@@ -675,8 +718,8 @@ async fn fetch_codex_reset_credits(
             )
         })
         .unwrap_or_else(|| CODEX_RESET_CREDITS_URL.to_string());
-    let mut req = state
-        .http_client
+    let client = state.client_for_member(member);
+    let mut req = client
         .get(url)
         .header("Authorization", format!("Bearer {token}"))
         .header("Accept", "application/json")
@@ -722,8 +765,8 @@ async fn try_consume_reset_credit(
             )
         })
         .unwrap_or_else(|| CODEX_RESET_URL.to_string());
-    let mut req = state
-        .http_client
+    let client = state.client_for_member(member);
+    let mut req = client
         .post(reset_url)
         .header("Authorization", format!("Bearer {token}"))
         .header("Content-Type", "application/json")

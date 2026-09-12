@@ -158,6 +158,40 @@ pub fn build_http_client(proxy_url: Option<&str>) -> anyhow::Result<reqwest::Cli
         .map_err(|e| anyhow::anyhow!("failed to build reqwest client: {e}"))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DevinClientBuildError {
+    #[error("failed to configure outbound proxy")]
+    ProxyConfig,
+    #[error("failed to build Devin HTTP/1.1 client")]
+    BuildFailed,
+}
+
+pub fn build_devin_http_client(proxy_url: Option<&str>) -> Result<reqwest::Client, DevinClientBuildError> {
+    let mut builder = reqwest::Client::builder()
+        .http1_only()
+        .redirect(reqwest::redirect::Policy::none())
+        .tcp_nodelay(true);
+    if let Some(url) = proxy_url {
+        let trimmed = url.trim();
+        if !trimmed.is_empty() {
+            let proxy = reqwest::Proxy::all(trimmed)
+                .map_err(|_| DevinClientBuildError::ProxyConfig)?;
+            builder = builder.proxy(proxy);
+        } else {
+            builder = builder.no_proxy();
+        }
+    } else {
+        builder = builder.no_proxy();
+    }
+    builder
+        .build()
+        .map_err(|_| DevinClientBuildError::BuildFailed)
+}
+
+pub fn build_devin_discovery_client(proxy_url: Option<&str>) -> Result<reqwest::Client, DevinClientBuildError> {
+    build_devin_http_client(proxy_url)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

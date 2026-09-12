@@ -1,5 +1,5 @@
 use mahoquot_types::Health;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::monitor::{LastError, TtftSnapshot};
@@ -87,6 +87,31 @@ pub struct AccountStats {
     pub reset_at_unix_ms: Option<i64>,
     pub last_error: Option<LastError>,
     pub ttft: Option<TtftSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovery: Option<AccountDiscoveryMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AccountDiscoveryMetadata {
+    pub status: String,
+    pub has_succeeded: bool,
+    pub refreshed_at_unix_ms: Option<u64>,
+    pub models: Vec<DiscoveredModelMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DiscoveredModelMetadata {
+    pub id: String,
+    pub model_uid: String,
+    pub supports_images: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credit_multiplier: Option<f32>,
+    pub is_recommended: bool,
+    pub is_new: bool,
+    pub is_capacity_limited: bool,
+    pub promo_active: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

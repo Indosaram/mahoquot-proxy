@@ -185,10 +185,23 @@ pub struct AppState {
     pub shutdown: Arc<tokio::sync::Notify>,
     /// Per-account usage-poll backoff (unix secs). A 429 from a usage endpoint
     /// parks the account here so the poller stops keeping the throttle hot.
+    pub devin_http_client: reqwest::Client,
+    pub devin_direct_client: reqwest::Client,
     pub usage_poll_backoff: std::sync::Mutex<std::collections::HashMap<String, i64>>,
+    pub devin_cache: Arc<crate::devin_catalog::DevinDiscoveryCache>,
+    pub finalizer_notifiers: Arc<
+        std::sync::Mutex<std::collections::HashMap<String, Vec<tokio::sync::mpsc::Sender<()>>>>,
+    >,
 }
 
 pub(crate) fn adopt_runtime_state(target: &AccountMember, previous: &Arc<AccountMember>) {
+    // Only adopt runtime state if target represents the exact same credential identity.
+    // True credential replacement (token change, endpoint change, or credential recreation)
+    // creates a clean break, leaving target with fresh, distinct runtime cells.
+    if !target.same_credential_identity(previous) {
+        return;
+    }
+
     let seq = std::sync::atomic::Ordering::Relaxed;
     let target_health = target.health();
     if target_health != Health::Disabled {
@@ -218,6 +231,11 @@ pub(crate) fn adopt_runtime_state(target: &AccountMember, previous: &Arc<Account
         .clone();
     target.ok_count.store(previous.ok_count.load(seq), seq);
     target.fail_count.store(previous.fail_count.load(seq), seq);
+    if target.kind() == crate::account::ProviderKind::Devin
+        && previous.kind() == crate::account::ProviderKind::Devin
+    {
+        target.devin_catalog.store(previous.devin_catalog.load_full());
+    }
 }
 
 impl AppState {
@@ -240,6 +258,10 @@ impl AppState {
             .map_err(|e| anyhow::anyhow!("failed to build reqwest client: {}", e))?;
         let direct_client = crate::proxy_policy::build_http_client(None)
             .map_err(|e| anyhow::anyhow!("failed to build reqwest client: {}", e))?;
+        let devin_http_client = crate::proxy_policy::build_devin_http_client(base_proxy)
+            .map_err(|e| anyhow::anyhow!("failed to build devin reqwest client: {}", e))?;
+        let devin_direct_client = crate::proxy_policy::build_devin_http_client(None)
+            .map_err(|e| anyhow::anyhow!("failed to build direct devin reqwest client: {}", e))?;
 
         let proxy_runtime = Arc::new(arc_swap::ArcSwap::from_pointee(
             crate::proxy_policy::ProxyRuntime::from_settings(&initial_settings),
@@ -366,6 +388,8 @@ impl AppState {
             models_env: config.models_env.clone(),
             http_client,
             direct_client,
+            devin_http_client,
+            devin_direct_client,
             proxy_runtime,
             proxy_clients,
             metrics,
@@ -381,6 +405,8 @@ impl AppState {
                 config.max_failover
             },
             model_restrictions: AtomicBool::new(false),
+            devin_cache: Arc::new(crate::devin_catalog::DevinDiscoveryCache::new()),
+            finalizer_notifiers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         })
     }
 
@@ -496,6 +522,98 @@ impl AppState {
         }
     }
 
+    /// Reusable HTTP/1.1 client with no-redirect policy for Devin discovery and Chat relay.
+    /// Follows provider-aware outbound proxy configuration and caches clients by target.
+    /// Returns typed/safe Result propagating pre-dispatch failure without secret disclosure or unproxied fallback.
+    pub fn devin_client_for_member(
+        &self,
+        member: &AccountMember,
+    ) -> Result<reqwest::Client, crate::proxy_policy::DevinClientBuildError> {
+        self.devin_client_for_target(member.id())
+    }
+
+    pub fn subscribe_finalizer(&self, account_or_event: &str) -> tokio::sync::mpsc::Receiver<()> {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut guard = self
+            .finalizer_notifiers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        guard.entry(account_or_event.to_string()).or_default().push(tx);
+        rx
+    }
+
+    pub fn notify_finalizer(&self, account: Option<&str>, event_id: &str) {
+        let mut guard = self
+            .finalizer_notifiers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Some(acc) = account {
+            if let Some(senders) = guard.remove(acc) {
+                for sender in senders {
+                    let _ = sender.try_send(());
+                }
+            }
+        }
+        if let Some(senders) = guard.remove(event_id) {
+            for sender in senders {
+                let _ = sender.try_send(());
+            }
+        }
+    }
+
+    /// Alias for devin_client_for_member returning typed/safe Result.
+    pub fn try_devin_client_for_member(
+        &self,
+        member: &AccountMember,
+    ) -> Result<reqwest::Client, crate::proxy_policy::DevinClientBuildError> {
+        self.devin_client_for_member(member)
+    }
+
+    /// Reusable HTTP/1.1 client with no-redirect policy for Devin by member ID.
+    pub fn devin_client_for_target(
+        &self,
+        member_id: &str,
+    ) -> Result<reqwest::Client, crate::proxy_policy::DevinClientBuildError> {
+        let runtime = self.proxy_runtime.load();
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let Some(proxy_url) = runtime.session_proxy_url("devin", member_id, now_unix) else {
+            // session_proxy_url(None) must honor global proxy semantics consistently with existing client_for_target
+            return Ok(if runtime.scoped_routing_active() {
+                self.devin_direct_client.clone()
+            } else {
+                self.devin_http_client.clone()
+            });
+        };
+
+        let cache_key = format!("devin|{member_id}|{proxy_url}");
+        {
+            let clients = self.proxy_clients.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(client) = clients.get(&cache_key) {
+                return Ok(client.clone());
+            }
+        }
+
+        match crate::proxy_policy::build_devin_http_client(Some(&proxy_url)) {
+            Ok(client) => {
+                let mut clients = self.proxy_clients.lock().unwrap_or_else(|p| p.into_inner());
+                clients.insert(cache_key, client.clone());
+                Ok(client)
+            }
+            Err(err) => {
+                // Propagate pre-dispatch failure without secret disclosure or unproxied fallback
+                tracing::error!(
+                    member_id = %member_id,
+                    "failed to configure Devin outbound proxy: {err}"
+                );
+                Err(err)
+            }
+        }
+    }
+
     pub fn get_stats(&self) -> AdminStatsResponse {
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -528,6 +646,57 @@ impl AppState {
                     last_error: self.monitor.last_error(&m.id),
                     ttft: self.monitor.account_ttft(&m.id),
                     usage: m.usage_snapshot(),
+                    models: if m.kind() == crate::account::ProviderKind::Devin {
+                        m.devin_models()
+                    } else {
+                        None
+                    },
+                    discovery: if m.kind() == crate::account::ProviderKind::Devin {
+                        Some(match m.devin_catalog_state() {
+                            Some(cat) => crate::metrics::AccountDiscoveryMetadata {
+                                status: if m.is_manually_disabled() {
+                                    "disabled".to_string()
+                                } else if !cat.has_succeeded {
+                                    "unknown".to_string()
+                                } else if cat.models.is_empty() {
+                                    "empty".to_string()
+                                } else {
+                                    "discovered".to_string()
+                                },
+                                has_succeeded: cat.has_succeeded,
+                                refreshed_at_unix_ms: cat.last_refresh_at,
+                                models: if m.is_manually_disabled() {
+                                    Vec::new()
+                                } else {
+                                    cat.models
+                                        .iter()
+                                        .map(|model| crate::metrics::DiscoveredModelMetadata {
+                                            id: model.public_id.clone(),
+                                            model_uid: model.model_uid.clone(),
+                                            supports_images: model.supports_images,
+                                            credit_multiplier: model.credit_multiplier,
+                                            is_recommended: model.is_recommended,
+                                            is_new: model.is_new,
+                                            is_capacity_limited: model.is_capacity_limited,
+                                            promo_active: model.promo_active,
+                                        })
+                                        .collect()
+                                },
+                            },
+                            None => crate::metrics::AccountDiscoveryMetadata {
+                                status: if m.is_manually_disabled() {
+                                    "disabled".to_string()
+                                } else {
+                                    "unknown".to_string()
+                                },
+                                has_succeeded: false,
+                                refreshed_at_unix_ms: None,
+                                models: Vec::new(),
+                            },
+                        })
+                    } else {
+                        None
+                    },
                 }
             })
             .collect();

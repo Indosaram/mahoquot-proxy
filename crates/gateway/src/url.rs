@@ -38,6 +38,9 @@ pub fn build_provider_url(
             .replace("{region}", mahoquot_providers::KIRO_DEFAULT_REGION),
         ProviderKind::Generic => upstream_override.unwrap_or_default().to_string(),
         ProviderKind::Vertex => "https://aiplatform.googleapis.com".to_string(),
+        ProviderKind::Devin => upstream_override
+            .map(|base| base.trim_end_matches('/').to_string())
+            .unwrap_or_else(|| mahoquot_providers::devin::DEVIN_DEFAULT_API_SERVER_URL.to_string()),
     };
 
     join_provider_path(upstream_override.unwrap_or(&base), req_path)
@@ -117,6 +120,16 @@ mod tests {
         assert!(
             cursor.starts_with("https://api2.cursor.sh"),
             "cursor routed to {cursor}"
+        );
+
+        let devin = build_provider_url(
+            ProviderKind::Devin,
+            None,
+            "/exa.api_server_pb.ApiServerService/GetChatMessage",
+        );
+        assert_eq!(
+            devin,
+            "https://server.codeium.com/exa.api_server_pb.ApiServerService/GetChatMessage"
         );
 
         let kiro = build_provider_url(ProviderKind::Kiro, None, "/v1/messages");

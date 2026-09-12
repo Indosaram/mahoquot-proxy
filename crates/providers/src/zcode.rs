@@ -173,7 +173,7 @@ pub fn parse_zcode_input(input: &str, expected_state: &str) -> Result<ZcodeInput
         ("redirect_uri", ZCODE_OAUTH_REDIRECT_URI),
     ] {
         let mut values = url.query_pairs().filter(|(name, _)| name == key);
-        if !values.next().is_some_and(|(_, value)| value == expected) || values.next().is_some() {
+        if values.next().is_none_or(|(_, value)| value != expected) || values.next().is_some() {
             return Err(format!("ZCode authorization URL has invalid {key}"));
         }
     }

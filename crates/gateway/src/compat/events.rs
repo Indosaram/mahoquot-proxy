@@ -20,6 +20,10 @@ pub enum CodexEvent {
     /// Opaque provider-side reasoning marker. Preserved rather than parsed so it
     /// can be handed back in whichever shape the client surface expects.
     ReasoningSignature(String),
+    /// Upstream reports the reasoning was redacted (Devin
+    /// `thinking_redacted`). Preserved as an explicit state event so surfaces
+    /// can decide how to represent it instead of silently dropping it.
+    ReasoningRedacted,
     ToolCallBegin {
         output_index: u64,
         call_id: String,

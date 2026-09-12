@@ -1884,7 +1884,7 @@ async fn anthropic_auth_url_handler(
                         let expected_state = expected_state1.clone();
                         async move {
                             if query.get("state") != Some(&expected_state)
-                                || !query.get("code").is_some_and(|code| !code.is_empty())
+                                || query.get("code").is_none_or(|code| code.is_empty())
                             {
                                 return json_status(StatusCode::BAD_REQUEST,
                                     json!({"status":"error","error":"Invalid Anthropic OAuth callback"}));
@@ -1910,7 +1910,7 @@ async fn anthropic_auth_url_handler(
                         let expected_state = expected_state2.clone();
                         async move {
                             if query.get("state") != Some(&expected_state)
-                                || !query.get("code").is_some_and(|code| !code.is_empty())
+                                || query.get("code").is_none_or(|code| code.is_empty())
                             {
                                 return json_status(StatusCode::BAD_REQUEST,
                                     json!({"status":"error","error":"Invalid Anthropic OAuth callback"}));
