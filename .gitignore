@@ -5,3 +5,7 @@ target/
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+
+# zcode plan captcha solver build artifacts
+captcha-solver/node_modules/
+captcha-solver/mahoquot-captcha-solver

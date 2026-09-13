@@ -24,6 +24,8 @@ fn gateway_config(auth_dir: &std::path::Path) -> GatewayConfig {
         config_path: auth_dir.join("config.yaml"),
         history_queue_capacity: 1024,
         history_batch_size: 64,
+        captcha_config_url: None,
+        captcha_solver_bin: None,
         catalog_cache_path: None,
     }
 }

@@ -152,6 +152,13 @@ impl ServeArgs {
                 .map(|dir| PathBuf::from(dir).join("models-v1.signed.json")),
             history_queue_capacity: 1024,
             history_batch_size: 64,
+            captcha_config_url: std::env::var("ZCODE_CAPTCHA_CONFIG_URL")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
+            captcha_solver_bin: std::env::var("MAHOQUOT_CAPTCHA_SOLVER_BIN")
+                .ok()
+                .map(PathBuf::from)
+                .filter(|value| !value.as_os_str().is_empty()),
         })
     }
 }

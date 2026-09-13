@@ -986,6 +986,22 @@ async fn send_upstream(
         }
     }
 
+    let plan_replay = (member.kind() == crate::account::ProviderKind::Zcode).then(|| {
+        crate::plan_captcha::ReplayPieces {
+            client: &client,
+            url: target_url,
+            headers: member_headers.clone(),
+            content_type: headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string),
+            accept: accept.map(str::to_string),
+            body: body_bytes.clone(),
+            config_url: state.captcha_config_url.clone(),
+            solver_bin: state.captcha_solver_bin.clone(),
+            solve_gate: &state.captcha_solve_gate,
+        }
+    });
     for (name, val) in member_headers {
         req_builder = req_builder.header(name, val);
     }
@@ -1044,7 +1060,7 @@ async fn send_upstream(
     let elapsed_ms = req_start.elapsed().as_secs_f64() * 1000.0;
     state.monitor.record_ttft(member.id(), elapsed_ms);
     let resp = if member.kind() == crate::account::ProviderKind::Zcode {
-        zcode_plan_gateway_response(resp).await
+        zcode_plan_gateway_response(resp, plan_replay.as_ref()).await
     } else {
         resp
     };
@@ -1057,11 +1073,18 @@ async fn send_upstream(
 /// The plan gateway reports business errors (quota, auth, WAF) inside HTTP 200
 /// JSON bodies — for streaming requests leaving them in place surfaces
 /// downstream as a silently truncated SSE stream. Map the known shapes onto
-/// real statuses; genuine message bodies pass through untouched. Non-2xx WAF
-/// challenges (verify-param header or in-body 3007) surface as 502: the relay
-/// has no browser-grade captcha solver, and replaying into the challenge only
-/// deepens the block (the reference implementation's 3012 posture).
-async fn zcode_plan_gateway_response(resp: reqwest::Response) -> reqwest::Response {
+/// real statuses; genuine message bodies pass through untouched.
+///
+/// Non-2xx WAF challenges (verify-param header or in-body 3007) are resolved
+/// when a replay context is available: the vendored traceless solver mints a
+/// single-use verify param and the challenged request replays ONCE with it.
+/// A replay that is challenged again, a solve failure, and biz 3012 are hard
+/// blocks surfacing as 502 — retrying into a hard block only deepens it (the
+/// reference implementation's posture).
+async fn zcode_plan_gateway_response(
+    resp: reqwest::Response,
+    pieces: Option<&crate::plan_captcha::ReplayPieces<'_>>,
+) -> reqwest::Response {
     let status = resp.status();
     let is_json = resp
         .headers()
@@ -1086,28 +1109,67 @@ async fn zcode_plan_gateway_response(resp: reqwest::Response) -> reqwest::Respon
                 .iter()
                 .any(|marker| body.windows(marker.len()).any(|w| w == marker.as_bytes()))
         {
-            let message = "zcode-plan: the gateway issued a WAF captcha challenge (biz 3007); browser captcha solving is unavailable in the relay — retry after a few minutes";
-            return rebuild_plan_response(
-                StatusCode::BAD_GATEWAY,
-                &http::HeaderMap::new(),
-                &serde_json::to_vec(&serde_json::json!({
-                    "error": { "message": message, "type": "upstream_error" }
-                }))
-                .unwrap_or_default(),
-            );
+            return match pieces {
+                Some(pieces) => match crate::plan_captcha::resolve_challenge(pieces).await {
+                    Ok(replayed) => {
+                        let replay_status = replayed.status();
+                        let replay_json = replayed
+                            .headers()
+                            .get(reqwest::header::CONTENT_TYPE)
+                            .and_then(|v| v.to_str().ok())
+                            .map(|ct| ct.to_ascii_lowercase().contains("application/json"))
+                            .unwrap_or(false);
+                        if replay_status.is_success() && !replay_json {
+                            return replayed;
+                        }
+                        let replay_headers = replayed.headers().clone();
+                        let replay_body = replayed.bytes().await.unwrap_or_default();
+                        let replay_challenge = mahoquot_providers::zcode::is_plan_captcha_challenge(
+                            replay_status.as_u16(),
+                            replay_headers
+                                .get(mahoquot_providers::zcode::ZCODE_CAPTCHA_PARAM_HEADER)
+                                .and_then(|v| v.to_str().ok()),
+                            &String::from_utf8_lossy(&replay_body),
+                        );
+                        if replay_challenge {
+                            plan_challenge_502(
+                                    "challenge persisted after captcha solve replay — hard block, retry after a few minutes",
+                                )
+                        } else {
+                            map_plan_body(replay_status, replay_headers, &replay_body)
+                        }
+                    }
+                    Err(failure) => {
+                        plan_challenge_502(&format!("automatic solve failed: {failure}"))
+                    }
+                },
+                None => plan_challenge_502(
+                    "no captcha solver is available in this relay — retry after a few minutes",
+                ),
+            };
         }
         return rebuild_plan_response(status, &upstream_headers, &body);
     }
-    let parsed: serde_json::Value = match serde_json::from_slice(&body) {
+    map_plan_body(status, upstream_headers, &body)
+}
+
+/// Shared tail: a JSON body is inspected for in-200 business errors (quota,
+/// auth, WAF); anything unparseable or with `code` 0 passes through untouched.
+fn map_plan_body(
+    status: reqwest::StatusCode,
+    upstream_headers: http::HeaderMap,
+    body: &[u8],
+) -> reqwest::Response {
+    let parsed: serde_json::Value = match serde_json::from_slice(body) {
         Ok(parsed) => parsed,
-        Err(_) => return rebuild_plan_response(status, &upstream_headers, &body),
+        Err(_) => return rebuild_plan_response(status, &upstream_headers, body),
     };
     let code = parsed.get("code").and_then(serde_json::Value::as_i64);
     let Some(code) = code else {
-        return rebuild_plan_response(status, &upstream_headers, &body);
+        return rebuild_plan_response(status, &upstream_headers, body);
     };
     if code == 0 {
-        return rebuild_plan_response(status, &upstream_headers, &body);
+        return rebuild_plan_response(status, &upstream_headers, body);
     }
     let (mapped_status, error_type) = mahoquot_providers::zcode::plan_biz_error(code);
     let message = format!(
@@ -1123,6 +1185,17 @@ async fn zcode_plan_gateway_response(resp: reqwest::Response) -> reqwest::Respon
     .unwrap_or_default();
     let mapped = StatusCode::from_u16(mapped_status).unwrap_or(StatusCode::BAD_GATEWAY);
     rebuild_plan_response(mapped, &http::HeaderMap::new(), &error_body)
+}
+
+fn plan_challenge_502(message: &str) -> reqwest::Response {
+    let body = serde_json::to_vec(&serde_json::json!({
+        "error": {
+            "message": format!("zcode-plan: the gateway issued a WAF captcha challenge (biz 3007); {message}"),
+            "type": "upstream_error"
+        }
+    }))
+    .unwrap_or_default();
+    rebuild_plan_response(StatusCode::BAD_GATEWAY, &http::HeaderMap::new(), &body)
 }
 
 /// Rebuild a reqwest response after its body was consumed. Hop-by-hop and

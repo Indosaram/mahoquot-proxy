@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -108,7 +109,9 @@ impl ScopedKeyTracker {
             let mut entry = ScopedKeyEntry::new(key.clone());
             if let Some(existing) = previous.values().find(|entry| entry.key.id == key.id) {
                 entry.token_used = Arc::clone(&existing.token_used);
-                entry.token_used.fetch_max(key.token_used, Ordering::Relaxed);
+                entry
+                    .token_used
+                    .fetch_max(key.token_used, Ordering::Relaxed);
             }
             next.insert(key.key_identifier.clone(), Arc::new(entry));
         }
@@ -171,6 +174,13 @@ pub struct AppState {
     pub scoped_keys: Arc<ScopedKeyTracker>,
     pub refresh_url: String,
     pub auth_refresh_enabled: bool,
+    /// Captcha scene endpoint + solver sidecar overrides for the zcode plan
+    /// gateway (config/env-resolved at startup; tests inject directly).
+    pub captcha_config_url: Option<String>,
+    pub captcha_solver_bin: Option<PathBuf>,
+    /// Verify params are single-use — challenge solves serialize on this gate
+    /// (per-state, never a global static).
+    pub captcha_solve_gate: tokio::sync::Mutex<()>,
     pub refreshed: AtomicU64,
     pub max_failover: usize,
     pub model_restrictions: AtomicBool,
@@ -234,7 +244,9 @@ pub(crate) fn adopt_runtime_state(target: &AccountMember, previous: &Arc<Account
     if target.kind() == crate::account::ProviderKind::Devin
         && previous.kind() == crate::account::ProviderKind::Devin
     {
-        target.devin_catalog.store(previous.devin_catalog.load_full());
+        target
+            .devin_catalog
+            .store(previous.devin_catalog.load_full());
     }
 }
 
@@ -247,6 +259,9 @@ impl AppState {
         let monitor = Arc::new(MonitorState::default());
         let refresh_url = config.refresh_url.clone();
         let auth_refresh_enabled = config.auth_refresh_enabled;
+        let captcha_config_url = config.captcha_config_url.clone();
+        let captcha_solver_bin = config.captcha_solver_bin.clone();
+        let captcha_solve_gate = tokio::sync::Mutex::new(());
         let settings = Arc::new(SettingsStore::load_or(
             config.config_path.clone(),
             config.as_settings(),
@@ -271,7 +286,9 @@ impl AppState {
         let proxy_runtime_obs = Arc::clone(&proxy_runtime);
         let proxy_clients_obs = Arc::clone(&proxy_clients);
         settings.add_observer(Arc::new(move |published| {
-            proxy_runtime_obs.store(Arc::new(crate::proxy_policy::ProxyRuntime::from_settings(published)));
+            proxy_runtime_obs.store(Arc::new(crate::proxy_policy::ProxyRuntime::from_settings(
+                published,
+            )));
             if let Ok(mut clients) = proxy_clients_obs.lock() {
                 clients.clear();
             }
@@ -361,9 +378,7 @@ impl AppState {
         catalog.bind_settings(&settings);
 
         let catalog_for_snapshot = Arc::clone(&catalog);
-        settings.set_snapshot_provider(Arc::new(move || {
-            catalog_for_snapshot.raw_snapshot()
-        }));
+        settings.set_snapshot_provider(Arc::new(move || catalog_for_snapshot.raw_snapshot()));
         let runtime_for_publisher = Arc::clone(&runtime);
         settings.set_pool_publisher(Arc::new(move |registry| {
             runtime_for_publisher.update_registry(registry).map(|_| ())
@@ -398,6 +413,9 @@ impl AppState {
             scoped_keys,
             refresh_url,
             auth_refresh_enabled,
+            captcha_config_url,
+            captcha_solver_bin,
+            captcha_solve_gate,
             refreshed: AtomicU64::new(0),
             max_failover: if config.max_failover == 0 {
                 3
@@ -538,7 +556,10 @@ impl AppState {
             .finalizer_notifiers
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        guard.entry(account_or_event.to_string()).or_default().push(tx);
+        guard
+            .entry(account_or_event.to_string())
+            .or_default()
+            .push(tx);
         rx
     }
 

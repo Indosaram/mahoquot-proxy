@@ -39,6 +39,14 @@ pub struct GatewayConfig {
     pub catalog_cache_path: Option<PathBuf>,
     pub history_queue_capacity: usize,
     pub history_batch_size: usize,
+    /// Captcha scene endpoint override for the zcode plan gateway (tests,
+    /// relays steering a different plan origin). Falls back to
+    /// `ZCODE_CAPTCHA_CONFIG_URL`, then the official client config URL.
+    pub captcha_config_url: Option<String>,
+    /// Vendored captcha solver sidecar override. Falls back to
+    /// `MAHOQUOT_CAPTCHA_SOLVER_BIN`, then the binary staged next to the
+    /// gateway executable.
+    pub captcha_solver_bin: Option<PathBuf>,
 }
 
 impl Default for GatewayConfig {
@@ -58,6 +66,8 @@ impl Default for GatewayConfig {
             catalog_cache_path: None,
             history_queue_capacity: 1024,
             history_batch_size: 64,
+            captcha_config_url: None,
+            captcha_solver_bin: None,
         }
     }
 }
@@ -117,6 +127,13 @@ impl GatewayConfig {
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(64);
+        let captcha_config_url = std::env::var("ZCODE_CAPTCHA_CONFIG_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        let captcha_solver_bin = std::env::var("MAHOQUOT_CAPTCHA_SOLVER_BIN")
+            .ok()
+            .map(PathBuf::from)
+            .filter(|value| !value.as_os_str().is_empty());
 
         Ok(Self {
             config_path,
@@ -135,6 +152,8 @@ impl GatewayConfig {
             auth_refresh_enabled,
             history_queue_capacity,
             history_batch_size,
+            captcha_config_url,
+            captcha_solver_bin,
         })
     }
 

@@ -9,6 +9,7 @@ pub mod management;
 pub mod metrics;
 pub mod models_route;
 pub mod monitor;
+pub mod plan_captcha;
 pub mod proxy_policy;
 pub mod quota;
 pub mod realtime;

@@ -1,6 +1,5 @@
 mod common;
 
-use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{header, Method, Request, StatusCode};
 use common::unique_temp_dir;
@@ -15,6 +14,7 @@ use mahoquot_providers::devin::{
 };
 use mahoquot_types::{PoolMember, Strategy};
 use serde_json::{json, Value};
+use std::sync::Arc;
 use tower::ServiceExt;
 
 const MASTER_KEY: &str = "test-management-master-key";
@@ -41,6 +41,8 @@ fn test_gateway_config(auth_dir: &std::path::Path) -> GatewayConfig {
         catalog_cache_path: None,
         history_queue_capacity: 1024,
         history_batch_size: 64,
+        captcha_config_url: None,
+        captcha_solver_bin: None,
     }
 }
 
@@ -254,7 +256,13 @@ api_server_url = "https://server.codeium.com"
     std::env::set_var(DEVIN_CREDENTIALS_PATH_ENV, cli_file.to_str().unwrap());
 
     // A. Rejection of arbitrary file paths in import request
-    for path_key in ["path", "file_path", "file", "credentials_path", "source_path"] {
+    for path_key in [
+        "path",
+        "file_path",
+        "file",
+        "credentials_path",
+        "source_path",
+    ] {
         let evil_body = json!({
             "identity": "devin-evil",
             path_key: "/etc/passwd"
@@ -273,7 +281,10 @@ api_server_url = "https://server.codeium.com"
         );
         let evil_json = body_json(evil_resp).await;
         assert!(
-            evil_json["error"].as_str().unwrap().contains("arbitrary file paths"),
+            evil_json["error"]
+                .as_str()
+                .unwrap()
+                .contains("arbitrary file paths"),
             "error should mention arbitrary file paths"
         );
     }
@@ -309,11 +320,15 @@ api_server_url = "https://server.codeium.com"
     // Verify imported auth file in auth_dir
     let saved_auth_file = ctx.auth_dir.join("devin-cli-work.json");
     assert!(saved_auth_file.exists());
-    let saved_json: Value = serde_json::from_slice(&std::fs::read(&saved_auth_file).unwrap()).unwrap();
+    let saved_json: Value =
+        serde_json::from_slice(&std::fs::read(&saved_auth_file).unwrap()).unwrap();
     assert_eq!(saved_json["type"], "devin");
     assert_eq!(saved_json["identity_slug"], "cli-work");
     assert_eq!(saved_json["label"], "Devin CLI Work Account");
-    assert_eq!(saved_json["access_token"], "devin-cli-session-token$host999");
+    assert_eq!(
+        saved_json["access_token"],
+        "devin-cli-session-token$host999"
+    );
     assert_eq!(saved_json["api_server_url"], "https://server.codeium.com");
     assert_eq!(saved_json["disabled"], false);
 
@@ -343,7 +358,10 @@ api_server_url = "https://server.codeium.com"
     // Verify token was updated in pool while preserving identity
     let member_reloaded = ctx.state.find_member("cli-work").expect("member in pool");
     assert_eq!(member_reloaded.id(), "cli-work");
-    assert_eq!(member_reloaded.access_token(), "devin-cli-session-token$fresh_rotate_001");
+    assert_eq!(
+        member_reloaded.access_token(),
+        "devin-cli-session-token$fresh_rotate_001"
+    );
 
     // Clean up
     std::env::remove_var(DEVIN_CREDENTIALS_PATH_ENV);
@@ -401,10 +419,14 @@ api_server_url = "https://server.codeium.com"
     let file_work = ctx.auth_dir.join("devin-work.json");
     let file_devin_work = ctx.auth_dir.join("devin-devin-work.json");
     assert!(file_work.exists(), "devin-work.json must exist");
-    assert!(file_devin_work.exists(), "devin-devin-work.json must exist as a separate file");
+    assert!(
+        file_devin_work.exists(),
+        "devin-devin-work.json must exist as a separate file"
+    );
 
     // 4. Verify exact inventory identity_slug in GET /v0/management/auth-files
-    let list_resp = send_management_request(&ctx.app, Method::GET, "/v0/management/auth-files", None).await;
+    let list_resp =
+        send_management_request(&ctx.app, Method::GET, "/v0/management/auth-files", None).await;
     assert_eq!(list_resp.status(), StatusCode::OK);
     let list_json = body_json(list_resp).await;
     let files = list_json["files"].as_array().expect("files array");
@@ -441,7 +463,10 @@ api_server_url = "https://server.codeium.com"
     // Verify disabled state isolated to target
     let member_work = ctx.state.find_member("work").expect("member work");
     assert!(member_work.is_manually_disabled());
-    let member_devin_work = ctx.state.find_member("devin-work").expect("member devin-work");
+    let member_devin_work = ctx
+        .state
+        .find_member("devin-work")
+        .expect("member devin-work");
     assert!(!member_devin_work.is_manually_disabled());
 
     // 6. Reimport target "work" only with fresh token in source TOML
@@ -464,22 +489,39 @@ api_server_url = "https://server.codeium.com"
     // 7. Verify reimport only updated target "work", preserving disabled and label
     let reloaded_work = ctx.state.find_member("work").expect("reloaded work");
     assert_eq!(reloaded_work.access_token(), "devin-updated-token-222");
-    assert!(reloaded_work.is_manually_disabled(), "must preserve disabled state across reimport");
+    assert!(
+        reloaded_work.is_manually_disabled(),
+        "must preserve disabled state across reimport"
+    );
 
-    let file_work_content: Value = serde_json::from_slice(&std::fs::read(&file_work).unwrap()).unwrap();
+    let file_work_content: Value =
+        serde_json::from_slice(&std::fs::read(&file_work).unwrap()).unwrap();
     assert_eq!(file_work_content["identity_slug"], "work");
-    assert_eq!(file_work_content["label"], "Devin Work", "must preserve label across reimport");
+    assert_eq!(
+        file_work_content["label"], "Devin Work",
+        "must preserve label across reimport"
+    );
     assert_eq!(file_work_content["disabled"], true);
 
     // Verify non-target "devin-work" remained untouched
-    let file_devin_work_content: Value = serde_json::from_slice(&std::fs::read(&file_devin_work).unwrap()).unwrap();
+    let file_devin_work_content: Value =
+        serde_json::from_slice(&std::fs::read(&file_devin_work).unwrap()).unwrap();
     assert_eq!(file_devin_work_content["identity_slug"], "devin-work");
     assert_eq!(file_devin_work_content["label"], "Devin Namespaced Work");
-    assert_eq!(file_devin_work_content["access_token"], "devin-initial-token-111");
+    assert_eq!(
+        file_devin_work_content["access_token"],
+        "devin-initial-token-111"
+    );
     assert_eq!(file_devin_work_content["disabled"], false);
 
-    let untouched_devin_work = ctx.state.find_member("devin-work").expect("devin-work member");
-    assert_eq!(untouched_devin_work.access_token(), "devin-initial-token-111");
+    let untouched_devin_work = ctx
+        .state
+        .find_member("devin-work")
+        .expect("devin-work member");
+    assert_eq!(
+        untouched_devin_work.access_token(),
+        "devin-initial-token-111"
+    );
     assert!(!untouched_devin_work.is_manually_disabled());
 
     // Clean up
@@ -518,7 +560,8 @@ async fn test_devin_lifecycle_disable_delete_rescan_and_redaction() {
     assert_eq!(resp.status(), StatusCode::OK);
 
     // A. Redacted outputs in listing
-    let list_resp = send_management_request(&ctx.app, Method::GET, "/v0/management/auth-files", None).await;
+    let list_resp =
+        send_management_request(&ctx.app, Method::GET, "/v0/management/auth-files", None).await;
     assert_eq!(list_resp.status(), StatusCode::OK);
     let list_json = body_json(list_resp).await;
     let files = list_json["files"].as_array().expect("files array");
@@ -723,7 +766,8 @@ async fn test_disabled_and_unloaded_credential_exposes_canonical_identity_slug_i
     .expect("write legacy devin file");
 
     // 3. Query inventory directly via GET /v0/management/auth-files
-    let list_resp = send_management_request(&ctx.app, Method::GET, "/v0/management/auth-files", None).await;
+    let list_resp =
+        send_management_request(&ctx.app, Method::GET, "/v0/management/auth-files", None).await;
     assert_eq!(list_resp.status(), StatusCode::OK);
     let list_json = body_json(list_resp).await;
     let files = list_json["files"].as_array().expect("files array");
@@ -885,7 +929,11 @@ api_server_url = "https://server.codeium.com"
         })),
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "must reject unknown fields");
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "must reject unknown fields"
+    );
 
     // 2. Wrong types rejected
     let resp = send_management_request(
@@ -897,7 +945,11 @@ api_server_url = "https://server.codeium.com"
         })),
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "must reject non-string identity");
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "must reject non-string identity"
+    );
 
     let resp = send_management_request(
         &app,
@@ -908,7 +960,11 @@ api_server_url = "https://server.codeium.com"
         })),
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "must reject non-string label");
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "must reject non-string label"
+    );
 
     // 3. Explicit empty identity rejected (must not silently default to "devin")
     let resp = send_management_request(
@@ -920,7 +976,11 @@ api_server_url = "https://server.codeium.com"
         })),
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "must reject explicit empty identity");
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "must reject explicit empty identity"
+    );
 
     let resp = send_management_request(
         &app,
@@ -931,7 +991,11 @@ api_server_url = "https://server.codeium.com"
         })),
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "must reject whitespace identity");
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "must reject whitespace identity"
+    );
 
     // 4. Conflicting alias values rejected
     let resp = send_management_request(
@@ -944,7 +1008,11 @@ api_server_url = "https://server.codeium.com"
         })),
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "must reject conflicting alias values");
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "must reject conflicting alias values"
+    );
 
     // 5. Omitted default succeeds
     let resp = send_management_request(
@@ -954,7 +1022,11 @@ api_server_url = "https://server.codeium.com"
         Some(json!({})),
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::OK, "omitted default should succeed");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "omitted default should succeed"
+    );
     let json_resp = body_json(resp).await;
     assert_eq!(json_resp["identity_slug"], "devin");
 
@@ -1039,10 +1111,16 @@ async fn test_disk_rescan_validates_devin_account_and_skips_invalid() {
     );
 
     // Valid accounts MUST be loaded into the pool
-    let good_member = ctx.state.find_member("good-acct").expect("good-acct loaded");
+    let good_member = ctx
+        .state
+        .find_member("good-acct")
+        .expect("good-acct loaded");
     assert_eq!(good_member.access_token(), "valid-token-12345");
 
-    let derived_member = ctx.state.find_member("derived-worker").expect("derived-worker loaded");
+    let derived_member = ctx
+        .state
+        .find_member("derived-worker")
+        .expect("derived-worker loaded");
     assert_eq!(derived_member.access_token(), "valid-token-67890");
 
     std::fs::remove_dir_all(ctx.auth_dir).ok();
@@ -1081,11 +1159,23 @@ async fn test_manual_auth_file_upload_persists_validated_normalized_content() {
     let disk_json: Value = serde_json::from_str(&disk_raw).expect("parse json");
 
     // Persisted content must be the normalized object
-    assert_eq!(disk_json["type"], "devin", "persisted type must be normalized to `devin`");
-    assert_eq!(disk_json["label"], "Trimmed Label", "persisted label must be trimmed");
-    assert_eq!(disk_json["email"], "worker@devin.ai", "persisted email must be trimmed");
+    assert_eq!(
+        disk_json["type"], "devin",
+        "persisted type must be normalized to `devin`"
+    );
+    assert_eq!(
+        disk_json["label"], "Trimmed Label",
+        "persisted label must be trimmed"
+    );
+    assert_eq!(
+        disk_json["email"], "worker@devin.ai",
+        "persisted email must be trimmed"
+    );
     assert_eq!(disk_json["identity_slug"], "norm-test");
-    assert_eq!(disk_json["access_token"], "devin-session-token$normalized123");
+    assert_eq!(
+        disk_json["access_token"],
+        "devin-session-token$normalized123"
+    );
 
     // Verify in-memory member matches persisted disk content
     let member = ctx.state.find_member("norm-test").expect("loaded in pool");
@@ -1094,11 +1184,15 @@ async fn test_manual_auth_file_upload_persists_validated_normalized_content() {
     assert_eq!(member.access_token(), "devin-session-token$normalized123");
 
     // Verify inventory describes normalized label
-    let list_resp = send_management_request(&ctx.app, Method::GET, "/v0/management/auth-files", None).await;
+    let list_resp =
+        send_management_request(&ctx.app, Method::GET, "/v0/management/auth-files", None).await;
     assert_eq!(list_resp.status(), StatusCode::OK);
     let list_json = body_json(list_resp).await;
     let files = list_json["files"].as_array().expect("files array");
-    let norm_entry = files.iter().find(|f| f["name"] == "devin-norm.json").expect("entry found");
+    let norm_entry = files
+        .iter()
+        .find(|f| f["name"] == "devin-norm.json")
+        .expect("entry found");
     assert_eq!(norm_entry["label"], "Trimmed Label");
 
     std::fs::remove_dir_all(ctx.auth_dir).ok();
@@ -1122,7 +1216,8 @@ async fn test_describe_does_not_synthesize_identity_for_non_devin_providers() {
     )
     .expect("write codex file");
 
-    let list_resp = send_management_request(&ctx.app, Method::GET, "/v0/management/auth-files", None).await;
+    let list_resp =
+        send_management_request(&ctx.app, Method::GET, "/v0/management/auth-files", None).await;
     assert_eq!(list_resp.status(), StatusCode::OK);
     let list_json = body_json(list_resp).await;
     let files = list_json["files"].as_array().expect("files array");
@@ -1192,7 +1287,11 @@ async fn test_devin_reload_from_file_display_debug_does_not_leak_secret() {
         "disabled": false
     });
     let file_path = ctx.auth_dir.join("devin-reload-leak.json");
-    std::fs::write(&file_path, serde_json::to_string_pretty(&valid_doc).unwrap()).unwrap();
+    std::fs::write(
+        &file_path,
+        serde_json::to_string_pretty(&valid_doc).unwrap(),
+    )
+    .unwrap();
 
     ctx.state.rescan_pool().expect("rescan pool");
     let member = ctx.state.find_member("reload-leak").expect("member loaded");
@@ -1205,10 +1304,16 @@ async fn test_devin_reload_from_file_display_debug_does_not_leak_secret() {
         "access_token": "valid-token-12345",
         "disabled": secret_sentinel
     });
-    std::fs::write(&file_path, serde_json::to_string_pretty(&malformed_doc).unwrap()).unwrap();
+    std::fs::write(
+        &file_path,
+        serde_json::to_string_pretty(&malformed_doc).unwrap(),
+    )
+    .unwrap();
 
     // 3. Call reload_from_file
-    let err = member.reload_from_file().expect_err("reload must fail on malformed JSON");
+    let err = member
+        .reload_from_file()
+        .expect_err("reload must fail on malformed JSON");
 
     let display_str = format!("{err}");
     let debug_str = format!("{err:?}");
@@ -1262,9 +1367,7 @@ async fn test_devin_loader_skips_malformed_typed_json_without_raw_value_diagnost
 
     let log_buf = Arc::new(std::sync::Mutex::new(Vec::new()));
     let writer = BufferWriter(Arc::clone(&log_buf));
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(writer)
-        .finish();
+    let subscriber = tracing_subscriber::fmt().with_writer(writer).finish();
 
     let members = tracing::subscriber::with_default(subscriber, || {
         mahoquot_gateway::account::load_account_members(&auth_dir).unwrap()
@@ -1316,4 +1419,3 @@ fn test_management_contract_schema_and_parity_matrix_for_devin_import_cli() {
         "crates/gateway/src/management/creds.rs"
     );
 }
-

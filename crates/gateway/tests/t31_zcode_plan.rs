@@ -1,12 +1,14 @@
 mod common;
 
+use std::os::unix::fs::PermissionsExt;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
 use axum::extract::State as AxumState;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::Router;
 use base64::Engine as _;
 use common::unique_temp_dir;
@@ -88,6 +90,14 @@ async fn spawn_mock_plan_gateway(
 }
 
 async fn spawn_gateway(auth_dir: &std::path::Path) -> String {
+    spawn_gateway_with_captcha(auth_dir, None, None).await
+}
+
+async fn spawn_gateway_with_captcha(
+    auth_dir: &std::path::Path,
+    captcha_config_url: Option<String>,
+    captcha_solver_bin: Option<std::path::PathBuf>,
+) -> String {
     let config = GatewayConfig {
         usage_poll_secs: 0,
         port: 0,
@@ -99,6 +109,8 @@ async fn spawn_gateway(auth_dir: &std::path::Path) -> String {
         models_env: None,
         refresh_url: mahoquot_providers::refresh::REFRESH_TOKEN_URL.to_string(),
         auth_refresh_enabled: false,
+        captcha_config_url,
+        captcha_solver_bin,
         ..Default::default()
     };
     let state = Arc::new(AppState::new(&config).unwrap());
@@ -266,7 +278,10 @@ async fn zcode_plan_waf_challenge_maps_to_upstream_error() {
     })
     .await;
     std::fs::write(temp_dir.join("zcode-z.json"), zcode_credential(&upstream)).unwrap();
-    let gateway = spawn_gateway(&temp_dir).await;
+    // No solver override and a dead config endpoint: the solve path fails fast,
+    // offline — the challenge still surfaces as the bounded 502 mapping.
+    let gateway =
+        spawn_gateway_with_captcha(&temp_dir, Some("http://127.0.0.1:9".to_string()), None).await;
 
     let response = send_messages(&gateway, "glm-5.3-flash").await;
     assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
@@ -276,6 +291,156 @@ async fn zcode_plan_waf_challenge_maps_to_upstream_error() {
         .as_str()
         .unwrap()
         .contains("captcha challenge"));
+
+    std::fs::remove_dir_all(temp_dir).ok();
+}
+
+/// Config endpoint mock serving the captcha scene the relay must read.
+async fn spawn_mock_captcha_config() -> String {
+    let app = Router::new().route(
+        "/configs",
+        get(|| async {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "application/json")
+                .body(Body::from(
+                    json!({ "data": { "configs": { "captcha": {
+                        "enabled": true, "sceneId": "scene-t31", "prefix": "pret31", "region": "sgp"
+                    } } } })
+                    .to_string(),
+                ))
+                .unwrap()
+                .into_response()
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://127.0.0.1:{port}")
+}
+
+/// Fake solver sidecar: takes the solve request via argv (production contract)
+/// and prints a fixed result.
+fn write_solver_script(dir: &std::path::Path, stdout_line: &str) -> std::path::PathBuf {
+    let path = dir.join("fake-solver.sh");
+    std::fs::write(
+        &path,
+        format!("#!/bin/sh\nprintf '%s\\n' '{stdout_line}'\n"),
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&path, perms).unwrap();
+    path
+}
+
+#[tokio::test]
+async fn zcode_plan_challenge_solves_and_replays_once() {
+    let temp_dir = unique_temp_dir("qgw-test-t31-zcode-solve");
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_for_respond = hits.clone();
+    let (upstream, captured) = spawn_mock_plan_gateway(move || {
+        let hit = hits_for_respond.fetch_add(1, AtomicOrdering::SeqCst);
+        if hit == 0 {
+            Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .header("Content-Type", "application/json")
+                .body(Body::from(
+                    json!({ "code": 3007, "msg": "waf" }).to_string(),
+                ))
+                .unwrap()
+                .into_response()
+        } else {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "text/event-stream")
+                .body(Body::from(ANTHROPIC_SSE))
+                .unwrap()
+                .into_response()
+        }
+    })
+    .await;
+    let config_base = spawn_mock_captcha_config().await;
+    let solver = write_solver_script(&temp_dir, r#"{"ok":true,"param":"test-param-t31"}"#);
+    std::fs::write(temp_dir.join("zcode-z.json"), zcode_credential(&upstream)).unwrap();
+    let gateway = spawn_gateway_with_captcha(
+        &temp_dir,
+        Some(format!("{config_base}/configs")),
+        Some(solver),
+    )
+    .await;
+
+    let response = send_messages(&gateway, "glm-5.3-flash").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.unwrap();
+    assert!(body.contains("message_start"), "replayed SSE lost: {body}");
+
+    let captures = captured.lock().unwrap();
+    assert_eq!(captures.len(), 2, "expected exactly one challenge replay");
+    let header = |cap: &CapturedRequest, name: &str| {
+        cap.headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+    };
+    assert_eq!(
+        header(&captures[1], "x-aliyun-captcha-verify-param").as_deref(),
+        Some("test-param-t31")
+    );
+    assert_eq!(
+        header(&captures[1], "x-aliyun-captcha-verify-region").as_deref(),
+        Some("sgp")
+    );
+    assert_eq!(
+        header(&captures[0], "x-aliyun-captcha-verify-param"),
+        None,
+        "the original challenge request must carry no verify header"
+    );
+    // The replay reuses the original plan body byte-for-byte.
+    assert_eq!(captures[0].body, captures[1].body);
+    assert_eq!(captures[1].body["model"], "GLM-5.3-Flash");
+
+    std::fs::remove_dir_all(temp_dir).ok();
+}
+
+#[tokio::test]
+async fn zcode_plan_solve_failure_surfaces_upstream_error_without_replay() {
+    let temp_dir = unique_temp_dir("qgw-test-t31-zcode-solvefail");
+    let (upstream, captured) = spawn_mock_plan_gateway(|| {
+        Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                json!({ "code": 3007, "msg": "waf" }).to_string(),
+            ))
+            .unwrap()
+            .into_response()
+    })
+    .await;
+    let config_base = spawn_mock_captcha_config().await;
+    let solver = write_solver_script(&temp_dir, r#"{"ok":false,"error":"solver exploded"}"#);
+    std::fs::write(temp_dir.join("zcode-z.json"), zcode_credential(&upstream)).unwrap();
+    let gateway = spawn_gateway_with_captcha(
+        &temp_dir,
+        Some(format!("{config_base}/configs")),
+        Some(solver),
+    )
+    .await;
+
+    let response = send_messages(&gateway, "glm-5.3-flash").await;
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
+    let payload: Value = response.json().await.unwrap();
+    assert_eq!(payload["error"]["type"], "upstream_error");
+    let message = payload["error"]["message"].as_str().unwrap();
+    assert!(message.contains("automatic solve failed"), "{message}");
+    assert!(message.contains("solver exploded"), "{message}");
+    assert_eq!(
+        captured.lock().unwrap().len(),
+        1,
+        "a failed solve must not replay into the challenge"
+    );
 
     std::fs::remove_dir_all(temp_dir).ok();
 }

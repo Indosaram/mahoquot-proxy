@@ -64,6 +64,12 @@ pub const ZCODE_SDK_UA: &str = "ZCode/3.11.2";
 pub const ZCODE_ANTHROPIC_SDK_UA: &str = "ai-sdk/anthropic/3.0.81";
 /// Response header carrying the WAF challenge parameter on non-2xx replies.
 pub const ZCODE_CAPTCHA_PARAM_HEADER: &str = "x-aliyun-captcha-verify-param";
+/// Request headers a challenged request replays with after a local solve
+/// (mirrors the official client's retry posture; params are single-use).
+pub const ZCODE_CAPTCHA_VERIFY_PARAM_HEADER: &str = "X-Aliyun-Captcha-Verify-Param";
+pub const ZCODE_CAPTCHA_VERIFY_REGION_HEADER: &str = "X-Aliyun-Captcha-Verify-Region";
+/// Solve budget handed to the captcha sidecar (the reference's default).
+pub const ZCODE_CAPTCHA_SOLVE_TIMEOUT_MS: u64 = 30_000;
 /// In-body magic of the WAF challenge, in both JSON spacing styles.
 pub const ZCODE_CAPTCHA_BODY_MARKERS: &[&str] = &["\"code\":3007", "\"code\": 3007"];
 
@@ -218,6 +224,66 @@ pub fn plan_biz_error(code: i64) -> (u16, &'static str) {
     } else {
         (502, "upstream_error")
     }
+}
+
+/// Captcha scene advertised by the plan gateway's public client config.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlanCaptchaScene {
+    pub scene_id: String,
+    pub prefix: String,
+    pub region: String,
+}
+
+/// Read the captcha scene out of a `client/configs` body. `None` when the
+/// config endpoint is unreachable-by-shape or the captcha is disabled — the
+/// challenge handler then skips straight to the static 502 mapping.
+pub fn parse_captcha_scene(body: &Value) -> Option<PlanCaptchaScene> {
+    let cfg = body
+        .get("data")?
+        .get("configs")?
+        .get("captcha")?
+        .as_object()?;
+    if cfg.get("enabled").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let scene_id = cfg.get("sceneId").and_then(Value::as_str)?.trim();
+    let prefix = cfg.get("prefix").and_then(Value::as_str)?.trim();
+    if scene_id.is_empty() || prefix.is_empty() {
+        return None;
+    }
+    Some(PlanCaptchaScene {
+        scene_id: scene_id.to_string(),
+        prefix: prefix.to_string(),
+        region: cfg
+            .get("region")
+            .and_then(Value::as_str)
+            .unwrap_or("sgp")
+            .trim()
+            .to_string(),
+    })
+}
+
+/// Query for the public client-config endpoint (the desktop client's captcha
+/// scene source). Tests override the origin via `ZCODE_CAPTCHA_CONFIG_URL`.
+pub fn captcha_config_url(origin: &str, app_version: &str, platform: &str) -> String {
+    format!(
+        "{origin}/api/v1/client/configs?app_version={}&platform={}",
+        urlencode_component(app_version),
+        urlencode_component(platform)
+    )
+}
+
+fn urlencode_component(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
 }
 
 /// Companion headers the desktop client sends on plan-gateway billing calls —

@@ -1,0 +1,10 @@
+{
+  "name": "mahoquot-captcha-solver",
+  "version": "0.1.0",
+  "private": true,
+  "description": "One-shot traceless Aliyun captcha solver sidecar for the mahoquot gateway (vendored from opencodex PR #4437)",
+  "type": "module",
+  "dependencies": {
+    "happy-dom": "^20.14.3"
+  }
+}

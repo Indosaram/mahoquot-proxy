@@ -7,7 +7,6 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use futures::StreamExt;
 use http_body_util::BodyExt;
-use mahoquot_types::PoolMember;
 use mahoquot_gateway::account::{AccountMember, ProviderAccount};
 use mahoquot_gateway::config::GatewayConfig;
 use mahoquot_gateway::devin_catalog::{
@@ -20,9 +19,8 @@ use mahoquot_gateway::models_route::scoped_model_entries;
 use mahoquot_gateway::routes::create_app;
 use mahoquot_gateway::state::AppState;
 use mahoquot_providers::devin::DevinAccount;
-use mahoquot_registry::{
-    ModelCapability, ModelId, ProviderId,
-};
+use mahoquot_registry::{ModelCapability, ModelId, ProviderId};
+use mahoquot_types::PoolMember;
 use prost::Message;
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -131,6 +129,8 @@ fn test_gateway_config(auth_dir: &Path) -> GatewayConfig {
         catalog_cache_path: None,
         history_queue_capacity: 1024,
         history_batch_size: 64,
+        captcha_config_url: None,
+        captcha_solver_bin: None,
     }
 }
 
@@ -248,10 +248,13 @@ async fn test_devin_catalog_wire_codec_and_transport_invariants() {
     let err_handle = tokio::spawn(async move {
         axum::serve(err_listener, err_server).await.unwrap();
     });
-    let auth_err = fetch_devin_model_catalog(&client, &format!("http://{err_addr}"), "invalid-token")
-        .await
-        .unwrap_err();
-    assert!(matches!(auth_err, DevinDiscoveryError::HttpStatus { status } if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN));
+    let auth_err =
+        fetch_devin_model_catalog(&client, &format!("http://{err_addr}"), "invalid-token")
+            .await
+            .unwrap_err();
+    assert!(
+        matches!(auth_err, DevinDiscoveryError::HttpStatus { status } if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN)
+    );
     err_handle.abort();
 
     // 3. Rejection of non-proto content-type
@@ -270,10 +273,14 @@ async fn test_devin_catalog_wire_codec_and_transport_invariants() {
     let handle = tokio::spawn(async move {
         axum::serve(listener, non_proto_server).await.unwrap();
     });
-    let non_proto_err = fetch_devin_model_catalog(&client, &format!("http://{addr}"), "dummy-token")
-        .await
-        .unwrap_err();
-    assert!(matches!(non_proto_err, DevinDiscoveryError::InvalidContentType));
+    let non_proto_err =
+        fetch_devin_model_catalog(&client, &format!("http://{addr}"), "dummy-token")
+            .await
+            .unwrap_err();
+    assert!(matches!(
+        non_proto_err,
+        DevinDiscoveryError::InvalidContentType
+    ));
     handle.abort();
 }
 
@@ -358,7 +365,10 @@ async fn test_devin_disjoint_account_routing_and_pool_snapshot() {
         .resolve("devin/glm-5-2-none")
         .unwrap_err();
     assert!(
-        matches!(unresolved_err, mahoquot_registry::RegistryError::UnknownModel(_)),
+        matches!(
+            unresolved_err,
+            mahoquot_registry::RegistryError::UnknownModel(_)
+        ),
         "unobserved suffix variant must not be resolved from base model"
     );
 }
@@ -423,10 +433,12 @@ async fn test_devin_account_pinning_scoped_keys_exclusions_unsupported() {
 
     // 3. Exclusions: Exclusion rule prevents model from routing even if discovered
     let mut reg_with_exclusion = (*base_registry).clone();
-    reg_with_exclusion.exclusions.insert(mahoquot_registry::ModelExclusionRule {
-        model_id: ModelId::new("devin/swe-1-7").unwrap(),
-        provider_id: Some(ProviderId::devin()),
-    });
+    reg_with_exclusion
+        .exclusions
+        .insert(mahoquot_registry::ModelExclusionRule {
+            model_id: ModelId::new("devin/swe-1-7").unwrap(),
+            provider_id: Some(ProviderId::devin()),
+        });
     let comp_with_exclusion = mahoquot_gateway::runtime_state::compute_candidate_composition(
         2,
         vec![member_b.clone()],
@@ -470,10 +482,16 @@ async fn test_devin_supports_images_vision_not_image_generation() {
     .expect("candidate composition");
 
     let resolved = candidate.registry().resolve("devin/glm-5-2").unwrap();
-    assert!(resolved.effective_capabilities.contains(&ModelCapability::Chat));
-    assert!(resolved.effective_capabilities.contains(&ModelCapability::Tools));
+    assert!(resolved
+        .effective_capabilities
+        .contains(&ModelCapability::Chat));
+    assert!(resolved
+        .effective_capabilities
+        .contains(&ModelCapability::Tools));
     assert!(
-        !resolved.effective_capabilities.contains(&ModelCapability::Image),
+        !resolved
+            .effective_capabilities
+            .contains(&ModelCapability::Image),
         "supports_images must NOT grant ModelCapability::Image (image generation)"
     );
     assert!(member.devin_model_supports_vision("devin/glm-5-2"));
@@ -487,11 +505,8 @@ async fn test_devin_cache_ttl_and_transient_failure_preservation() {
     let now_unix = 1726000000;
 
     // 1. Initial successful cache entry
-    let mut state = DevinAccountCatalogState::new_success(
-        key.clone(),
-        vec![model.clone()],
-        now_unix,
-    );
+    let mut state =
+        DevinAccountCatalogState::new_success(key.clone(), vec![model.clone()], now_unix);
 
     assert!(!state.is_stale(now_unix + 100));
     assert!(!state.is_stale(now_unix + 299));
@@ -522,7 +537,11 @@ async fn test_devin_management_refresh_endpoint_flow() {
         "api_server_url": mock.url,
         "disabled": false
     });
-    std::fs::write(auth_dir.join("devin-a.json"), serde_json::to_string(&acct_a).unwrap()).unwrap();
+    std::fs::write(
+        auth_dir.join("devin-a.json"),
+        serde_json::to_string(&acct_a).unwrap(),
+    )
+    .unwrap();
 
     let config = test_gateway_config(&auth_dir);
     let state = Arc::new(AppState::new(&config).expect("create state"));
@@ -533,7 +552,9 @@ async fn test_devin_management_refresh_endpoint_flow() {
         .method("POST")
         .uri("/v0/management/devin/models/refresh")
         .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_string(&json!({"identity_slug": "devin-a"})).unwrap()))
+        .body(Body::from(
+            serde_json::to_string(&json!({"identity_slug": "devin-a"})).unwrap(),
+        ))
         .unwrap();
     let resp = app.clone().oneshot(missing_auth_req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -544,7 +565,9 @@ async fn test_devin_management_refresh_endpoint_flow() {
         .uri("/v0/management/devin/models/refresh")
         .header("authorization", "Bearer wrong-key")
         .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_string(&json!({"identity_slug": "devin-a"})).unwrap()))
+        .body(Body::from(
+            serde_json::to_string(&json!({"identity_slug": "devin-a"})).unwrap(),
+        ))
         .unwrap();
     let resp = app.clone().oneshot(wrong_auth_req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -555,7 +578,9 @@ async fn test_devin_management_refresh_endpoint_flow() {
         .uri("/v0/management/devin/models/refresh")
         .header("authorization", "Bearer test-mgmt-key")
         .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_string(&json!({"identity_slug": "devin-a"})).unwrap()))
+        .body(Body::from(
+            serde_json::to_string(&json!({"identity_slug": "devin-a"})).unwrap(),
+        ))
         .unwrap();
 
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -584,12 +609,21 @@ async fn test_devin_management_refresh_endpoint_flow() {
     let models_json: Value = serde_json::from_slice(&models_body).unwrap();
     assert_eq!(models_json["object"], "list");
     let model_items = models_json["data"].as_array().expect("data array");
-    let found_glm = model_items.iter().any(|m| m["id"] == "devin/glm-5-2" && m["owned_by"] == "devin");
-    assert!(found_glm, "devin/glm-5-2 must be visible in /v1/models with owned_by: devin");
+    let found_glm = model_items
+        .iter()
+        .any(|m| m["id"] == "devin/glm-5-2" && m["owned_by"] == "devin");
+    assert!(
+        found_glm,
+        "devin/glm-5-2 must be visible in /v1/models with owned_by: devin"
+    );
 
     // Check GET /admin/stats serialization
     let stats = state.get_stats();
-    let acct_stats = stats.accounts.iter().find(|a| a.id == "devin-a").expect("find account");
+    let acct_stats = stats
+        .accounts
+        .iter()
+        .find(|a| a.id == "devin-a")
+        .expect("find account");
     assert_eq!(acct_stats.provider, "devin");
     assert!(acct_stats.models.is_some());
     let models_stats = acct_stats.models.as_ref().unwrap();
@@ -609,7 +643,11 @@ async fn test_devin_old_snapshot_hold_immutability() {
         "api_server_url": mock.url,
         "disabled": false
     });
-    std::fs::write(auth_dir.join("devin-a.json"), serde_json::to_string(&acct_a).unwrap()).unwrap();
+    std::fs::write(
+        auth_dir.join("devin-a.json"),
+        serde_json::to_string(&acct_a).unwrap(),
+    )
+    .unwrap();
 
     let config = test_gateway_config(&auth_dir);
     let state = Arc::new(AppState::new(&config).expect("create state"));
@@ -622,17 +660,21 @@ async fn test_devin_old_snapshot_hold_immutability() {
 
     // Execute refresh to discover models
     let member = state.find_member("devin-a").expect("find member");
-    let client = state.devin_client_for_member(&member).expect("devin client");
-    let new_cat = mahoquot_gateway::devin_catalog::refresh_account_models(&member, &client, Some(&state.devin_cache))
-        .await
-        .expect("refresh account");
+    let client = state
+        .devin_client_for_member(&member)
+        .expect("devin client");
+    let new_cat = mahoquot_gateway::devin_catalog::refresh_account_models(
+        &member,
+        &client,
+        Some(&state.devin_cache),
+    )
+    .await
+    .expect("refresh account");
     let rev = new_cat.key.credential_revision.clone();
-    let comp_v1 = state.runtime.publish_devin_member_catalog(
-        "devin-a",
-        &rev,
-        new_cat,
-        &state.devin_cache,
-    ).expect("publish runtime");
+    let comp_v1 = state
+        .runtime
+        .publish_devin_member_catalog("devin-a", &rev, new_cat, &state.devin_cache)
+        .expect("publish runtime");
 
     // New snapshot has incremented generation and discovered models
     assert_eq!(comp_v1.generation(), initial_gen + 1);
@@ -660,10 +702,19 @@ fn test_devin_concurrent_discovery_cache_rcu() {
         let cache_clone = Arc::clone(&cache);
         let barrier_clone = Arc::clone(&barrier);
         handles.push(std::thread::spawn(move || {
-            let key = DevinCacheKey::new(format!("devin-{i}"), &format!("tok-{i}"), "http://127.0.0.1:18899");
+            let key = DevinCacheKey::new(
+                format!("devin-{i}"),
+                &format!("tok-{i}"),
+                "http://127.0.0.1:18899",
+            );
             let state = Arc::new(DevinAccountCatalogState::new_success(
                 key.clone(),
-                vec![create_test_model(&format!("model-{i}"), &format!("Model {i}"), false, false)],
+                vec![create_test_model(
+                    &format!("model-{i}"),
+                    &format!("Model {i}"),
+                    false,
+                    false,
+                )],
                 now_unix,
             ));
             // Synchronize all threads to fire simultaneously at the barrier
@@ -678,10 +729,17 @@ fn test_devin_concurrent_discovery_cache_rcu() {
 
     // Assert that zero updates were lost due to CAS/rcu
     for i in 0..NUM_THREADS {
-        let key = DevinCacheKey::new(format!("devin-{i}"), &format!("tok-{i}"), "http://127.0.0.1:18899");
+        let key = DevinCacheKey::new(
+            format!("devin-{i}"),
+            &format!("tok-{i}"),
+            "http://127.0.0.1:18899",
+        );
         let entry = cache.get(&key);
         assert!(entry.is_some(), "entry {i} must exist in cache");
-        assert_eq!(entry.unwrap().models[0].public_id, format!("devin/model-{i}"));
+        assert_eq!(
+            entry.unwrap().models[0].public_id,
+            format!("devin/model-{i}")
+        );
     }
 }
 
@@ -736,9 +794,10 @@ async fn test_devin_known_empty_catalog_is_valid_stale_lkg() {
     let cache = mahoquot_gateway::devin_catalog::DevinDiscoveryCache::new();
 
     // 1. First real refresh via HTTP: returns 200 OK with 0 models
-    let state1 = mahoquot_gateway::devin_catalog::refresh_account_models(&member, &client, Some(&cache))
-        .await
-        .expect("initial empty discovery must succeed");
+    let state1 =
+        mahoquot_gateway::devin_catalog::refresh_account_models(&member, &client, Some(&cache))
+            .await
+            .expect("initial empty discovery must succeed");
     assert!(!state1.stale);
     assert!(state1.has_succeeded);
     assert!(state1.models.is_empty());
@@ -749,9 +808,10 @@ async fn test_devin_known_empty_catalog_is_valid_stale_lkg() {
 
     // 2. Second real refresh via HTTP: transient 503 failure
     // Known-empty catalog must be preserved as valid stale LKG!
-    let state2 = mahoquot_gateway::devin_catalog::refresh_account_models(&member, &client, Some(&cache))
-        .await
-        .expect("transient failure with existing empty catalog must return stale LKG Ok");
+    let state2 =
+        mahoquot_gateway::devin_catalog::refresh_account_models(&member, &client, Some(&cache))
+            .await
+            .expect("transient failure with existing empty catalog must return stale LKG Ok");
     assert!(state2.stale);
     assert!(state2.has_succeeded);
     assert!(state2.models.is_empty());
@@ -805,7 +865,12 @@ async fn test_devin_channel_gated_credential_rotation_race() {
         axum::serve(listener, app).await.unwrap();
     });
 
-    let member = create_devin_member("devin-race", "token-initial", &format!("http://{addr}"), false);
+    let member = create_devin_member(
+        "devin-race",
+        "token-initial",
+        &format!("http://{addr}"),
+        false,
+    );
     let client = reqwest::Client::builder()
         .http1_only()
         .no_proxy()
@@ -888,7 +953,12 @@ async fn test_devin_channel_gated_account_disabled_race() {
         axum::serve(listener, app).await.unwrap();
     });
 
-    let member = create_devin_member("devin-disabled-race", "token-init", &format!("http://{addr}"), false);
+    let member = create_devin_member(
+        "devin-disabled-race",
+        "token-init",
+        &format!("http://{addr}"),
+        false,
+    );
     let client = reqwest::Client::builder()
         .http1_only()
         .no_proxy()
@@ -927,12 +997,20 @@ async fn test_devin_same_token_endpoint_change_race() {
         "api_server_url": "http://127.0.0.1:18899",
         "disabled": false
     });
-    std::fs::write(auth_dir.join("devin-endpoint.json"), serde_json::to_string(&acct).unwrap()).unwrap();
+    std::fs::write(
+        auth_dir.join("devin-endpoint.json"),
+        serde_json::to_string(&acct).unwrap(),
+    )
+    .unwrap();
 
     let config = test_gateway_config(&auth_dir);
     let state = Arc::new(AppState::new(&config).expect("create state"));
 
-    let initial_key = DevinCacheKey::new("devin-endpoint", "devin-token-stable", "http://127.0.0.1:18899");
+    let initial_key = DevinCacheKey::new(
+        "devin-endpoint",
+        "devin-token-stable",
+        "http://127.0.0.1:18899",
+    );
     let catalog = Arc::new(DevinAccountCatalogState::new_success(
         initial_key.clone(),
         vec![create_test_model("model-1", "Model 1", false, false)],
@@ -945,7 +1023,8 @@ async fn test_devin_same_token_endpoint_change_race() {
     std::fs::write(
         auth_dir.join("devin-endpoint.json"),
         serde_json::to_string(&replacement).unwrap(),
-    ).unwrap();
+    )
+    .unwrap();
     state.rescan_pool().unwrap();
 
     // When an in-flight catalog attempts publication with the old endpoint
@@ -978,7 +1057,11 @@ async fn test_devin_chat_completion_runtime_identity_preserved_across_catalog_re
         "api_server_url": mock.url,
         "disabled": false
     });
-    std::fs::write(auth_dir.join("devin-chat.json"), serde_json::to_string(&acct).unwrap()).unwrap();
+    std::fs::write(
+        auth_dir.join("devin-chat.json"),
+        serde_json::to_string(&acct).unwrap(),
+    )
+    .unwrap();
 
     let config = test_gateway_config(&auth_dir);
     let state = Arc::new(AppState::new(&config).expect("create state"));
@@ -990,16 +1073,18 @@ async fn test_devin_chat_completion_runtime_identity_preserved_across_catalog_re
 
     // Refresh discovery, publishing incremented snapshot
     let client = state.devin_client_for_member(&member_v0).expect("client");
-    let new_cat = mahoquot_gateway::devin_catalog::refresh_account_models(&member_v0, &client, Some(&state.devin_cache))
-        .await
-        .expect("refresh");
+    let new_cat = mahoquot_gateway::devin_catalog::refresh_account_models(
+        &member_v0,
+        &client,
+        Some(&state.devin_cache),
+    )
+    .await
+    .expect("refresh");
     let rev = new_cat.key.credential_revision.clone();
-    let comp_v1 = state.runtime.publish_devin_member_catalog(
-        "devin-chat",
-        &rev,
-        new_cat,
-        &state.devin_cache,
-    ).expect("publish runtime");
+    let comp_v1 = state
+        .runtime
+        .publish_devin_member_catalog("devin-chat", &rev, new_cat, &state.devin_cache)
+        .expect("publish runtime");
     assert_eq!(comp_v1.generation(), initial_gen + 1);
 
     // Get Generation 1 member from current pool
@@ -1009,7 +1094,9 @@ async fn test_devin_chat_completion_runtime_identity_preserved_across_catalog_re
     member_v0.record_ok();
     member_v0.record_ok();
     member_v0.record_fail();
-    member_v0.set_health(mahoquot_types::Health::Cooldown { until_unix_ms: 9999999999 });
+    member_v0.set_health(mahoquot_types::Health::Cooldown {
+        until_unix_ms: 9999999999,
+    });
 
     // CRITICAL INVARIANT: The mutable runtime identity is preserved!
     // Current pool member_v1 sees the ok/fail counts and cooldown immediately!
@@ -1019,11 +1106,17 @@ async fn test_devin_chat_completion_runtime_identity_preserved_across_catalog_re
     assert_eq!(member_v1.fail_count.load(Ordering::Relaxed), 1);
     assert_eq!(
         member_v1.health(),
-        mahoquot_types::Health::Cooldown { until_unix_ms: 9999999999 }
+        mahoquot_types::Health::Cooldown {
+            until_unix_ms: 9999999999
+        }
     );
 
     let stats = state.get_stats();
-    let stat = stats.accounts.iter().find(|a| a.id == "devin-chat").unwrap();
+    let stat = stats
+        .accounts
+        .iter()
+        .find(|a| a.id == "devin-chat")
+        .unwrap();
     assert_eq!(stat.ok, 2);
     assert_eq!(stat.fails, 1);
 }
@@ -1113,27 +1206,41 @@ async fn test_devin_generation_consistent_snapshot_permissions_isolation() {
 
     // Set up Gen0 catalog: contains only devin/glm-5-2 with vision
     let _member_gen0 = state.find_member("devin-iso").expect("find member");
-    let key_gen0 = DevinCacheKey::new("devin-iso", "token-gen0", "http://endpoint-gen0.example.com");
+    let key_gen0 = DevinCacheKey::new(
+        "devin-iso",
+        "token-gen0",
+        "http://endpoint-gen0.example.com",
+    );
     let cat_gen0 = Arc::new(DevinAccountCatalogState::new_success(
         key_gen0.clone(),
         vec![create_test_model("glm-5-2", "GLM 5.2", true, false)],
         1726000000,
     ));
     let rev_gen0 = mahoquot_gateway::devin_catalog::compute_credential_revision("token-gen0");
-    let snap_gen0 = state.runtime.publish_devin_member_catalog(
-        "devin-iso",
-        &rev_gen0,
-        cat_gen0,
-        &state.devin_cache,
-    ).expect("publish gen0");
+    let snap_gen0 = state
+        .runtime
+        .publish_devin_member_catalog("devin-iso", &rev_gen0, cat_gen0, &state.devin_cache)
+        .expect("publish gen0");
 
     let gen0_num = snap_gen0.generation();
 
     // Verify Gen0 permissions
-    assert_eq!(snap_gen0.routable_accounts_for_model("devin/glm-5-2").len(), 1);
-    assert_eq!(snap_gen0.routable_accounts_for_model("devin/swe-1-7").len(), 0);
-    assert_eq!(snap_gen0.devin_credential_revision("devin-iso"), Some("token-gen0"));
-    assert_eq!(snap_gen0.devin_effective_base_url("devin-iso"), Some("http://endpoint-gen0.example.com"));
+    assert_eq!(
+        snap_gen0.routable_accounts_for_model("devin/glm-5-2").len(),
+        1
+    );
+    assert_eq!(
+        snap_gen0.routable_accounts_for_model("devin/swe-1-7").len(),
+        0
+    );
+    assert_eq!(
+        snap_gen0.devin_credential_revision("devin-iso"),
+        Some("token-gen0")
+    );
+    assert_eq!(
+        snap_gen0.devin_effective_base_url("devin-iso"),
+        Some("http://endpoint-gen0.example.com")
+    );
     assert!(snap_gen0.devin_model_supports_vision("devin-iso", "devin/glm-5-2"));
     assert!(!snap_gen0.devin_model_supports_vision("devin-iso", "devin/swe-1-7"));
 
@@ -1151,36 +1258,62 @@ async fn test_devin_generation_consistent_snapshot_permissions_isolation() {
 
     // Publish Gen1 catalog: contains only devin/swe-1-7 without vision
     let _member_gen1 = state.find_member("devin-iso").expect("find member gen1");
-    let key_gen1 = DevinCacheKey::new("devin-iso", "token-gen1", "http://endpoint-gen1.example.com");
+    let key_gen1 = DevinCacheKey::new(
+        "devin-iso",
+        "token-gen1",
+        "http://endpoint-gen1.example.com",
+    );
     let cat_gen1 = Arc::new(DevinAccountCatalogState::new_success(
         key_gen1.clone(),
         vec![create_test_model("swe-1-7", "SWE 1.7", false, false)],
         1726000005,
     ));
     let rev_gen1 = mahoquot_gateway::devin_catalog::compute_credential_revision("token-gen1");
-    let snap_gen1 = state.runtime.publish_devin_member_catalog(
-        "devin-iso",
-        &rev_gen1,
-        cat_gen1,
-        &state.devin_cache,
-    ).expect("publish gen1");
+    let snap_gen1 = state
+        .runtime
+        .publish_devin_member_catalog("devin-iso", &rev_gen1, cat_gen1, &state.devin_cache)
+        .expect("publish gen1");
 
     assert!(snap_gen1.generation() > gen0_num);
 
     // Verify Gen1 permissions
-    assert_eq!(snap_gen1.routable_accounts_for_model("devin/swe-1-7").len(), 1);
-    assert_eq!(snap_gen1.routable_accounts_for_model("devin/glm-5-2").len(), 0);
-    assert_eq!(snap_gen1.devin_credential_revision("devin-iso"), Some("token-gen1"));
-    assert_eq!(snap_gen1.devin_effective_base_url("devin-iso"), Some("http://endpoint-gen1.example.com"));
+    assert_eq!(
+        snap_gen1.routable_accounts_for_model("devin/swe-1-7").len(),
+        1
+    );
+    assert_eq!(
+        snap_gen1.routable_accounts_for_model("devin/glm-5-2").len(),
+        0
+    );
+    assert_eq!(
+        snap_gen1.devin_credential_revision("devin-iso"),
+        Some("token-gen1")
+    );
+    assert_eq!(
+        snap_gen1.devin_effective_base_url("devin-iso"),
+        Some("http://endpoint-gen1.example.com")
+    );
     assert!(!snap_gen1.devin_model_supports_vision("devin-iso", "devin/swe-1-7"));
 
     // Step 3: CRITICAL INVARIANT: snap_gen0 held across replacement remains completely isolated!
     // It must NEVER mix credentials, endpoints, or model permissions from Gen1!
     assert_eq!(snap_gen0.generation(), gen0_num);
-    assert_eq!(snap_gen0.routable_accounts_for_model("devin/glm-5-2").len(), 1);
-    assert_eq!(snap_gen0.routable_accounts_for_model("devin/swe-1-7").len(), 0);
-    assert_eq!(snap_gen0.devin_credential_revision("devin-iso"), Some("token-gen0"));
-    assert_eq!(snap_gen0.devin_effective_base_url("devin-iso"), Some("http://endpoint-gen0.example.com"));
+    assert_eq!(
+        snap_gen0.routable_accounts_for_model("devin/glm-5-2").len(),
+        1
+    );
+    assert_eq!(
+        snap_gen0.routable_accounts_for_model("devin/swe-1-7").len(),
+        0
+    );
+    assert_eq!(
+        snap_gen0.devin_credential_revision("devin-iso"),
+        Some("token-gen0")
+    );
+    assert_eq!(
+        snap_gen0.devin_effective_base_url("devin-iso"),
+        Some("http://endpoint-gen0.example.com")
+    );
     assert!(snap_gen0.devin_model_supports_vision("devin-iso", "devin/glm-5-2"));
     assert!(!snap_gen0.devin_model_supports_vision("devin-iso", "devin/swe-1-7"));
 }
@@ -1213,7 +1346,11 @@ async fn test_devin_invalid_credentialed_proxy_prevents_direct_leak_and_masks_cr
         "api_server_url": format!("http://{upstream_addr}"),
         "disabled": false
     });
-    std::fs::write(auth_dir.join("devin-leak-test.json"), serde_json::to_string(&acct).unwrap()).unwrap();
+    std::fs::write(
+        auth_dir.join("devin-leak-test.json"),
+        serde_json::to_string(&acct).unwrap(),
+    )
+    .unwrap();
 
     let config = test_gateway_config(&auth_dir);
     let state = Arc::new(AppState::new(&config).expect("create state"));
@@ -1221,25 +1358,31 @@ async fn test_devin_invalid_credentialed_proxy_prevents_direct_leak_and_masks_cr
     // Set invalid proxy with secret password in settings
     let secret_pass = "super_secret_password_xyz_9988";
     let proxy_with_creds = format!("http://leak_user:{secret_pass}@127.0.0.1:65534");
-    state.settings.mutate(|s| {
-        let mut providers = s.proxy_providers.clone();
-        providers.insert(
-            "devin".to_string(),
-            mahoquot_gateway::management::settings::ProviderProxyPolicy {
-                enabled: true,
-                url: proxy_with_creds.clone(),
-                sticky: false,
-                ttl_secs: 0,
-            },
-        );
-        s.proxy_providers = providers;
-    }).unwrap();
+    state
+        .settings
+        .mutate(|s| {
+            let mut providers = s.proxy_providers.clone();
+            providers.insert(
+                "devin".to_string(),
+                mahoquot_gateway::management::settings::ProviderProxyPolicy {
+                    enabled: true,
+                    url: proxy_with_creds.clone(),
+                    sticky: false,
+                    ttl_secs: 0,
+                },
+            );
+            s.proxy_providers = providers;
+        })
+        .unwrap();
 
     let member = state.find_member("devin-leak-test").unwrap();
-    let client = state.devin_client_for_member(&member).expect("client built");
+    let client = state
+        .devin_client_for_member(&member)
+        .expect("client built");
 
     // Execute discovery through the proxied client
-    let fetch_res = fetch_devin_model_catalog(&client, &format!("http://{upstream_addr}"), "devin-token").await;
+    let fetch_res =
+        fetch_devin_model_catalog(&client, &format!("http://{upstream_addr}"), "devin-token").await;
 
     // Must fail due to proxy connection failure
     let err = fetch_res.unwrap_err();
@@ -1423,7 +1566,10 @@ async fn test_devin_discovery_exact_mime_essence_validation() {
     // Exact MIME essence with parameter: application/proto; charset=utf-8
     *current_ct.lock().unwrap() = "application/proto; charset=utf-8".to_string();
     let res = fetch_devin_model_catalog(&client, &base_url, "dummy-tok").await;
-    assert!(res.is_ok(), "application/proto; charset=utf-8 must be accepted");
+    assert!(
+        res.is_ok(),
+        "application/proto; charset=utf-8 must be accepted"
+    );
 
     // Invalid suffix MIME type: application/protobuf
     *current_ct.lock().unwrap() = "application/protobuf".to_string();
@@ -1479,7 +1625,11 @@ async fn test_devin_initial_refresh_failure_publishes_catalog_and_subsequent_get
         "api_server_url": format!("http://{addr}"),
         "disabled": false
     });
-    std::fs::write(auth_dir.join("devin-fail.json"), serde_json::to_string(&acct).unwrap()).unwrap();
+    std::fs::write(
+        auth_dir.join("devin-fail.json"),
+        serde_json::to_string(&acct).unwrap(),
+    )
+    .unwrap();
 
     let config = test_gateway_config(&auth_dir);
     let state = Arc::new(AppState::new(&config).expect("create state"));
@@ -1491,7 +1641,9 @@ async fn test_devin_initial_refresh_failure_publishes_catalog_and_subsequent_get
         .uri("/v0/management/devin/models/refresh")
         .header("authorization", "Bearer test-mgmt-key")
         .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_string(&json!({"identity_slug": "devin-fail"})).unwrap()))
+        .body(Body::from(
+            serde_json::to_string(&json!({"identity_slug": "devin-fail"})).unwrap(),
+        ))
         .unwrap();
 
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -1513,14 +1665,21 @@ async fn test_devin_initial_refresh_failure_publishes_catalog_and_subsequent_get
     let status_body = status_resp.into_body().collect().await.unwrap().to_bytes();
     let status_json: Value = serde_json::from_slice(&status_body).unwrap();
     let accts = status_json["accounts"].as_array().expect("accounts array");
-    let acct_status = accts.iter().find(|a| a["identity_slug"] == "devin-fail").expect("found devin-fail");
+    let acct_status = accts
+        .iter()
+        .find(|a| a["identity_slug"] == "devin-fail")
+        .expect("found devin-fail");
 
     assert_ne!(
         acct_status["status"], "uninitialized",
         "subsequent GET must not report uninitialized after failed refresh"
     );
     assert_eq!(acct_status["status"], "error");
-    assert!(acct_status["error"].is_string(), "subsequent GET must report recorded error message, got: {:?}", acct_status["error"]);
+    assert!(
+        acct_status["error"].is_string(),
+        "subsequent GET must report recorded error message, got: {:?}",
+        acct_status["error"]
+    );
     assert_eq!(
         acct_status["error"].as_str().unwrap(),
         "upstream authentication failed (HTTP 401)"
@@ -1541,7 +1700,11 @@ async fn test_devin_cached_transient_failure_refresh_returns_outcome_error_when_
         "api_server_url": mock.url,
         "disabled": false
     });
-    std::fs::write(auth_dir.join("devin-transient.json"), serde_json::to_string(&acct).unwrap()).unwrap();
+    std::fs::write(
+        auth_dir.join("devin-transient.json"),
+        serde_json::to_string(&acct).unwrap(),
+    )
+    .unwrap();
 
     let config = test_gateway_config(&auth_dir);
     let state = Arc::new(AppState::new(&config).expect("create state"));
@@ -1553,7 +1716,9 @@ async fn test_devin_cached_transient_failure_refresh_returns_outcome_error_when_
         .uri("/v0/management/devin/models/refresh")
         .header("authorization", "Bearer test-mgmt-key")
         .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_string(&json!({"identity_slug": "devin-transient"})).unwrap()))
+        .body(Body::from(
+            serde_json::to_string(&json!({"identity_slug": "devin-transient"})).unwrap(),
+        ))
         .unwrap();
 
     let resp1 = app.clone().oneshot(req1).await.unwrap();
@@ -1571,7 +1736,9 @@ async fn test_devin_cached_transient_failure_refresh_returns_outcome_error_when_
         .uri("/v0/management/devin/models/refresh")
         .header("authorization", "Bearer test-mgmt-key")
         .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_string(&json!({"identity_slug": "devin-transient"})).unwrap()))
+        .body(Body::from(
+            serde_json::to_string(&json!({"identity_slug": "devin-transient"})).unwrap(),
+        ))
         .unwrap();
 
     let resp2 = app.clone().oneshot(req2).await.unwrap();
@@ -1602,7 +1769,11 @@ async fn test_devin_stale_get_schedules_async_refresh() {
         "api_server_url": mock.url,
         "disabled": false
     });
-    std::fs::write(auth_dir.join("devin-stale-get.json"), serde_json::to_string(&acct).unwrap()).unwrap();
+    std::fs::write(
+        auth_dir.join("devin-stale-get.json"),
+        serde_json::to_string(&acct).unwrap(),
+    )
+    .unwrap();
 
     let config = test_gateway_config(&auth_dir);
     let state = Arc::new(AppState::new(&config).expect("create state"));
@@ -1630,7 +1801,9 @@ async fn test_devin_stale_get_schedules_async_refresh() {
 
     let member = state.find_member("devin-stale-get").expect("found member");
     assert!(
-        member.devin_catalog_state().is_some_and(|cat| !cat.models.is_empty()),
+        member
+            .devin_catalog_state()
+            .is_some_and(|cat| !cat.models.is_empty()),
         "catalog state must be populated by async refresh scheduled by stale GET"
     );
 }
@@ -1702,42 +1875,61 @@ async fn test_devin_overlapping_refresh_out_of_order_stale_overwrite_prevented()
         "api_server_url": format!("http://{addr}"),
         "disabled": false
     });
-    std::fs::write(auth_dir.join("devin-overlap.json"), serde_json::to_string(&acct).unwrap()).unwrap();
+    std::fs::write(
+        auth_dir.join("devin-overlap.json"),
+        serde_json::to_string(&acct).unwrap(),
+    )
+    .unwrap();
 
     let config = test_gateway_config(&auth_dir);
     let state = Arc::new(AppState::new(&config).expect("create state"));
 
     let member = state.find_member("devin-overlap").expect("find member");
-    let client = state.devin_client_for_member(&member).expect("devin client");
+    let client = state
+        .devin_client_for_member(&member)
+        .expect("devin client");
 
     // 1. Launch Request 1 (older request) in background
     let member_clone1 = Arc::clone(&member);
     let client_clone1 = client.clone();
     let state_cache1 = Arc::clone(&state.devin_cache);
     let task_req1 = tokio::spawn(async move {
-        mahoquot_gateway::devin_catalog::refresh_account_models(&member_clone1, &client_clone1, Some(&state_cache1)).await
+        mahoquot_gateway::devin_catalog::refresh_account_models(
+            &member_clone1,
+            &client_clone1,
+            Some(&state_cache1),
+        )
+        .await
     });
 
     // Await Request 1 reaching the upstream server and pausing at the barrier
     barrier_req1_started.notified().await;
 
     // 2. Launch Request 2 (newer request) while Request 1 is paused in-flight
-    let cat2 = mahoquot_gateway::devin_catalog::refresh_account_models(&member, &client, Some(&state.devin_cache))
-        .await
-        .expect("request 2 refresh");
+    let cat2 = mahoquot_gateway::devin_catalog::refresh_account_models(
+        &member,
+        &client,
+        Some(&state.devin_cache),
+    )
+    .await
+    .expect("request 2 refresh");
     assert_eq!(cat2.models[0].model_uid, "glm-5-2-new");
 
     // Publish Request 2's catalog
     let rev2 = cat2.key.credential_revision.clone();
-    let snap2 = state.runtime.publish_devin_member_catalog(
-        "devin-overlap",
-        &rev2,
-        cat2,
-        &state.devin_cache,
-    ).expect("publish request 2 catalog");
+    let snap2 = state
+        .runtime
+        .publish_devin_member_catalog("devin-overlap", &rev2, cat2, &state.devin_cache)
+        .expect("publish request 2 catalog");
 
-    assert_eq!(snap2.routable_accounts_for_model("devin/glm-5-2-new").len(), 1);
-    assert_eq!(snap2.routable_accounts_for_model("devin/glm-5-2-old").len(), 0);
+    assert_eq!(
+        snap2.routable_accounts_for_model("devin/glm-5-2-new").len(),
+        1
+    );
+    assert_eq!(
+        snap2.routable_accounts_for_model("devin/glm-5-2-old").len(),
+        0
+    );
 
     // 3. Now release Request 1 (the older request) to complete its RPC late
     barrier_req1_allow_finish.notify_one();
@@ -1763,16 +1955,19 @@ async fn test_devin_overlapping_refresh_out_of_order_stale_overwrite_prevented()
     // Verify current snapshot still serves the newer model and not the older model
     let current_snap = state.pool.load();
     assert_eq!(
-        current_snap.routable_accounts_for_model("devin/glm-5-2-new").len(),
+        current_snap
+            .routable_accounts_for_model("devin/glm-5-2-new")
+            .len(),
         1,
         "newer model devin/glm-5-2-new must be preserved"
     );
     assert_eq!(
-        current_snap.routable_accounts_for_model("devin/glm-5-2-old").len(),
+        current_snap
+            .routable_accounts_for_model("devin/glm-5-2-old")
+            .len(),
         0,
         "older model devin/glm-5-2-old must not be routed"
     );
 
     server_handle.abort();
 }
-
