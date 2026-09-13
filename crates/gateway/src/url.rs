@@ -31,7 +31,10 @@ pub fn build_provider_url(
             .map(|base| base.trim_end_matches('/').to_string())
             .unwrap_or_else(|| mahoquot_providers::CLAUDE_UPSTREAM_BASE.to_string()),
         ProviderKind::Cursor => mahoquot_providers::CURSOR_UPSTREAM_BASE.to_string(),
-        ProviderKind::Zcode => mahoquot_providers::ZCODE_ANTHROPIC_BASE.to_string(),
+        // relay deployments steer the plan gateway through upstream_override
+        ProviderKind::Zcode => upstream_override
+            .map(|base| base.trim_end_matches('/').to_string())
+            .unwrap_or_else(|| mahoquot_providers::ZCODE_ANTHROPIC_BASE.to_string()),
         // Kiro's host is region-templated; the default region is correct for
         // accounts that did not record one.
         ProviderKind::Kiro => mahoquot_providers::KIRO_API_HOST_TEMPLATE
@@ -112,9 +115,15 @@ mod tests {
 
         let zcode = build_provider_url(ProviderKind::Zcode, None, "/v1/messages");
         assert!(
-            zcode.starts_with("https://api.z.ai/api/anthropic"),
+            zcode.starts_with("https://zcode.z.ai/api/v1/zcode-plan"),
             "zcode routed to {zcode}"
         );
+        let zcode_override = build_provider_url(
+            ProviderKind::Zcode,
+            Some("http://127.0.0.1:18893/"),
+            "/v1/messages",
+        );
+        assert_eq!(zcode_override, "http://127.0.0.1:18893/v1/messages");
 
         let cursor = build_provider_url(ProviderKind::Cursor, None, "/v1/chat/completions");
         assert!(

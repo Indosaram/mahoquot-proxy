@@ -1,5 +1,6 @@
 mod common;
 
+use base64::Engine as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -74,9 +75,18 @@ async fn start_mock(
 }
 
 fn credential(kind: &str, upstream: &str) -> String {
+    // The zcode plan account authenticates with a JWT; metadata.user_id comes
+    // from its payload, so the fixture uses a real three-segment token.
+    let access_token = if kind == "zcode" {
+        let payload =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"user_id":"usr-42"}"#);
+        format!("eyJhbGciOiJub25lIn0.{payload}.sig")
+    } else {
+        format!("{kind}-token")
+    };
     let mut value = serde_json::json!({
         "identity_slug": format!("{kind}-relay"),
-        "access_token": format!("{kind}-token"),
+        "access_token": access_token,
         "refresh_token": format!("{kind}-refresh"),
         "email": format!("u@{kind}.test"),
         "expired": "2099-01-01T00:00:00Z",
@@ -878,7 +888,22 @@ async fn assert_anthropic_native(kind: &str, model: &str) {
         .cloned()
         .expect("upstream call");
     assert_eq!(request.path, "/v1/messages");
-    assert_eq!(request.body["messages"][0]["content"], "ping");
+    if kind == "zcode" {
+        // The plan gateway requires the official ZCode identity blocks and the
+        // client's two-phase cache_control, so string content becomes a block
+        // array with the ephemeral breakpoint on the last message.
+        let content = request.body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["text"], "ping");
+        assert_eq!(content[0]["cache_control"]["type"], "ephemeral");
+        let system = request.body["system"].as_array().unwrap();
+        assert!(system[0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("You are ZCode"));
+        assert_eq!(request.body["metadata"]["user_id"], "usr-42");
+    } else {
+        assert_eq!(request.body["messages"][0]["content"], "ping");
+    }
     assert!(
         request.body.get("input").is_none(),
         "must not send Codex body"
@@ -1087,28 +1112,45 @@ async fn kiro_relays_conversation_state_and_decodes_eventstream() {
         frame
     }
     let mut wire = frame(br#"{"content":"kiro-ok"}"#);
-    wire.extend(frame(br#"{"name":"lookup","toolUseId":"kiro-call","input":"{}"}"#));
+    wire.extend(frame(
+        br#"{"name":"lookup","toolUseId":"kiro-call","input":"{}"}"#,
+    ));
     let seen = Arc::new(Mutex::new(Vec::new()));
     let captured = seen.clone();
-    let app = Router::new().fallback(post(move |uri: axum::http::Uri, headers: HeaderMap, body: Bytes| {
-        let captured = captured.clone();
-        let wire = wire.clone();
-        async move {
-            captured.lock().unwrap().push(SeenRequest {path:uri.path().to_string(), headers, body:serde_json::from_slice(&body).unwrap(),raw_body:body.to_vec()});
-            ([("content-type", "application/vnd.amazon.eventstream")], wire)
-        }
-    }));
+    let app = Router::new().fallback(post(
+        move |uri: axum::http::Uri, headers: HeaderMap, body: Bytes| {
+            let captured = captured.clone();
+            let wire = wire.clone();
+            async move {
+                captured.lock().unwrap().push(SeenRequest {
+                    path: uri.path().to_string(),
+                    headers,
+                    body: serde_json::from_slice(&body).unwrap(),
+                    raw_body: body.to_vec(),
+                });
+                (
+                    [("content-type", "application/vnd.amazon.eventstream")],
+                    wire,
+                )
+            }
+        },
+    ));
     let mut bound = None;
     for port in 18840..=18899 {
         match tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await {
-            Ok(listener) => {bound = Some(listener); break;}
+            Ok(listener) => {
+                bound = Some(listener);
+                break;
+            }
             Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
             Err(error) => panic!("fixture bind: {error}"),
         }
     }
     let listener = bound.expect("available fixture port");
     let upstream = format!("http://{}", listener.local_addr().unwrap());
-    let mock_task = tokio::spawn(async move {axum::serve(listener, app).await.unwrap();});
+    let mock_task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
     let (gateway, auth_dir, gateway_task) = start_gateway("kiro", &upstream).await;
 
     let response = reqwest::Client::new()
@@ -1358,4 +1400,3 @@ async fn codex_does_not_claim_models_owned_by_loaded_provider_accounts() {
     assert!(!codex.supports_model("kiro/claude-haiku-4-5-20251001"));
     std::fs::remove_dir_all(dir).ok();
 }
-

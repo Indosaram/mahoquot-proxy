@@ -48,7 +48,10 @@ fn snippet(text: &str, limit: usize) -> &str {
     if text.len() <= limit {
         return text;
     }
-    let end = (0..=limit).rev().find(|i| text.is_char_boundary(*i)).unwrap_or(0);
+    let end = (0..=limit)
+        .rev()
+        .find(|i| text.is_char_boundary(*i))
+        .unwrap_or(0);
     &text[..end]
 }
 
@@ -282,18 +285,21 @@ async fn refresh_generic_usage(
     .await
 }
 
-/// ZCode quota comes from the ZCode desktop app itself: it polls its own
-/// backend (`zcode.z.ai/api/v1/zcode-plan/billing/balance`) with a signed
-/// client — replicating that auth is not feasible — and logs the full balance
-/// JSON. Read the newest entry out of that log. No desktop app (no logs dir)
-/// means this account cannot report quota at all: import itself requires the
-/// app, so treat a missing dir as Unsupported and skip quietly.
+/// ZCode plan quota comes from the gateway's billing control plane: a direct
+/// `billing/balance` probe with the plan JWT and the client identity headers
+/// (minus X-ZCode-Agent) plus the per-install device id — the same call the
+/// desktop client makes. Accounts that cannot probe yet (old credentials, WAF
+/// challenge) fall back to scraping the desktop app's balance logs.
 async fn refresh_zcode_usage(
     state: &AppState,
     member: &Arc<AccountMember>,
 ) -> Result<(), QuotaError> {
-    let _ = state;
     let now_unix = now_unix();
+    match try_zcode_balance_probe(state, member, now_unix).await {
+        Ok(()) => return Ok(()),
+        Err(QuotaError::Unauthorized) => return Err(QuotaError::Unauthorized),
+        Err(_) => {}
+    }
     let logs_dir = std::env::var("ZCODE_LOGS_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
@@ -331,6 +337,132 @@ async fn refresh_zcode_usage(
         let usage = crate::usage::zcode_balances_usage(&balances, now_unix);
         member.set_usage(usage);
     })
+}
+
+/// One billing/balance probe against the plan gateway's control plane.
+/// `Unauthorized` on a 4xx (terminal — no log-scan fallback), other failures
+/// let the caller fall back to the desktop-log scrape.
+async fn try_zcode_balance_probe(
+    state: &AppState,
+    member: &Arc<AccountMember>,
+    now_unix: i64,
+) -> Result<(), QuotaError> {
+    let jwt = member.access_token();
+    let auth_dir = state.settings.current().auth_dir.clone();
+    let device_mid = zcode_plan_device_mid(&auth_dir);
+    let platform = format!(
+        "{}-{}",
+        crate::account::zcode_node_platform(),
+        crate::account::zcode_node_arch()
+    );
+    let origin = member
+        .usage_override
+        .clone()
+        .or_else(|| member.upstream_override.clone())
+        .map(|base| base.trim_end_matches('/').to_string())
+        .unwrap_or_else(|| mahoquot_providers::zcode::ZCODE_PLAN_ORIGIN.to_string());
+    let url = format!(
+        "{origin}/api/v1/zcode-plan/billing/balance?app_version={}&platform={}",
+        urlencode_component(mahoquot_providers::zcode::ZCODE_APP_VERSION),
+        urlencode_component(&platform),
+    );
+    let client = state.client_for_member(member);
+    let mut request = client.get(&url).timeout(Duration::from_secs(20));
+    for (name, value) in mahoquot_providers::zcode::plan_billing_headers(
+        &jwt,
+        &device_mid,
+        &platform,
+        &crate::account::zcode_os_category(),
+        &crate::account::zcode_client_language(),
+        &crate::account::zcode_client_timezone(),
+    ) {
+        request = request.header(name, value);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|error| QuotaError::Upstream(error.to_string()))?;
+    let status = response.status();
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Err(QuotaError::RateLimited);
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Err(QuotaError::Unauthorized);
+    }
+    if !status.is_success() {
+        return Err(QuotaError::Upstream(format!("balance http {status}")));
+    }
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|error| QuotaError::Upstream(error.to_string()))?;
+    if body
+        .get("code")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0)
+        != 0
+    {
+        return Err(QuotaError::Upstream(format!(
+            "balance biz error {:?}",
+            body.get("code")
+        )));
+    }
+    let data = body.get("data").cloned().unwrap_or(serde_json::Value::Null);
+    let rows = mahoquot_providers::zcode::parse_plan_balances(&data);
+    if rows.is_empty() {
+        return Err(QuotaError::Upstream("balance returned no rows".to_string()));
+    }
+    let entries = rows
+        .into_iter()
+        .map(|row| crate::usage::ZcodeBalanceEntry {
+            show_name: row.show_name,
+            used_units: row.used_units,
+            total_units: row.total_units,
+            period_end_unix: row.period_end_unix.unwrap_or(0),
+        })
+        .collect::<Vec<_>>();
+    let usage = crate::usage::zcode_balances_usage(&entries, now_unix);
+    member.set_usage(usage);
+    Ok(())
+}
+
+/// Stable per-install device id the billing control plane requires
+/// (`X-Device-Mid`; its absence answers biz 3001). Generated once and stored
+/// next to the credentials; `ZCODE_DEVICE_MID` overrides it (e.g. to reuse the
+/// desktop client's id so the gateway sees one continuous device).
+fn zcode_plan_device_mid(auth_dir: &str) -> String {
+    if let Ok(mid) = std::env::var("ZCODE_DEVICE_MID") {
+        let mid = mid.trim().to_string();
+        if !mid.is_empty() {
+            return mid;
+        }
+    }
+    let file = std::path::Path::new(auth_dir).join("zcode-plan-device-mid");
+    if let Ok(stored) = std::fs::read_to_string(&file) {
+        let stored = stored.trim().to_string();
+        if !stored.is_empty() {
+            return stored;
+        }
+    }
+    let mid = uuid::Uuid::new_v4().to_string();
+    if let Some(parent) = file.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&file, &mid);
+    mid
+}
+
+fn urlencode_component(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
 async fn refresh_json_usage(
@@ -593,13 +725,13 @@ async fn try_antigravity_quota(
         .json()
         .await
         .map_err(|e| QuotaError::Upstream(e.to_string()))?;
-    let mut usage = crate::usage::parse_antigravity_quota_summary(
-        &body,
-        now_unix(),
-    );
+    let mut usage = crate::usage::parse_antigravity_quota_summary(&body, now_unix());
 
     // Fetch plan tier from loadCodeAssist using the same token
-    let load_url = format!("{}/v1internal:loadCodeAssist", mahoquot_providers::ANTIGRAVITY_LOAD_BASE);
+    let load_url = format!(
+        "{}/v1internal:loadCodeAssist",
+        mahoquot_providers::ANTIGRAVITY_LOAD_BASE
+    );
     if let Ok(load_resp) = client
         .post(&load_url)
         .header("Authorization", format!("Bearer {token}"))
@@ -613,8 +745,15 @@ async fn try_antigravity_quota(
         if load_resp.status().is_success() {
             if let Ok(load_data) = load_resp.json::<serde_json::Value>().await {
                 let paid = load_data.get("paidTier");
-                let tid = paid.and_then(|p| p.get("id")).and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
-                let tname = paid.and_then(|p| p.get("name")).and_then(|v| v.as_str()).unwrap_or("");
+                let tid = paid
+                    .and_then(|p| p.get("id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                let tname = paid
+                    .and_then(|p| p.get("name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 if tid.contains("ultra") || tname.to_lowercase().contains("ultra") {
                     usage.plan_type = Some("Ultra".to_string());
                 } else if tid.contains("pro") || tname.to_lowercase().contains("pro") {
@@ -623,8 +762,15 @@ async fn try_antigravity_quota(
                     usage.plan_type = Some(tname.to_string());
                 } else {
                     let curr = load_data.get("currentTier");
-                    let cid = curr.and_then(|c| c.get("id")).and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
-                    let cname = curr.and_then(|c| c.get("name")).and_then(|v| v.as_str()).unwrap_or("");
+                    let cid = curr
+                        .and_then(|c| c.get("id"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_lowercase();
+                    let cname = curr
+                        .and_then(|c| c.get("name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
                     if cid.contains("ultra") || cname.to_lowercase().contains("ultra") {
                         usage.plan_type = Some("Ultra".to_string());
                     } else if cid.contains("pro") || cname.to_lowercase().contains("pro") {

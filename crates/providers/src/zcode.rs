@@ -16,6 +16,8 @@
 
 use std::path::{Path, PathBuf};
 
+use base64::Engine as _;
+
 use crate::account::LoadError;
 
 pub const ZCODE_OAUTH_AUTHORIZE_URL: &str = "https://chat.z.ai/api/oauth/authorize";
@@ -29,9 +31,288 @@ pub const ZCODE_API_KEY_NAME: &str = "zcode-api-key";
 
 pub const ZCODE_API_BASE: &str = "https://api.z.ai";
 
-/// Inference speaks the Anthropic wire format under this prefix.
-pub const ZCODE_ANTHROPIC_BASE: &str = "https://api.z.ai/api/anthropic";
+/// The plan gateway fronts the Z.ai Start Plan quota that ships with the ZCode
+/// desktop client. The JWT from its OAuth CLI login only authorizes this route —
+/// the general `api.z.ai` path answers 1113 (no balance) for it. Inference speaks
+/// the Anthropic wire format under this prefix.
+pub const ZCODE_ANTHROPIC_BASE: &str = "https://zcode.z.ai/api/v1/zcode-plan/anthropic";
 pub const ZCODE_MESSAGES_PATH: &str = "/v1/messages";
+
+// ── Plan-gateway auth surface (mirrors opencodex PR #4437) ───────────────────
+//
+// The plan gateway is what the ZCode desktop client talks to for Start Plan
+// quota. Its OAuth CLI flow issues a JWT with no `exp` claim (rejection is
+// terminal and surfaces as re-login), the plan route is exempt from any V4
+// request signing (`Authorization: Bearer` + `anthropic-version` only), and the
+// gateway fingerprints the caller: without the ZCode identity system blocks,
+// metadata.user_id, and the client identity headers it answers biz code 3012,
+// and unfamiliar callers are challenged by the Aliyun WAF (biz 3007 in the
+// body, or a non-empty `x-aliyun-captcha-verify-param` response header).
+
+/// Plan-gateway control-plane origin (login, client config, billing).
+pub const ZCODE_PLAN_ORIGIN: &str = "https://zcode.z.ai";
+/// OAuth CLI flow: init returns the authorize URL, poll/{flow_id} returns the JWT.
+pub const ZCODE_OAUTH_CLI_INIT_URL: &str = "https://zcode.z.ai/api/v1/oauth/cli/init";
+pub const ZCODE_OAUTH_CLI_POLL_PREFIX: &str = "/api/v1/oauth/cli/poll";
+/// Billing balance the desktop client reads for Start Plan usage (JWT + X-Device-Mid).
+pub const ZCODE_PLAN_BILLING_BALANCE_URL: &str =
+    "https://zcode.z.ai/api/v1/zcode-plan/billing/balance";
+/// Version string the desktop client sends on every plan-gateway call.
+pub const ZCODE_APP_VERSION: &str = "3.11.2";
+pub const ZCODE_SDK_UA: &str = "ZCode/3.11.2";
+/// The AI SDK appends its identity to the UA on Anthropic-wire calls.
+pub const ZCODE_ANTHROPIC_SDK_UA: &str = "ai-sdk/anthropic/3.0.81";
+/// Response header carrying the WAF challenge parameter on non-2xx replies.
+pub const ZCODE_CAPTCHA_PARAM_HEADER: &str = "x-aliyun-captcha-verify-param";
+/// In-body magic of the WAF challenge, in both JSON spacing styles.
+pub const ZCODE_CAPTCHA_BODY_MARKERS: &[&str] = &["\"code\":3007", "\"code\": 3007"];
+
+/// Plan-meter model ids: the gateway's client config publishes uppercase ids,
+/// while gateway clients request the catalog's lowercase aliases.
+pub const ZCODE_PLAN_MODEL_IDS: &[(&str, &str)] = &[
+    ("glm-5.3", "GLM-5.3"),
+    ("glm-5.3-flash", "GLM-5.3-Flash"),
+    ("glm-5.2", "GLM-5.2"),
+    ("glm-5-turbo", "GLM-5-Turbo"),
+];
+
+/// Map a requested model id onto the plan gateway's client-config id. Unknown
+/// ids pass through unchanged (the gateway, not the relay, owns that verdict).
+pub fn normalize_plan_model(model: &str) -> String {
+    let requested = model.trim();
+    for (alias, plan_id) in ZCODE_PLAN_MODEL_IDS {
+        if requested.eq_ignore_ascii_case(alias) {
+            return (*plan_id).to_string();
+        }
+    }
+    requested.to_string()
+}
+
+/// Decode the `user_id` claim from a plan JWT without verification — it is the
+/// token the gateway issued to us, and it only feeds `metadata.user_id`.
+pub fn plan_user_id_from_jwt(jwt: &str) -> Option<String> {
+    let payload = jwt.split('.').nth(1)?;
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    let value: Value = serde_json::from_slice(&decoded).ok()?;
+    let user_id = value.get("user_id")?.as_str()?;
+    let trimmed = user_id.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ZcodeCliInit {
+    pub flow_id: String,
+    pub authorize_url: String,
+    pub poll_interval_sec: Option<u64>,
+}
+
+/// Parse `/api/v1/oauth/cli/init` (status 200, `code` 0, `data` carrying the
+/// flow id and authorize URL).
+pub fn parse_cli_init(body: &Value) -> Result<ZcodeCliInit, String> {
+    let data = body
+        .get("data")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "missing data".to_string())?;
+    let non_empty = |key: &str| -> Option<String> {
+        data.get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let flow_id = non_empty("flow_id").ok_or_else(|| "missing flow_id".to_string())?;
+    let authorize_url =
+        non_empty("authorize_url").ok_or_else(|| "missing authorize_url".to_string())?;
+    let poll_interval_sec = data.get("poll_interval_sec").and_then(Value::as_u64);
+    Ok(ZcodeCliInit {
+        flow_id,
+        authorize_url,
+        poll_interval_sec,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ZcodeCliPoll {
+    Pending,
+    Ready {
+        token: String,
+        email: Option<String>,
+        user_id: Option<String>,
+        zai_access_token: Option<String>,
+    },
+    Failed(String),
+}
+
+/// Parse `/api/v1/oauth/cli/poll/{flow_id}`.
+pub fn parse_cli_poll(body: &Value) -> ZcodeCliPoll {
+    let data = match body.get("data") {
+        Some(data) => data,
+        None => return ZcodeCliPoll::Pending,
+    };
+    let non_empty = |key: &str| -> Option<String> {
+        data.get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    match data
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+    {
+        "ready" => {
+            let token = non_empty("token").expect("ready poll without token");
+            ZcodeCliPoll::Ready {
+                token,
+                email: data
+                    .get("user")
+                    .and_then(|user| user.get("email"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                user_id: data
+                    .get("user")
+                    .and_then(|user| user.get("user_id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                zai_access_token: data
+                    .get("zai")
+                    .and_then(|zai| zai.get("access_token"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            }
+        }
+        "failed" => ZcodeCliPoll::Failed(
+            body.get("msg")
+                .and_then(Value::as_str)
+                .unwrap_or("authorization denied")
+                .to_string(),
+        ),
+        _ => ZcodeCliPoll::Pending,
+    }
+}
+
+/// True when the response is an Aliyun WAF captcha challenge: a non-2xx status
+/// with a verify-param header, or the in-body 3007 marker.
+pub fn is_plan_captcha_challenge(status: u16, verify_param: Option<&str>, body: &str) -> bool {
+    if (200..300).contains(&status) {
+        return false;
+    }
+    if verify_param.map(str::trim).is_some_and(|v| !v.is_empty()) {
+        return true;
+    }
+    ZCODE_CAPTCHA_BODY_MARKERS.iter().any(|m| body.contains(m))
+}
+
+/// HTTP status + Anthropic error type for an in-200 business error. Only 1005
+/// is a rate limit (per-window plan quota); everything else is upstream-class.
+pub fn plan_biz_error(code: i64) -> (u16, &'static str) {
+    if code == 1005 {
+        (429, "rate_limit_error")
+    } else {
+        (502, "upstream_error")
+    }
+}
+
+/// Companion headers the desktop client sends on plan-gateway billing calls —
+/// the identity set without `X-ZCode-Agent` (the client omits it on the control
+/// plane), plus the required `X-Device-Mid` (its absence answers biz 3001).
+pub fn plan_billing_headers(
+    jwt: &str,
+    device_mid: &str,
+    platform: &str,
+    os_category: &str,
+    language: &str,
+    timezone: &str,
+) -> Vec<(String, String)> {
+    vec![
+        ("Accept".to_string(), "application/json".to_string()),
+        ("Authorization".to_string(), format!("Bearer {jwt}")),
+        ("HTTP-Referer".to_string(), ZCODE_PLAN_ORIGIN.to_string()),
+        ("User-Agent".to_string(), ZCODE_SDK_UA.to_string()),
+        (
+            "X-ZCode-App-Version".to_string(),
+            ZCODE_APP_VERSION.to_string(),
+        ),
+        ("X-Title".to_string(), "Z Code@cli".to_string()),
+        ("X-Release-Channel".to_string(), "production".to_string()),
+        ("X-Client-Language".to_string(), language.to_string()),
+        ("X-Client-Timezone".to_string(), timezone.to_string()),
+        ("X-Platform".to_string(), platform.to_string()),
+        ("X-Os-Category".to_string(), os_category.to_string()),
+        ("X-Device-Mid".to_string(), device_mid.to_string()),
+    ]
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ZcodePlanBalanceRow {
+    pub show_name: String,
+    pub total_units: f64,
+    pub used_units: f64,
+    pub period_end_unix: Option<i64>,
+}
+
+/// Parse the balance rows out of a `billing/balance` response body (`code` 0,
+/// `data.balances[]` with `show_name`, `total_units`, `used_units` or
+/// `remaining_units`, and an optional `expires_at`).
+pub fn parse_plan_balances(data: &Value) -> Vec<ZcodePlanBalanceRow> {
+    let Some(rows) = data.get("balances").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for row in rows {
+        let Some(obj) = row.as_object() else { continue };
+        let total = obj
+            .get("total_units")
+            .or_else(|| obj.get("totalUnits"))
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        if total <= 0.0 {
+            continue;
+        }
+        let show_name = obj
+            .get("show_name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("balance")
+            .to_string();
+        let used = obj
+            .get("used_units")
+            .or_else(|| obj.get("usedUnits"))
+            .and_then(Value::as_f64)
+            .unwrap_or_else(|| {
+                let remaining = obj
+                    .get("remaining_units")
+                    .or_else(|| obj.get("remainingUnits"))
+                    .and_then(Value::as_f64);
+                remaining.map(|r| (total - r).max(0.0)).unwrap_or(0.0)
+            });
+        let period_end_unix = obj
+            .get("expires_at")
+            .or_else(|| obj.get("expiresAt"))
+            .and_then(parse_reset_at);
+        out.push(ZcodePlanBalanceRow {
+            show_name,
+            total_units: total,
+            used_units: used,
+            period_end_unix,
+        });
+    }
+    out
+}
+
+/// `expires_at` may be a unix epoch (number) or an RFC3339-ish string; keep the
+/// number form and ignore the string form (no chrono dependency in pure code).
+fn parse_reset_at(value: &Value) -> Option<i64> {
+    value.as_i64().or_else(|| value.as_f64().map(|f| f as i64))
+}
 
 use mahoquot_registry::{embedded_snapshot, ProviderContribution, ProviderId, RegistrySnapshot};
 use serde_json::Value;
@@ -102,7 +383,9 @@ fn form_encode(value: &str) -> String {
 pub fn extract_callback_code(callback_url: &str, expected_state: &str) -> Result<String, String> {
     match parse_zcode_input(callback_url, expected_state)? {
         ZcodeInput::AuthorizationCode(code) => Ok(code),
-        ZcodeInput::AuthorizationUrl(_) => Err("ZCode authorization is waiting for browser approval".to_string()),
+        ZcodeInput::AuthorizationUrl(_) => {
+            Err("ZCode authorization is waiting for browser approval".to_string())
+        }
     }
 }
 
@@ -122,17 +405,30 @@ pub fn parse_zcode_input(input: &str, expected_state: &str) -> Result<ZcodeInput
     } else {
         input.to_string()
     };
-    let mut url = match reqwest::Url::parse(&normalized) {
-        Ok(url) => url,
-        Err(_) if input.len() >= 4 && input.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"-_.+/=~".contains(&byte)) => {
-            return Ok(ZcodeInput::AuthorizationCode(input.to_string()));
-        }
-        Err(_) => return Err("ZCode callback must be a URL, code=...&state=... query, or an authorization code".to_string()),
-    };
+    let mut url =
+        match reqwest::Url::parse(&normalized) {
+            Ok(url) => url,
+            Err(_)
+                if input.len() >= 4
+                    && input
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"-_.+/=~".contains(&byte)) =>
+            {
+                return Ok(ZcodeInput::AuthorizationCode(input.to_string()));
+            }
+            Err(_) => return Err(
+                "ZCode callback must be a URL, code=...&state=... query, or an authorization code"
+                    .to_string(),
+            ),
+        };
     if url.scheme() == "zcode" {
-        if !url.host_str().is_some_and(|host| host.eq_ignore_ascii_case("oauth"))
+        if !url
+            .host_str()
+            .is_some_and(|host| host.eq_ignore_ascii_case("oauth"))
             || !url.path().eq_ignore_ascii_case("/callback")
-            || !url.username().is_empty() || url.password().is_some() || url.port().is_some()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.port().is_some()
         {
             return Err("ZCode callback must use zcode://oauth/callback".to_string());
         }
@@ -143,23 +439,35 @@ pub fn parse_zcode_input(input: &str, expected_state: &str) -> Result<ZcodeInput
         }
         return callback_code_from_url(&url, expected_state).map(ZcodeInput::AuthorizationCode);
     }
-    if url.scheme() != "https" || url.host_str() != Some("chat.z.ai")
+    if url.scheme() != "https"
+        || url.host_str() != Some("chat.z.ai")
         || !matches!(url.path(), "/auth/oauth/authorize" | "/api/oauth/authorize")
-        || !url.username().is_empty() || url.password().is_some() || url.port().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
     {
         return Err("ZCode sign-in URL must be the chat.z.ai authorization page".to_string());
     }
     if url.query_pairs().any(|(key, _)| key == "code") {
         return callback_code_from_url(&url, expected_state).map(ZcodeInput::AuthorizationCode);
     }
-    let states: Vec<_> = url.query_pairs().filter(|(key, _)| key == "state").map(|(_, value)| value).collect();
+    let states: Vec<_> = url
+        .query_pairs()
+        .filter(|(key, _)| key == "state")
+        .map(|(_, value)| value)
+        .collect();
     if states.len() > 1 {
         return Err("GLM ZCode callback state did not match".to_string());
     }
-    let redirects: Vec<_> = url.query_pairs().filter(|(key, _)| key == "redirect_uri").map(|(_, value)| value).collect();
+    let redirects: Vec<_> = url
+        .query_pairs()
+        .filter(|(key, _)| key == "redirect_uri")
+        .map(|(_, value)| value)
+        .collect();
     if redirects.len() == 1 {
         if let Ok(inner) = reqwest::Url::parse(&redirects[0]) {
-            if inner.scheme() == "zcode" && (inner.query().is_some() || inner.fragment().is_some()) {
+            if inner.scheme() == "zcode" && (inner.query().is_some() || inner.fragment().is_some())
+            {
                 if states.first().is_some_and(|state| state != expected_state) {
                     return Err("GLM ZCode callback state did not match".to_string());
                 }
@@ -177,7 +485,9 @@ pub fn parse_zcode_input(input: &str, expected_state: &str) -> Result<ZcodeInput
             return Err(format!("ZCode authorization URL has invalid {key}"));
         }
     }
-    Ok(ZcodeInput::AuthorizationUrl(zcode_authorize_url(expected_state)))
+    Ok(ZcodeInput::AuthorizationUrl(zcode_authorize_url(
+        expected_state,
+    )))
 }
 
 fn callback_code_from_url(callback: &reqwest::Url, expected_state: &str) -> Result<String, String> {
@@ -393,15 +703,28 @@ pub fn pick_desktop_api_key(config: &Value) -> Option<String> {
     candidates.into_iter().next().map(|(_, key)| key)
 }
 
+/// Pastes and CLI logins both write the same far-future expiry: the plan JWT
+/// has no `exp` claim, so staleness is detected by upstream 401/3012 instead.
+fn default_zcode_expiry() -> String {
+    "2099-12-31T00:00:00Z".to_string()
+}
+
 #[derive(Clone, Default, serde::Deserialize, serde::Serialize)]
 pub struct ZcodeAccount {
     #[serde(default)]
     pub identity_slug: String,
-    /// The provisioned `{id}.{secret}` API key, not the OAuth access token.
+    /// The plan-gateway JWT issued by the OAuth CLI flow (rejection is terminal:
+    /// re-login, never a silent refresh).
     pub access_token: String,
-    /// Upstream Z.AI OAuth token, used to re-provision the API key.
+    /// Upstream Z.AI OAuth token from the same login (kept for diagnosability).
+    /// Optional: the JWT paste flow has no OAuth login, and the CLI flow
+    /// defaults it to empty when Z.AI omits it.
+    #[serde(default)]
     pub refresh_token: String,
     pub email: String,
+    /// The plan JWT carries no `exp` claim; pasted tokens get the same
+    /// far-future expiry the CLI flow writes (staleness is detected upstream).
+    #[serde(default = "default_zcode_expiry")]
     pub expired: String,
     #[serde(default)]
     pub disabled: bool,
@@ -485,7 +808,7 @@ mod tests {
     fn messages_url_uses_anthropic_prefix_and_override() {
         assert_eq!(
             zcode_messages_url(ZCODE_ANTHROPIC_BASE),
-            "https://api.z.ai/api/anthropic/v1/messages"
+            "https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages"
         );
         assert_eq!(
             zcode_messages_url("http://127.0.0.1:18893/"),
@@ -613,5 +936,146 @@ mod tests {
         assert!(is_zcode_model("glm-5.2"));
         assert!(is_zcode_model("glm-5.3-flash"));
         assert!(!is_zcode_model("claude-sonnet-4-5-20250929"));
+    }
+
+    #[test]
+    fn plan_model_normalizes_catalog_aliases() {
+        assert_eq!(normalize_plan_model("glm-5.3-flash"), "GLM-5.3-Flash");
+        assert_eq!(normalize_plan_model("GLM-5.3"), "GLM-5.3");
+        assert_eq!(normalize_plan_model("glm-5-turbo"), "GLM-5-Turbo");
+        assert_eq!(normalize_plan_model("glm-4.6"), "glm-4.6");
+        assert_eq!(normalize_plan_model("  glm-5.2 "), "GLM-5.2");
+    }
+
+    #[test]
+    fn plan_jwt_yields_the_user_id_claim() {
+        let payload =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"user_id":"usr-42"}"#);
+        let jwt = format!("eyJhbGciOiJIUzI1NiJ9.{payload}.sig");
+        assert_eq!(plan_user_id_from_jwt(&jwt).as_deref(), Some("usr-42"));
+        assert_eq!(plan_user_id_from_jwt("not-a-jwt"), None);
+        let empty = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"user_id":""}"#);
+        assert_eq!(plan_user_id_from_jwt(&format!("h.{empty}.s")), None);
+    }
+
+    #[test]
+    fn cli_init_parses_flow_and_interval() {
+        let init = parse_cli_init(&serde_json::json!({
+            "code": 0,
+            "data": {
+                "flow_id": "fl-1",
+                "authorize_url": "https://zcode.z.ai/authorize?x=1",
+                "poll_interval_sec": 3
+            }
+        }))
+        .unwrap();
+        assert_eq!(init.flow_id, "fl-1");
+        assert_eq!(init.authorize_url, "https://zcode.z.ai/authorize?x=1");
+        assert_eq!(init.poll_interval_sec, Some(3));
+        assert!(parse_cli_init(&serde_json::json!({"data": {}})).is_err());
+    }
+
+    #[test]
+    fn cli_poll_maps_pending_ready_and_failed() {
+        assert_eq!(
+            parse_cli_poll(&serde_json::json!({"data": {"status": "pending"}})),
+            ZcodeCliPoll::Pending
+        );
+        assert_eq!(
+            parse_cli_poll(&serde_json::json!({"data": {}})),
+            ZcodeCliPoll::Pending
+        );
+        match parse_cli_poll(&serde_json::json!({
+            "data": {
+                "status": "ready",
+                "token": "eyJ.plan.jwt",
+                "user": {"user_id": "u1", "email": "a@b.c"},
+                "zai": {"access_token": "zai-tok"}
+            }
+        })) {
+            ZcodeCliPoll::Ready {
+                token,
+                email,
+                user_id,
+                zai_access_token,
+            } => {
+                assert_eq!(token, "eyJ.plan.jwt");
+                assert_eq!(email.as_deref(), Some("a@b.c"));
+                assert_eq!(user_id.as_deref(), Some("u1"));
+                assert_eq!(zai_access_token.as_deref(), Some("zai-tok"));
+            }
+            other => panic!("expected ready, got {other:?}"),
+        }
+        assert_eq!(
+            parse_cli_poll(&serde_json::json!({"data": {"status": "failed"}, "msg": "denied"})),
+            ZcodeCliPoll::Failed("denied".to_string())
+        );
+    }
+
+    #[test]
+    fn captcha_challenge_detected_from_header_or_body() {
+        assert!(is_plan_captcha_challenge(403, Some("param"), ""));
+        assert!(is_plan_captcha_challenge(
+            403,
+            None,
+            "{\"code\":3007,\"msg\":\"waf\"}"
+        ));
+        assert!(is_plan_captcha_challenge(502, None, "{\"code\": 3007}"));
+        assert!(!is_plan_captcha_challenge(200, Some("param"), ""));
+        assert!(!is_plan_captcha_challenge(
+            403,
+            Some("  "),
+            "{\"code\":3006}"
+        ));
+        assert!(!is_plan_captcha_challenge(401, None, "unauthorized"));
+    }
+
+    #[test]
+    fn biz_errors_map_to_real_statuses() {
+        assert_eq!(plan_biz_error(1005), (429, "rate_limit_error"));
+        assert_eq!(plan_biz_error(3012), (502, "upstream_error"));
+        assert_eq!(plan_biz_error(1113), (502, "upstream_error"));
+    }
+
+    #[test]
+    fn billing_headers_carry_identity_and_device_mid() {
+        let headers = plan_billing_headers(
+            "jwt",
+            "mid-1",
+            "darwin-arm64",
+            "macos",
+            "ko-KR",
+            "Asia/Seoul",
+        );
+        let get = |name: &str| {
+            headers
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(get("Authorization").as_deref(), Some("Bearer jwt"));
+        assert_eq!(get("X-Device-Mid").as_deref(), Some("mid-1"));
+        assert_eq!(get("X-Title").as_deref(), Some("Z Code@cli"));
+        assert_eq!(get("X-Platform").as_deref(), Some("darwin-arm64"));
+        assert_eq!(get("X-ZCode-Agent"), None);
+        assert_eq!(get("anthropic-version"), None);
+    }
+
+    #[test]
+    fn plan_balances_parse_rows_and_reset() {
+        let rows = parse_plan_balances(&serde_json::json!({
+            "balances": [
+                {"show_name": "GLM-5.3", "total_units": 3000000.0,
+                 "used_units": 300000.0, "expires_at": 1900000000},
+                {"show_name": "", "totalUnits": 100, "remainingUnits": 40},
+                {"total_units": 0}
+            ]
+        }));
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].show_name, "GLM-5.3");
+        assert_eq!(rows[0].used_units, 300000.0);
+        assert_eq!(rows[0].period_end_unix, Some(1_900_000_000));
+        assert_eq!(rows[1].show_name, "balance");
+        assert_eq!(rows[1].used_units, 60.0);
     }
 }

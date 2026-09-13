@@ -1,11 +1,9 @@
 // allow: SIZE_OK — single-loop failover relay state machine with auth refresh, retry, and in-flight tracking
 
-
 use std::hash::Hasher;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-
 
 use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
@@ -139,7 +137,8 @@ impl StreamCapture {
                 .find(|m| {
                     m.id() == outcome.member.id()
                         && m.access_token() == outcome.credential_token
-                        && (Arc::ptr_eq(&outcome.member, m) || outcome.member.shares_runtime_identity(m))
+                        && (Arc::ptr_eq(&outcome.member, m)
+                            || outcome.member.shares_runtime_identity(m))
                 })
                 .cloned();
 
@@ -162,7 +161,9 @@ impl StreamCapture {
                         current.record_ok();
                     }
                     state.monitor.clear_error(current.id());
-                    state.scheduler.record_success(current.id(), &state.pool.load().members);
+                    state
+                        .scheduler
+                        .record_success(current.id(), &state.pool.load().members);
                     state.router.feedback(current.id(), Outcome::Success);
                 }
                 state.metrics.served.fetch_add(1, Ordering::Relaxed);
@@ -185,7 +186,9 @@ impl StreamCapture {
                             .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
                             .unwrap_or(0);
                         let until = cooldown_deadline_ms(now_ms, 300);
-                        current.set_health(Health::Cooldown { until_unix_ms: until });
+                        current.set_health(Health::Cooldown {
+                            until_unix_ms: until,
+                        });
                     } else if code == "unauthenticated" {
                         current.set_health(Health::AuthFailed);
                     }
@@ -196,7 +199,9 @@ impl StreamCapture {
                         .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
                         .unwrap_or(0);
                     let until = cooldown_deadline_ms(now_ms, 300);
-                    outcome.member.set_health(Health::Cooldown { until_unix_ms: until });
+                    outcome.member.set_health(Health::Cooldown {
+                        until_unix_ms: until,
+                    });
                 } else if code == "unauthenticated" {
                     outcome.member.set_health(Health::AuthFailed);
                 }
@@ -848,9 +853,17 @@ fn resolve_target(
                 compat::claude::ensure_claude_code_system_instruction(&mut anthropic_val);
             }
 
-            let body = Bytes::from(
-                serde_json::to_vec(&anthropic_val).map_err(|e| e.to_string())?,
-            );
+            if member.kind() == crate::account::ProviderKind::Zcode {
+                let user_id =
+                    mahoquot_providers::zcode::plan_user_id_from_jwt(&member.access_token());
+                compat::zcode::apply_zcode_plan_identity(
+                    &mut anthropic_val,
+                    upstream_model,
+                    user_id.as_deref(),
+                );
+            }
+
+            let body = Bytes::from(serde_json::to_vec(&anthropic_val).map_err(|e| e.to_string())?);
             return Ok(UpstreamTarget {
                 url: crate::url::build_provider_url(
                     member.kind(),
@@ -1030,10 +1043,110 @@ async fn send_upstream(
     };
     let elapsed_ms = req_start.elapsed().as_secs_f64() * 1000.0;
     state.monitor.record_ttft(member.id(), elapsed_ms);
+    let resp = if member.kind() == crate::account::ProviderKind::Zcode {
+        zcode_plan_gateway_response(resp).await
+    } else {
+        resp
+    };
     Ok(UpstreamExchange {
         response: resp,
         cursor_reply,
     })
+}
+
+/// The plan gateway reports business errors (quota, auth, WAF) inside HTTP 200
+/// JSON bodies — for streaming requests leaving them in place surfaces
+/// downstream as a silently truncated SSE stream. Map the known shapes onto
+/// real statuses; genuine message bodies pass through untouched. Non-2xx WAF
+/// challenges (verify-param header or in-body 3007) surface as 502: the relay
+/// has no browser-grade captcha solver, and replaying into the challenge only
+/// deepens the block (the reference implementation's 3012 posture).
+async fn zcode_plan_gateway_response(resp: reqwest::Response) -> reqwest::Response {
+    let status = resp.status();
+    let is_json = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.to_ascii_lowercase().contains("application/json"))
+        .unwrap_or(false);
+    if status.is_success() && !is_json {
+        return resp;
+    }
+    let challenge_header = resp
+        .headers()
+        .get(mahoquot_providers::zcode::ZCODE_CAPTCHA_PARAM_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    let upstream_headers = resp.headers().clone();
+    let body = resp.bytes().await.unwrap_or_default();
+    if !status.is_success() {
+        if challenge_header
+            || mahoquot_providers::zcode::ZCODE_CAPTCHA_BODY_MARKERS
+                .iter()
+                .any(|marker| body.windows(marker.len()).any(|w| w == marker.as_bytes()))
+        {
+            let message = "zcode-plan: the gateway issued a WAF captcha challenge (biz 3007); browser captcha solving is unavailable in the relay — retry after a few minutes";
+            return rebuild_plan_response(
+                StatusCode::BAD_GATEWAY,
+                &http::HeaderMap::new(),
+                &serde_json::to_vec(&serde_json::json!({
+                    "error": { "message": message, "type": "upstream_error" }
+                }))
+                .unwrap_or_default(),
+            );
+        }
+        return rebuild_plan_response(status, &upstream_headers, &body);
+    }
+    let parsed: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(parsed) => parsed,
+        Err(_) => return rebuild_plan_response(status, &upstream_headers, &body),
+    };
+    let code = parsed.get("code").and_then(serde_json::Value::as_i64);
+    let Some(code) = code else {
+        return rebuild_plan_response(status, &upstream_headers, &body);
+    };
+    if code == 0 {
+        return rebuild_plan_response(status, &upstream_headers, &body);
+    }
+    let (mapped_status, error_type) = mahoquot_providers::zcode::plan_biz_error(code);
+    let message = format!(
+        "zcode-plan: gateway biz error {code}: {}",
+        parsed
+            .get("msg")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+    );
+    let error_body = serde_json::to_vec(&serde_json::json!({
+        "error": { "message": message, "type": error_type, "code": code }
+    }))
+    .unwrap_or_default();
+    let mapped = StatusCode::from_u16(mapped_status).unwrap_or(StatusCode::BAD_GATEWAY);
+    rebuild_plan_response(mapped, &http::HeaderMap::new(), &error_body)
+}
+
+/// Rebuild a reqwest response after its body was consumed. Hop-by-hop and
+/// length headers are dropped: the new body (or reqwest itself) decides them.
+fn rebuild_plan_response(
+    status: reqwest::StatusCode,
+    headers: &http::HeaderMap,
+    body: &[u8],
+) -> reqwest::Response {
+    let mut builder = http::Response::builder().status(status);
+    for (name, value) in headers.iter() {
+        if matches!(
+            name.as_str(),
+            "content-length" | "transfer-encoding" | "connection" | "content-encoding"
+        ) {
+            continue;
+        }
+        builder = builder.header(name, value);
+    }
+    reqwest::Response::from(
+        builder
+            .body(bytes::Bytes::copy_from_slice(body))
+            .expect("rebuilt plan response is always a valid http response"),
+    )
 }
 
 async fn extract_failure(resp: reqwest::Response, status_code: u16) -> FinalFailure {
@@ -1130,13 +1243,22 @@ fn parse_cline_cap_error(body: &[u8]) -> Option<(String, i64)> {
 }
 
 /// Updates the member's `AccountUsage` with a QuotaGroup bucket representing the Cline model limit.
-fn record_cline_quota_bucket(member: &AccountMember, model: &str, reset_seconds: i64, now_unix: i64) {
+fn record_cline_quota_bucket(
+    member: &AccountMember,
+    model: &str,
+    reset_seconds: i64,
+    now_unix: i64,
+) {
     let reset_at_unix = now_unix + reset_seconds;
     let mut usage = member.usage_snapshot();
     let group_name = "Cline Free Limits".to_string();
     let bucket_label = format!("{model} (Daily limit)");
 
-    let group = match usage.groups.iter_mut().find(|g| g.display_name.as_deref() == Some(&group_name)) {
+    let group = match usage
+        .groups
+        .iter_mut()
+        .find(|g| g.display_name.as_deref() == Some(&group_name))
+    {
         Some(g) => g,
         None => {
             usage.groups.push(crate::usage::QuotaGroup {
@@ -1148,7 +1270,11 @@ fn record_cline_quota_bucket(member: &AccountMember, model: &str, reset_seconds:
         }
     };
 
-    if let Some(bucket) = group.buckets.iter_mut().find(|b| b.bucket_id.as_deref() == Some(model)) {
+    if let Some(bucket) = group
+        .buckets
+        .iter_mut()
+        .find(|b| b.bucket_id.as_deref() == Some(model))
+    {
         bucket.used_percent = Some(100.0);
         bucket.reset_at_unix = Some(reset_at_unix);
         bucket.display_name = Some(bucket_label);
@@ -1476,19 +1602,29 @@ pub(crate) fn resolve_model(
         base_model
     };
     let canonical_id = mahoquot_registry::ModelId::new(resolved_model_id)?;
-    if pool.registry.exclusions().contains(&mahoquot_registry::ModelExclusionRule {
-        model_id: canonical_id.clone(),
-        provider_id: None,
-    }) {
-        return Err(mahoquot_registry::RegistryError::ModelExcluded { model_id: canonical_id });
+    if pool
+        .registry
+        .exclusions()
+        .contains(&mahoquot_registry::ModelExclusionRule {
+            model_id: canonical_id.clone(),
+            provider_id: None,
+        })
+    {
+        return Err(mahoquot_registry::RegistryError::ModelExcluded {
+            model_id: canonical_id,
+        });
     }
     if resolved_model_id.starts_with("claude-")
         && !pool.registry.models().contains_key(&canonical_id)
     {
-        if pool.registry.exclusions().contains(&mahoquot_registry::ModelExclusionRule {
-            model_id: canonical_id.clone(),
-            provider_id: Some(ProviderId::claude()),
-        }) {
+        if pool
+            .registry
+            .exclusions()
+            .contains(&mahoquot_registry::ModelExclusionRule {
+                model_id: canonical_id.clone(),
+                provider_id: Some(ProviderId::claude()),
+            })
+        {
             return Err(mahoquot_registry::RegistryError::UnknownModel(canonical_id));
         }
         Ok(mahoquot_registry::ResolvedModel {
@@ -1578,18 +1714,15 @@ fn eligible_indices(
             .filter(|(_, member)| state.scheduler.permits(member.id()))
             .filter(|(_, member)| member_matches_api_key_binding(member, api_key_binding))
             .filter(|(_, member)| crate::models_route::member_matches_scope(member, scoped_key))
-            .filter(|(_, member)| {
-                match prefix {
-                    Some(ModelPrefix::Anthropic) => {
-                        member.kind() == crate::account::ProviderKind::Claude
-                            && !member.is_nekos_relay()
-                    }
-                    Some(ModelPrefix::Nekos) => {
-                        member.kind() == crate::account::ProviderKind::Claude
-                            && member.is_nekos_relay()
-                    }
-                    None => true,
+            .filter(|(_, member)| match prefix {
+                Some(ModelPrefix::Anthropic) => {
+                    member.kind() == crate::account::ProviderKind::Claude
+                        && !member.is_nekos_relay()
                 }
+                Some(ModelPrefix::Nekos) => {
+                    member.kind() == crate::account::ProviderKind::Claude && member.is_nekos_relay()
+                }
+                None => true,
             })
             .filter(|(_, member)| {
                 member_provider_id(member).as_ref() == Some(&provider.binding.provider_id)
@@ -1782,7 +1915,9 @@ async fn acquire_devin_first_frame(
             Some(Ok(c)) => c,
             Some(Err(_)) => return Err("upstream connection error during preflight".to_string()),
             None => {
-                return Err("connect stream ended with truncated header during preflight".to_string())
+                return Err(
+                    "connect stream ended with truncated header during preflight".to_string(),
+                )
             }
         };
 
@@ -1837,9 +1972,12 @@ async fn acquire_devin_first_frame(
             while frame_buf.len() < required_frame_len {
                 let chunk = match s.next().await {
                     Some(Ok(c)) => c,
-                    Some(Err(_)) => return Err("upstream connection error during preflight".to_string()),
+                    Some(Err(_)) => {
+                        return Err("upstream connection error during preflight".to_string())
+                    }
                     None => {
-                        return Err("connect stream ended with truncated frame during preflight".to_string())
+                        return Err("connect stream ended with truncated frame during preflight"
+                            .to_string())
                     }
                 };
                 let needed = required_frame_len - frame_buf.len();
@@ -1861,9 +1999,12 @@ async fn acquire_devin_first_frame(
             while frame_buf.len() < required_frame_len {
                 let chunk = match s.next().await {
                     Some(Ok(c)) => c,
-                    Some(Err(_)) => return Err("upstream connection error during preflight".to_string()),
+                    Some(Err(_)) => {
+                        return Err("upstream connection error during preflight".to_string())
+                    }
                     None => {
-                        return Err("connect stream ended with truncated frame during preflight".to_string())
+                        return Err("connect stream ended with truncated frame during preflight"
+                            .to_string())
                     }
                 };
                 let needed = required_frame_len - frame_buf.len();
@@ -1923,7 +2064,9 @@ async fn finish_success(
     if protocol == compat::Protocol::Devin {
         let is_valid_ct = content_type
             .as_deref()
-            .map(|ct| ct.split(';').next().unwrap_or("").trim() == compat::devin::STREAM_CONTENT_TYPE)
+            .map(|ct| {
+                ct.split(';').next().unwrap_or("").trim() == compat::devin::STREAM_CONTENT_TYPE
+            })
             .unwrap_or(false);
         if !is_valid_ct {
             let actual = content_type.as_deref().unwrap_or("missing");
@@ -2054,8 +2197,8 @@ async fn finish_success(
     let model = plan.model.clone().unwrap_or_default();
 
     if plan.mode == RelayMode::Anthropic && plan.client_stream {
-        let devin_outcome = (protocol == compat::Protocol::Devin)
-            .then(|| Arc::new(std::sync::Mutex::new(None)));
+        let devin_outcome =
+            (protocol == compat::Protocol::Devin).then(|| Arc::new(std::sync::Mutex::new(None)));
         if protocol != compat::Protocol::Devin {
             member.record_ok();
             state.metrics.served.fetch_add(1, Ordering::Relaxed);
@@ -2096,7 +2239,10 @@ async fn finish_success(
                 if let Some(code) = devin.error_code {
                     return Err(format!(
                         "{code}: {}",
-                        devin.error_message.as_deref().unwrap_or("unknown upstream error")
+                        devin
+                            .error_message
+                            .as_deref()
+                            .unwrap_or("unknown upstream error")
                     ));
                 }
                 if !devin.terminated {
@@ -2107,13 +2253,8 @@ async fn finish_success(
         member.record_ok();
         state.metrics.served.fetch_add(1, Ordering::Relaxed);
         state.router.feedback(member.id(), Outcome::Success);
-        let mut response = compat::anthropic_response(
-            &raw,
-            &model,
-            created,
-            protocol,
-            plan.client_stream,
-        );
+        let mut response =
+            compat::anthropic_response(&raw, &model, created, protocol, plan.client_stream);
         if let Some(usage) = upstream_usage {
             response
                 .extensions_mut()
@@ -2123,8 +2264,8 @@ async fn finish_success(
     }
 
     if plan.client_stream {
-        let devin_outcome = (protocol == compat::Protocol::Devin)
-            .then(|| Arc::new(std::sync::Mutex::new(None)));
+        let devin_outcome =
+            (protocol == compat::Protocol::Devin).then(|| Arc::new(std::sync::Mutex::new(None)));
         if protocol != compat::Protocol::Devin {
             member.record_ok();
             state.metrics.served.fetch_add(1, Ordering::Relaxed);
@@ -2164,7 +2305,10 @@ async fn finish_success(
             if let Some(code) = devin.error_code {
                 return Err(format!(
                     "{code}: {}",
-                    devin.error_message.as_deref().unwrap_or("unknown upstream error")
+                    devin
+                        .error_message
+                        .as_deref()
+                        .unwrap_or("unknown upstream error")
                 ));
             }
             if !devin.terminated {
@@ -2192,7 +2336,9 @@ async fn finish_success(
                 current.record_ok();
             }
             state.monitor.clear_error(current.id());
-            state.scheduler.record_success(current.id(), &state.pool.load().members);
+            state
+                .scheduler
+                .record_success(current.id(), &state.pool.load().members);
             state.router.feedback(current.id(), Outcome::Success);
         }
         state.metrics.served.fetch_add(1, Ordering::Relaxed);
@@ -2294,7 +2440,8 @@ fn body_affinity_key(body: &[u8]) -> Option<String> {
 
     if let Some(user) = obj.get("user").and_then(|v| v.as_str()) {
         let user = user.trim();
-        if user.starts_with("session_") || user.starts_with("conv_") || user.starts_with("thread_") {
+        if user.starts_with("session_") || user.starts_with("conv_") || user.starts_with("thread_")
+        {
             return Some(format!("body-id-{user}"));
         }
     }
@@ -2339,7 +2486,9 @@ pub async fn handle_relay(
         .unwrap_or(0);
     let key_identifier = auth.key_identifier.clone();
     let scoped_key = auth.identity.scoped().cloned();
-    let scoped_entry = scoped_key.as_ref().and_then(|key| state.scoped_keys.get(&key.key_identifier));
+    let scoped_entry = scoped_key
+        .as_ref()
+        .and_then(|key| state.scoped_keys.get(&key.key_identifier));
 
     // 1. Quota check: if token budget is exhausted, reject with 429.
     if let Some(ref entry) = scoped_entry {
@@ -2353,8 +2502,13 @@ pub async fn handle_relay(
         }
     }
 
-    let binding = state.settings.current().api_key_bindings.iter()
-        .find(|binding| Some(&binding.key_identifier) == key_identifier.as_ref()).cloned();
+    let binding = state
+        .settings
+        .current()
+        .api_key_bindings
+        .iter()
+        .find(|binding| Some(&binding.key_identifier) == key_identifier.as_ref())
+        .cloned();
     let _in_flight = state.monitor.track_in_flight();
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3120,7 +3274,9 @@ mod routing_tests {
         pool.registry = Arc::new(registry);
 
         // When: resolving the explicit alias.
-        let route = resolve_route(&pool, Some("claude-sonnet"), None).unwrap().unwrap();
+        let route = resolve_route(&pool, Some("claude-sonnet"), None)
+            .unwrap()
+            .unwrap();
 
         // Then: shorthand matching must not override the configured target.
         assert_eq!(route.canonical_model, "claude-3-7-sonnet-20250219");
@@ -3134,19 +3290,27 @@ mod routing_tests {
         let mut pool = (*state.pool.load_full()).clone();
         let mut registry = (*pool.registry).clone();
         for model in ["claude-3-7-sonnet-20250219", "claude-opus-5"] {
-            registry.exclusions.insert(mahoquot_registry::ModelExclusionRule {
-                model_id: mahoquot_registry::ModelId::new(model).unwrap(),
-                provider_id: None,
-            });
+            registry
+                .exclusions
+                .insert(mahoquot_registry::ModelExclusionRule {
+                    model_id: mahoquot_registry::ModelId::new(model).unwrap(),
+                    provider_id: None,
+                });
         }
         pool.registry = Arc::new(registry);
 
         // When: clients address either model through an official prefix.
-        for model in ["anthropic-claude-3-7-sonnet-20250219", "anthropic-claude-opus-5"] {
+        for model in [
+            "anthropic-claude-3-7-sonnet-20250219",
+            "anthropic-claude-opus-5",
+        ] {
             let result = resolve_route(&pool, Some(model), None);
 
             // Then: a fallback cannot erase the explicit exclusion.
-            assert!(matches!(result, Err(mahoquot_registry::RegistryError::ModelExcluded { .. })));
+            assert!(matches!(
+                result,
+                Err(mahoquot_registry::RegistryError::ModelExcluded { .. })
+            ));
         }
         std::fs::remove_dir_all(auth_dir).unwrap();
     }
@@ -3410,43 +3574,91 @@ mod routing_tests {
         let pool = state.pool.load_full();
         assert_eq!(pool.members.len(), 2);
 
-        let official_idx = pool.members.iter().position(|m| !m.is_nekos_relay()).unwrap();
-        let nekos_idx = pool.members.iter().position(|m| m.is_nekos_relay()).unwrap();
+        let official_idx = pool
+            .members
+            .iter()
+            .position(|m| !m.is_nekos_relay())
+            .unwrap();
+        let nekos_idx = pool
+            .members
+            .iter()
+            .position(|m| m.is_nekos_relay())
+            .unwrap();
         assert_ne!(official_idx, nekos_idx);
 
         // 1. anthropic- prefixed model resolves and routes ONLY to official
         let route = resolve_route(&pool, Some("anthropic-claude-3-7-sonnet-20250219"), None)
             .unwrap()
             .unwrap();
-        let eligible = eligible_indices(&pool, Some(&route), Some("anthropic-claude-3-7-sonnet-20250219"), 0, None, None, &state);
+        let eligible = eligible_indices(
+            &pool,
+            Some(&route),
+            Some("anthropic-claude-3-7-sonnet-20250219"),
+            0,
+            None,
+            None,
+            &state,
+        );
         assert_eq!(eligible, vec![official_idx]);
 
         // 2. anthropic/ slash-prefixed model routes ONLY to official
         let route = resolve_route(&pool, Some("anthropic/claude-3-7-sonnet-20250219"), None)
             .unwrap()
             .unwrap();
-        let eligible = eligible_indices(&pool, Some(&route), Some("anthropic/claude-3-7-sonnet-20250219"), 0, None, None, &state);
+        let eligible = eligible_indices(
+            &pool,
+            Some(&route),
+            Some("anthropic/claude-3-7-sonnet-20250219"),
+            0,
+            None,
+            None,
+            &state,
+        );
         assert_eq!(eligible, vec![official_idx]);
 
         // 3. nekos- prefixed model resolves and routes ONLY to nekos
         let route = resolve_route(&pool, Some("nekos-claude-3-7-sonnet-20250219"), None)
             .unwrap()
             .unwrap();
-        let eligible = eligible_indices(&pool, Some(&route), Some("nekos-claude-3-7-sonnet-20250219"), 0, None, None, &state);
+        let eligible = eligible_indices(
+            &pool,
+            Some(&route),
+            Some("nekos-claude-3-7-sonnet-20250219"),
+            0,
+            None,
+            None,
+            &state,
+        );
         assert_eq!(eligible, vec![nekos_idx]);
 
         // 4. nekos/ slash-prefixed model routes ONLY to nekos
         let route = resolve_route(&pool, Some("nekos/claude-3-7-sonnet-20250219"), None)
             .unwrap()
             .unwrap();
-        let eligible = eligible_indices(&pool, Some(&route), Some("nekos/claude-3-7-sonnet-20250219"), 0, None, None, &state);
+        let eligible = eligible_indices(
+            &pool,
+            Some(&route),
+            Some("nekos/claude-3-7-sonnet-20250219"),
+            0,
+            None,
+            None,
+            &state,
+        );
         assert_eq!(eligible, vec![nekos_idx]);
 
         // 5. Bare unprefixed model routes to BOTH accounts
         let route = resolve_route(&pool, Some("claude-3-7-sonnet-20250219"), None)
             .unwrap()
             .unwrap();
-        let mut eligible = eligible_indices(&pool, Some(&route), Some("claude-3-7-sonnet-20250219"), 0, None, None, &state);
+        let mut eligible = eligible_indices(
+            &pool,
+            Some(&route),
+            Some("claude-3-7-sonnet-20250219"),
+            0,
+            None,
+            None,
+            &state,
+        );
         eligible.sort();
         let mut expected = vec![official_idx, nekos_idx];
         expected.sort();
@@ -3456,26 +3668,58 @@ mod routing_tests {
         let route = resolve_route(&pool, Some("anthropic-claude-3-7-sonnet"), None)
             .unwrap()
             .unwrap();
-        let eligible = eligible_indices(&pool, Some(&route), Some("anthropic-claude-3-7-sonnet"), 0, None, None, &state);
+        let eligible = eligible_indices(
+            &pool,
+            Some(&route),
+            Some("anthropic-claude-3-7-sonnet"),
+            0,
+            None,
+            None,
+            &state,
+        );
         assert_eq!(eligible, vec![official_idx]);
 
         let route = resolve_route(&pool, Some("nekos-claude-3-7-sonnet"), None)
             .unwrap()
             .unwrap();
-        let eligible = eligible_indices(&pool, Some(&route), Some("nekos-claude-3-7-sonnet"), 0, None, None, &state);
+        let eligible = eligible_indices(
+            &pool,
+            Some(&route),
+            Some("nekos-claude-3-7-sonnet"),
+            0,
+            None,
+            None,
+            &state,
+        );
         assert_eq!(eligible, vec![nekos_idx]);
 
         // 7. Uncataloged future Claude models (e.g. claude-opus-5) route cleanly
         let route = resolve_route(&pool, Some("anthropic-claude-opus-5"), None)
             .unwrap()
             .unwrap();
-        let eligible = eligible_indices(&pool, Some(&route), Some("anthropic-claude-opus-5"), 0, None, None, &state);
+        let eligible = eligible_indices(
+            &pool,
+            Some(&route),
+            Some("anthropic-claude-opus-5"),
+            0,
+            None,
+            None,
+            &state,
+        );
         assert_eq!(eligible, vec![official_idx]);
 
         let route = resolve_route(&pool, Some("nekos-claude-opus-5"), None)
             .unwrap()
             .unwrap();
-        let eligible = eligible_indices(&pool, Some(&route), Some("nekos-claude-opus-5"), 0, None, None, &state);
+        let eligible = eligible_indices(
+            &pool,
+            Some(&route),
+            Some("nekos-claude-opus-5"),
+            0,
+            None,
+            None,
+            &state,
+        );
         assert_eq!(eligible, vec![nekos_idx]);
 
         std::fs::remove_dir_all(auth_dir).ok();

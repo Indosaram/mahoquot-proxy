@@ -96,7 +96,8 @@ pub async fn execute_cline_refresh_to(
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
         .map(|dt| dt.timestamp() - chrono::Utc::now().timestamp())
         .filter(|secs| *secs > 0);
-    let mut json_str = serde_json::to_string(&value).map_err(|e| RefreshError::Parse(e.to_string()))?;
+    let mut json_str =
+        serde_json::to_string(&value).map_err(|e| RefreshError::Parse(e.to_string()))?;
     // Re-attach the `workos:` scheme the server strips: the CLI stores
     // `workos:eyJ...` and sends it back verbatim, and the bare JWT alone
     // is rejected with 401 re-authenticate. Verified live 2026-09-10.
@@ -126,8 +127,7 @@ pub async fn execute_cline_refresh_to(
                 serde_json::Value::Number(secs.into()),
             );
         }
-        json_str =
-            serde_json::to_string(&obj).map_err(|e| RefreshError::Parse(e.to_string()))?;
+        json_str = serde_json::to_string(&obj).map_err(|e| RefreshError::Parse(e.to_string()))?;
     }
     crate::refresh::parse_refresh_response(&json_str).map_err(RefreshError::Parse)
 }
@@ -161,138 +161,6 @@ pub async fn execute_refresh_spec(
     }
 
     crate::refresh::parse_refresh_response(&body).map_err(RefreshError::Parse)
-}
-
-/// Maps a non-success response to a typed `RefreshError::Status`.
-///
-/// `Response::error_for_status` collapses the status into `reqwest::Error`,
-/// surfacing as `RefreshError::Http`, whose `is_auth_failure()` is false - so
-/// a rejected credential would be retried forever instead of marked AuthFailed.
-trait TypedStatus: Sized {
-    fn error_for_status_typed(self) -> Result<Self, RefreshError>;
-}
-
-impl TypedStatus for reqwest::Response {
-    fn error_for_status_typed(self) -> Result<Self, RefreshError> {
-        let status = self.status();
-        if status.is_success() {
-            Ok(self)
-        } else {
-            Err(RefreshError::Status {
-                code: status.as_u16(),
-                body: String::new(),
-            })
-        }
-    }
-}
-
-pub async fn execute_zcode_refresh(
-    client: &reqwest::Client,
-    api_base: &str,
-    upstream_token: &str,
-) -> Result<Tokens, RefreshError> {
-    let base = api_base.trim_end_matches('/');
-    let login: serde_json::Value = client
-        .post(format!("{base}/api/auth/z/login"))
-        .json(&serde_json::json!({"token": upstream_token}))
-        .send()
-        .await?
-        .error_for_status_typed()?
-        .json()
-        .await?;
-    let business = login["data"]["access_token"]
-        .as_str()
-        .ok_or_else(|| RefreshError::Parse("Z-code login missing access_token".to_string()))?;
-    let customer: serde_json::Value = client
-        .get(format!("{base}/api/biz/customer/getCustomerInfo"))
-        .bearer_auth(business)
-        .send()
-        .await?
-        .error_for_status_typed()?
-        .json()
-        .await?;
-    let organizations = customer["data"]["organizations"]
-        .as_array()
-        .ok_or_else(|| RefreshError::Parse("Z-code customer missing organizations".to_string()))?;
-    let organization = organizations
-        .iter()
-        .find(|entry| entry["isDefault"] == true)
-        .or_else(|| organizations.first())
-        .ok_or_else(|| RefreshError::Parse("Z-code customer has no organization".to_string()))?;
-    let org_id = organization["organizationId"]
-        .as_str()
-        .or_else(|| organization["id"].as_str())
-        .ok_or_else(|| RefreshError::Parse("Z-code organization missing id".to_string()))?;
-    let projects = organization["projects"]
-        .as_array()
-        .ok_or_else(|| RefreshError::Parse("Z-code organization missing projects".to_string()))?;
-    let project = projects
-        .iter()
-        .find(|entry| entry["isDefault"] == true)
-        .or_else(|| projects.first())
-        .ok_or_else(|| RefreshError::Parse("Z-code organization has no project".to_string()))?;
-    let project_id = project["projectId"]
-        .as_str()
-        .or_else(|| project["id"].as_str())
-        .ok_or_else(|| RefreshError::Parse("Z-code project missing id".to_string()))?;
-    let path = format!("/api/biz/v1/organization/{org_id}/projects/{project_id}/api_keys");
-    let keys: serde_json::Value = client
-        .get(format!("{base}{path}"))
-        .bearer_auth(business)
-        .send()
-        .await?
-        .error_for_status_typed()?
-        .json()
-        .await?;
-    let existing_key_id = keys["data"]
-        .as_array()
-        .and_then(|entries| {
-            entries
-                .iter()
-                .find(|entry| entry["name"] == "zcode-api-key")
-        })
-        .and_then(|entry| entry["apiKey"].as_str().or_else(|| entry["id"].as_str()));
-    let created_key: serde_json::Value;
-    let key_id = match existing_key_id {
-        Some(key_id) => key_id,
-        None => {
-            created_key = client
-                .post(format!("{base}{path}"))
-                .bearer_auth(business)
-                .json(&serde_json::json!({"name": "zcode-api-key"}))
-                .send()
-                .await?
-                .error_for_status_typed()?
-                .json()
-                .await?;
-            let entry = created_key.get("data").unwrap_or(&created_key);
-            entry["apiKey"]
-                .as_str()
-                .or_else(|| entry["id"].as_str())
-                .ok_or_else(|| {
-                    RefreshError::Parse("Z-code API key create missing id".to_string())
-                })?
-        }
-    };
-    let copied: serde_json::Value = client
-        .get(format!("{base}{path}/copy/{key_id}"))
-        .bearer_auth(business)
-        .send()
-        .await?
-        .error_for_status_typed()?
-        .json()
-        .await?;
-    let secret = copied["data"]["secretKey"]
-        .as_str()
-        .or_else(|| copied["secretKey"].as_str())
-        .ok_or_else(|| RefreshError::Parse("Z-code API key copy missing secret".to_string()))?;
-    Ok(Tokens {
-        access_token: format!("{key_id}.{secret}"),
-        refresh_token: Some(upstream_token.to_string()),
-        id_token: None,
-        token_type: Some("Bearer".to_string()),
-        expires_in: Some(10 * 365 * 24 * 3600),
-    })
 }
 
 pub fn apply_refresh_to_file(
@@ -472,34 +340,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn zcode_refresh_reports_a_401_as_an_auth_failure() {
-        // A rejected zcode login must mark the account AuthFailed like every
-        // other provider; error_for_status() collapses it into
-        // RefreshError::Http, whose is_auth_failure() is false, so the account
-        // would be retried forever instead.
-        let app = Router::new().route(
-            "/api/auth/z/login",
-            post(|| async { (axum::http::StatusCode::UNAUTHORIZED, "token rejected") }),
-        );
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr: SocketAddr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        let client = reqwest::Client::new();
-        let base = format!("http://{addr}");
-        let err = execute_zcode_refresh(&client, &base, "dead-token")
-            .await
-            .unwrap_err();
-
-        assert!(
-            err.is_auth_failure(),
-            "zcode 401 not classified as an auth failure: {err:?}"
-        );
-    }
-
-    #[tokio::test]
     async fn claude_refresh_uses_anthropic_json_contract() {
         let app = Router::new().route(
             "/v1/oauth/token",
@@ -589,97 +429,6 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(tokens.access_token, "kiro-new");
-    }
-
-    #[tokio::test]
-    async fn zcode_refresh_reprovisions_composite_api_key() {
-        let app = Router::new()
-            .route(
-                "/api/auth/z/login",
-                post(|body: String| async move {
-                    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
-                    assert_eq!(value["token"], "zai-upstream");
-                    axum::Json(serde_json::json!({"data":{"access_token":"business"}}))
-                }),
-            )
-            .route(
-                "/api/biz/customer/getCustomerInfo",
-                axum::routing::get(|| async {
-                    axum::Json(serde_json::json!({"data":{"organizations":[{"id":"org","isDefault":true,"projects":[{"id":"proj","isDefault":true}]}]}}))
-                }),
-            )
-            .route(
-                "/api/biz/v1/organization/org/projects/proj/api_keys",
-                axum::routing::get(|| async {
-                    axum::Json(serde_json::json!({"data":[{"id":"key-id","name":"zcode-api-key"}]}))
-                }),
-            )
-            .route(
-                "/api/biz/v1/organization/org/projects/proj/api_keys/copy/key-id",
-                axum::routing::get(|| async {
-                    axum::Json(serde_json::json!({"data":{"secretKey":"key-secret"}}))
-                }),
-            );
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let tokens = execute_zcode_refresh(
-            &reqwest::Client::new(),
-            &format!("http://{addr}"),
-            "zai-upstream",
-        )
-        .await
-        .unwrap();
-        assert_eq!(tokens.access_token, "key-id.key-secret");
-        assert_eq!(tokens.refresh_token.as_deref(), Some("zai-upstream"));
-    }
-
-    #[tokio::test]
-    async fn zcode_refresh_creates_missing_named_api_key() {
-        let app = Router::new()
-            .route(
-                "/api/auth/z/login",
-                post(|| async {
-                    axum::Json(serde_json::json!({"data":{"access_token":"business"}}))
-                }),
-            )
-            .route(
-                "/api/biz/customer/getCustomerInfo",
-                axum::routing::get(|| async {
-                    axum::Json(serde_json::json!({"data":{"organizations":[{
-                        "organizationId":"org","isDefault":true,
-                        "projects":[{"projectId":"proj","isDefault":true}]
-                    }]}}))
-                }),
-            )
-            .route(
-                "/api/biz/v1/organization/org/projects/proj/api_keys",
-                axum::routing::get(|| async { axum::Json(serde_json::json!({"data":[]})) }).post(
-                    |body: String| async move {
-                        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
-                        assert_eq!(value["name"], "zcode-api-key");
-                        axum::Json(serde_json::json!({"data":{"apiKey":"created-id"}}))
-                    },
-                ),
-            )
-            .route(
-                "/api/biz/v1/organization/org/projects/proj/api_keys/copy/created-id",
-                axum::routing::get(|| async {
-                    axum::Json(serde_json::json!({"data":{"secretKey":"created-secret"}}))
-                }),
-            );
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
-        let tokens = execute_zcode_refresh(
-            &reqwest::Client::new(),
-            &format!("http://{addr}"),
-            "zai-upstream",
-        )
-        .await
-        .unwrap();
-        assert_eq!(tokens.access_token, "created-id.created-secret");
     }
 
     #[tokio::test]

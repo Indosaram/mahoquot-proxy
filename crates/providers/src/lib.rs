@@ -63,9 +63,9 @@ pub use mimo::{
 };
 pub use refresh::{
     build_antigravity_refresh_request, build_claude_refresh_request, build_cline_refresh_request,
-    build_cursor_refresh_request, build_kiro_idc_refresh_request, build_kiro_social_refresh_request,
-    build_refresh_request, parse_refresh_response, RefreshRequest, Tokens, CLINE_REFRESH_URL,
-    REFRESH_CLIENT_ID, REFRESH_TOKEN_URL,
+    build_cursor_refresh_request, build_kiro_idc_refresh_request,
+    build_kiro_social_refresh_request, build_refresh_request, parse_refresh_response,
+    RefreshRequest, Tokens, CLINE_REFRESH_URL, REFRESH_CLIENT_ID, REFRESH_TOKEN_URL,
 };
 pub use refresh_exec::{execute_cline_refresh, execute_cline_refresh_to, format_expired_rfc3339};
 #[allow(deprecated)]
@@ -75,12 +75,17 @@ pub use vertex::{
 };
 #[allow(deprecated)]
 pub use zcode::{
-    extract_callback_code, find_existing_api_key, is_provisioned_api_key, is_zcode_model,
-    list_zcode_auth_files, parse_broker_token, parse_business_token, parse_copied_secret,
-    parse_created_api_key, parse_customer_info, zcode_authorize_url, zcode_messages_url,
-    ZcodeAccount, ZcodeCustomerInfo, ZCODE_ANTHROPIC_BASE, ZCODE_API_BASE, ZCODE_API_KEY_NAME,
-    ZCODE_LOGIN_URL, ZCODE_MESSAGES_PATH, ZCODE_MODELS, ZCODE_OAUTH_AUTHORIZE_URL,
-    ZCODE_OAUTH_BROKER_TOKEN_URL, ZCODE_OAUTH_CLIENT_ID, ZCODE_OAUTH_REDIRECT_URI,
+    extract_callback_code, find_existing_api_key, is_plan_captcha_challenge,
+    is_provisioned_api_key, is_zcode_model, list_zcode_auth_files, normalize_plan_model,
+    parse_broker_token, parse_business_token, parse_cli_init, parse_cli_poll, parse_copied_secret,
+    parse_created_api_key, parse_customer_info, parse_plan_balances, plan_billing_headers,
+    plan_biz_error, plan_user_id_from_jwt, zcode_authorize_url, zcode_messages_url, ZcodeAccount,
+    ZcodeCliInit, ZcodeCliPoll, ZcodeCustomerInfo, ZcodePlanBalanceRow, ZCODE_ANTHROPIC_BASE,
+    ZCODE_ANTHROPIC_SDK_UA, ZCODE_API_BASE, ZCODE_API_KEY_NAME, ZCODE_APP_VERSION,
+    ZCODE_CAPTCHA_BODY_MARKERS, ZCODE_CAPTCHA_PARAM_HEADER, ZCODE_LOGIN_URL, ZCODE_MESSAGES_PATH,
+    ZCODE_MODELS, ZCODE_OAUTH_AUTHORIZE_URL, ZCODE_OAUTH_BROKER_TOKEN_URL, ZCODE_OAUTH_CLIENT_ID,
+    ZCODE_OAUTH_CLI_INIT_URL, ZCODE_OAUTH_CLI_POLL_PREFIX, ZCODE_OAUTH_REDIRECT_URI,
+    ZCODE_PLAN_BILLING_BALANCE_URL, ZCODE_PLAN_MODEL_IDS, ZCODE_PLAN_ORIGIN, ZCODE_SDK_UA,
     ZCODE_USERINFO_URL,
 };
 
@@ -147,7 +152,10 @@ mod edge_tests {
             derive_identity_slug_from_filename("noextension"),
             "noextension"
         );
-        assert_eq!(derive_identity_slug_from_filename("no-extension"), "no-extension");
+        assert_eq!(
+            derive_identity_slug_from_filename("no-extension"),
+            "no-extension"
+        );
         for plan in ["pro", "plus", "team", "free"] {
             assert_eq!(
                 derive_identity_slug_from_filename(&format!("codex-team-alpha-{plan}.json")),
@@ -158,9 +166,16 @@ mod edge_tests {
                 format!("team-alpha-{plan}")
             );
         }
-        for filename in ["a-b-c-d.json", "claude-team-alpha.json", "codex-team-alpha-enterprise.json"] {
-            let expected = filename.strip_prefix("codex-").unwrap_or(filename)
-                .strip_suffix(".json").unwrap();
+        for filename in [
+            "a-b-c-d.json",
+            "claude-team-alpha.json",
+            "codex-team-alpha-enterprise.json",
+        ] {
+            let expected = filename
+                .strip_prefix("codex-")
+                .unwrap_or(filename)
+                .strip_suffix(".json")
+                .unwrap();
             assert_eq!(derive_identity_slug_from_filename(filename), expected);
         }
         assert_ne!(

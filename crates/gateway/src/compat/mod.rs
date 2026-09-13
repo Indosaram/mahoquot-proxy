@@ -3,6 +3,7 @@ pub mod cursor;
 mod cursor_proto;
 pub mod devin;
 pub mod devin_proto;
+pub mod zcode;
 
 #[doc(hidden)]
 pub fn cursor_fixture_text(text: &str) -> cursor_proto::AgentServerMessage {
@@ -136,8 +137,10 @@ pub async fn open_stream(
     let mut stream: UpstreamStream = Box::pin(resp.bytes_stream());
     match stream.next().await {
         Some(Ok(first))
-            if matches!(protocol, Protocol::Kiro | Protocol::Cursor | Protocol::Devin)
-                || looks_like_sse(&first) =>
+            if matches!(
+                protocol,
+                Protocol::Kiro | Protocol::Cursor | Protocol::Devin
+            ) || looks_like_sse(&first) =>
         {
             Ok((first, stream))
         }
@@ -461,7 +464,14 @@ pub async fn collect_stream_with_replies(
     first: Bytes,
     mut stream: UpstreamStream,
     session: ProtocolSession,
-) -> Result<(Vec<u8>, Option<crate::usage::ResponseTokenUsage>, Option<devin::DevinOutcome>), String> {
+) -> Result<
+    (
+        Vec<u8>,
+        Option<crate::usage::ResponseTokenUsage>,
+        Option<devin::DevinOutcome>,
+    ),
+    String,
+> {
     let mut parser = ProtocolParser::with_cursor_reply(session.protocol, session.cursor_reply);
     let mut raw = first.to_vec();
     let mut events = Vec::new();
@@ -624,8 +634,7 @@ pub fn anthropic_response(
         }
     }
 
-    let tool_calls: Vec<(String, String, String)> =
-        tool_calls_by_index.into_values().collect();
+    let tool_calls: Vec<(String, String, String)> = tool_calls_by_index.into_values().collect();
 
     let payload = claude::messages_payload_full(
         &id,

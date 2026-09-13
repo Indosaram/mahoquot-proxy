@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, LazyLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -457,9 +458,13 @@ async fn exchange_xai_code(
         .get("email")
         .and_then(Value::as_str)
         .unwrap_or("xai-account");
-    let models =
-        fetch_credential_models(&state.http_client, "https://api.x.ai/v1", access_token, "xai")
-            .await?;
+    let models = fetch_credential_models(
+        &state.http_client,
+        "https://api.x.ai/v1",
+        access_token,
+        "xai",
+    )
+    .await?;
     let credential = json!({
         "type":"generic", "provider":"xai", "label":email, "adapter":"openai-chat",
         "base_url":"https://api.x.ai/v1", "api_key":access_token, "auth_mode":"oauth",
@@ -1442,6 +1447,34 @@ async fn auth_status(
         };
 
         if let Some(mut session) = session_opt {
+            if session.provider == "zcode" && session.status == SessionStatus::Pending {
+                let auth_dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
+                match poll_zcode_session(&state.http_client, &auth_dir, &mut session).await {
+                    Ok(Some(_cred)) => {
+                        if let Err(error) = state.rescan_pool() {
+                            eprintln!("pool rescan failed after zcode onboarding: {error}");
+                        }
+                        let mut sessions = SESSIONS.write().unwrap();
+                        sessions.insert(session.state.clone(), session);
+                        return json_status(
+                            StatusCode::OK,
+                            json!({ "status": "ok", "provider": "zcode" }),
+                        );
+                    }
+                    Ok(None) => {
+                        return json_status(StatusCode::OK, json!({ "status": "pending" }));
+                    }
+                    Err(err) => {
+                        session.status = SessionStatus::Failed(err.clone());
+                        let mut sessions = SESSIONS.write().unwrap();
+                        sessions.insert(session.state.clone(), session);
+                        return json_status(
+                            StatusCode::BAD_REQUEST,
+                            json!({ "status": "error", "error": err }),
+                        );
+                    }
+                }
+            }
             if session.provider == "cursor" && session.status == SessionStatus::Pending {
                 let auth_dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
                 match poll_cursor_session(&state.http_client, &auth_dir, &mut session).await {
@@ -1808,7 +1841,10 @@ pub async fn oauth_callback(
                     .unwrap()
                     .insert(session.state.clone(), session);
             } else if session.provider == "anthropic"
-                && matches!(session.status, SessionStatus::Pending | SessionStatus::Failed(_))
+                && matches!(
+                    session.status,
+                    SessionStatus::Pending | SessionStatus::Failed(_)
+                )
             {
                 let auth_dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
                 let exchange_res = exchange_anthropic_code(
@@ -1828,9 +1864,14 @@ pub async fn oauth_callback(
                     }
                     Err(err) => {
                         session.status = SessionStatus::Failed(err.clone());
-                        SESSIONS.write().unwrap().insert(session.state.clone(), session);
-                        return json_status(StatusCode::BAD_REQUEST,
-                            json!({"status":"error","error":err}));
+                        SESSIONS
+                            .write()
+                            .unwrap()
+                            .insert(session.state.clone(), session);
+                        return json_status(
+                            StatusCode::BAD_REQUEST,
+                            json!({"status":"error","error":err}),
+                        );
                     }
                 }
 
@@ -2193,269 +2234,141 @@ async fn command_code_auth_url_handler(
     )
 }
 
-fn create_zcode_auth_url(params: &HashMap<String, String>) -> (String, String, OAuthSession) {
-    let state = new_state();
-    let broker_url = params
-        .get("broker_url")
-        .cloned()
-        .or_else(|| std::env::var("ZCODE_BROKER_TOKEN_URL").ok())
-        .unwrap_or_else(|| mahoquot_providers::zcode::ZCODE_OAUTH_BROKER_TOKEN_URL.to_string());
-    let api_base = params
-        .get("api_base")
-        .cloned()
-        .or_else(|| std::env::var("ZCODE_API_BASE").ok())
-        .unwrap_or_else(|| mahoquot_providers::zcode::ZCODE_API_BASE.to_string());
+async fn start_zcode_plan_session(
+    state: &AppState,
+    params: &HashMap<String, String>,
+) -> Result<(String, OAuthSession), String> {
+    let _ = params;
+    // The CLI poll token doubles as the init/poll bearer (the desktop client's
+    // own flow sends a random hex blob as its bearer); the session state is a
+    // separate handle so get-auth-status cannot replay the poll bearer.
+    let poll_token = new_state();
+    let init_url = std::env::var("ZCODE_CLI_INIT_URL")
+        .ok()
+        .unwrap_or_else(|| mahoquot_providers::zcode::ZCODE_OAUTH_CLI_INIT_URL.to_string());
+    let init_response: Value = state
+        .http_client
+        .post(&init_url)
+        .bearer_auth(&poll_token)
+        .header("content-type", "application/json")
+        .header("user-agent", mahoquot_providers::zcode::ZCODE_SDK_UA)
+        .json(&json!({ "provider": "zai" }))
+        .send()
+        .await
+        .map_err(|err| format!("ZCode plan login init request failed: {err}"))?
+        .error_for_status()
+        .map_err(|err| format!("ZCode plan login init request failed: {err}"))?
+        .json()
+        .await
+        .map_err(|err| format!("ZCode plan login init response was not valid JSON: {err}"))?;
+    let init = mahoquot_providers::zcode::parse_cli_init(&init_response)
+        .map_err(|detail| format!("ZCode plan login init failed: {detail}"))?;
 
-    let url = mahoquot_providers::zcode::zcode_authorize_url(&state);
     let session = OAuthSession {
-        state: state.clone(),
+        state: new_state(),
         provider: "zcode".to_string(),
-        verifier: String::new(),
+        verifier: poll_token,
         challenge: String::new(),
-        redirect_uri: mahoquot_providers::zcode::ZCODE_OAUTH_REDIRECT_URI.to_string(),
-        token_url: broker_url,
-        poll_url: api_base,
+        redirect_uri: init.flow_id,
+        token_url: String::new(),
+        poll_url: String::new(),
         uuid: String::new(),
         status: SessionStatus::Pending,
         created_at: Instant::now(),
         saved_account_email: None,
     };
-
-    (url, state, session)
+    Ok((init.authorize_url, session))
 }
 
-async fn exchange_zcode_code(
-    state: &AppState,
+/// One poll step of the gateway's OAuth CLI flow. `Ok(Some(...))` completes
+/// the session (credential written), `Ok(None)` keeps it pending, `Err` fails
+/// it terminally — the plan JWT has no refresh grant, so a rejected flow needs
+/// a fresh browser login.
+pub(crate) async fn poll_zcode_session(
+    client: &reqwest::Client,
+    auth_dir: &Path,
     session: &mut OAuthSession,
-    code: &str,
-) -> Result<(), String> {
-    let broker_url = if session.token_url.is_empty() {
-        mahoquot_providers::zcode::ZCODE_OAUTH_BROKER_TOKEN_URL.to_string()
-    } else {
-        session.token_url.clone()
-    };
-    let broker_response: Value = state
-        .http_client
-        .post(&broker_url)
-        .json(&json!({
-            "provider": "zai",
-            "code": code,
-            "redirect_uri": session.redirect_uri,
-            "state": session.state,
-        }))
-        .send()
-        .await
-        .map_err(|err| format!("GLM ZCode broker request failed: {err}"))?
-        .error_for_status()
-        .map_err(|err| format!("GLM ZCode broker request failed: {err}"))?
-        .json()
-        .await
-        .map_err(|err| format!("GLM ZCode broker response was not valid JSON: {err}"))?;
-    let upstream_token = mahoquot_providers::zcode::parse_broker_token(&broker_response)?;
-    let api_base = if session.poll_url.is_empty() {
-        mahoquot_providers::zcode::ZCODE_API_BASE.to_string()
-    } else {
-        session.poll_url.clone()
-    };
-    let email = provision_zcode_account(state, &api_base, &upstream_token).await?;
-
-    session.saved_account_email = Some(email);
-    session.status = SessionStatus::Completed;
-    Ok(())
-}
-
-/// Turn an upstream Z.AI OAuth token into a provisioned `{id}.{secret}` API
-/// key credential file: business login, default org/project lookup, find or
-/// create `zcode-api-key`, copy its secret, write `zcode-<email>.json`.
-async fn provision_zcode_account(
-    state: &AppState,
-    api_base: &str,
-    upstream_token: &str,
-) -> Result<String, String> {
-    let login_response: Value = state
-        .http_client
-        .post(format!("{api_base}/api/auth/z/login"))
-        .json(&json!({ "token": upstream_token }))
-        .send()
-        .await
-        .map_err(|err| format!("GLM ZCode z/login request failed: {err}"))?
-        .error_for_status()
-        .map_err(|err| format!("GLM ZCode z/login request failed: {err}"))?
-        .json()
-        .await
-        .map_err(|err| format!("GLM ZCode z/login response was not valid JSON: {err}"))?;
-    let business_token = mahoquot_providers::zcode::parse_business_token(&login_response).map_err(
-        |detail| {
-            format!(
-                "{detail}; the saved ZCode session was rejected by Z.AI - open the ZCode desktop app once to refresh it, then import again"
-            )
-        },
-    );
-    let business_token = business_token?;
-
-    let customer_response: Value = state
-        .http_client
-        .get(format!("{api_base}/api/biz/customer/getCustomerInfo"))
-        .bearer_auth(&business_token)
-        .send()
-        .await
-        .map_err(|err| format!("GLM ZCode getCustomerInfo request failed: {err}"))?
-        .error_for_status()
-        .map_err(|err| format!("GLM ZCode getCustomerInfo request failed: {err}"))?
-        .json()
-        .await
-        .map_err(|err| format!("GLM ZCode getCustomerInfo response was not valid JSON: {err}"))?;
-    let customer = mahoquot_providers::zcode::parse_customer_info(&customer_response)?;
-
-    let keys_url = format!(
-        "{api_base}/api/biz/v1/organization/{}/projects/{}/api_keys",
-        customer.organization_id, customer.project_id
-    );
-    let listed: Value = state
-        .http_client
-        .get(&keys_url)
-        .bearer_auth(&business_token)
-        .send()
-        .await
-        .map_err(|err| format!("GLM ZCode api_keys list request failed: {err}"))?
-        .error_for_status()
-        .map_err(|err| format!("GLM ZCode api_keys list request failed: {err}"))?
-        .json()
-        .await
-        .map_err(|err| format!("GLM ZCode api_keys list response was not valid JSON: {err}"))?;
-    let key_id = match mahoquot_providers::zcode::find_existing_api_key(&listed) {
-        Some(key_id) => key_id,
-        None => {
-            let created: Value = state
-                .http_client
-                .post(&keys_url)
-                .bearer_auth(&business_token)
-                .json(&json!({ "name": mahoquot_providers::zcode::ZCODE_API_KEY_NAME }))
-                .send()
-                .await
-                .map_err(|err| format!("GLM ZCode api_keys create request failed: {err}"))?
-                .error_for_status()
-                .map_err(|err| format!("GLM ZCode api_keys create request failed: {err}"))?
-                .json()
-                .await
-                .map_err(|err| {
-                    format!("GLM ZCode api_keys create response was not valid JSON: {err}")
-                })?;
-            mahoquot_providers::zcode::parse_created_api_key(&created)?
-        }
-    };
-
-    let copied: Value = state
-        .http_client
-        .get(format!("{keys_url}/copy/{}", url_encode(&key_id)))
-        .bearer_auth(&business_token)
-        .send()
-        .await
-        .map_err(|err| format!("GLM ZCode api_keys copy request failed: {err}"))?
-        .error_for_status()
-        .map_err(|err| format!("GLM ZCode api_keys copy request failed: {err}"))?
-        .json()
-        .await
-        .map_err(|err| format!("GLM ZCode api_keys copy response was not valid JSON: {err}"))?;
-    let secret_key = mahoquot_providers::zcode::parse_copied_secret(&copied)?;
-
-    let email = if customer.email.is_empty() {
-        "zcode-user@local".to_string()
-    } else {
-        customer.email.clone()
-    };
-    let credential = json!({
-        "identity_slug": "",
-        "access_token": format!("{key_id}.{secret_key}"),
-        "refresh_token": upstream_token,
-        "email": email,
-        "expired": "2099-12-31T00:00:00Z",
-        "type": "zcode",
-        "disabled": false,
+) -> Result<Option<String>, String> {
+    let flow_id = session.redirect_uri.trim();
+    if flow_id.is_empty() {
+        return Err("ZCode plan login has no flow id".to_string());
+    }
+    let poll_url_override = std::env::var("ZCODE_CLI_POLL_URL").ok();
+    let poll_url = poll_url_override.unwrap_or_else(|| {
+        format!(
+            "{}{}/{}",
+            mahoquot_providers::zcode::ZCODE_PLAN_ORIGIN,
+            mahoquot_providers::zcode::ZCODE_OAUTH_CLI_POLL_PREFIX,
+            url_encode(flow_id)
+        )
     });
-    let filename = format!("zcode-{}.json", sanitize_filename(&email));
-    let auth_dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
-    let rendered = serde_json::to_string_pretty(&credential).map_err(|e| e.to_string())?;
-    write_credential_atomically(&auth_dir.join(filename), rendered.as_bytes())
-        .map_err(|e| e.to_string())?;
-
-    if let Err(error) = state.rescan_pool() {
-        eprintln!("pool rescan failed after ZCode onboarding: {error}");
-    }
-
-    Ok(email)
-}
-
-async fn zcode_auth_url_handler(Query(params): Query<HashMap<String, String>>) -> Response {
-    let (url, state, session) = create_zcode_auth_url(&params);
-    register_session(session);
-    json_status(
-        StatusCode::OK,
-        json!({ "url": url, "state": state, "provider": "zcode", "status": "ok" }),
-    )
-}
-
-async fn zcode_callback_handler(
-    State(app_state): State<Arc<AppState>>,
-    Json(body): Json<Value>,
-) -> Response {
-    let session_state = body
-        .get("state")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let callback_url = body
-        .get("callback_url")
-        .or_else(|| body.get("callback"))
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-
-    if session_state.is_empty() || callback_url.trim().is_empty() {
-        return json_status(
-            StatusCode::BAD_REQUEST,
-            json!({ "error": "ZCode callback requires state and callback_url", "status": "error" }),
-        );
-    }
-
-    let Some(mut session) = SESSIONS.read().unwrap().get(&session_state).cloned() else {
-        return json_status(
-            StatusCode::BAD_REQUEST,
-            json!({ "error": "ZCode OAuth state mismatch", "status": "error" }),
-        );
-    };
-    if session.provider != "zcode" {
-        return json_status(
-            StatusCode::BAD_REQUEST,
-            json!({ "error": "OAuth session provider mismatch", "status": "error" }),
-        );
-    }
-
-    let code = match mahoquot_providers::zcode::parse_zcode_input(&callback_url, &session.state) {
-        Ok(mahoquot_providers::zcode::ZcodeInput::AuthorizationUrl(url)) => {
-            session.status = SessionStatus::Pending;
-            register_session(session);
-            return json_status(StatusCode::OK, json!({ "status": "pending", "url": url, "provider": "zcode" }));
+    let poll_response: Value = client
+        .get(&poll_url)
+        .bearer_auth(&session.verifier)
+        .header("user-agent", mahoquot_providers::zcode::ZCODE_SDK_UA)
+        .send()
+        .await
+        .map_err(|err| format!("ZCode plan login poll request failed: {err}"))?
+        .error_for_status()
+        .map_err(|err| format!("ZCode plan login poll request failed: {err}"))?
+        .json()
+        .await
+        .map_err(|err| format!("ZCode plan login poll response was not valid JSON: {err}"))?;
+    match mahoquot_providers::zcode::parse_cli_poll(&poll_response) {
+        mahoquot_providers::zcode::ZcodeCliPoll::Pending => Ok(None),
+        mahoquot_providers::zcode::ZcodeCliPoll::Ready {
+            token,
+            email,
+            user_id,
+            zai_access_token,
+        } => {
+            let identity = email
+                .or(user_id)
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| format!("zcode-{}", sanitize_filename(&session.state)));
+            let filename = format!("zcode-{}.json", sanitize_filename(&identity));
+            let credential = json!({
+                "identity_slug": "",
+                "access_token": token,
+                "refresh_token": zai_access_token.unwrap_or_default(),
+                "email": identity,
+                // The plan JWT carries no `exp` claim: a stale token is rejected
+                // by the gateway (401/3012) and the relay marks the account for
+                // re-login instead of attempting a refresh.
+                "expired": "2099-12-31T00:00:00Z",
+                "type": "zcode",
+                "disabled": false,
+            });
+            let rendered = serde_json::to_string_pretty(&credential).map_err(|e| e.to_string())?;
+            write_credential_atomically(&auth_dir.join(filename), rendered.as_bytes())
+                .map_err(|e| e.to_string())?;
+            session.saved_account_email = Some(identity.clone());
+            session.status = SessionStatus::Completed;
+            Ok(Some(identity))
         }
-        Ok(mahoquot_providers::zcode::ZcodeInput::AuthorizationCode(code)) => code,
-        Err(error) => return json_status(StatusCode::BAD_REQUEST, json!({ "status": "error", "error": error })),
-    };
-    match exchange_zcode_code(&app_state, &mut session, &code).await {
-        Ok(()) => {
+        mahoquot_providers::zcode::ZcodeCliPoll::Failed(message) => {
+            Err(format!("ZCode plan login failed: {message}"))
+        }
+    }
+}
+
+async fn zcode_auth_url_handler(
+    State(app_state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    match start_zcode_plan_session(&app_state, &params).await {
+        Ok((url, session)) => {
+            let state = session.state.clone();
             register_session(session);
             json_status(
                 StatusCode::OK,
-                json!({ "status": "ok", "success": true, "provider": "zcode" }),
+                json!({ "url": url, "state": state, "provider": "zcode", "status": "ok" }),
             )
         }
-        Err(error) => {
-            session.status = SessionStatus::Failed(error.clone());
-            register_session(session);
-            json_status(
-                StatusCode::BAD_REQUEST,
-                json!({ "error": error, "status": "error" }),
-            )
-        }
+        Err(error) => json_status(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": error, "status": "error", "provider": "zcode" }),
+        ),
     }
 }
 
@@ -2492,7 +2405,6 @@ pub fn oauth_routes() -> Router<Arc<AppState>> {
         .route("/xai-auth-url", get(xai_auth_url_handler))
         .route("/command-code-auth-url", get(command_code_auth_url_handler))
         .route("/zcode-auth-url", get(zcode_auth_url_handler))
-        .route("/zcode-callback", post(zcode_callback_handler))
         .route(
             "/kimi-auth-url",
             get(|state, params| device_auth_url(state, params, "kimi")),

@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mahoquot_providers::credential_file::write_credential_atomically;
@@ -11,6 +11,118 @@ use mahoquot_providers::{
     ZcodeAccount,
 };
 use mahoquot_types::{Health, PoolMember};
+
+// ── ZCode client identity values ──────────────────────────────────────────
+//
+// The plan gateway fingerprints the official client's identity headers. These
+// accessors reproduce what the desktop client's runtime reports (node
+// `platform()`/`arch()` naming, `os.release()`, BCP-47 locale, IANA timezone)
+// and are computed once — the values must not flip between requests, and
+// `uname` would otherwise run per request.
+
+pub(crate) fn zcode_node_platform() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "darwin",
+        other => other,
+    }
+}
+
+pub(crate) fn zcode_node_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "x64",
+        other => other,
+    }
+}
+
+pub(crate) fn zcode_os_category() -> String {
+    match std::env::consts::OS {
+        "macos" => "macos",
+        "windows" => "windows",
+        _ => "linux",
+    }
+    .to_string()
+}
+
+fn zcode_os_version() -> String {
+    static OS_VERSION: OnceLock<String> = OnceLock::new();
+    OS_VERSION
+        .get_or_init(|| {
+            #[cfg(target_os = "macos")]
+            {
+                let status = std::process::Command::new("uname").arg("-r").output();
+                if let Ok(output) = status {
+                    if output.status.success() {
+                        let release = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                        if !release.is_empty() {
+                            return release;
+                        }
+                    }
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                if let Ok(release) = std::fs::read_to_string("/proc/sys/kernel/osrelease") {
+                    let release = release.trim().to_string();
+                    if !release.is_empty() {
+                        return release;
+                    }
+                }
+            }
+            "unknown".to_string()
+        })
+        .clone()
+}
+
+pub(crate) fn zcode_client_language() -> String {
+    static LANGUAGE: OnceLock<String> = OnceLock::new();
+    LANGUAGE
+        .get_or_init(|| {
+            let raw = std::env::var("LC_ALL")
+                .or_else(|_| std::env::var("LANG"))
+                .unwrap_or_default();
+            // `ko_KR.UTF-8` -> `ko-KR`; anything unshaped stays "unknown".
+            let stripped = raw.split('.').next().unwrap_or("");
+            let mut parts = stripped.split('_');
+            match (parts.next(), parts.next()) {
+                (Some(lang), Some(region)) if !lang.is_empty() && !region.is_empty() => {
+                    format!(
+                        "{}-{}",
+                        lang.to_ascii_lowercase(),
+                        region.to_ascii_uppercase()
+                    )
+                }
+                (Some(lang), None) if lang.len() == 2 => lang.to_ascii_lowercase(),
+                _ => "unknown".to_string(),
+            }
+        })
+        .clone()
+}
+
+pub(crate) fn zcode_client_timezone() -> String {
+    static TIMEZONE: OnceLock<String> = OnceLock::new();
+    TIMEZONE
+        .get_or_init(|| {
+            if let Ok(tz) = std::env::var("TZ") {
+                let tz = tz.trim();
+                if !tz.is_empty() && !tz.starts_with(':') {
+                    return tz.trim_start_matches('/').to_string();
+                }
+            }
+            if let Ok(target) = std::fs::read_link("/etc/localtime") {
+                // .../zoneinfo/<Area>/<City> — keep the IANA id.
+                let path = target.to_string_lossy();
+                if let Some(idx) = path.find("zoneinfo/") {
+                    let id = path[idx + "zoneinfo/".len()..].trim().to_string();
+                    if !id.is_empty() {
+                        return id;
+                    }
+                }
+            }
+            "unknown".to_string()
+        })
+        .clone()
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ProviderKind {
@@ -469,9 +581,7 @@ impl ProviderAccount {
             }
             // Cline CLI login (WorkOS OAuth) carries a short-lived JWT and a
             // server-side refresh; expiry gates re-auth like other OAuth.
-            Self::Generic(a) if a.provider == "cline" => {
-                expired_at_is_past(&a.expired, now_unix)
-            }
+            Self::Generic(a) if a.provider == "cline" => expired_at_is_past(&a.expired, now_unix),
             Self::Vertex(a) => a.is_expired(now_unix),
             Self::Devin(_) => false,
             // A MiMo Free account holds a bootstrap JWT rather than a pasted
@@ -495,10 +605,16 @@ impl ProviderAccount {
                             "authorization".to_string(),
                             format!("Bearer {}", a.access_token),
                         ),
-                        ("user-agent".to_string(), "@anthropic-ai/sdk/0.74.0".to_string()),
+                        (
+                            "user-agent".to_string(),
+                            "@anthropic-ai/sdk/0.74.0".to_string(),
+                        ),
                         ("x-app".to_string(), "cli".to_string()),
                         ("x-stainless-lang".to_string(), "js".to_string()),
-                        ("x-stainless-package-version".to_string(), "0.74.0".to_string()),
+                        (
+                            "x-stainless-package-version".to_string(),
+                            "0.74.0".to_string(),
+                        ),
                         ("x-stainless-os".to_string(), "macos".to_string()),
                         ("x-stainless-arch".to_string(), "arm64".to_string()),
                         ("x-stainless-runtime".to_string(), "node".to_string()),
@@ -560,33 +676,56 @@ impl ProviderAccount {
                     "aws-sdk-js/1.0.27 KiroIDE-0.7.45-mahoquot".to_string(),
                 ),
             ],
-            Self::Zcode(a) => vec![
-                (
-                    "authorization".to_string(),
-                    format!("Bearer {}", a.access_token),
-                ),
-                ("anthropic-version".to_string(), "2023-06-01".to_string()),
-                ("content-type".to_string(), "application/json".to_string()),
-                ("user-agent".to_string(), "ZCode/3.1.2".to_string()),
-                ("http-referer".to_string(), "https://zcode.z.ai".to_string()),
-                ("x-title".to_string(), "Z Code@electron".to_string()),
-                ("x-zcode-agent".to_string(), "glm".to_string()),
-                ("x-zcode-app-version".to_string(), "3.1.2".to_string()),
-                ("x-release-channel".to_string(), "production".to_string()),
-                (
-                    "x-platform".to_string(),
-                    format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
-                ),
-                (
-                    "x-os-category".to_string(),
-                    match std::env::consts::OS {
-                        "macos" => "macos",
-                        "windows" => "windows",
-                        _ => "linux",
-                    }
-                    .to_string(),
-                ),
-            ],
+            // Identity and attribution mirror the official client's LLM calls
+            // exactly (opencodex PR #4437): UA with the AI SDK suffix, X-ZCode-Agent
+            // last, fresh per-request trace ids, x-zcode-session-type: main, and NO
+            // device id on LLM calls. The gateway fingerprints this set; a missing
+            // or wrong header answers biz 3012.
+            Self::Zcode(a) => {
+                let headers = vec![
+                    (
+                        "authorization".to_string(),
+                        format!("Bearer {}", a.access_token),
+                    ),
+                    ("anthropic-version".to_string(), "2023-06-01".to_string()),
+                    ("content-type".to_string(), "application/json".to_string()),
+                    (
+                        "http-referer".to_string(),
+                        mahoquot_providers::zcode::ZCODE_PLAN_ORIGIN.to_string(),
+                    ),
+                    (
+                        "user-agent".to_string(),
+                        format!(
+                            "{} {}",
+                            mahoquot_providers::zcode::ZCODE_SDK_UA,
+                            mahoquot_providers::zcode::ZCODE_ANTHROPIC_SDK_UA,
+                        ),
+                    ),
+                    (
+                        "x-zcode-app-version".to_string(),
+                        mahoquot_providers::zcode::ZCODE_APP_VERSION.to_string(),
+                    ),
+                    ("x-title".to_string(), "Z Code@cli".to_string()),
+                    ("x-release-channel".to_string(), "production".to_string()),
+                    ("x-client-language".to_string(), zcode_client_language()),
+                    ("x-client-timezone".to_string(), zcode_client_timezone()),
+                    (
+                        "x-platform".to_string(),
+                        format!("{}-{}", zcode_node_platform(), zcode_node_arch()),
+                    ),
+                    ("x-os-category".to_string(), zcode_os_category()),
+                    ("x-os-version".to_string(), zcode_os_version()),
+                    ("x-zcode-session-type".to_string(), "main".to_string()),
+                    ("x-request-id".to_string(), uuid::Uuid::new_v4().to_string()),
+                    (
+                        "x-zcode-trace-id".to_string(),
+                        uuid::Uuid::new_v4().to_string(),
+                    ),
+                    // The official client sends this header last.
+                    ("x-zcode-agent".to_string(), "glm".to_string()),
+                ];
+                headers
+            }
             Self::Vertex(a) => a.build_upstream_headers(),
             Self::Devin(a) => vec![
                 (
@@ -804,7 +943,8 @@ impl AccountMember {
             .filter_map(|target| reqwest::Url::parse(target).ok())
             .any(|target| {
                 target.host_str().is_some_and(|host| {
-                    host.split('.').any(|label| matches!(label, "nekos" | "ccapi"))
+                    host.split('.')
+                        .any(|label| matches!(label, "nekos" | "ccapi"))
                 })
             })
     }
@@ -888,7 +1028,9 @@ impl AccountMember {
         }
     }
 
-    pub fn devin_discovered_models(&self) -> Option<Vec<crate::devin_catalog::DiscoveredDevinModel>> {
+    pub fn devin_discovered_models(
+        &self,
+    ) -> Option<Vec<crate::devin_catalog::DiscoveredDevinModel>> {
         if self.kind() != ProviderKind::Devin {
             return None;
         }
@@ -904,11 +1046,16 @@ impl AccountMember {
         }
     }
 
-    pub fn devin_catalog_state(&self) -> Option<Arc<crate::devin_catalog::DevinAccountCatalogState>> {
+    pub fn devin_catalog_state(
+        &self,
+    ) -> Option<Arc<crate::devin_catalog::DevinAccountCatalogState>> {
         self.devin_catalog.load_full()
     }
 
-    pub fn set_devin_catalog_state(&self, state: Arc<crate::devin_catalog::DevinAccountCatalogState>) {
+    pub fn set_devin_catalog_state(
+        &self,
+        state: Arc<crate::devin_catalog::DevinAccountCatalogState>,
+    ) {
         self.devin_catalog.store(Some(state));
     }
 
@@ -982,8 +1129,14 @@ impl AccountMember {
         if self.kind() != ProviderKind::Devin || self.is_manually_disabled() {
             return false;
         }
-        let unsupported = self.unsupported_models.read().unwrap_or_else(|p| p.into_inner());
-        if unsupported.iter().any(|m| m == requested || m == canonical || m == upstream) {
+        let unsupported = self
+            .unsupported_models
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        if unsupported
+            .iter()
+            .any(|m| m == requested || m == canonical || m == upstream)
+        {
             return false;
         }
         let cat = self.devin_catalog.load();
@@ -1021,18 +1174,26 @@ impl AccountMember {
         let Some(catalog) = cat.as_ref() else {
             return false;
         };
-        catalog.models.iter().any(|m| {
-            (m.public_id == model || m.model_uid == model) && m.supports_images
-        })
+        catalog
+            .models
+            .iter()
+            .any(|m| (m.public_id == model || m.model_uid == model) && m.supports_images)
     }
 
-    pub fn devin_model_metadata(&self, model: &str) -> Option<crate::devin_catalog::DiscoveredDevinModel> {
+    pub fn devin_model_metadata(
+        &self,
+        model: &str,
+    ) -> Option<crate::devin_catalog::DiscoveredDevinModel> {
         if self.kind() != ProviderKind::Devin {
             return None;
         }
         let cat = self.devin_catalog.load();
         let catalog = cat.as_ref()?;
-        catalog.models.iter().find(|m| m.public_id == model || m.model_uid == model).cloned()
+        catalog
+            .models
+            .iter()
+            .find(|m| m.public_id == model || m.model_uid == model)
+            .cloned()
     }
 
     pub fn project_id(&self) -> Option<String> {
@@ -1164,8 +1325,7 @@ impl AccountMember {
                             && (mahoquot_providers::is_claude_model(stripped)
                                 || stripped.starts_with("claude-"))
                     } else {
-                        mahoquot_providers::is_claude_model(model)
-                            || model.starts_with("claude-")
+                        mahoquot_providers::is_claude_model(model) || model.starts_with("claude-")
                     }
                 }
                 account => account.kind().serves_model(model),
@@ -1302,8 +1462,8 @@ impl AccountMember {
                         path: self.file_path.clone(),
                         msg: e.to_string(),
                     })?;
-                let mut devin: mahoquot_providers::DevinAccount =
-                    serde_json::from_value(value).map_err(|_| LoadError::Parse {
+                let mut devin: mahoquot_providers::DevinAccount = serde_json::from_value(value)
+                    .map_err(|_| LoadError::Parse {
                         path: self.file_path.clone(),
                         msg: "invalid devin credential format".to_string(),
                     })?;
@@ -1408,21 +1568,16 @@ impl AccountMember {
             let (bootstrap_url, client_id) = self.ensure_mimo_client_id()?;
             mahoquot_providers::execute_mimo_bootstrap(client, &bootstrap_url, &client_id, now_unix)
                 .await?
-        } else if self.kind() == ProviderKind::Generic
-            && self.provider_name() == "cline"
-        {
+        } else if self.kind() == ProviderKind::Generic && self.provider_name() == "cline" {
             mahoquot_providers::execute_cline_refresh(client, &self.refresh_token()).await?
         } else if self.kind() == ProviderKind::Zcode {
-            let base = self
-                .upstream_override
-                .as_deref()
-                .unwrap_or(mahoquot_providers::ZCODE_API_BASE);
-            mahoquot_providers::refresh_exec::execute_zcode_refresh(
-                client,
-                base,
-                &self.refresh_token(),
-            )
-            .await?
+            // The plan JWT carries no `exp` claim and has no refresh grant: a
+            // gateway rejection is terminal and surfaces as re-login (the
+            // reference implementation disables refresh entirely for it).
+            return Err(RefreshError::Status {
+                code: 401,
+                body: "the ZCode plan JWT cannot be refreshed; re-authenticate".to_string(),
+            });
         } else {
             execute_refresh_spec(client, url, &spec).await?
         };
@@ -1716,8 +1871,12 @@ pub fn load_account_members(auth_dir: &Path) -> anyhow::Result<Vec<Arc<AccountMe
             .or_else(|| match kind {
                 ProviderKind::Generic => value.get("base_url").and_then(|v| v.as_str()),
                 ProviderKind::Devin => value.get("api_server_url").and_then(|v| v.as_str()),
-                ProviderKind::Codex | ProviderKind::Antigravity | ProviderKind::Claude
-                | ProviderKind::Cursor | ProviderKind::Kiro | ProviderKind::Zcode
+                ProviderKind::Codex
+                | ProviderKind::Antigravity
+                | ProviderKind::Claude
+                | ProviderKind::Cursor
+                | ProviderKind::Kiro
+                | ProviderKind::Zcode
                 | ProviderKind::Vertex => None,
             })
             .map(str::to_string);
@@ -1757,7 +1916,10 @@ pub fn load_account_members(auth_dir: &Path) -> anyhow::Result<Vec<Arc<AccountMe
                 if let ProviderAccount::Generic(ref g) = inner {
                     if g.provider == "cline" && !g.email.is_empty() {
                         format!("cline-{}", g.email)
-                    } else if !g.label.is_empty() && g.label != "generic" && !g.label.starts_with("generic-") {
+                    } else if !g.label.is_empty()
+                        && g.label != "generic"
+                        && !g.label.starts_with("generic-")
+                    {
                         g.label.clone()
                     } else {
                         derive_identity_slug(&file_path)

@@ -276,9 +276,8 @@ async fn test_anthropic_oauth_flow_end_to_end() {
     assert!(auth_url.contains("user%3Ainference"));
 
     // 4. Public callback token exchange on port 54545
-    let callback_url = format!(
-        "http://127.0.0.1:54545/callback?code=anthropic_code_test_1&state={state_token}"
-    );
+    let callback_url =
+        format!("http://127.0.0.1:54545/callback?code=anthropic_code_test_1&state={state_token}");
     let callback_resp = client.get(&callback_url).send().await.unwrap();
     assert_eq!(callback_resp.status(), StatusCode::OK);
 
@@ -1674,7 +1673,11 @@ async fn test_zcode_quota_reads_the_desktop_app_balance_log() {
             "email": "",
             "expired": "2099-12-31T00:00:00Z",
             "type": "zcode",
-            "disabled": false
+            "disabled": false,
+            // Pin the billing probe to a dead local port so it fails fast and
+            // deterministically, leaving the desktop-log fallback to supply
+            // the quota snapshot this test asserts.
+            "usage_override": "http://127.0.0.1:1"
         })
         .to_string(),
     )
@@ -1720,49 +1723,161 @@ async fn test_zcode_quota_reads_the_desktop_app_balance_log() {
 }
 
 #[tokio::test]
+async fn test_zcode_plan_billing_probe_reads_balance_windows() {
+    use mahoquot_gateway::quota::refresh_account_usage;
+
+    let auth_dir = unique_temp_dir("qg-t13-zcode-probe");
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<Vec<(String, String)>>::new()));
+    let seen_route = seen.clone();
+    let probe = Router::new().route(
+        "/api/v1/zcode-plan/billing/balance",
+        get(move |headers: axum::http::HeaderMap| async move {
+            let captured = seen_route.clone();
+            let headers = headers
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.as_str().to_string(),
+                        value.to_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            captured.lock().unwrap().push(headers);
+            Json(json!({
+                "code": 0,
+                "data": {
+                    "balances": [
+                        {"show_name": "GLM-5.3", "total_units": 3000000.0,
+                         "used_units": 300000.0, "expires_at": 1900000000},
+                        {"show_name": "GLM-5.3-Flash", "totalUnits": 5000000,
+                         "remainingUnits": 4950000}
+                    ]
+                }
+            }))
+        }),
+    );
+    let probe_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let probe_port = probe_listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(probe_listener, probe).await.unwrap();
+    });
+
+    std::fs::write(
+        auth_dir.join("zcode-plan.json"),
+        serde_json::json!({
+            "identity_slug": "",
+            "access_token": "eyJhbGciOiJub25lIn0.eyJ1c2VyX2lkIjoidXNyLTQyIn0.sig",
+            "refresh_token": "",
+            "email": "",
+            "expired": "2099-12-31T00:00:00Z",
+            "type": "zcode",
+            "disabled": false,
+            "usage_override": format!("http://127.0.0.1:{probe_port}")
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let config = GatewayConfig {
+        auth_dir: auth_dir.clone(),
+        api_keys: mahoquot_gateway::inbound::ApiKeys::new(vec![API_KEY.to_string()]),
+        ..GatewayConfig::default()
+    };
+    let state = Arc::new(AppState::new(&config).unwrap());
+    let snapshot = state.pool.load();
+    let member = snapshot
+        .members
+        .iter()
+        .find(|m| m.kind() == mahoquot_gateway::account::ProviderKind::Zcode)
+        .expect("zcode member")
+        .clone();
+
+    refresh_account_usage(&state, &member)
+        .await
+        .expect("billing balance probe");
+
+    let usage = member.usage_snapshot();
+    let group = usage
+        .groups
+        .iter()
+        .find(|group| group.display_name.as_deref() == Some("GLM Coding Plan"))
+        .expect("coding plan group from the billing probe");
+    assert_eq!(group.buckets.len(), 2);
+    assert_eq!(group.buckets[0].display_name.as_deref(), Some("GLM-5.3"));
+    assert_eq!(group.buckets[0].used_percent, Some(10.0));
+    assert_eq!(group.buckets[0].reset_at_unix, Some(1_900_000_000));
+    assert_eq!(
+        group.buckets[1].display_name.as_deref(),
+        Some("GLM-5.3-Flash")
+    );
+    assert_eq!(group.buckets[1].used_percent, Some(1.0));
+
+    let captured = seen.lock().unwrap();
+    assert_eq!(captured.len(), 1);
+    let header = |name: &str| {
+        captured[0]
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+    };
+    assert!(header("authorization").is_some_and(|v| v.ends_with(".sig")));
+    assert!(header("x-device-mid").is_some_and(|v| !v.is_empty()));
+    assert_eq!(header("x-title").as_deref(), Some("Z Code@cli"));
+    assert_eq!(header("x-zcode-agent"), None);
+    // The device id persists for later probes so the control plane sees one
+    // continuous device per install.
+    assert!(auth_dir.join("zcode-plan-device-mid").exists());
+
+    std::fs::remove_dir_all(auth_dir).ok();
+}
+
+#[tokio::test]
 async fn test_zcode_oauth_flow_end_to_end() {
-    use mahoquot_providers::zcode::{extract_callback_code, zcode_authorize_url, ZcodeAccount};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use mahoquot_providers::zcode::ZcodeAccount;
 
     let auth_dir = unique_temp_dir("qg-t13-zcode");
 
+    // Mock plan-gateway control plane: cli/init issues the flow, cli/poll
+    // flips pending -> ready on the second call.
+    let ready = Arc::new(AtomicBool::new(false));
+    let poll_gate = ready.clone();
     let zcode_api = Router::new()
         .route(
-            "/api/v1/oauth/token",
+            "/api/v1/oauth/cli/init",
             post(|| async {
-                Json(json!({ "data": { "zai": { "access_token": "upstream-zai-token" } } }))
-            }),
-        )
-        .route(
-            "/api/auth/z/login",
-            post(|| async { Json(json!({ "data": { "access_token": "business-token" } })) }),
-        )
-        .route(
-            "/api/biz/customer/getCustomerInfo",
-            get(|| async {
                 Json(json!({
+                    "code": 0,
                     "data": {
-                        "email": "zcode.user@zai.example",
-                        "id": "cust-1",
-                        "organizations": [
-                            {"organizationId": "org-other", "projects": []},
-                            {"organizationId": "org-1", "isDefault": true,
-                             "projects": [
-                                 {"projectId": "proj-other"},
-                                 {"projectId": "proj-1", "isDefault": true}
-                             ]}
-                        ]
+                        "flow_id": "flow-1",
+                        "authorize_url": "https://zcode.z.ai/authorize?x=1",
+                        "poll_interval_sec": 0
                     }
                 }))
             }),
         )
         .route(
-            "/api/biz/v1/organization/org-1/projects/proj-1/api_keys",
-            get(|| async { Json(json!({ "data": [{"name": "other-key", "apiKey": "k0"}] })) })
-                .post(|| async { Json(json!({ "data": { "apiKey": "key_id_1" } })) }),
-        )
-        .route(
-            "/api/biz/v1/organization/org-1/projects/proj-1/api_keys/copy/key_id_1",
-            get(|| async { Json(json!({ "data": { "secretKey": "secret_1" } })) }),
+            "/api/v1/oauth/cli/poll/flow-1",
+            get(move || {
+                let gate = poll_gate.clone();
+                async move {
+                    if !gate.swap(true, Ordering::SeqCst) {
+                        Json(json!({ "code": 0, "data": { "status": "pending" } })).into_response()
+                    } else {
+                        Json(json!({
+                            "code": 0,
+                            "data": {
+                                "status": "ready",
+                                "token": "eyJhbGciOiJub25lIn0.eyJ1c2VyX2lkIjoiNjc0NDAzMTY2NDUxMjg4MDAwIn0.c2ln",
+                                "user": { "user_id": "674403166451288000", "email": "zcode.user@zai.example" },
+                                "zai": { "access_token": "upstream-zai-token" }
+                            }
+                        }))
+                        .into_response()
+                    }
+                }
+            }),
         );
     let zcode_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let zcode_port = zcode_listener.local_addr().unwrap().port();
@@ -1770,7 +1885,17 @@ async fn test_zcode_oauth_flow_end_to_end() {
         axum::serve(zcode_listener, zcode_api).await.unwrap();
     });
     let api_base = format!("http://127.0.0.1:{zcode_port}");
-    let broker_url = format!("{api_base}/api/v1/oauth/token");
+    // Point the gateway's CLI flow at the mock instead of zcode.z.ai.
+    unsafe {
+        std::env::set_var(
+            "ZCODE_CLI_INIT_URL",
+            format!("{api_base}/api/v1/oauth/cli/init"),
+        );
+        std::env::set_var(
+            "ZCODE_CLI_POLL_URL",
+            format!("{api_base}/api/v1/oauth/cli/poll/flow-1"),
+        );
+    }
 
     let config = GatewayConfig {
         auth_dir: auth_dir.clone(),
@@ -1791,13 +1916,10 @@ async fn test_zcode_oauth_flow_end_to_end() {
     });
     let client = reqwest::Client::new();
 
-    let start_url = format!(
-        "http://127.0.0.1:{gateway_port}/v0/management/zcode-auth-url?broker_url={}&api_base={}",
-        url_encode(&broker_url),
-        url_encode(&api_base)
-    );
     let start_resp = client
-        .get(&start_url)
+        .get(format!(
+            "http://127.0.0.1:{gateway_port}/v0/management/zcode-auth-url"
+        ))
         .bearer_auth(API_KEY)
         .send()
         .await
@@ -1806,34 +1928,32 @@ async fn test_zcode_oauth_flow_end_to_end() {
     let start_json: Value = start_resp.json().await.unwrap();
     assert_eq!(start_json["status"], "ok");
     assert_eq!(start_json["provider"], "zcode");
-    let auth_url = start_json["url"].as_str().unwrap();
-    let state_token = start_json["state"].as_str().unwrap();
+    assert_eq!(start_json["url"], "https://zcode.z.ai/authorize?x=1");
+    let state_token = start_json["state"].as_str().unwrap().to_string();
 
-    let authorize = zcode_authorize_url(state_token);
-    assert_eq!(auth_url, authorize);
-    assert!(auth_url.starts_with("https://chat.z.ai/api/oauth/authorize?"));
-    assert!(auth_url.contains("response_type=code"));
-    assert!(auth_url.contains("client_id=client_P8X5CMWmlaRO9gyO-KSqtg"));
-    assert!(auth_url.contains(&format!("state={state_token}")));
-
-    let callback = format!("zcode://oauth/callback?code=zc_code_1&state={state_token}");
-    assert_eq!(
-        extract_callback_code(&callback, state_token).unwrap(),
-        "zc_code_1"
-    );
-
-    let callback_resp = client
-        .post(format!(
-            "http://127.0.0.1:{gateway_port}/v0/management/zcode-callback"
-        ))
+    let auth_status_url = |state: &str| {
+        format!("http://127.0.0.1:{gateway_port}/v0/management/get-auth-status?state={state}")
+    };
+    let pending_resp = client
+        .get(auth_status_url(&state_token))
         .bearer_auth(API_KEY)
-        .json(&json!({ "state": state_token, "callback_url": callback }))
         .send()
         .await
         .unwrap();
-    assert_eq!(callback_resp.status(), StatusCode::OK);
-    let callback_json: Value = callback_resp.json().await.unwrap();
-    assert_eq!(callback_json["status"], "ok");
+    assert_eq!(
+        pending_resp.json::<Value>().await.unwrap()["status"],
+        "pending"
+    );
+
+    let done_resp = client
+        .get(auth_status_url(&state_token))
+        .bearer_auth(API_KEY)
+        .send()
+        .await
+        .unwrap();
+    let done_json: Value = done_resp.json().await.unwrap();
+    assert_eq!(done_json["status"], "ok");
+    assert_eq!(done_json["provider"], "zcode");
 
     let cred_file = auth_dir.join("zcode-zcode.user_zai.example.json");
     assert!(
@@ -1842,22 +1962,26 @@ async fn test_zcode_oauth_flow_end_to_end() {
     );
     let parsed: ZcodeAccount =
         serde_json::from_str(&std::fs::read_to_string(&cred_file).unwrap()).unwrap();
-    assert_eq!(parsed.access_token, "key_id_1.secret_1");
+    assert!(parsed.access_token.starts_with("eyJhbGciOiJub25lIn0."));
     assert_eq!(parsed.refresh_token, "upstream-zai-token");
     assert_eq!(parsed.email, "zcode.user@zai.example");
     assert_eq!(parsed.r#type, "zcode");
 
-    let status_resp = client
-        .get(format!(
-            "http://127.0.0.1:{gateway_port}/v0/management/get-auth-status?state={state_token}"
+    // The callback paste route is gone with the flow that needed it.
+    let callback_resp = client
+        .post(format!(
+            "http://127.0.0.1:{gateway_port}/v0/management/zcode-callback"
         ))
         .bearer_auth(API_KEY)
+        .json(&json!({ "state": state_token, "callback_url": "zcode://oauth/callback?code=x" }))
         .send()
         .await
         .unwrap();
-    let status_json: Value = status_resp.json().await.unwrap();
-    assert_eq!(status_json["status"], "ok");
-    assert_eq!(status_json["provider"], "zcode");
+    assert_eq!(callback_resp.status(), StatusCode::NOT_FOUND);
 
+    unsafe {
+        std::env::remove_var("ZCODE_CLI_INIT_URL");
+        std::env::remove_var("ZCODE_CLI_POLL_URL");
+    }
     std::fs::remove_dir_all(auth_dir).ok();
 }
