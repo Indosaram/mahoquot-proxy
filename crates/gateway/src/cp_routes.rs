@@ -19,13 +19,13 @@ use mahoquot_registry::ModelCapability;
 use serde_json::{json, Value};
 
 use crate::capability::{self, model_of};
+use crate::inbound::ResolvedAuth;
 use crate::realtime;
 use crate::relay::{handle_relay, RelayMode};
 use crate::state::AppState;
-use axum::Extension;
-use crate::inbound::ResolvedAuth;
 use crate::static_pages::{CALLBACK_HTML, MANAGEMENT_HTML, ROOT_JSON};
 use crate::v1beta::{self, GeminiAction};
+use axum::Extension;
 
 const CODEX_RESPONSES_PATH: &str = "/backend-api/codex/responses";
 const CODEX_RESPONSES_COMPACT_PATH: &str = "/backend-api/codex/responses/compact";
@@ -125,7 +125,12 @@ fn multipart_field(text: &str, name: &str) -> Option<String> {
     Some(value[..end].to_string())
 }
 
-async fn image_surface(state: Arc<AppState>, auth: &ResolvedAuth, headers: &HeaderMap, body: Bytes) -> Response {
+async fn image_surface(
+    state: Arc<AppState>,
+    auth: &ResolvedAuth,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Response {
     let parsed = match parse_body(&body) {
         Ok(v) => v,
         Err(resp) => return *resp,
@@ -704,7 +709,10 @@ pub async fn alpha_search(
     .await
 }
 
-pub async fn v1beta_models(State(state): State<Arc<AppState>>, Extension(auth): Extension<ResolvedAuth>) -> Response {
+pub async fn v1beta_models(
+    State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<ResolvedAuth>,
+) -> Response {
     let pool = state.pool.load();
     let models = match auth.identity.scoped() {
         Some(key) => crate::models_route::scoped_model_entries(&pool, key),
@@ -730,7 +738,13 @@ pub async fn v1beta_action(
     let entry = match models.iter().find(|m| m.id == model).cloned() {
         Some(e) => e,
         None => {
-            if pool.registry().resolve(&model).is_ok() {
+            // A model the pool no longer lists must not be advertised by the
+            // single-model view either: disabling the last account for a model
+            // drops it from /v1/models and /v1beta/models, so answering 200 here
+            // would describe a model nothing can serve. Relay verbs still fall
+            // back to the registry, which is how discovered provider models stay
+            // routable before they appear in the pool listing.
+            if verb.is_some() && pool.registry().resolve(&model).is_ok() {
                 let owner = owner_of(&state, &model).unwrap_or_else(|| "devin".to_string());
                 crate::models_route::ModelEntry {
                     id: model.clone(),
@@ -965,7 +979,6 @@ mod tests {
         assert_eq!(call["call_id"], "call_1");
     }
 
-
     #[test]
     fn a_reply_with_both_text_and_tool_calls_keeps_both_output_items() {
         // Self-audit of the output-array rewrite: a model may answer with prose
@@ -1009,7 +1022,10 @@ mod tests {
         let chat = responses_input_to_chat(&req, "m");
         let tools = chat["tools"].as_array().expect("tools");
         assert_eq!(tools[0]["function"]["name"], "already");
-        assert!(tools[0]["function"]["function"].is_null(), "double wrapped: {chat}");
+        assert!(
+            tools[0]["function"]["function"].is_null(),
+            "double wrapped: {chat}"
+        );
     }
 
     #[test]
@@ -1027,7 +1043,10 @@ mod tests {
             .find(|m| m["role"] == "assistant")
             .unwrap_or_else(|| panic!("prior tool call dropped: {chat}"));
         assert_eq!(assistant["tool_calls"][0]["id"], "call_1");
-        assert_eq!(assistant["tool_calls"][0]["function"]["name"], "get_weather");
+        assert_eq!(
+            assistant["tool_calls"][0]["function"]["name"],
+            "get_weather"
+        );
         let tool = messages
             .iter()
             .find(|m| m["role"] == "tool")
@@ -1035,7 +1054,9 @@ mod tests {
         assert_eq!(tool["tool_call_id"], "call_1");
         assert_eq!(tool["content"], "22C");
         assert!(
-            !messages.iter().any(|m| m["role"] == "user" && m["content"] == ""),
+            !messages
+                .iter()
+                .any(|m| m["role"] == "user" && m["content"] == ""),
             "round-trip item collapsed into an empty user turn: {chat}"
         );
     }
@@ -1049,8 +1070,9 @@ mod tests {
         let chat = responses_input_to_chat(&req, "m");
         let tools = chat["tools"].as_array().expect("tools");
         assert!(
-            !tools.iter().any(|t| t["type"] == "function"
-                && t["function"]["name"].is_null()),
+            !tools
+                .iter()
+                .any(|t| t["type"] == "function" && t["function"]["name"].is_null()),
             "emitted a nameless function tool: {chat}"
         );
         assert!(
@@ -1069,5 +1091,4 @@ mod tests {
         let plain = responses_input_to_chat(&json!({"tool_choice":"auto"}), "m");
         assert_eq!(plain["tool_choice"], "auto");
     }
-
 }
