@@ -218,8 +218,11 @@ pub fn is_plan_captcha_challenge(status: u16, verify_param: Option<&str>, body: 
 
 /// HTTP status + Anthropic error type for an in-200 business error. Only 1005
 /// is a rate limit (per-window plan quota); everything else is upstream-class.
+/// Plan biz code for an exhausted plan quota (`exceed quota limit`).
+pub const PLAN_QUOTA_BIZ_CODE: i64 = 1005;
+
 pub fn plan_biz_error(code: i64) -> (u16, &'static str) {
-    if code == 1005 {
+    if code == PLAN_QUOTA_BIZ_CODE {
         (429, "rate_limit_error")
     } else {
         (502, "upstream_error")

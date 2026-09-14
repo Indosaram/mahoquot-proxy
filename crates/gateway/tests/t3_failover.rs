@@ -41,7 +41,10 @@ fn assert_cooldown(headers: &[(&str, &str)], seconds: i64) {
 fn test_cooldown_relative_reset_after_seconds_header_honored() {
     for seconds in [42, 600] {
         assert_cooldown(
-            &[("anthropic-ratelimit-unified-reset-after-seconds", &seconds.to_string())],
+            &[(
+                "anthropic-ratelimit-unified-reset-after-seconds",
+                &seconds.to_string(),
+            )],
             seconds,
         );
     }
@@ -52,11 +55,17 @@ fn test_cooldown_absolute_reset_and_mixed_headers() {
     assert_cooldown(&[("x-ratelimit-reset-at", "1800000060")], 60);
     assert_cooldown(&[("x-ratelimit-reset-at", "1799999999")], 300);
     assert_cooldown(
-        &[("x-ratelimit-reset-at", "1800000060"), ("x-ratelimit-reset-after-seconds", "42")],
+        &[
+            ("x-ratelimit-reset-at", "1800000060"),
+            ("x-ratelimit-reset-after-seconds", "42"),
+        ],
         42,
     );
     assert_cooldown(
-        &[("retry-after", "90"), ("x-ratelimit-reset-after-seconds", "42")],
+        &[
+            ("retry-after", "90"),
+            ("x-ratelimit-reset-after-seconds", "42"),
+        ],
         90,
     );
 }
@@ -67,11 +76,18 @@ fn test_cooldown_invalid_headers_fallback_and_overflow_clamp() {
     for value in ["0", "-1", "invalid", "9223372036854775808"] {
         assert_cooldown(&[("x-ratelimit-reset-after-seconds", value)], 300);
     }
-    for name in ["retry-after", "x-ratelimit-reset-at", "x-ratelimit-reset-after-seconds"] {
+    for name in [
+        "retry-after",
+        "x-ratelimit-reset-at",
+        "x-ratelimit-reset-after-seconds",
+    ] {
         assert_cooldown(&[(name, "9223372036854775807")], 86_400);
     }
     assert_eq!(
-        mahoquot_gateway::relay::cooldown_deadline_from_headers(&reqwest::header::HeaderMap::new(), i64::MAX - 1),
+        mahoquot_gateway::relay::cooldown_deadline_from_headers(
+            &reqwest::header::HeaderMap::new(),
+            i64::MAX - 1
+        ),
         i64::MAX
     );
 }
@@ -97,7 +113,9 @@ async fn test_t3_failover() {
     shutdowns.push(shutdown);
     servers.push(tokio::spawn(async move {
         axum::serve(listener_a, app_a)
-            .with_graceful_shutdown(async { stopped.await.unwrap(); })
+            .with_graceful_shutdown(async {
+                stopped.await.unwrap();
+            })
             .await
             .unwrap();
     }));
@@ -118,7 +136,9 @@ async fn test_t3_failover() {
     shutdowns.push(shutdown);
     servers.push(tokio::spawn(async move {
         axum::serve(listener_b, app_b)
-            .with_graceful_shutdown(async { stopped.await.unwrap(); })
+            .with_graceful_shutdown(async {
+                stopped.await.unwrap();
+            })
             .await
             .unwrap();
     }));
@@ -163,7 +183,9 @@ async fn test_t3_failover() {
     shutdowns.push(shutdown);
     servers.push(tokio::spawn(async move {
         axum::serve(gw_listener, app)
-            .with_graceful_shutdown(async { stopped.await.unwrap(); })
+            .with_graceful_shutdown(async {
+                stopped.await.unwrap();
+            })
             .await
             .unwrap();
     }));
@@ -216,7 +238,227 @@ async fn test_t3_failover() {
     }
     for server in servers {
         tokio::time::timeout(std::time::Duration::from_secs(5), server)
-            .await.unwrap().unwrap();
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    drop(state);
+    std::fs::remove_dir_all(&temp_dir).unwrap();
+}
+
+#[tokio::test]
+async fn test_t3_limit_exhaustion_429_records_no_account_error() {
+    let mut servers = Vec::new();
+    let mut shutdowns = Vec::new();
+    // Given: the upstream answers 429 with a cline daily-limit body
+    let listener = bind_fixture_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let cap_body =
+        "{\"error\":{\"code\":\"INFERENCE_CAP_ERROR\",\"message\":\"Error 429: Daily free limit reached on model z-ai/glm-5.3-flash. Try again in 8h 48m\"}}"
+            .to_string();
+    let app = Router::new().route(
+        common::CODEX_PATH,
+        post(move || {
+            let body = cap_body.clone();
+            async move {
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [("Retry-After", "300")],
+                    body,
+                )
+            }
+        }),
+    );
+    let (shutdown, stopped) = tokio::sync::oneshot::channel();
+    shutdowns.push(shutdown);
+    servers.push(tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                stopped.await.unwrap();
+            })
+            .await
+            .unwrap();
+    }));
+
+    let temp_dir = unique_temp_dir("qgw-test-t3q");
+    let json = create_auth_file_json(
+        "a",
+        "acc_a",
+        "token_a",
+        Some(&format!("http://127.0.0.1:{port}")),
+    );
+    std::fs::write(temp_dir.join("codex-a-plus.json"), json).unwrap();
+
+    let config = GatewayConfig {
+        usage_poll_secs: 120,
+        port: 0,
+        auth_dir: temp_dir.clone(),
+        config_path: temp_dir.join("config.yaml"),
+        strategy: Strategy::FillFirst,
+        max_failover: 3,
+        log_level: "info".to_string(),
+        api_keys: mahoquot_gateway::inbound::ApiKeys::default(),
+        models_env: None,
+        refresh_url: mahoquot_providers::refresh::REFRESH_TOKEN_URL.to_string(),
+        auth_refresh_enabled: true,
+        ..Default::default()
+    };
+
+    let state = Arc::new(AppState::new(&config).unwrap());
+    // A stale banner from an older failure must be wiped by the quota cooldown.
+    state
+        .monitor
+        .record_error("a", 502, "refresh network error: stale");
+    let app = create_app(state.clone());
+    let gw_listener = bind_fixture_listener().await;
+    let gw_port = gw_listener.local_addr().unwrap().port();
+    let (shutdown, stopped) = tokio::sync::oneshot::channel();
+    shutdowns.push(shutdown);
+    servers.push(tokio::spawn(async move {
+        axum::serve(gw_listener, app)
+            .with_graceful_shutdown(async {
+                stopped.await.unwrap();
+            })
+            .await
+            .unwrap();
+    }));
+
+    let client = reqwest::Client::new();
+    let gw_url = format!("http://127.0.0.1:{gw_port}/v1/chat/completions");
+
+    // When: the attempt fails with a limit-exhaustion 429
+    let res = client
+        .post(&gw_url)
+        .header("Content-Type", "application/json")
+        .body(common::OPENAI_REQUEST)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+    res.bytes().await.unwrap();
+
+    // Then: the account is benched but carries NO error banner
+    let acct_a = state.find_member("a").expect("member a exists");
+    assert!(
+        matches!(acct_a.health(), Health::Cooldown { .. }),
+        "acct a must be in Cooldown, was {:?}",
+        acct_a.health()
+    );
+    assert!(
+        state.monitor.last_error("a").is_none(),
+        "limit exhaustion must not surface an account error banner"
+    );
+
+    drop(client);
+    for shutdown in shutdowns {
+        shutdown.send(()).unwrap();
+    }
+    for server in servers {
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    drop(state);
+    std::fs::remove_dir_all(&temp_dir).unwrap();
+}
+
+#[tokio::test]
+async fn test_t3_plain_429_still_records_account_error() {
+    let mut servers = Vec::new();
+    let mut shutdowns = Vec::new();
+    // Given: the upstream answers 429 with a generic body (no limit signature)
+    let listener = bind_fixture_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let app = Router::new().route(
+        common::CODEX_PATH,
+        post(|| async {
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                [("Retry-After", "300")],
+                "{\"error\":\"rate limited\"}",
+            )
+        }),
+    );
+    let (shutdown, stopped) = tokio::sync::oneshot::channel();
+    shutdowns.push(shutdown);
+    servers.push(tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                stopped.await.unwrap();
+            })
+            .await
+            .unwrap();
+    }));
+
+    let temp_dir = unique_temp_dir("qgw-test-t3r");
+    let json = create_auth_file_json(
+        "a",
+        "acc_a",
+        "token_a",
+        Some(&format!("http://127.0.0.1:{port}")),
+    );
+    std::fs::write(temp_dir.join("codex-a-plus.json"), json).unwrap();
+
+    let config = GatewayConfig {
+        usage_poll_secs: 120,
+        port: 0,
+        auth_dir: temp_dir.clone(),
+        config_path: temp_dir.join("config.yaml"),
+        strategy: Strategy::FillFirst,
+        max_failover: 3,
+        log_level: "info".to_string(),
+        api_keys: mahoquot_gateway::inbound::ApiKeys::default(),
+        models_env: None,
+        refresh_url: mahoquot_providers::refresh::REFRESH_TOKEN_URL.to_string(),
+        auth_refresh_enabled: true,
+        ..Default::default()
+    };
+
+    let state = Arc::new(AppState::new(&config).unwrap());
+    let app = create_app(state.clone());
+    let gw_listener = bind_fixture_listener().await;
+    let gw_port = gw_listener.local_addr().unwrap().port();
+    let (shutdown, stopped) = tokio::sync::oneshot::channel();
+    shutdowns.push(shutdown);
+    servers.push(tokio::spawn(async move {
+        axum::serve(gw_listener, app)
+            .with_graceful_shutdown(async {
+                stopped.await.unwrap();
+            })
+            .await
+            .unwrap();
+    }));
+
+    let client = reqwest::Client::new();
+    let gw_url = format!("http://127.0.0.1:{gw_port}/v1/chat/completions");
+
+    // When: the attempt fails with a non-quota 429
+    let res = client
+        .post(&gw_url)
+        .header("Content-Type", "application/json")
+        .body(common::OPENAI_REQUEST)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+    res.bytes().await.unwrap();
+
+    // Then: the account error IS recorded (banner still works for real faults)
+    assert!(
+        state.monitor.last_error("a").is_some(),
+        "a plain 429 must still surface an account error"
+    );
+
+    drop(client);
+    for shutdown in shutdowns {
+        shutdown.send(()).unwrap();
+    }
+    for server in servers {
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
     }
     drop(state);
     std::fs::remove_dir_all(&temp_dir).unwrap();
@@ -243,7 +485,9 @@ async fn test_t3b_final_failure_records_the_attempted_account() {
     shutdowns.push(shutdown);
     servers.push(tokio::spawn(async move {
         axum::serve(listener, app)
-            .with_graceful_shutdown(async { stopped.await.unwrap(); })
+            .with_graceful_shutdown(async {
+                stopped.await.unwrap();
+            })
             .await
             .unwrap();
     }));
@@ -280,7 +524,9 @@ async fn test_t3b_final_failure_records_the_attempted_account() {
     shutdowns.push(shutdown);
     servers.push(tokio::spawn(async move {
         axum::serve(gw_listener, app)
-            .with_graceful_shutdown(async { stopped.await.unwrap(); })
+            .with_graceful_shutdown(async {
+                stopped.await.unwrap();
+            })
             .await
             .unwrap();
     }));
@@ -322,7 +568,9 @@ async fn test_t3b_final_failure_records_the_attempted_account() {
     }
     for server in servers {
         tokio::time::timeout(std::time::Duration::from_secs(5), server)
-            .await.unwrap().unwrap();
+            .await
+            .unwrap()
+            .unwrap();
     }
     drop(state);
     std::fs::remove_dir_all(&temp_dir).unwrap();
@@ -343,7 +591,9 @@ async fn test_t3c_final_failure_attribution_names_the_last_attempted_account() {
     shutdowns.push(shutdown);
     servers.push(tokio::spawn(async move {
         axum::serve(listener_a, app_a)
-            .with_graceful_shutdown(async { stopped.await.unwrap(); })
+            .with_graceful_shutdown(async {
+                stopped.await.unwrap();
+            })
             .await
             .unwrap();
     }));
@@ -395,7 +645,9 @@ async fn test_t3c_final_failure_attribution_names_the_last_attempted_account() {
     shutdowns.push(shutdown);
     servers.push(tokio::spawn(async move {
         axum::serve(gw_listener, app)
-            .with_graceful_shutdown(async { stopped.await.unwrap(); })
+            .with_graceful_shutdown(async {
+                stopped.await.unwrap();
+            })
             .await
             .unwrap();
     }));
@@ -439,7 +691,9 @@ async fn test_t3c_final_failure_attribution_names_the_last_attempted_account() {
     }
     for server in servers {
         tokio::time::timeout(std::time::Duration::from_secs(5), server)
-            .await.unwrap().unwrap();
+            .await
+            .unwrap()
+            .unwrap();
     }
     drop(state);
     std::fs::remove_dir_all(&temp_dir).unwrap();
@@ -460,7 +714,9 @@ async fn server_error_failover_keeps_health_and_moves_to_the_next_account() {
     shutdowns.push(shutdown);
     servers.push(tokio::spawn(async move {
         axum::serve(listener_a, app_a)
-            .with_graceful_shutdown(async { stopped.await.unwrap(); })
+            .with_graceful_shutdown(async {
+                stopped.await.unwrap();
+            })
             .await
             .unwrap();
     }));
@@ -481,7 +737,9 @@ async fn server_error_failover_keeps_health_and_moves_to_the_next_account() {
     shutdowns.push(shutdown);
     servers.push(tokio::spawn(async move {
         axum::serve(listener_b, app_b)
-            .with_graceful_shutdown(async { stopped.await.unwrap(); })
+            .with_graceful_shutdown(async {
+                stopped.await.unwrap();
+            })
             .await
             .unwrap();
     }));
@@ -526,7 +784,9 @@ async fn server_error_failover_keeps_health_and_moves_to_the_next_account() {
     shutdowns.push(shutdown);
     servers.push(tokio::spawn(async move {
         axum::serve(gw_listener, app)
-            .with_graceful_shutdown(async { stopped.await.unwrap(); })
+            .with_graceful_shutdown(async {
+                stopped.await.unwrap();
+            })
             .await
             .unwrap();
     }));
@@ -565,7 +825,9 @@ async fn server_error_failover_keeps_health_and_moves_to_the_next_account() {
     }
     for server in servers {
         tokio::time::timeout(std::time::Duration::from_secs(5), server)
-            .await.unwrap().unwrap();
+            .await
+            .unwrap()
+            .unwrap();
     }
     drop(state);
     std::fs::remove_dir_all(&temp_dir).unwrap();

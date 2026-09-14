@@ -1315,6 +1315,27 @@ fn parse_cline_cap_error(body: &[u8]) -> Option<(String, i64)> {
     Some((model, if total_secs > 0 { total_secs } else { 300 }))
 }
 
+/// A 429 whose body says the account ran out of usage budget rather than
+/// misbehaving — cline's daily free limit (`INFERENCE_CAP_ERROR`) or the
+/// zcode plan's quota biz error (1005). Exhaustion is an expected state the
+/// cooldown deadline already surfaces, so it must not be recorded as an
+/// account error.
+fn failure_is_limit_exhaustion(body: &[u8]) -> bool {
+    if parse_cline_cap_error(body).is_some() {
+        return true;
+    }
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|parsed| {
+            parsed
+                .get("error")
+                .and_then(|error| error.get("code"))
+                .and_then(serde_json::Value::as_i64)
+        })
+        .map(|code| code == mahoquot_providers::zcode::PLAN_QUOTA_BIZ_CODE)
+        .unwrap_or(false)
+}
+
 /// Updates the member's `AccountUsage` with a QuotaGroup bucket representing the Cline model limit.
 fn record_cline_quota_bucket(
     member: &AccountMember,
@@ -1375,17 +1396,26 @@ async fn record_cooldown(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
         .unwrap_or(0);
-    member.set_health(Health::Cooldown {
-        // Retry-After is upstream-controlled: clamp so a hostile or broken value
-        // cannot overflow into a past (or panicking) cooldown deadline.
-        until_unix_ms: cooldown_deadline_from_headers(resp.headers(), now_ms),
-    });
+    // Retry-After is upstream-controlled: clamp so a hostile or broken value
+    // cannot overflow into a past (or panicking) cooldown deadline. Read the
+    // headers before the body extraction consumes the response.
+    let until_unix_ms = cooldown_deadline_from_headers(resp.headers(), now_ms);
+    let failure = extract_failure(resp, status_code).await;
+    member.set_health(Health::Cooldown { until_unix_ms });
     member.record_fail();
     state.metrics.failed_over.fetch_add(1, Ordering::Relaxed);
-    state
-        .monitor
-        .record_error(member.id(), status_code, "upstream error");
-    extract_failure(resp, status_code).await
+    if failure_is_limit_exhaustion(&failure.body) {
+        // Limit exhaustion is an expected operating state: the cooldown deadline
+        // (and the cline quota bucket) already carry the reset information. It
+        // must not paint the account with an error banner, and a stale banner
+        // from an older failure must not linger either.
+        state.monitor.clear_error(member.id());
+    } else {
+        state
+            .monitor
+            .record_error(member.id(), status_code, "upstream error");
+    }
+    failure
 }
 
 fn content_type_of(resp: &reqwest::Response) -> Option<String> {
@@ -3150,6 +3180,30 @@ pub async fn handle_relay(
     )
     .await;
     response
+}
+
+#[cfg(test)]
+mod limit_exhaustion_tests {
+    use super::*;
+
+    #[test]
+    fn cline_daily_free_limit_body_is_limit_exhaustion() {
+        let body = br#"{"error":{"code":"INFERENCE_CAP_ERROR","message":"Error 429: Daily free limit reached on model z-ai/glm-5.3-flash. Try again in 8h 48m"}}"#;
+        assert!(failure_is_limit_exhaustion(body));
+    }
+
+    #[test]
+    fn zcode_plan_quota_body_is_limit_exhaustion() {
+        let body = br#"{"error":{"code":1005,"message":"zcode-plan: gateway biz error 1005: exceed quota limit","type":"rate_limit_error"}}"#;
+        assert!(failure_is_limit_exhaustion(body));
+    }
+
+    #[test]
+    fn other_429_bodies_are_not_limit_exhaustion() {
+        assert!(!failure_is_limit_exhaustion(br#"{"error":"rate limited"}"#));
+        assert!(!failure_is_limit_exhaustion(br#"{"error":{"code":1006}}"#));
+        assert!(!failure_is_limit_exhaustion(b"not json"));
+    }
 }
 
 #[cfg(test)]
