@@ -128,13 +128,29 @@ fn contract_route_names_have_one_registration_owner() {
     let owners = schema["x-route-registration-owners"]
         .as_object()
         .expect("route owner map");
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|path| path.parent())
+        .expect("repo root");
     let mut routes = std::collections::BTreeSet::new();
     for (route, owner) in owners {
         assert!(routes.insert(route), "duplicate route {route}");
+        // The owner is a path into this repository, so check the module really
+        // registers that path instead of matching it against a hand-maintained
+        // list: the list went stale the moment a route moved, and it kept
+        // naming a module that no longer exists.
+        let owner = owner.as_str().expect("owner path is a string");
+        let source = std::fs::read_to_string(repo_root.join(owner))
+            .unwrap_or_else(|error| panic!("route {route} owner {owner} is unreadable: {error}"));
+        let path = route
+            .split_once(' ')
+            .expect("route reads as METHOD /path")
+            .1
+            .trim_start_matches("/v0/management");
         assert!(
-            owner == "crates/gateway/src/management/contracts.rs"
-                || owner == "crates/gateway/src/management/registry.rs",
-            "unexpected route registration owner: {owner}"
+            source.contains(&format!(".route(\n            \"{path}\""))
+                || source.contains(&format!(".route(\"{path}\"")),
+            "route {route} is not registered in its declared owner {owner}"
         );
     }
     assert!(!routes.is_empty(), "contract routes must be declared");
