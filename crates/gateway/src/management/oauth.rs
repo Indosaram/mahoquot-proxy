@@ -405,6 +405,13 @@ fn create_xai_auth_url(params: &HashMap<String, String>) -> (String, String, OAu
         .get("redirect_uri")
         .cloned()
         .unwrap_or_else(|| "http://127.0.0.1:56121/callback".to_string());
+    // The catalog host is overridable like every other endpoint in this flow, so
+    // a QA run can point it at a mock instead of reaching api.x.ai with a fake
+    // token. Without it the callback always calls the live provider.
+    let base_url = params
+        .get("base_url")
+        .cloned()
+        .unwrap_or_else(|| "https://api.x.ai/v1".to_string());
     let client_id = "b1a00492-073a-47ea-816f-4c329264a828";
     let scope = "openid profile email offline_access grok-cli:access api:access";
     let url = format!(
@@ -418,7 +425,7 @@ fn create_xai_auth_url(params: &HashMap<String, String>) -> (String, String, OAu
         challenge: client_id.to_string(),
         redirect_uri,
         token_url,
-        poll_url: String::new(),
+        poll_url: base_url,
         uuid: "grok-4.6,grok-4.5,grok-4.3".to_string(),
         status: SessionStatus::Pending,
         created_at: Instant::now(),
@@ -458,16 +465,11 @@ async fn exchange_xai_code(
         .get("email")
         .and_then(Value::as_str)
         .unwrap_or("xai-account");
-    let models = fetch_credential_models(
-        &state.http_client,
-        "https://api.x.ai/v1",
-        access_token,
-        "xai",
-    )
-    .await?;
+    let models =
+        fetch_credential_models(&state.http_client, &session.poll_url, access_token, "xai").await?;
     let credential = json!({
         "type":"generic", "provider":"xai", "label":email, "adapter":"openai-chat",
-        "base_url":"https://api.x.ai/v1", "api_key":access_token, "auth_mode":"oauth",
+        "base_url":session.poll_url, "api_key":access_token, "auth_mode":"oauth",
         "refresh_token":body.get("refresh_token"), "expired":expiry_from_token_body(&body),
         "token_url":session.token_url, "client_id":session.challenge,
         "models":models, "disabled":false

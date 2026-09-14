@@ -520,12 +520,16 @@ async fn test_oauth_session_cancellation() {
 struct DeviceOAuthMock {
     starts: Arc<std::sync::Mutex<Vec<String>>>,
     polls: Arc<std::sync::Mutex<Vec<String>>>,
+    // The Copilot exchange advertises the catalogue host the flow will call
+    // next, so it has to name this mock rather than a real endpoint.
+    base: Arc<std::sync::OnceLock<String>>,
 }
 
 async fn start_device_mock() -> (String, DeviceOAuthMock, tokio::task::JoinHandle<()>) {
     let state = DeviceOAuthMock {
         starts: Arc::new(std::sync::Mutex::new(Vec::new())),
         polls: Arc::new(std::sync::Mutex::new(Vec::new())),
+        base: Arc::new(std::sync::OnceLock::new()),
     };
     let app = axum::Router::new()
         .route(
@@ -560,17 +564,34 @@ async fn start_device_mock() -> (String, DeviceOAuthMock, tokio::task::JoinHandl
         )
         .route(
             "/copilot/exchange",
-            axum::routing::get(|headers: axum::http::HeaderMap| async move {
-                assert_eq!(headers.get("authorization").unwrap(), "token device-access");
+            axum::routing::get(
+                |axum::extract::State(state): axum::extract::State<DeviceOAuthMock>,
+                 headers: axum::http::HeaderMap| async move {
+                    assert_eq!(headers.get("authorization").unwrap(), "token device-access");
+                    let api = format!("{}/catalog", state.base.get().expect("mock base"));
+                    axum::Json(serde_json::json!({
+                        "token":"copilot-api-token",
+                        "endpoints":{"api": api}
+                    }))
+                },
+            ),
+        )
+        // Onboarding reads the account's catalogue from the provider it just
+        // authenticated against. QA must answer that itself: reaching the real
+        // provider with a fake token fails the flow on a 401 and sends test
+        // traffic upstream.
+        .route(
+            "/catalog/models",
+            axum::routing::get(|| async move {
                 axum::Json(serde_json::json!({
-                    "token":"copilot-api-token",
-                    "endpoints":{"api":"https://api.githubcopilot.example.test"}
+                    "data": [{ "id": "mock-model-1" }, { "id": "mock-model-2" }]
                 }))
             }),
         )
         .with_state(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
+    state.base.set(base.clone()).expect("mock base set once");
     let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     (base, state, task)
 }
@@ -590,10 +611,12 @@ async fn device_oauth_starts_polls_and_writes_generic_provider_credentials() {
     let app = create_app(Arc::new(AppState::new(&config).unwrap()));
 
     for provider in ["kimi", "qwen", "nous", "github-copilot"] {
+        // exchange_url doubles as the catalogue base for device flows, so point
+        // every provider at the mock catalogue rather than its live API.
         let exchange = if provider == "github-copilot" {
             format!("&exchange_url={}%2Fcopilot%2Fexchange", mock_base)
         } else {
-            String::new()
+            format!("&exchange_url={}%2Fcatalog", mock_base)
         };
         let start = app
             .clone()
@@ -651,18 +674,29 @@ async fn device_oauth_starts_polls_and_writes_generic_provider_credentials() {
 
 #[tokio::test]
 async fn xai_pkce_callback_writes_a_live_generic_account() {
-    let token_app = axum::Router::new().route(
-        "/oauth/token",
-        axum::routing::post(|body: String| async move {
-            assert!(body.contains("grant_type=authorization_code"));
-            assert!(body.contains("code_verifier="));
-            axum::Json(json!({
-                "access_token":"xai-access", "refresh_token":"xai-refresh", "email":"grok@example.test"
-            }))
-        }),
-    );
+    let token_app = axum::Router::new()
+        .route(
+            "/oauth/token",
+            axum::routing::post(|body: String| async move {
+                assert!(body.contains("grant_type=authorization_code"));
+                assert!(body.contains("code_verifier="));
+                axum::Json(json!({
+                    "access_token":"xai-access", "refresh_token":"xai-refresh", "email":"grok@example.test"
+                }))
+            }),
+        )
+        // The callback reads the account's catalogue before writing the
+        // credential; serve it here so the flow never calls api.x.ai.
+        .route(
+            "/v1/models",
+            axum::routing::get(|| async move {
+                axum::Json(json!({ "data": [{ "id": "grok-4.6" }] }))
+            }),
+        );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let token_url = format!("http://{}/oauth/token", listener.local_addr().unwrap());
+    let mock_base = format!("http://{}", listener.local_addr().unwrap());
+    let token_url = format!("{mock_base}/oauth/token");
+    let catalog_base = format!("{mock_base}/v1");
     let token_task = tokio::spawn(async move { axum::serve(listener, token_app).await.unwrap() });
     let auth_dir = unique_temp_dir("qg-t13-xai");
     std::fs::remove_dir_all(&auth_dir).ok();
@@ -675,7 +709,7 @@ async fn xai_pkce_callback_writes_a_live_generic_account() {
     };
     let app = create_app(Arc::new(AppState::new(&config).unwrap()));
     let start = app.clone().oneshot(Request::builder()
-        .uri(format!("/v0/management/xai-auth-url?auth_url=https%3A%2F%2Fauth.example.test%2Fauthorize&token_url={}", url_encode(&token_url)))
+        .uri(format!("/v0/management/xai-auth-url?auth_url=https%3A%2F%2Fauth.example.test%2Fauthorize&token_url={}&base_url={}", url_encode(&token_url), url_encode(&catalog_base)))
         .header(header::AUTHORIZATION, format!("Bearer {API_KEY}"))
         .body(Body::empty()).unwrap()).await.unwrap();
     assert_eq!(start.status(), StatusCode::OK);
@@ -1162,6 +1196,14 @@ async fn test_command_code_oauth_flow_end_to_end() {
                 },
             ),
         )
+        // Onboarding fetches the account's catalogue before writing the
+        // credential, so the mock owns that endpoint too.
+        .route(
+            "/provider/v1/models",
+            get(
+                || async move { Json(json!({ "data": [{ "id": "deepseek/deepseek-v4-flash" }] })) },
+            ),
+        )
         .with_state(s_clone);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1182,9 +1224,10 @@ async fn test_command_code_oauth_flow_end_to_end() {
 
     // When: GET /v0/management/command-code-auth-url is requested
     let start_uri = format!(
-        "/v0/management/command-code-auth-url?whoami_url={}&callback={}",
+        "/v0/management/command-code-auth-url?whoami_url={}&callback={}&base_url={}",
         url_encode(&whoami_url),
-        url_encode(callback_url)
+        url_encode(callback_url),
+        url_encode(&format!("http://127.0.0.1:{port}/provider/v1"))
     );
     let start = app
         .clone()
@@ -1253,7 +1296,7 @@ async fn test_command_code_oauth_flow_end_to_end() {
     assert_eq!(cred_json["label"], "command-user");
     assert_eq!(
         cred_json["base_url"],
-        "https://api.commandcode.ai/provider/v1"
+        format!("http://127.0.0.1:{port}/provider/v1")
     );
     assert_eq!(cred_json["models"], json!(["deepseek/deepseek-v4-flash"]));
     assert_eq!(cred_json["disabled"], false);
