@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
@@ -428,6 +429,65 @@ mod provider_kind_contract_tests {
     }
 
     #[test]
+    fn gemini_rate_limit_leaves_third_party_models_routable() {
+        let member = AccountMember::for_test(ProviderAccount::Antigravity(AntigravityAccount {
+            email: "test@example.com".to_string(),
+            project_id: "p".to_string(),
+            ..Default::default()
+        }));
+        let now_ms = 1_000_000;
+        let until_ms = now_ms + 300_000;
+
+        assert!(member.group_available("gemini-3.8-flash-high", now_ms));
+        assert!(member.group_available("claude-opus-4-6-thinking", now_ms));
+
+        assert!(member.set_group_cooldown("gemini-3.8-flash-high", until_ms));
+
+        // The Gemini bucket is benched until its deadline...
+        assert!(!member.group_available("gemini-3.8-flash-high", now_ms));
+        assert!(member.group_available("gemini-3.8-flash-high", until_ms));
+        // ...while the untouched third-party bucket keeps serving, and the
+        // account itself is never benched account-wide.
+        assert!(member.group_available("claude-opus-4-6-thinking", now_ms));
+        assert!(member.group_available("gpt-oss-120b-medium", now_ms));
+        assert_eq!(member.health(), Health::Available);
+
+        // A shorter repeat deadline must not cut an active bench short.
+        assert!(member.set_group_cooldown("gemini-3-flash", until_ms - 100_000));
+        assert!(!member.group_available("gemini-3.8-flash-high", until_ms - 1));
+
+        // Providers that meter one pool have no group split, so the caller
+        // falls back to account-wide cooldown.
+        let codex = AccountMember::for_test(ProviderAccount::Codex(CodexAccount {
+            email: "test@example.com".to_string(),
+            ..Default::default()
+        }));
+        assert!(!codex.set_group_cooldown("gpt-5.6-sol", until_ms));
+        assert!(codex.group_available("gpt-5.6-sol", now_ms));
+    }
+
+    #[test]
+    fn group_cooldowns_survive_a_credential_rescan() {
+        let account = AntigravityAccount {
+            email: "test@example.com".to_string(),
+            project_id: "p".to_string(),
+            ..Default::default()
+        };
+        let member = AccountMember::for_test(ProviderAccount::Antigravity(account.clone()));
+        let now_ms = 1_000_000;
+        let until_ms = now_ms + 300_000;
+        member.set_group_cooldown("gemini-3.8-flash-high", until_ms);
+
+        let fresh = AccountMember::for_test(ProviderAccount::Antigravity(account));
+        assert!(fresh.group_available("gemini-3.8-flash-high", now_ms));
+
+        crate::state::adopt_runtime_state(&fresh, &Arc::new(member));
+
+        assert!(!fresh.group_available("gemini-3.8-flash-high", now_ms));
+        assert!(fresh.group_available("claude-opus-4-6-thinking", now_ms));
+    }
+
+    #[test]
     fn characterization_unsupported_model_inheritance() {
         let member = AccountMember::for_test(ProviderAccount::Codex(CodexAccount {
             email: "test@example.com".to_string(),
@@ -841,11 +901,34 @@ impl ProviderAccount {
     }
 }
 
+/// Antigravity meters Gemini and third-party (Claude/GPT) models against
+/// separate upstream buckets — the live quota summary reports `gemini-5h` /
+/// `gemini-weekly` beside `3p-5h` / `3p-weekly`. A 429 on one says nothing
+/// about the other, so benching the whole account on a Gemini rate limit makes
+/// Claude and GPT models unroutable while their allowance is untouched.
+///
+/// Returns the bucket group a model bills against, or `None` for providers that
+/// meter the account as a single pool (where account-wide cooldown is correct).
+pub fn model_quota_group(kind: ProviderKind, model: &str) -> Option<&'static str> {
+    if kind != ProviderKind::Antigravity {
+        return None;
+    }
+    Some(if model.starts_with("gemini-") {
+        "gemini"
+    } else {
+        "3p"
+    })
+}
+
 pub struct AccountMember {
     pub id: String,
     pub file_path: PathBuf,
     pub inner: RwLock<ProviderAccount>,
     pub health: Arc<RwLock<Health>>,
+    /// Per-quota-group cooldown deadlines (unix ms) for providers that meter
+    /// model families separately. Empty for single-pool providers, whose
+    /// cooldown lives in `health`.
+    pub group_cooldowns: Arc<RwLock<BTreeMap<String, i64>>>,
     pub upstream_override: Option<String>,
     /// Usage-polling-only base; falls back to `upstream_override` when unset.
     pub usage_override: Option<String>,
@@ -893,6 +976,7 @@ impl AccountMember {
             file_path: PathBuf::from("/dev/null"),
             inner: RwLock::new(inner),
             health: Arc::new(RwLock::new(Health::Available)),
+            group_cooldowns: Arc::new(RwLock::new(BTreeMap::new())),
             upstream_override: None,
             usage_override: None,
             ok_count: Arc::new(AtomicU64::new(0)),
@@ -1068,6 +1152,7 @@ impl AccountMember {
             file_path: self.file_path.clone(),
             inner: RwLock::new(self.inner.read().unwrap_or_else(|p| p.into_inner()).clone()),
             health: Arc::clone(&self.health),
+            group_cooldowns: Arc::clone(&self.group_cooldowns),
             upstream_override: self.upstream_override.clone(),
             usage_override: self.usage_override.clone(),
             ok_count: Arc::clone(&self.ok_count),
@@ -1357,6 +1442,43 @@ impl AccountMember {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *guard = health;
+    }
+
+    /// The quota group `model` bills against on this account, if its provider
+    /// meters model families separately.
+    pub fn quota_group_for(&self, model: &str) -> Option<&'static str> {
+        model_quota_group(self.kind(), model)
+    }
+
+    /// Bench only the quota group `model` belongs to, leaving the rest of the
+    /// account routable. Returns false when the provider has no group split, so
+    /// the caller falls back to an account-wide cooldown.
+    pub fn set_group_cooldown(&self, model: &str, until_unix_ms: i64) -> bool {
+        let Some(group) = self.quota_group_for(model) else {
+            return false;
+        };
+        let mut guard = self
+            .group_cooldowns
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let slot = guard.entry(group.to_string()).or_insert(until_unix_ms);
+        // A later deadline wins: a repeated 429 must not shorten an existing
+        // bench, and an earlier one must not extend it past what upstream said.
+        *slot = (*slot).max(until_unix_ms);
+        true
+    }
+
+    /// Whether this account may currently serve `model`, considering only the
+    /// per-group cooldowns. Account-wide health is checked separately.
+    pub fn group_available(&self, model: &str, now_unix_ms: i64) -> bool {
+        let Some(group) = self.quota_group_for(model) else {
+            return true;
+        };
+        let guard = self
+            .group_cooldowns
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.get(group).is_none_or(|until| *until <= now_unix_ms)
     }
 
     pub fn is_expired(&self, now_unix: i64) -> bool {
@@ -1985,6 +2107,7 @@ pub fn load_account_members(auth_dir: &Path) -> anyhow::Result<Vec<Arc<AccountMe
             } else {
                 Health::Available
             })),
+            group_cooldowns: Arc::new(RwLock::new(BTreeMap::new())),
             upstream_override,
             usage_override,
             ok_count: Arc::new(AtomicU64::new(0)),

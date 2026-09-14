@@ -186,9 +186,7 @@ impl StreamCapture {
                             .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
                             .unwrap_or(0);
                         let until = cooldown_deadline_ms(now_ms, 300);
-                        current.set_health(Health::Cooldown {
-                            until_unix_ms: until,
-                        });
+                        bench_exhausted_quota(current, outcome.model.as_deref(), until);
                     } else if code == "unauthenticated" {
                         current.set_health(Health::AuthFailed);
                     }
@@ -199,9 +197,7 @@ impl StreamCapture {
                         .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
                         .unwrap_or(0);
                     let until = cooldown_deadline_ms(now_ms, 300);
-                    outcome.member.set_health(Health::Cooldown {
-                        until_unix_ms: until,
-                    });
+                    bench_exhausted_quota(&outcome.member, outcome.model.as_deref(), until);
                 } else if code == "unauthenticated" {
                     outcome.member.set_health(Health::AuthFailed);
                 }
@@ -1390,6 +1386,7 @@ async fn record_cooldown(
     resp: reqwest::Response,
     member: &AccountMember,
     status_code: u16,
+    model: Option<&str>,
     state: &AppState,
 ) -> FinalFailure {
     let now_ms = SystemTime::now()
@@ -1401,7 +1398,7 @@ async fn record_cooldown(
     // headers before the body extraction consumes the response.
     let until_unix_ms = cooldown_deadline_from_headers(resp.headers(), now_ms);
     let failure = extract_failure(resp, status_code).await;
-    member.set_health(Health::Cooldown { until_unix_ms });
+    bench_exhausted_quota(member, model, until_unix_ms);
     member.record_fail();
     state.metrics.failed_over.fetch_add(1, Ordering::Relaxed);
     if failure_is_limit_exhaustion(&failure.body) {
@@ -1416,6 +1413,20 @@ async fn record_cooldown(
             .record_error(member.id(), status_code, "upstream error");
     }
     failure
+}
+
+/// Bench an account that just hit an upstream rate limit.
+///
+/// Providers that meter model families separately (Antigravity bills Gemini and
+/// third-party Claude/GPT models against distinct `gemini-*` / `3p-*` buckets)
+/// bench only the family that actually ran out, so a Gemini limit no longer
+/// makes the account's untouched Claude and GPT allowance unroutable. Providers
+/// with a single pool keep the account-wide cooldown.
+fn bench_exhausted_quota(member: &AccountMember, model: Option<&str>, until_unix_ms: i64) {
+    if model.is_some_and(|model| member.set_group_cooldown(model, until_unix_ms)) {
+        return;
+    }
+    member.set_health(Health::Cooldown { until_unix_ms });
 }
 
 fn content_type_of(resp: &reqwest::Response) -> Option<String> {
@@ -1807,6 +1818,7 @@ fn eligible_indices(
     };
     let requested_model = requested_model.unwrap_or(&route.canonical_model);
     let (prefix, _) = parse_model_prefix(requested_model);
+    let canonical_model = route.canonical_model.as_str();
     let mut eligible = Vec::new();
     for provider in &route.provider_classes {
         let indices: Vec<usize> = pool
@@ -1814,6 +1826,9 @@ fn eligible_indices(
             .iter()
             .enumerate()
             .filter(|(_, member)| member.health().is_available(now_ms))
+            // A quota group benched by its own 429 (Antigravity gemini vs 3p)
+            // excludes only the models that bill against it.
+            .filter(|(_, member)| member.group_available(canonical_model, now_ms))
             .filter(|(_, member)| state.scheduler.permits(member.id()))
             .filter(|(_, member)| member_matches_api_key_binding(member, api_key_binding))
             .filter(|(_, member)| crate::models_route::member_matches_scope(member, scoped_key))
@@ -3028,7 +3043,8 @@ pub async fn handle_relay(
         }
 
         if status_code == 429 {
-            let failure = record_cooldown(resp, &member, status_code, &state).await;
+            let failure =
+                record_cooldown(resp, &member, status_code, plan.model.as_deref(), &state).await;
             if member.provider_name() == "cline" {
                 if let Some((model, reset_secs)) = parse_cline_cap_error(&failure.body) {
                     record_cline_quota_bucket(&member, &model, reset_secs, now_unix);

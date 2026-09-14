@@ -239,6 +239,17 @@ pub(crate) fn adopt_runtime_state(target: &AccountMember, previous: &Arc<Account
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
+    // Per-group cooldowns survive a reload for the same reason account-wide
+    // health does: a reload must not hand back an allowance upstream is still
+    // rate-limiting.
+    *target
+        .group_cooldowns
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = previous
+        .group_cooldowns
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
     target.ok_count.store(previous.ok_count.load(seq), seq);
     target.fail_count.store(previous.fail_count.load(seq), seq);
     if target.kind() == crate::account::ProviderKind::Devin
