@@ -111,6 +111,11 @@ pub async fn solve(
     });
     let mut child = tokio::process::Command::new(&binary)
         .arg(request.to_string())
+        // The sidecar must never share the gateway's stdin: inheriting it lets a
+        // solver that reads stdin block until the gateway's own input closes,
+        // which burns the whole solve deadline and can steal bytes meant for the
+        // gateway. A null stdin reaches EOF immediately.
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
