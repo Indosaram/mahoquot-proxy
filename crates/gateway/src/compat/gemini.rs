@@ -235,7 +235,10 @@ pub fn gemini_to_openai(req: &Value, model: &str) -> Result<Value, String> {
             {
                 for func in funcs {
                     let name = func.get("name").and_then(Value::as_str).unwrap_or("");
-                    let desc = func.get("description").and_then(Value::as_str).unwrap_or("");
+                    let desc = func
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
                     let params = func
                         .get("parameters")
                         .cloned()
@@ -660,6 +663,11 @@ fn sanitize_claude_schema_for_gemini(value: &mut Value) -> Result<(), String> {
     if *value == Value::Bool(true) {
         *value = json!({});
     }
+    if *value == Value::Bool(false) {
+        // A never-valid member cannot be expressed on the Gemini wire; an empty
+        // schema is the only lossless-enough stand-in.
+        *value = json!({});
+    }
     let map = value
         .as_object_mut()
         .ok_or("Antigravity requires object-valued schema nodes")?;
@@ -679,7 +687,88 @@ fn sanitize_claude_schema_for_gemini(value: &mut Value) -> Result<(), String> {
     if let Some(one) = map.remove("oneOf") {
         map.entry("anyOf").or_insert(one);
     }
+    fold_anyof_for_antigravity(map)?;
     super::tool_schema::visit_schema_children(map, &mut sanitize_claude_schema_for_gemini)
+}
+
+fn is_null_schema(schema: &Value) -> bool {
+    schema.get("type").and_then(Value::as_str) == Some("null")
+}
+
+/// Fold `anyOf` unions into the subset Google's antigravity→Anthropic tool
+/// converter actually translates. Probed 2026-09-15 against the live claude
+/// path: plain typed schemas and `nullable: true` reach Claude as valid draft
+/// 2020-12 schemas, while EVERY anyOf — including a single-member union — is
+/// mangled into an input_schema that fails Claude's validation with
+/// "JSON schema is invalid. It must match JSON Schema draft 2020-12".
+///
+/// The fold: inline the sole non-null member (a `[S, null]` union becomes
+/// `S` plus `nullable: true`, the optional-field idiom clients actually
+/// emit); merge members that are enums of one primitive type into a single
+/// enum; express an always-null union as `type: "null"`. Disjoint-shape
+/// unions have no expressible form, so the first member stands in for the
+/// union rather than failing the whole request.
+fn fold_anyof_for_antigravity(map: &mut Map<String, Value>) -> Result<(), String> {
+    let Some(members) = map.remove("anyOf") else {
+        return Ok(());
+    };
+    let Some(members) = members.as_array() else {
+        return Ok(());
+    };
+    let has_null = members.iter().any(|member| is_null_schema(member));
+    let non_null: Vec<Value> = members
+        .iter()
+        .filter(|member| !is_null_schema(member))
+        .cloned()
+        .collect();
+    if non_null.is_empty() {
+        map.insert("type".into(), json!("null"));
+        return Ok(());
+    }
+    let member = match non_null.as_slice() {
+        [only] => only.clone(),
+        many => {
+            let refs: Vec<&Value> = many.iter().collect();
+            merge_enum_members(&refs).unwrap_or_else(|| many[0].clone())
+        }
+    };
+    // The member came straight from the inbound tree: its top-level keys
+    // bypassed the strip loop above, so a `const` or nested union inside it
+    // would ride the Gemini wire untouched and draw a request-wide 400.
+    // Sanitize it as its own node before merging its fields.
+    let mut member = member;
+    sanitize_claude_schema_for_gemini(&mut member)?;
+    if let Some(member_map) = member.as_object() {
+        for (key, value) in member_map {
+            // Union siblings (description, examples) survive: the member may
+            // only fill keys the union did not constrain itself.
+            map.entry(key.clone()).or_insert(value.clone());
+        }
+    }
+    if has_null {
+        map.entry("nullable".to_string()).or_insert(json!(true));
+    }
+    Ok(())
+}
+
+/// Members like `{type: string, enum: ["a"]} | {type: string, enum: ["b"]}`
+/// express faithfully as one `{type: string, enum: ["a", "b"]}`. Returns None
+/// when the members are not one-primitive-type enums.
+fn merge_enum_members(members: &[&Value]) -> Option<Value> {
+    let kind = members.first()?.get("type").and_then(Value::as_str)?;
+    let mut values: Vec<Value> = Vec::new();
+    for member in members {
+        if member.get("type").and_then(Value::as_str) != Some(kind) {
+            return None;
+        }
+        let enum_values = member.get("enum")?.as_array()?;
+        for value in enum_values {
+            if !values.contains(value) {
+                values.push(value.clone());
+            }
+        }
+    }
+    Some(json!({ "type": kind, "enum": values }))
 }
 
 pub fn openai_to_antigravity(body: &Value, project_id: &str) -> Result<Value, String> {
@@ -1181,6 +1270,138 @@ mod tests {
         let request = openai_to_gemini(&body).expect("translate");
         let text = request["contents"][0]["parts"][0]["text"].as_str().unwrap();
         assert!(text.contains("payload text stays"));
+    }
+
+    #[test]
+    fn claude_path_folds_an_optional_anyof_union_into_nullable() {
+        // The shape omo's read tool actually sends: `offset: number | null`.
+        // Google's antigravity→Anthropic converter mangles every anyOf into an
+        // input_schema Claude rejects, while `nullable: true` converts cleanly.
+        let body = json!({
+            "model": "claude-opus-4-6-thinking",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "tools": [{ "function": {
+                "name": "read",
+                "description": "d",
+                "parameters": {
+                    "type": "object",
+                    "required": ["path", "offset"],
+                    "properties": {
+                        "path": { "type": "string" },
+                        "offset": { "anyOf": [
+                            { "type": "number", "description": "line" },
+                            { "type": "null" }
+                        ] }
+                    }
+                }
+            }}]
+        });
+
+        let request = openai_to_antigravity(&body, "p").expect("translate");
+        let offset = &request["request"]["tools"][0]["functionDeclarations"][0]["parameters"]
+            ["properties"]["offset"];
+        assert_eq!(offset["type"], json!("number"));
+        assert_eq!(offset["nullable"], json!(true));
+        assert_eq!(offset["description"], json!("line"));
+        assert!(offset.get("anyOf").is_none());
+    }
+
+    #[test]
+    fn claude_path_folds_union_siblings_and_multi_member_unions() {
+        // A union-level description survives the fold; disjoint-shape members
+        // collapse to the first member because no expressible form exists.
+        let body = json!({
+            "model": "claude-opus-4-6-thinking",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "tools": [{ "function": {
+                "name": "t",
+                "description": "d",
+                "parameters": {
+                    "type": "object",
+                    "required": [],
+                    "properties": {
+                        "enums": { "description": "choice", "anyOf": [
+                            { "type": "string", "enum": ["a"] },
+                            { "type": "string", "enum": ["b"] }
+                        ] },
+                        "shapes": { "anyOf": [
+                            { "type": "object", "properties": { "a": { "type": "string" } }, "required": ["a"] },
+                            { "type": "object", "properties": { "b": { "type": "string" } }, "required": [] }
+                        ] },
+                        "always_null": { "anyOf": [{ "type": "null" }] }
+                    }
+                }
+            }}]
+        });
+
+        let request = openai_to_antigravity(&body, "p").expect("translate");
+        let props =
+            &request["request"]["tools"][0]["functionDeclarations"][0]["parameters"]["properties"];
+        let enums = &props["enums"];
+        assert_eq!(enums["type"], json!("string"));
+        assert_eq!(enums["enum"], json!(["a", "b"]));
+        assert_eq!(enums["description"], json!("choice"));
+        let shapes = &props["shapes"];
+        assert_eq!(shapes["type"], json!("object"));
+        assert!(shapes["properties"].get("a").is_some());
+        assert!(shapes["properties"].get("b").is_none());
+        assert_eq!(props["always_null"]["type"], json!("null"));
+    }
+
+    #[test]
+    fn claude_path_sanitizes_folded_anyof_members_before_merging() {
+        // A `const` inside an anyOf member bypassed the strip loop and rode
+        // the Gemini wire untouched, drawing a request-wide 400 upstream.
+        let body = json!({
+            "model": "claude-opus-4-6-thinking",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "tools": [{ "function": {
+                "name": "t",
+                "description": "d",
+                "parameters": {
+                    "type": "object",
+                    "required": [],
+                    "properties": { "mode": { "anyOf": [
+                        { "type": "string", "const": "fast", "description": "fast mode" },
+                        { "type": "null" }
+                    ] } }
+                }
+            }}]
+        });
+
+        let request = openai_to_antigravity(&body, "p").expect("translate");
+        let mode = &request["request"]["tools"][0]["functionDeclarations"][0]["parameters"]
+            ["properties"]["mode"];
+        assert_eq!(mode["type"], json!("string"));
+        assert_eq!(mode["enum"], json!(["fast"]));
+        assert_eq!(mode["nullable"], json!(true));
+        assert_eq!(mode["description"], json!("fast mode"));
+        assert!(mode.get("const").is_none());
+        assert!(mode.get("anyOf").is_none());
+    }
+
+    #[test]
+    fn native_gemini_tools_keep_anyof_unions() {
+        // The fold is claude-path only: native Gemini handles anyOf natively.
+        let body = json!({
+            "model": "gemini-3.7-flash-high",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "tools": [{ "function": {
+                "name": "t",
+                "description": "d",
+                "parameters": {
+                    "type": "object",
+                    "required": [],
+                    "properties": { "x": { "anyOf": [
+                        { "type": "number" }, { "type": "string" }
+                    ] } }
+                }
+            }}]
+        });
+
+        let request = openai_to_gemini(&body).expect("translate");
+        let x = &request["tools"][0]["functionDeclarations"][0]["parameters"]["properties"]["x"];
+        assert_eq!(x["anyOf"].as_array().expect("anyOf").len(), 2);
     }
 }
 
