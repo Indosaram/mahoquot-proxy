@@ -35,6 +35,13 @@ const CLAUDE_OAUTH_BETA: &str = "oauth-2025-04-20";
 /// routing is unaffected.
 const RELAY_USAGE_HOST_MARKERS: [&str; 2] = ["nekos", "ccapi"];
 
+/// The relay's `/v1/usage/self` endpoint is only published on the nekos front
+/// door. The ccapi front door proxies chat traffic for the very same accounts
+/// but answers 404 there, so an account registered against ccapi has to read
+/// its quota from here with the same static key. Chat routing is untouched:
+/// this base is only ever used for usage polling.
+const RELAY_USAGE_FALLBACK_BASE: &str = "https://claude.nekos.me";
+
 /// After a 429 from a usage endpoint, skip that account's usage polls for this
 /// long. Anthropic's OAuth usage endpoint throttles hard and sends no
 /// Retry-After, so re-polling every cycle keeps the throttle hot and an
@@ -70,6 +77,27 @@ fn relay_usage_target(key: Option<String>, base: Option<&str>) -> Option<String>
 
 fn relay_usage_key(member: &AccountMember) -> Option<String> {
     relay_usage_target(member.relay_api_key(), member.upstream_override.as_deref())
+}
+
+/// Usage bases to try in order: the pinned usage front door, then the account's
+/// chat target, then the known relay usage front door. Only a 404 advances to
+/// the next candidate, so a relay that does publish the endpoint is never
+/// silently re-pointed at another host.
+fn relay_usage_bases(usage_override: Option<&str>, upstream_override: Option<&str>) -> Vec<String> {
+    let mut bases: Vec<String> = Vec::new();
+    for candidate in [
+        usage_override,
+        upstream_override,
+        Some(RELAY_USAGE_FALLBACK_BASE),
+    ] {
+        let Some(base) = candidate else { continue };
+        let base = base.trim().trim_end_matches('/');
+        if base.is_empty() || bases.iter().any(|known| known == base) {
+            continue;
+        }
+        bases.push(base.to_string());
+    }
+    bases
 }
 
 fn now_unix() -> i64 {
@@ -533,58 +561,70 @@ async fn try_claude_usage(state: &AppState, member: &Arc<AccountMember>) -> Resu
     if let Some(key) = relay_usage_key(member) {
         // Poll the usage front door when one is pinned; chat still uses the
         // upstream_override target.
-        let base = member
-            .usage_override
-            .as_deref()
-            .or(member.upstream_override.as_deref())
-            .unwrap_or_default()
-            .trim_end_matches('/');
-        if base.is_empty() {
+        let bases = relay_usage_bases(
+            member.usage_override.as_deref(),
+            member.upstream_override.as_deref(),
+        );
+        if bases.is_empty() {
             return Err(QuotaError::Upstream(
                 "relay account has no upstream_override".into(),
             ));
         }
         let client = state.client_for_member(member);
-        let resp = client
-            .get(format!("{base}/v1/usage/self"))
-            .header("x-api-key", key)
-            .header("anthropic-version", "2023-06-01")
-            .header("Accept", "application/json")
-            .timeout(Duration::from_secs(20))
-            .send()
-            .await
-            .map_err(|e| QuotaError::Upstream(e.to_string()))?;
-        let status = resp.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            return Err(QuotaError::Unauthorized);
+        let mut last_missing: Option<String> = None;
+        for base in bases {
+            let resp = client
+                .get(format!("{base}/v1/usage/self"))
+                .header("x-api-key", key.clone())
+                .header("anthropic-version", "2023-06-01")
+                .header("Accept", "application/json")
+                .timeout(Duration::from_secs(20))
+                .send()
+                .await
+                .map_err(|e| QuotaError::Upstream(e.to_string()))?;
+            let status = resp.status();
+            // Only a missing endpoint advances to the next candidate: an auth or
+            // throttle answer is a fact about this key, not about the host.
+            if status == reqwest::StatusCode::NOT_FOUND {
+                last_missing = Some(format!("usage http {status} at {base}"));
+                continue;
+            }
+            if status == reqwest::StatusCode::UNAUTHORIZED
+                || status == reqwest::StatusCode::FORBIDDEN
+            {
+                return Err(QuotaError::Unauthorized);
+            }
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                return Err(QuotaError::RateLimited);
+            }
+            if !status.is_success() {
+                return Err(QuotaError::Upstream(format!("usage http {status}")));
+            }
+            let payload: serde_json::Value = resp
+                .json()
+                .await
+                .map_err(|e| QuotaError::Upstream(e.to_string()))?;
+            let totals = crate::usage::parse_relay_usage(&payload).ok_or_else(|| {
+                QuotaError::Upstream("usage payload had no cumulative counters".into())
+            })?;
+            let now = now_unix();
+            let samples = state.usage_samples.push(
+                &member.id,
+                crate::usage::UsageSample {
+                    unix: now,
+                    requests: totals.requests,
+                    tokens: totals.tokens,
+                    cost_usd: totals.total_cost_usd,
+                },
+            );
+            member.set_usage(crate::usage::parse_relay_account_usage(
+                &payload, totals, samples, now,
+            ));
+            return Ok(());
         }
-        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            return Err(QuotaError::RateLimited);
-        }
-        if !status.is_success() {
-            return Err(QuotaError::Upstream(format!("usage http {status}")));
-        }
-        let payload: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| QuotaError::Upstream(e.to_string()))?;
-        let totals = crate::usage::parse_relay_usage(&payload).ok_or_else(|| {
-            QuotaError::Upstream("usage payload had no cumulative counters".into())
-        })?;
-        let now = now_unix();
-        let samples = state.usage_samples.push(
-            &member.id,
-            crate::usage::UsageSample {
-                unix: now,
-                requests: totals.requests,
-                tokens: totals.tokens,
-                cost_usd: totals.total_cost_usd,
-            },
-        );
-        member.set_usage(crate::usage::parse_relay_account_usage(
-            &payload, totals, samples, now,
+        return Err(QuotaError::Upstream(
+            last_missing.unwrap_or_else(|| "relay usage endpoint not found".into()),
         ));
-        return Ok(());
     }
     let token = member.access_token();
     if token.is_empty() {
@@ -1150,6 +1190,41 @@ mod tests {
         assert_eq!(
             relay_usage_target(None, Some("https://claude.nekos.me")),
             None
+        );
+    }
+
+    #[test]
+    fn relay_usage_bases_fall_back_to_the_host_that_serves_usage_self() {
+        // given a ccapi-registered account with no pinned usage front door:
+        // ccapi answers 404 on /v1/usage/self, so the known nekos front door
+        // has to be tried before the poll can be called a failure
+        assert_eq!(
+            relay_usage_bases(None, Some("https://ccapi.labs.mengmota.com/anthropic")),
+            vec![
+                "https://ccapi.labs.mengmota.com/anthropic".to_string(),
+                RELAY_USAGE_FALLBACK_BASE.to_string(),
+            ]
+        );
+        // a pinned usage override keeps first place
+        assert_eq!(
+            relay_usage_bases(
+                Some("https://claude.nekos.me"),
+                Some("https://ccapi.labs.mengmota.com/anthropic")
+            ),
+            vec![
+                "https://claude.nekos.me".to_string(),
+                "https://ccapi.labs.mengmota.com/anthropic".to_string(),
+            ]
+        );
+        // a nekos-targeted account never repeats the same host twice
+        assert_eq!(
+            relay_usage_bases(None, Some("https://claude.nekos.me/")),
+            vec!["https://claude.nekos.me".to_string()]
+        );
+        // no configured base still leaves the known front door to try
+        assert_eq!(
+            relay_usage_bases(None, None),
+            vec![RELAY_USAGE_FALLBACK_BASE.to_string()]
         );
     }
 }
