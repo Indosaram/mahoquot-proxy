@@ -304,9 +304,10 @@ fn validate(body: &[u8], provider: &str) -> bool {
                     v["type"] == "response.completed" && v["response"]["status"] == "completed";
             }
             "cline" => {
-                content |= v["choices"][0]["delta"]["content"]
-                    .as_str()
-                    .is_some_and(|s| !s.is_empty());
+                let delta = &v["choices"][0]["delta"];
+                content |= delta["content"].as_str().is_some_and(|s| !s.is_empty())
+                    || delta["reasoning"].as_str().is_some_and(|s| !s.is_empty())
+                    || delta["reasoning_content"].as_str().is_some_and(|s| !s.is_empty());
                 terminal |= matches!(
                     v["choices"][0]["finish_reason"].as_str(),
                     Some("stop" | "length")
@@ -806,6 +807,7 @@ mod tests {
             "antigravity"
         ));
         assert!(validate(b"data: {\"choices\":[{\"delta\":{\"content\":\"x\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n","cline"));
+        assert!(validate(b"data: {\"choices\":[{\"delta\":{\"content\":\"\",\"reasoning\":\"Thinking\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n","cline"));
     }
     #[test]
     fn antigravity_window_priming_group_isolation() {
