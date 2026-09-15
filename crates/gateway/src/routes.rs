@@ -299,14 +299,24 @@ async fn admin_usage_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
     Json(state.get_stats())
 }
 
-async fn admin_warmup_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(serde_json::json!({ "results": crate::warmup::warm_all(&state).await }))
+async fn admin_warmup_handler(
+    State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<ResolvedAuth>,
+) -> Response {
+    if auth.identity.is_scoped() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    Json(serde_json::json!({ "results": crate::warmup::warm_all(&state).await })).into_response()
 }
 
 async fn admin_warmup_one_handler(
     State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<ResolvedAuth>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
+    if auth.identity.is_scoped() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     match state.find_member(&id) {
         Some(member) => Json(crate::warmup::warm_account(&state, &member).await).into_response(),
         None => (

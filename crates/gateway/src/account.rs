@@ -901,6 +901,18 @@ impl ProviderAccount {
     }
 }
 
+pub struct AccountActivity(Arc<AccountMember>);
+impl Drop for AccountActivity {
+    fn drop(&mut self) {
+        *self
+            .0
+            .last_activity
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = tokio::time::Instant::now();
+        self.0.active_requests.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// Antigravity meters Gemini and third-party (Claude/GPT) models against
 /// separate upstream buckets — the live quota summary reports `gemini-5h` /
 /// `gemini-weekly` beside `3p-5h` / `3p-weekly`. A 429 on one says nothing
@@ -932,6 +944,8 @@ pub struct AccountMember {
     /// model families separately. Empty for single-pool providers, whose
     /// cooldown lives in `health`.
     pub group_cooldowns: Arc<RwLock<BTreeMap<String, i64>>>,
+    pub active_requests: Arc<AtomicU64>,
+    pub last_activity: Arc<std::sync::Mutex<tokio::time::Instant>>,
     pub upstream_override: Option<String>,
     /// Usage-polling-only base; falls back to `upstream_override` when unset.
     pub usage_override: Option<String>,
@@ -980,6 +994,8 @@ impl AccountMember {
             inner: RwLock::new(inner),
             health: Arc::new(RwLock::new(Health::Available)),
             group_cooldowns: Arc::new(RwLock::new(BTreeMap::new())),
+            active_requests: Arc::new(AtomicU64::new(0)),
+            last_activity: Arc::new(std::sync::Mutex::new(tokio::time::Instant::now())),
             upstream_override: None,
             usage_override: None,
             ok_count: Arc::new(AtomicU64::new(0)),
@@ -992,7 +1008,14 @@ impl AccountMember {
         }
     }
 
+    pub fn begin_activity(self: &Arc<Self>) -> AccountActivity {
+        self.active_requests.fetch_add(1, Ordering::Relaxed);
+        *self.last_activity.lock().unwrap_or_else(|p| p.into_inner()) = tokio::time::Instant::now();
+        AccountActivity(self.clone())
+    }
+
     pub fn record_ok(&self) {
+        *self.last_activity.lock().unwrap_or_else(|p| p.into_inner()) = tokio::time::Instant::now();
         self.ok_count.fetch_add(1, Ordering::Relaxed);
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1064,6 +1087,7 @@ impl AccountMember {
     }
 
     pub fn record_fail(&self) {
+        *self.last_activity.lock().unwrap_or_else(|p| p.into_inner()) = tokio::time::Instant::now();
         self.fail_count.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -1177,6 +1201,8 @@ impl AccountMember {
             inner: RwLock::new(self.inner.read().unwrap_or_else(|p| p.into_inner()).clone()),
             health: Arc::clone(&self.health),
             group_cooldowns: Arc::clone(&self.group_cooldowns),
+            active_requests: Arc::clone(&self.active_requests),
+            last_activity: Arc::clone(&self.last_activity),
             upstream_override: self.upstream_override.clone(),
             usage_override: self.usage_override.clone(),
             ok_count: Arc::clone(&self.ok_count),
@@ -2132,6 +2158,8 @@ pub fn load_account_members(auth_dir: &Path) -> anyhow::Result<Vec<Arc<AccountMe
                 Health::Available
             })),
             group_cooldowns: Arc::new(RwLock::new(BTreeMap::new())),
+            active_requests: Arc::new(AtomicU64::new(0)),
+            last_activity: Arc::new(std::sync::Mutex::new(tokio::time::Instant::now())),
             upstream_override,
             usage_override,
             ok_count: Arc::new(AtomicU64::new(0)),

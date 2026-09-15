@@ -65,6 +65,7 @@ fn get_preflight_deadline(headers: &HeaderMap) -> std::time::Duration {
 }
 
 struct StreamedOutcome {
+    _activity: crate::account::AccountActivity,
     state: Arc<AppState>,
     member: Arc<AccountMember>,
     credential_token: String,
@@ -1283,7 +1284,7 @@ pub fn cooldown_deadline_from_headers(headers: &reqwest::header::HeaderMap, now_
 /// Parses a Cline `INFERENCE_CAP_ERROR` 429 response:
 /// `{"error":{"code":"INFERENCE_CAP_ERROR","message":"Error 429: Daily free limit reached on model z-ai/glm-5.3-flash. Try again in 8h 48m"}}`
 /// Returns `Some((model_slug, reset_seconds))`.
-fn parse_cline_cap_error(body: &[u8]) -> Option<(String, i64)> {
+pub(crate) fn parse_cline_cap_error(body: &[u8]) -> Option<(String, i64)> {
     let value: serde_json::Value = serde_json::from_slice(body).ok()?;
     let message = value.get("error")?.get("message")?.as_str()?;
     let prefix = "Daily free limit reached on model ";
@@ -1339,7 +1340,7 @@ fn failure_is_limit_exhaustion(body: &[u8]) -> bool {
 }
 
 /// Updates the member's `AccountUsage` with a QuotaGroup bucket representing the Cline model limit.
-fn record_cline_quota_bucket(
+pub(crate) fn record_cline_quota_bucket(
     member: &AccountMember,
     model: &str,
     reset_seconds: i64,
@@ -2745,6 +2746,7 @@ pub async fn handle_relay(
             Some(m) => m.clone(),
             None => break,
         };
+        let activity = member.begin_activity();
         attempted.push(chosen_idx);
         last_attempted = Some((member.kind().as_str(), member.id().to_string()));
 
@@ -2989,6 +2991,7 @@ pub async fn handle_relay(
                     }
                     let credential_token = member.access_token();
                     let outcome = StreamedOutcome {
+                        _activity: activity,
                         state: Arc::clone(&state),
                         member: Arc::clone(&member),
                         credential_token,

@@ -155,6 +155,7 @@ impl ScopedKeyTracker {
 }
 
 pub struct AppState {
+    pub warmup: crate::warmup::WarmupRunner,
     pub router: Router,
     pub pool: Arc<arc_swap::ArcSwap<PoolSnapshot>>,
     pub runtime: Arc<UnifiedRuntimeState>,
@@ -251,6 +252,7 @@ pub(crate) fn adopt_runtime_state(target: &AccountMember, previous: &Arc<Account
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
     target.ok_count.store(previous.ok_count.load(seq), seq);
+    *target.last_activity.lock().unwrap() = *previous.last_activity.lock().unwrap();
     target.fail_count.store(previous.fail_count.load(seq), seq);
     if target.kind() == crate::account::ProviderKind::Devin
         && previous.kind() == crate::account::ProviderKind::Devin
@@ -418,6 +420,7 @@ impl AppState {
             router,
             runtime,
             catalog,
+            warmup: crate::warmup::WarmupRunner::default(),
             pool,
             models_env: config.models_env.clone(),
             http_client,
@@ -473,10 +476,15 @@ impl AppState {
             .collect();
         let members: Vec<Arc<AccountMember>> = members
             .into_iter()
-            .map(|m| match previous.get(&m.id) {
+            .map(|mut m| match previous.get(&m.id) {
                 Some(previous_member) => {
                     // fresh parse wins (new tokens/project), runtime state transfers
                     adopt_runtime_state(&m, previous_member);
+                    if m.same_credential_identity(previous_member) {
+                        let fresh = Arc::get_mut(&mut m).expect("freshly loaded account");
+                        fresh.last_activity = previous_member.last_activity.clone();
+                        fresh.active_requests = previous_member.active_requests.clone();
+                    }
                     m
                 }
                 None => m,

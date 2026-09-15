@@ -23,6 +23,7 @@ pub mod scheduler;
 pub mod scoped_keys;
 pub mod settings;
 pub mod store;
+pub mod warmup;
 
 use std::sync::Arc;
 
@@ -43,6 +44,7 @@ pub fn management_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .merge(scoped_keys::scoped_keys_routes())
         .merge(scalars::scalars_routes())
         .merge(scheduler::scheduler_routes())
+        .merge(warmup::warmup_routes())
         .layer(axum::middleware::from_fn_with_state(
             state.api_keys.clone(),
             require_api_key,
