@@ -215,6 +215,168 @@ fn default_max_retry() -> usize {
     3
 }
 
+fn default_warmup_idle_secs() -> u64 {
+    3600
+}
+
+fn default_warmup_min_interval_secs() -> u64 {
+    300
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WarmupProviderPolicy {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default = "default_warmup_idle_secs")]
+    pub idle_secs: u64,
+    #[serde(default = "default_warmup_min_interval_secs")]
+    pub min_interval_secs: u64,
+}
+
+impl Default for WarmupProviderPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model: None,
+            idle_secs: default_warmup_idle_secs(),
+            min_interval_secs: default_warmup_min_interval_secs(),
+        }
+    }
+}
+
+impl WarmupProviderPolicy {
+    pub fn validate(&self, provider: &str) -> Result<(), SettingsError> {
+        if !(1..=86400).contains(&self.idle_secs) {
+            return Err(SettingsError::InvalidWarmupPolicy(format!(
+                "provider '{provider}' idle_secs {} out of bounds (1..=86400)",
+                self.idle_secs
+            )));
+        }
+        if !(1..=604800).contains(&self.min_interval_secs) {
+            return Err(SettingsError::InvalidWarmupPolicy(format!(
+                "provider '{provider}' min_interval_secs {} out of bounds (1..=604800)",
+                self.min_interval_secs
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WarmupAccountPolicy {
+    Inherit,
+    Off,
+    Custom {
+        #[serde(default)]
+        model: Option<String>,
+        idle_secs: u64,
+        min_interval_secs: u64,
+    },
+}
+
+impl Default for WarmupAccountPolicy {
+    fn default() -> Self {
+        Self::Inherit
+    }
+}
+
+impl WarmupAccountPolicy {
+    pub fn validate(&self, account_id: &str) -> Result<(), SettingsError> {
+        match self {
+            WarmupAccountPolicy::Inherit | WarmupAccountPolicy::Off => Ok(()),
+            WarmupAccountPolicy::Custom {
+                idle_secs,
+                min_interval_secs,
+                ..
+            } => {
+                if !(1..=86400).contains(idle_secs) {
+                    return Err(SettingsError::InvalidWarmupPolicy(format!(
+                        "account '{account_id}' idle_secs {idle_secs} out of bounds (1..=86400)"
+                    )));
+                }
+                if !(1..=604800).contains(min_interval_secs) {
+                    return Err(SettingsError::InvalidWarmupPolicy(format!(
+                        "account '{account_id}' min_interval_secs {min_interval_secs} out of bounds (1..=604800)"
+                    )));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EffectiveWarmupPolicy {
+    pub enabled: bool,
+    pub model: Option<String>,
+    pub idle_secs: u64,
+    pub min_interval_secs: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WarmupSettings {
+    #[serde(default)]
+    pub providers: std::collections::BTreeMap<String, WarmupProviderPolicy>,
+    #[serde(default)]
+    pub accounts: std::collections::BTreeMap<String, WarmupAccountPolicy>,
+}
+
+impl WarmupSettings {
+    pub fn validate(&self) -> Result<(), SettingsError> {
+        for (provider, policy) in &self.providers {
+            policy.validate(provider)?;
+        }
+        for (account_id, policy) in &self.accounts {
+            policy.validate(account_id)?;
+        }
+        Ok(())
+    }
+
+    pub fn effective_provider_policy(&self, provider: &str) -> WarmupProviderPolicy {
+        self.providers.get(provider).cloned().unwrap_or_default()
+    }
+
+    pub fn effective_account_policy(
+        &self,
+        provider: &str,
+        account_id: &str,
+    ) -> EffectiveWarmupPolicy {
+        let provider_policy = self.effective_provider_policy(provider);
+        let account_policy = self
+            .accounts
+            .get(account_id)
+            .unwrap_or(&WarmupAccountPolicy::Inherit);
+
+        match account_policy {
+            WarmupAccountPolicy::Inherit => EffectiveWarmupPolicy {
+                enabled: provider_policy.enabled,
+                model: provider_policy.model,
+                idle_secs: provider_policy.idle_secs,
+                min_interval_secs: provider_policy.min_interval_secs,
+            },
+            WarmupAccountPolicy::Off => EffectiveWarmupPolicy {
+                enabled: false,
+                model: None,
+                idle_secs: provider_policy.idle_secs,
+                min_interval_secs: provider_policy.min_interval_secs,
+            },
+            WarmupAccountPolicy::Custom {
+                model,
+                idle_secs,
+                min_interval_secs,
+            } => EffectiveWarmupPolicy {
+                enabled: true,
+                model: model.clone(),
+                idle_secs: *idle_secs,
+                min_interval_secs: *min_interval_secs,
+            },
+        }
+    }
+}
+
 /// The persisted settings document, mirroring the YAML keys CLIProxyAPI uses
 /// so a `config.yaml` written by either proxy is readable by the other.
 ///
@@ -337,6 +499,8 @@ pub struct Settings {
         skip_serializing_if = "Option::is_none"
     )]
     pub model_catalog: Option<ModelCatalogSettings>,
+    #[serde(default)]
+    pub warmup: WarmupSettings,
 
     #[serde(flatten)]
     pub extra: serde_yaml::Mapping,
@@ -400,6 +564,7 @@ impl Default for Settings {
             oauth_model_alias: serde_json::Value::Null,
             oauth_request_scoped_errors: serde_json::Value::Null,
             model_catalog: None,
+            warmup: WarmupSettings::default(),
             extra: serde_yaml::Mapping::new(),
         }
     }
@@ -431,6 +596,8 @@ pub enum SettingsError {
     Validation(#[from] mahoquot_registry::RegistryError),
     #[error("invalid model-catalog setting: {0}")]
     InvalidCatalogConfig(String),
+    #[error("invalid warmup policy: {0}")]
+    InvalidWarmupPolicy(String),
 }
 
 impl Settings {
@@ -667,12 +834,17 @@ impl Settings {
         Ok(rules)
     }
 
+    pub fn validate_warmup(&self) -> Result<(), SettingsError> {
+        self.warmup.validate()
+    }
+
     /// Validate this settings document atomically against an active registry snapshot,
     /// returning the composed candidate snapshot on success.
     pub fn validate_against_registry(
         &self,
         snapshot: &mahoquot_registry::RegistrySnapshot,
     ) -> Result<mahoquot_registry::RegistrySnapshot, SettingsError> {
+        self.validate_warmup()?;
         let aliases = self.parse_model_aliases()?;
         let exclusions = self.parse_model_exclusions()?;
 

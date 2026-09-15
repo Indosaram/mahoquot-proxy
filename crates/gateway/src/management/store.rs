@@ -181,6 +181,9 @@ impl SettingsStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::settings::{
+        WarmupAccountPolicy, WarmupProviderPolicy,
+    };
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -324,5 +327,355 @@ mod tests {
         writer.join().expect("writer");
         reader.join().expect("reader");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_warmup_settings_mutate_persistence_and_reload() {
+        // given a store with default settings
+        let dir = temp_dir("warmup_roundtrip");
+        let path = dir.join("config.yaml");
+        let store = SettingsStore::load_or(path.clone(), Settings::default()).expect("loads");
+
+        // when provider and account warmup policies are mutated
+        store
+            .mutate(|s| {
+                s.warmup.providers.insert(
+                    "codex".to_string(),
+                    WarmupProviderPolicy {
+                        enabled: true,
+                        model: Some("gpt-5.6-sol".to_string()),
+                        idle_secs: 1800,
+                        min_interval_secs: 120,
+                    },
+                );
+                s.warmup.accounts.insert(
+                    "ag-acct-2".to_string(),
+                    WarmupAccountPolicy::Custom {
+                        model: Some("gemini-3.7-flash-high".to_string()),
+                        idle_secs: 1800,
+                        min_interval_secs: 120,
+                    },
+                );
+                s.warmup.accounts.insert(
+                    "codex-acct-1".to_string(),
+                    WarmupAccountPolicy::Inherit,
+                );
+                s.warmup.accounts.insert(
+                    "generic-cline-1".to_string(),
+                    WarmupAccountPolicy::Off,
+                );
+            })
+            .expect("mutates");
+
+        // then an independent store reload from disk produces exact equality
+        let reloaded = SettingsStore::load_or(path, Settings::default()).expect("reloads");
+        assert_eq!(store.current().warmup, reloaded.current().warmup);
+        assert_eq!(
+            reloaded.current().warmup.providers.get("codex"),
+            Some(&WarmupProviderPolicy {
+                enabled: true,
+                model: Some("gpt-5.6-sol".to_string()),
+                idle_secs: 1800,
+                min_interval_secs: 120,
+            })
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_warmup_concurrent_mutate_unrelated_scopes_retained() {
+        // given a store shared across concurrent writers
+        let dir = temp_dir("warmup_concurrent");
+        let path = dir.join("config.yaml");
+        let store = Arc::new(SettingsStore::load_or(path.clone(), Settings::default()).expect("loads"));
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+
+        let store1 = Arc::clone(&store);
+        let barrier1 = Arc::clone(&barrier);
+        let t1 = std::thread::spawn(move || {
+            barrier1.wait();
+            store1
+                .mutate(|s| {
+                    s.warmup.providers.insert(
+                        "codex".to_string(),
+                        WarmupProviderPolicy {
+                            enabled: true,
+                            model: Some("gpt-5.6-sol".to_string()),
+                            idle_secs: 1800,
+                            min_interval_secs: 120,
+                        },
+                    );
+                })
+                .expect("provider mutate");
+        });
+
+        let store2 = Arc::clone(&store);
+        let barrier2 = Arc::clone(&barrier);
+        let t2 = std::thread::spawn(move || {
+            barrier2.wait();
+            store2
+                .mutate(|s| {
+                    s.warmup.accounts.insert(
+                        "generic-cline-1".to_string(),
+                        WarmupAccountPolicy::Custom {
+                            model: Some("z-ai/glm-5.3-flash".to_string()),
+                            idle_secs: 7200,
+                            min_interval_secs: 600,
+                        },
+                    );
+                })
+                .expect("account mutate");
+        });
+
+        t1.join().expect("t1 join");
+        t2.join().expect("t2 join");
+
+        // then both distinct policy keys are retained in memory
+        let in_memory = store.current();
+        assert!(
+            in_memory.warmup.providers.contains_key("codex"),
+            "provider scope must be retained"
+        );
+        assert!(
+            in_memory.warmup.accounts.contains_key("generic-cline-1"),
+            "account scope must be retained"
+        );
+
+        // and an independent reload proves both distinct keys are retained on disk
+        let reloaded = SettingsStore::load_or(path, Settings::default()).expect("reloads");
+        assert_eq!(
+            reloaded.current().warmup.providers.get("codex"),
+            Some(&WarmupProviderPolicy {
+                enabled: true,
+                model: Some("gpt-5.6-sol".to_string()),
+                idle_secs: 1800,
+                min_interval_secs: 120,
+            })
+        );
+        assert_eq!(
+            reloaded.current().warmup.accounts.get("generic-cline-1"),
+            Some(&WarmupAccountPolicy::Custom {
+                model: Some("z-ai/glm-5.3-flash".to_string()),
+                idle_secs: 7200,
+                min_interval_secs: 600,
+            })
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_warmup_malformed_bounds_rejected() {
+        let dir = temp_dir("warmup_bounds");
+        let path = dir.join("config.yaml");
+        let store = SettingsStore::load_or(path.clone(), Settings::default()).expect("loads");
+
+        // provider idle_secs = 0 (too small: min 1)
+        let res = store.mutate(|s| {
+            s.warmup.providers.insert(
+                "codex".to_string(),
+                WarmupProviderPolicy {
+                    enabled: true,
+                    model: None,
+                    idle_secs: 0,
+                    min_interval_secs: 300,
+                },
+            );
+        });
+        assert!(res.is_err(), "idle_secs 0 must be rejected");
+        assert!(store.current().warmup.providers.is_empty(), "failed mutate must leave memory unchanged");
+
+        // provider idle_secs = 86401 (too large: max 86400)
+        let res = store.mutate(|s| {
+            s.warmup.providers.insert(
+                "codex".to_string(),
+                WarmupProviderPolicy {
+                    enabled: true,
+                    model: None,
+                    idle_secs: 86401,
+                    min_interval_secs: 300,
+                },
+            );
+        });
+        assert!(res.is_err(), "idle_secs 86401 must be rejected");
+
+        // provider min_interval_secs = 0 (too small: min 1)
+        let res = store.mutate(|s| {
+            s.warmup.providers.insert(
+                "codex".to_string(),
+                WarmupProviderPolicy {
+                    enabled: true,
+                    model: None,
+                    idle_secs: 3600,
+                    min_interval_secs: 0,
+                },
+            );
+        });
+        assert!(res.is_err(), "min_interval_secs 0 must be rejected");
+
+        // provider min_interval_secs = 604801 (too large: max 604800)
+        let res = store.mutate(|s| {
+            s.warmup.providers.insert(
+                "codex".to_string(),
+                WarmupProviderPolicy {
+                    enabled: true,
+                    model: None,
+                    idle_secs: 3600,
+                    min_interval_secs: 604801,
+                },
+            );
+        });
+        assert!(res.is_err(), "min_interval_secs 604801 must be rejected");
+
+        // account custom idle_secs = 0
+        let res = store.mutate(|s| {
+            s.warmup.accounts.insert(
+                "acct-1".to_string(),
+                WarmupAccountPolicy::Custom {
+                    model: None,
+                    idle_secs: 0,
+                    min_interval_secs: 300,
+                },
+            );
+        });
+        assert!(res.is_err(), "account custom idle_secs 0 must be rejected");
+
+        // account custom min_interval_secs = 0
+        let res = store.mutate(|s| {
+            s.warmup.accounts.insert(
+                "acct-1".to_string(),
+                WarmupAccountPolicy::Custom {
+                    model: None,
+                    idle_secs: 3600,
+                    min_interval_secs: 0,
+                },
+            );
+        });
+        assert!(res.is_err(), "account custom min_interval_secs 0 must be rejected");
+
+        // reload from disk confirms nothing was persisted
+        let reloaded = SettingsStore::load_or(path, Settings::default()).expect("reloads");
+        assert!(reloaded.current().warmup.providers.is_empty());
+        assert!(reloaded.current().warmup.accounts.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_warmup_defaults_automatic_off() {
+        let settings = Settings::default();
+        assert!(settings.warmup.providers.is_empty());
+        assert!(settings.warmup.accounts.is_empty());
+
+        let provider_default = WarmupProviderPolicy::default();
+        assert!(!provider_default.enabled, "default automatic must be off");
+        assert_eq!(provider_default.model, None);
+        assert_eq!(provider_default.idle_secs, 3600);
+        assert_eq!(provider_default.min_interval_secs, 300);
+
+        let account_default = WarmupAccountPolicy::default();
+        assert_eq!(account_default, WarmupAccountPolicy::Inherit);
+
+        let effective = settings.warmup.effective_account_policy("codex", "codex-acct-1");
+        assert!(!effective.enabled, "unconfigured account inherits default provider policy with enabled=false");
+        assert_eq!(effective.model, None);
+        assert_eq!(effective.idle_secs, 3600);
+        assert_eq!(effective.min_interval_secs, 300);
+    }
+
+    #[test]
+    fn test_warmup_account_custom_implicitly_enabled() {
+        let mut settings = Settings::default();
+        // provider is disabled (default)
+        settings.warmup.providers.insert(
+            "codex".to_string(),
+            WarmupProviderPolicy {
+                enabled: false,
+                model: None,
+                idle_secs: 3600,
+                min_interval_secs: 300,
+            },
+        );
+
+        // account custom is implicitly enabled even when provider is disabled
+        settings.warmup.accounts.insert(
+            "codex-acct-custom".to_string(),
+            WarmupAccountPolicy::Custom {
+                model: Some("gpt-5.6-sol".to_string()),
+                idle_secs: 1800,
+                min_interval_secs: 120,
+            },
+        );
+        let custom_effective = settings.warmup.effective_account_policy("codex", "codex-acct-custom");
+        assert!(custom_effective.enabled, "custom account policy is implicitly enabled");
+        assert_eq!(custom_effective.model, Some("gpt-5.6-sol".to_string()));
+        assert_eq!(custom_effective.idle_secs, 1800);
+        assert_eq!(custom_effective.min_interval_secs, 120);
+
+        // account custom with null model is also implicitly enabled
+        settings.warmup.accounts.insert(
+            "codex-acct-null-model".to_string(),
+            WarmupAccountPolicy::Custom {
+                model: None,
+                idle_secs: 2400,
+                min_interval_secs: 200,
+            },
+        );
+        let null_model_effective = settings.warmup.effective_account_policy("codex", "codex-acct-null-model");
+        assert!(null_model_effective.enabled, "custom account with null model is implicitly enabled");
+        assert_eq!(null_model_effective.model, None);
+        assert_eq!(null_model_effective.idle_secs, 2400);
+        assert_eq!(null_model_effective.min_interval_secs, 200);
+
+        // account off is disabled regardless of provider
+        settings.warmup.providers.get_mut("codex").unwrap().enabled = true;
+        settings.warmup.accounts.insert(
+            "codex-acct-off".to_string(),
+            WarmupAccountPolicy::Off,
+        );
+        let off_effective = settings.warmup.effective_account_policy("codex", "codex-acct-off");
+        assert!(!off_effective.enabled, "off account is disabled");
+
+        // account inherit follows provider
+        settings.warmup.accounts.insert(
+            "codex-acct-inherit".to_string(),
+            WarmupAccountPolicy::Inherit,
+        );
+        let inherit_effective = settings.warmup.effective_account_policy("codex", "codex-acct-inherit");
+        assert!(inherit_effective.enabled, "inherit follows enabled provider");
+    }
+
+    #[test]
+    fn test_warmup_custom_required_values_deserialization() {
+        // missing idle_secs and min_interval_secs in custom must fail to deserialize
+        let missing_both = serde_json::from_str::<WarmupAccountPolicy>(r#"{"type":"custom","model":null}"#);
+        assert!(missing_both.is_err(), "custom policy missing idle_secs and min_interval_secs must fail");
+
+        // missing min_interval_secs in custom must fail to deserialize
+        let missing_interval = serde_json::from_str::<WarmupAccountPolicy>(r#"{"type":"custom","idle_secs":1800}"#);
+        assert!(missing_interval.is_err(), "custom policy missing min_interval_secs must fail");
+
+        // missing idle_secs in custom must fail to deserialize
+        let missing_idle = serde_json::from_str::<WarmupAccountPolicy>(r#"{"type":"custom","min_interval_secs":120}"#);
+        assert!(missing_idle.is_err(), "custom policy missing idle_secs must fail");
+
+        // inherit and off deserialize successfully without extra fields
+        let inherit: WarmupAccountPolicy = serde_json::from_str(r#"{"type":"inherit"}"#).expect("parses inherit");
+        assert_eq!(inherit, WarmupAccountPolicy::Inherit);
+
+        let off: WarmupAccountPolicy = serde_json::from_str(r#"{"type":"off"}"#).expect("parses off");
+        assert_eq!(off, WarmupAccountPolicy::Off);
+
+        // valid custom with null model deserializes successfully
+        let valid_custom: WarmupAccountPolicy = serde_json::from_str(
+            r#"{"type":"custom","model":null,"idle_secs":1800,"min_interval_secs":120}"#
+        ).expect("parses custom with null model");
+        assert_eq!(
+            valid_custom,
+            WarmupAccountPolicy::Custom {
+                model: None,
+                idle_secs: 1800,
+                min_interval_secs: 120,
+            }
+        );
     }
 }
