@@ -1292,6 +1292,9 @@ fn parse_cline_cap_error(body: &[u8]) -> Option<(String, i64)> {
     let try_again_prefix = ". Try again in ";
     let try_pos = remainder.find(try_again_prefix)?;
     let model = remainder[..try_pos].trim().to_string();
+    if model.is_empty() {
+        return None;
+    }
     let time_str = remainder[try_pos + try_again_prefix.len()..].trim();
 
     let mut hours = 0i64;
@@ -1299,15 +1302,18 @@ fn parse_cline_cap_error(body: &[u8]) -> Option<(String, i64)> {
     for part in time_str.split_whitespace() {
         if let Some(h) = part.strip_suffix('h') {
             if let Ok(val) = h.parse::<i64>() {
-                hours = val;
+                hours = val.clamp(0, 8760);
             }
         } else if let Some(m) = part.strip_suffix('m') {
             if let Ok(val) = m.parse::<i64>() {
-                mins = val;
+                mins = val.clamp(0, 525600);
             }
         }
     }
-    let total_secs = hours * 3600 + mins * 60;
+    let total_secs = hours
+        .saturating_mul(3600)
+        .saturating_add(mins.saturating_mul(60))
+        .clamp(0, MAX_COOLDOWN_SECS);
     Some((model, if total_secs > 0 { total_secs } else { 300 }))
 }
 
@@ -1396,9 +1402,22 @@ async fn record_cooldown(
     // Retry-After is upstream-controlled: clamp so a hostile or broken value
     // cannot overflow into a past (or panicking) cooldown deadline. Read the
     // headers before the body extraction consumes the response.
-    let until_unix_ms = cooldown_deadline_from_headers(resp.headers(), now_ms);
+    let header_until_unix_ms = cooldown_deadline_from_headers(resp.headers(), now_ms);
     let failure = extract_failure(resp, status_code).await;
-    bench_exhausted_quota(member, model, until_unix_ms);
+
+    let (effective_model, until_unix_ms) = if member.provider_name() == "cline" {
+        if let Some((cap_model, reset_secs)) = parse_cline_cap_error(&failure.body) {
+            let deadline_ms = cooldown_deadline_ms(now_ms, reset_secs);
+            record_cline_quota_bucket(member, &cap_model, reset_secs, now_ms / 1000);
+            (Some(cap_model), deadline_ms)
+        } else {
+            (model.map(ToString::to_string), header_until_unix_ms)
+        }
+    } else {
+        (model.map(ToString::to_string), header_until_unix_ms)
+    };
+
+    bench_exhausted_quota(member, effective_model.as_deref().or(model), until_unix_ms);
     member.record_fail();
     state.metrics.failed_over.fetch_add(1, Ordering::Relaxed);
     if failure_is_limit_exhaustion(&failure.body) {
@@ -3045,11 +3064,6 @@ pub async fn handle_relay(
         if status_code == 429 {
             let failure =
                 record_cooldown(resp, &member, status_code, plan.model.as_deref(), &state).await;
-            if member.provider_name() == "cline" {
-                if let Some((model, reset_secs)) = parse_cline_cap_error(&failure.body) {
-                    record_cline_quota_bucket(&member, &model, reset_secs, now_unix);
-                }
-            }
             last_failure = Some(failure);
             continue;
         }
@@ -3206,6 +3220,23 @@ mod limit_exhaustion_tests {
     fn cline_daily_free_limit_body_is_limit_exhaustion() {
         let body = br#"{"error":{"code":"INFERENCE_CAP_ERROR","message":"Error 429: Daily free limit reached on model z-ai/glm-5.3-flash. Try again in 8h 48m"}}"#;
         assert!(failure_is_limit_exhaustion(body));
+    }
+
+    #[test]
+    fn cline_cap_error_parsing_safe_from_overflow() {
+        let body = br#"{"error":{"code":"INFERENCE_CAP_ERROR","message":"Error 429: Daily free limit reached on model z-ai/glm-5.3-flash. Try again in 999999999999999999h 999999999999999999m"}}"#;
+        let parsed = parse_cline_cap_error(body);
+        assert!(parsed.is_some());
+        let (model, secs) = parsed.unwrap();
+        assert_eq!(model, "z-ai/glm-5.3-flash");
+        assert!(secs > 0 && secs <= MAX_COOLDOWN_SECS);
+    }
+
+    #[test]
+    fn cline_cap_error_parsing_empty_model_rejected() {
+        let body = br#"{"error":{"code":"INFERENCE_CAP_ERROR","message":"Error 429: Daily free limit reached on model  . Try again in 8h"}}"#;
+        let parsed = parse_cline_cap_error(body);
+        assert!(parsed.is_none());
     }
 
     #[test]

@@ -909,15 +909,18 @@ impl ProviderAccount {
 ///
 /// Returns the bucket group a model bills against, or `None` for providers that
 /// meter the account as a single pool (where account-wide cooldown is correct).
-pub fn model_quota_group(kind: ProviderKind, model: &str) -> Option<&'static str> {
-    if kind != ProviderKind::Antigravity {
-        return None;
-    }
-    Some(if model.starts_with("gemini-") {
-        "gemini"
+pub fn model_quota_group<'a>(provider: &str, model: &'a str) -> Option<&'a str> {
+    if provider == "antigravity" {
+        Some(if model.starts_with("gemini-") {
+            "gemini"
+        } else {
+            "3p"
+        })
+    } else if provider == "cline" {
+        Some(model)
     } else {
-        "3p"
-    })
+        None
+    }
 }
 
 pub struct AccountMember {
@@ -991,10 +994,31 @@ impl AccountMember {
 
     pub fn record_ok(&self) {
         self.ok_count.fetch_add(1, Ordering::Relaxed);
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
+            .unwrap_or(0);
+        let mut guard = self
+            .health
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Health::Cooldown { until_unix_ms } = *guard {
+            if until_unix_ms <= now_ms {
+                *guard = Health::Available;
+            }
+        }
     }
 
     pub fn usage_snapshot(&self) -> crate::usage::AccountUsage {
-        self.usage.read().map(|u| u.clone()).unwrap_or_default()
+        let mut usage = self.usage.read().map(|u| u.clone()).unwrap_or_default();
+        if self.provider_name() == "cline" {
+            let now_unix = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            usage.expire_stale_cline_limits(now_unix);
+        }
+        usage
     }
 
     /// The static relay key for x-api-key deployments, if this is one.
@@ -1446,8 +1470,8 @@ impl AccountMember {
 
     /// The quota group `model` bills against on this account, if its provider
     /// meters model families separately.
-    pub fn quota_group_for(&self, model: &str) -> Option<&'static str> {
-        model_quota_group(self.kind(), model)
+    pub fn quota_group_for<'a>(&self, model: &'a str) -> Option<&'a str> {
+        model_quota_group(&self.provider_name(), model)
     }
 
     /// Bench only the quota group `model` belongs to, leaving the rest of the

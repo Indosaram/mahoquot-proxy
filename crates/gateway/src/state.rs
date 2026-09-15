@@ -344,7 +344,15 @@ impl AppState {
         let restored_usage = usage_state.restore();
         for member in &members {
             if let Some(snapshot) = restored_usage.get(&member.id) {
-                member.set_usage(snapshot.clone());
+                let mut usage = snapshot.clone();
+                if member.provider_name() == "cline" {
+                    let now_unix = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    usage.expire_stale_cline_limits(now_unix);
+                }
+                member.set_usage(usage);
             }
         }
 
@@ -660,15 +668,23 @@ impl AppState {
             .map(|m| {
                 let health = m.health();
                 let (input_tokens, output_tokens) = self.telemetry.account_tokens(&m.id);
-                let reset_at_unix_ms = match health {
-                    Health::Cooldown { until_unix_ms } => Some(until_unix_ms),
-                    _ => None,
+                let (effective_health, reset_at_unix_ms) = match health {
+                    Health::Cooldown { until_unix_ms } if until_unix_ms <= now_ms => {
+                        (crate::metrics::HealthStats::Available, None)
+                    }
+                    Health::Cooldown { until_unix_ms } => (
+                        crate::metrics::HealthStats::Cooldown { until_unix_ms },
+                        Some(until_unix_ms),
+                    ),
+                    Health::Available => (crate::metrics::HealthStats::Available, None),
+                    Health::AuthFailed => (crate::metrics::HealthStats::AuthFailed, None),
+                    Health::Disabled => (crate::metrics::HealthStats::Disabled, None),
                 };
                 crate::metrics::AccountStats {
                     id: m.id.clone(),
                     provider: m.provider_name(),
                     plan: m.relay_plan(),
-                    health: health.into(),
+                    health: effective_health,
                     ok: m.ok_count.load(Ordering::Relaxed),
                     fails: m.fail_count.load(Ordering::Relaxed),
                     input_tokens,

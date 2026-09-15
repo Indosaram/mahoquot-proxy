@@ -96,6 +96,24 @@ pub struct AccountUsage {
 }
 
 impl AccountUsage {
+    /// Inferred Cline free limits exist only while their daily 429 cap is active.
+    /// Once the reset deadline lapses, the inferred 100% quota has expired and
+    /// becomes unknown (`used_percent: None`), never fabricated zero.
+    /// If an account has other model buckets whose reset deadline is still in the
+    /// future, those active buckets remain intact.
+    pub fn expire_stale_cline_limits(&mut self, now_unix: i64) {
+        for group in &mut self.groups {
+            if group.display_name.as_deref() == Some("Cline Free Limits") {
+                for bucket in &mut group.buckets {
+                    if bucket.reset_at_unix.is_some_and(|reset| reset <= now_unix) {
+                        bucket.used_percent = None;
+                        bucket.reset_at_unix = None;
+                    }
+                }
+            }
+        }
+    }
+
     pub fn is_known(&self) -> bool {
         self.observed_at_unix.is_some()
     }
