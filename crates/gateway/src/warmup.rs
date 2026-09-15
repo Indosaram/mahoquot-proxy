@@ -135,23 +135,107 @@ fn eligibility(state: &AppState, m: &AccountMember, model: &str) -> Option<&'sta
     }
     None
 }
+/// Check whether the account's quota reset window for `model` is currently active (ticking down).
+/// Returns `(is_active, reset_at_unix)`.
+pub fn is_quota_window_active(m: &AccountMember, model: &str, now_unix: i64) -> (bool, Option<i64>) {
+    let usage = m.usage_snapshot();
+    let provider = m.provider_name();
+    if provider == "antigravity" {
+        let group_id = m.quota_group_for(model).unwrap_or("gemini");
+        for g in &usage.groups {
+            for b in &g.buckets {
+                let is_matching_bucket = b
+                    .bucket_id
+                    .as_deref()
+                    .is_some_and(|id| id.starts_with(group_id))
+                    || b.display_name
+                        .as_deref()
+                        .is_some_and(|name| name.to_ascii_lowercase().contains(group_id));
+                let is_session_window = b.window.as_deref() == Some("5h")
+                    || b.bucket_id.as_deref().is_some_and(|id| id.contains("5h"));
+                if is_matching_bucket && is_session_window {
+                    let reset_at = b.reset_at_unix.unwrap_or(0);
+                    let used = b.used_percent.unwrap_or(0.0);
+                    if reset_at > now_unix && used > 0.0 {
+                        return (true, Some(reset_at));
+                    }
+                }
+            }
+        }
+        (false, None)
+    } else if provider == "codex" {
+        let reset_at = usage.primary.reset_at_unix.unwrap_or(0);
+        let used = usage.primary.used_percent.unwrap_or(0.0);
+        if reset_at > now_unix && used > 0.0 {
+            (true, Some(reset_at))
+        } else {
+            (false, None)
+        }
+    } else if provider == "cline" {
+        let group = m.quota_group_for(model).unwrap_or(model);
+        if let Some(until) = m
+            .group_cooldowns
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(group)
+        {
+            if *until > now_unix * 1000 {
+                return (true, Some(*until / 1000));
+            }
+        }
+        for g in &usage.groups {
+            for b in &g.buckets {
+                if b.bucket_id.as_deref() == Some(model) {
+                    let reset_at = b.reset_at_unix.unwrap_or(0);
+                    let used = b.used_percent.unwrap_or(0.0);
+                    if reset_at > now_unix && used > 0.0 {
+                        return (true, Some(reset_at));
+                    }
+                }
+            }
+        }
+        (false, None)
+    } else {
+        let reset_at = usage.primary.reset_at_unix.unwrap_or(0);
+        let used = usage.primary.used_percent.unwrap_or(0.0);
+        if reset_at > now_unix && used > 0.0 {
+            (true, Some(reset_at))
+        } else {
+            (false, None)
+        }
+    }
+}
 fn due(state: &AppState, m: &AccountMember) -> bool {
     due_at(state, m, tokio::time::Instant::now())
 }
 fn due_at(state: &AppState, m: &AccountMember, time: tokio::time::Instant) -> bool {
     let p = policy(state, m);
-    p.enabled
-        && m.active_requests.load(std::sync::atomic::Ordering::Relaxed) == 0
-        && time.duration_since(*m.last_activity.lock().unwrap_or_else(|p| p.into_inner()))
-            >= Duration::from_secs(p.idle_secs)
-        && state
-            .warmup
-            .history
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(&m.id)
-            .map(|(at, _, _)| time.duration_since(*at) >= Duration::from_secs(p.min_interval_secs))
-            .unwrap_or(true)
+    if !p.enabled {
+        return false;
+    }
+    if m.active_requests.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+        return false;
+    }
+    let models = available_models(state, m);
+    let selected = p.model.as_ref().or_else(|| models.first());
+    let Some(model) = selected.filter(|s| models.contains(s)) else {
+        return false;
+    };
+    if eligibility(state, m, model).is_some() {
+        return false;
+    }
+    let recent = state
+        .warmup
+        .history
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&m.id)
+        .is_some_and(|(at, _, _)| time.duration_since(*at) < Duration::from_secs(60));
+    if recent {
+        return false;
+    }
+    let (window_active, _) = is_quota_window_active(m, model, now());
+    !window_active
 }
 type WarmupRequest = (String, Value, Vec<(String, String)>);
 fn warmup_request(m: &AccountMember, model: &str) -> Option<WarmupRequest> {
@@ -429,6 +513,13 @@ async fn execute(state: &Arc<AppState>, id: &str, automatic: bool) -> WarmupResu
     {
         record.2 = Some(out.clone());
     }
+    if out.ok {
+        let state_clone = state.clone();
+        let m_clone = m.clone();
+        tokio::spawn(async move {
+            let _ = crate::quota::refresh_account_usage(&state_clone, &m_clone).await;
+        });
+    }
     out
 }
 async fn run(state: &Arc<AppState>, m: &Arc<AccountMember>, automatic: bool) -> WarmupResult {
@@ -500,16 +591,24 @@ pub fn spawn_warmup_loop(state: Arc<AppState>, every: Duration) -> tokio::task::
 }
 pub fn status(state: &AppState) -> Value {
     let mut accounts = serde_json::Map::new();
+    let current_now = now();
     for m in &state.pool.load().members {
         let p = policy(state, m);
         let models = available_models(state, m);
         let model = p.model.as_ref().or_else(|| models.first());
+        let (window_active, reset_at) = model
+            .map(|m_name| is_quota_window_active(m, m_name, current_now))
+            .unwrap_or((false, None));
         let skip = if !supported(m) {
             Some("unsupported")
         } else if !model.is_some_and(|m| models.contains(m)) {
             Some("model_unavailable")
+        } else if let Some(reason) = eligibility(state, m, model.unwrap()) {
+            Some(reason)
+        } else if window_active {
+            Some("window_active")
         } else {
-            eligibility(state, m, model.unwrap())
+            None
         };
         let history = state
             .warmup
@@ -517,24 +616,39 @@ pub fn status(state: &AppState) -> Value {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         let last = history.get(&m.id);
-        let idle_remaining = p.idle_secs.saturating_sub(
-            m.last_activity
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .elapsed()
-                .as_secs(),
-        );
-        let interval_remaining = last
-            .map(|(at, _, _)| p.min_interval_secs.saturating_sub(at.elapsed().as_secs()))
-            .unwrap_or(0);
+        let next_due = if p.enabled {
+            if skip == Some("window_active") {
+                reset_at
+            } else if skip.is_none() {
+                Some(current_now)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let source = match state.settings.current().warmup.accounts.get(&m.id) {
             Some(crate::management::settings::WarmupAccountPolicy::Custom { .. }) => "custom",
             Some(crate::management::settings::WarmupAccountPolicy::Off) => "off",
             _ => "inherit",
         };
-        accounts.insert(m.id.clone(),json!({"source":source,"effective":p,"capability":if supported(m){"supported"}else{"unsupported"},"available_models":models,"last_result":last.and_then(|(_,_,r)|r.as_ref()),"last_attempt_at":last.map(|(_,at,_)|at),"next_due_at":if p.enabled && skip.is_none() {Some(now()+idle_remaining.max(interval_remaining) as i64)}else{None},"skip_reason":skip}));
+        accounts.insert(
+            m.id.clone(),
+            json!({
+                "source": source,
+                "effective": p,
+                "capability": if supported(m) { "supported" } else { "unsupported" },
+                "available_models": models,
+                "last_result": last.and_then(|(_, _, r)| r.as_ref()),
+                "last_attempt_at": last.map(|(_, at, _)| at),
+                "next_due_at": next_due,
+                "window_active": window_active,
+                "window_reset_at": reset_at,
+                "skip_reason": skip
+            }),
+        );
     }
-    json!({"accounts":accounts})
+    json!({ "accounts": accounts })
 }
 #[cfg(test)]
 mod tests {
@@ -595,7 +709,10 @@ mod tests {
             .unwrap(),
         );
         let member = Arc::new(AccountMember::for_test(ProviderAccount::Codex(
-            mahoquot_providers::CodexAccount::default(),
+            mahoquot_providers::CodexAccount {
+                access_token: "mock".into(),
+                ..Default::default()
+            },
         )));
         assert!(!due(&state, &member));
         let ag = AccountMember::for_test(ProviderAccount::Antigravity(
@@ -640,20 +757,38 @@ mod tests {
                 );
             })
             .unwrap();
-        assert!(!due(&state, &member));
+        // Window is inactive (unprimed) -> due_at is true
         let start = tokio::time::Instant::now();
-        *member.last_activity.lock().unwrap() = start;
-        assert!(!due_at(&state, &member, start + Duration::from_secs(9)));
-        assert!(due_at(&state, &member, start + Duration::from_secs(10)));
+        assert!(due_at(&state, &member, start));
+
+        // When a probe was attempted very recently (< 60s), due_at is false to avoid spam
         state.warmup.history.lock().unwrap().insert(
             member.id.clone(),
             (start, now(), Some(result(&member, "failed"))),
         );
-        assert!(!due_at(&state, &member, start + Duration::from_secs(19)));
-        assert!(due_at(&state, &member, start + Duration::from_secs(20)));
+        assert!(!due_at(&state, &member, start + Duration::from_secs(10)));
+        assert!(due_at(&state, &member, start + Duration::from_secs(61)));
+
+        // Active request in flight -> not due
         let activity = member.begin_activity();
-        assert!(!due_at(&state, &member, start + Duration::from_secs(20)));
+        assert!(!due_at(&state, &member, start + Duration::from_secs(61)));
         drop(activity);
+
+        // When window is active (ticking down) -> not due, and is_quota_window_active reports true
+        member.set_usage(crate::usage::AccountUsage {
+            primary: crate::usage::QuotaWindow {
+                reset_at_unix: Some(now() + 18000),
+                used_percent: Some(1.0),
+                window_minutes: Some(300),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        assert!(!due_at(&state, &member, start + Duration::from_secs(61)));
+        let (active, reset_at) = is_quota_window_active(&member, "gpt-5.6-sol", now());
+        assert_eq!(active, true);
+        assert_eq!(reset_at, Some(now() + 18000));
+
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
@@ -671,5 +806,64 @@ mod tests {
             "antigravity"
         ));
         assert!(validate(b"data: {\"choices\":[{\"delta\":{\"content\":\"x\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n","cline"));
+    }
+    #[test]
+    fn antigravity_window_priming_group_isolation() {
+        let ag = AccountMember::for_test(ProviderAccount::Antigravity(
+            mahoquot_providers::AntigravityAccount {
+                access_token: "mock".into(),
+                ..Default::default()
+            },
+        ));
+        let current = now();
+        // Initially empty usage -> inactive, ready to prime
+        let (active_gemini, _) = is_quota_window_active(&ag, "gemini-3.7-flash-high", current);
+        let (active_claude, _) = is_quota_window_active(&ag, "claude-3-5-sonnet", current);
+        assert!(!active_gemini);
+        assert!(!active_claude);
+
+        // Gemini 5h window is active (counting down to reset in 5 hours)
+        // while Claude/3p window is untouched (0% consumed)
+        ag.set_usage(crate::usage::AccountUsage {
+            groups: vec![
+                crate::usage::QuotaGroup {
+                    display_name: Some("Gemini Models".into()),
+                    models: None,
+                    buckets: vec![
+                        crate::usage::QuotaBucket {
+                            bucket_id: Some("gemini-5h".into()),
+                            display_name: Some("Five Hour Limit".into()),
+                            window: Some("5h".into()),
+                            used_percent: Some(15.0),
+                            reset_at_unix: Some(current + 18000),
+                        },
+                    ],
+                },
+                crate::usage::QuotaGroup {
+                    display_name: Some("Claude and GPT models".into()),
+                    models: None,
+                    buckets: vec![
+                        crate::usage::QuotaBucket {
+                            bucket_id: Some("3p-5h".into()),
+                            display_name: Some("Five Hour Limit".into()),
+                            window: Some("5h".into()),
+                            used_percent: Some(0.0),
+                            reset_at_unix: Some(current - 100), // past reset
+                        },
+                    ],
+                },
+            ],
+            ..Default::default()
+        });
+
+        // Gemini window is recognized as active
+        let (active_gemini, reset_gemini) = is_quota_window_active(&ag, "gemini-3.7-flash-high", current);
+        assert!(active_gemini);
+        assert_eq!(reset_gemini, Some(current + 18000));
+
+        // Claude window is recognized as inactive (can be primed separately!)
+        let (active_claude, reset_claude) = is_quota_window_active(&ag, "claude-3-5-sonnet", current);
+        assert!(!active_claude);
+        assert_eq!(reset_claude, None);
     }
 }
