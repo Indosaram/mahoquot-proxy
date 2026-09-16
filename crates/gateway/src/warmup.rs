@@ -155,8 +155,7 @@ pub fn is_quota_window_active(m: &AccountMember, model: &str, now_unix: i64) -> 
                     || b.bucket_id.as_deref().is_some_and(|id| id.contains("5h"));
                 if is_matching_bucket && is_session_window {
                     let reset_at = b.reset_at_unix.unwrap_or(0);
-                    let used = b.used_percent.unwrap_or(0.0);
-                    if reset_at > now_unix && used > 0.0 {
+                    if reset_at > now_unix {
                         return (true, Some(reset_at));
                     }
                 }
@@ -165,8 +164,7 @@ pub fn is_quota_window_active(m: &AccountMember, model: &str, now_unix: i64) -> 
         (false, None)
     } else if provider == "codex" {
         let reset_at = usage.primary.reset_at_unix.unwrap_or(0);
-        let used = usage.primary.used_percent.unwrap_or(0.0);
-        if reset_at > now_unix && used > 0.0 {
+        if reset_at > now_unix {
             (true, Some(reset_at))
         } else {
             (false, None)
@@ -187,8 +185,7 @@ pub fn is_quota_window_active(m: &AccountMember, model: &str, now_unix: i64) -> 
             for b in &g.buckets {
                 if b.bucket_id.as_deref() == Some(model) {
                     let reset_at = b.reset_at_unix.unwrap_or(0);
-                    let used = b.used_percent.unwrap_or(0.0);
-                    if reset_at > now_unix && used > 0.0 {
+                    if reset_at > now_unix {
                         return (true, Some(reset_at));
                     }
                 }
@@ -197,13 +194,40 @@ pub fn is_quota_window_active(m: &AccountMember, model: &str, now_unix: i64) -> 
         (false, None)
     } else {
         let reset_at = usage.primary.reset_at_unix.unwrap_or(0);
-        let used = usage.primary.used_percent.unwrap_or(0.0);
-        if reset_at > now_unix && used > 0.0 {
+        if reset_at > now_unix {
             (true, Some(reset_at))
         } else {
             (false, None)
         }
     }
+}
+pub fn resolve_window_state(
+    state: &AppState,
+    m: &AccountMember,
+    model: &str,
+    now_unix: i64,
+) -> (bool, Option<i64>) {
+    let (active, reset_at) = is_quota_window_active(m, model, now_unix);
+    if active {
+        return (true, reset_at);
+    }
+    // If upstream does not report a live quota reset timestamp (e.g. Cline or unpolled providers),
+    // but a warmup probe succeeded recently, recognize the account as primed for 5 hours (18,000s).
+    let history = state
+        .warmup
+        .history
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if let Some((_, attempt_unix, Some(res))) = history.get(&m.id) {
+        if res.ok {
+            let window_duration = 5 * 3600; // 5-hour sliding window
+            let expiry = attempt_unix + window_duration;
+            if expiry > now_unix {
+                return (true, Some(expiry));
+            }
+        }
+    }
+    (false, None)
 }
 fn due(state: &AppState, m: &AccountMember) -> bool {
     due_at(state, m, tokio::time::Instant::now())
@@ -234,7 +258,7 @@ fn due_at(state: &AppState, m: &AccountMember, time: tokio::time::Instant) -> bo
     if recent {
         return false;
     }
-    let (window_active, _) = is_quota_window_active(m, model, now());
+    let (window_active, _) = resolve_window_state(state, m, model, now());
     !window_active
 }
 type WarmupRequest = (String, Value, Vec<(String, String)>);
@@ -598,7 +622,7 @@ pub fn status(state: &AppState) -> Value {
         let models = available_models(state, m);
         let model = p.model.as_ref().or_else(|| models.first());
         let (window_active, reset_at) = model
-            .map(|m_name| is_quota_window_active(m, m_name, current_now))
+            .map(|m_name| resolve_window_state(state, m, m_name, current_now))
             .unwrap_or((false, None));
         let skip = if !supported(m) {
             Some("unsupported")
