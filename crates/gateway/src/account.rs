@@ -1531,6 +1531,19 @@ impl AccountMember {
         guard.get(group).is_none_or(|until| *until <= now_unix_ms)
     }
 
+    /// The benched-group reset (unix secs) for `model`, when this account's
+    /// provider meters it in a currently-benched group. Mirrors
+    /// `group_available`'s group resolution so exhaustion ETAs and routability
+    /// agree on the same deadline.
+    pub fn group_reset_at_unix(&self, model: &str) -> Option<i64> {
+        let group = self.quota_group_for(model)?;
+        let guard = self
+            .group_cooldowns
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.get(group).map(|until_ms| until_ms / 1000)
+    }
+
     pub fn is_expired(&self, now_unix: i64) -> bool {
         let guard = self
             .inner

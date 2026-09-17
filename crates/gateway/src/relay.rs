@@ -1483,6 +1483,94 @@ fn body_response(status: StatusCode, content_type: Option<&str>, body: Bytes) ->
         .unwrap_or_else(|_| (status, "error").into_response())
 }
 
+/// Human ETA in the same `13h 21m` shape upstream reports.
+fn format_reset_eta(total_secs: u64) -> String {
+    let hours = total_secs / 3600;
+    let mins = (total_secs % 3600) / 60;
+    if hours > 0 {
+        format!("{hours}h {mins}m")
+    } else {
+        format!("{mins}m")
+    }
+}
+
+/// Earliest future reset (unix secs) across the pool for `canonical_model`:
+/// per-quota-group benches first, then account-wide cooldowns. Returns None
+/// when no benched deadline lies ahead.
+fn earliest_exhaustion_reset_unix_secs(
+    pool: &crate::state::PoolSnapshot,
+    canonical_model: Option<&str>,
+) -> Option<i64> {
+    let now = now_unix_secs();
+    let mut earliest: Option<i64> = None;
+    for member in &pool.members {
+        for reset in [
+            canonical_model.and_then(|model| member.group_reset_at_unix(model)),
+            member.reset_at_unix(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if reset > now {
+                earliest = Some(earliest.map_or(reset, |current| current.min(reset)));
+            }
+        }
+    }
+    earliest
+}
+
+/// The 503 a client receives when every account that can serve the model is
+/// benched on the same hard cap: carries Retry-After and the earliest reset
+/// so agents can fall back immediately and retry on schedule.
+fn exhaustion_failure_response(
+    pool: &crate::state::PoolSnapshot,
+    canonical_model: Option<&str>,
+) -> Response {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or(0);
+    let retry_after_secs = earliest_exhaustion_reset_unix_secs(pool, canonical_model)
+        .map(|until_secs| ((until_secs * 1000 - now_ms) / 1000).max(0) as u64);
+    let positive_retry_after = retry_after_secs.filter(|secs| *secs > 0);
+    let eta = positive_retry_after.map(format_reset_eta);
+    let model_text = canonical_model.unwrap_or("the requested model");
+    let message = match eta {
+        Some(eta) => format!(
+            "all pool accounts are daily-exhausted for model '{model_text}'; earliest known quota reset in {eta}"
+        ),
+        None => format!(
+            "all pool accounts are daily-exhausted for model '{model_text}'"
+        ),
+    };
+    let payload = serde_json::json!({
+        "type": "error",
+        "error": {
+            "message": message,
+            "type": "quota_exhausted",
+            "code": "MODEL_QUOTA_EXHAUSTED",
+            "retry_after_seconds": retry_after_secs,
+        }
+    });
+    let mut builder = Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .header(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    if let Some(secs) = positive_retry_after {
+        if let Ok(value) = HeaderValue::from_str(&secs.to_string()) {
+            builder = builder.header(header::RETRY_AFTER, value);
+        }
+    }
+    builder
+        .body(Body::from(payload.to_string()))
+        .unwrap_or_else(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "all pool accounts are daily-exhausted",
+            )
+                .into_response()
+        })
+}
+
 fn json_error(status: StatusCode, message: &str) -> Response {
     let payload = serde_json::json!({
         "type": "error",
@@ -2737,7 +2825,16 @@ pub async fn handle_relay(
     // router to the failing one.
     let mut attempted: Vec<usize> = Vec::new();
 
-    for _ in 0..max_attempts {
+    // Limit-exhaustion 429s (daily model caps) bench the account for hours,
+    // so the same account can never repeat: walking the remaining pool is
+    // safe and must not consume the failover budget, which stays reserved
+    // for failures that CAN repeat on another account (5xx, transport,
+    // plain rate limits). The loop bound is the pool walk itself.
+    let mut failover_budget = 0usize;
+    for _ in 0..eligible.len() {
+        if failover_budget >= max_attempts {
+            break;
+        }
         let chosen_idx = match select_index(&state, &pool, &hint, &eligible, &attempted) {
             Some(idx) => idx,
             None => break,
@@ -2777,6 +2874,7 @@ pub async fn handle_relay(
                     }
                     member.record_fail();
                     state.metrics.failed_over.fetch_add(1, Ordering::Relaxed);
+                    failover_budget += 1;
                     continue;
                 }
             }
@@ -2830,6 +2928,7 @@ pub async fn handle_relay(
                         &format!("ambiguous upstream request error: {e}"),
                     );
                 }
+                failover_budget += 1;
                 continue;
             }
         };
@@ -2869,6 +2968,7 @@ pub async fn handle_relay(
                                 502,
                                 &format!("retry error: {e}"),
                             );
+                            failover_budget += 1;
                             continue;
                         }
                     }
@@ -2890,6 +2990,7 @@ pub async fn handle_relay(
                     }
                     member.record_fail();
                     state.metrics.failed_over.fetch_add(1, Ordering::Relaxed);
+                    failover_budget += 1;
                     last_failure = Some(extract_failure(resp, status_code).await);
                     continue;
                 }
@@ -3059,6 +3160,7 @@ pub async fn handle_relay(
                     {
                         break;
                     }
+                    failover_budget += 1;
                     continue;
                 }
             }
@@ -3067,6 +3169,13 @@ pub async fn handle_relay(
         if status_code == 429 {
             let failure =
                 record_cooldown(resp, &member, status_code, plan.model.as_deref(), &state).await;
+            // A limit-exhaustion 429 durably benches this account (hours, per
+            // the upstream reset), so it cannot repeat here: keep walking the
+            // pool without spending the failover budget. Any other 429 stays
+            // budgeted — it may be a shared limiter that every account hits.
+            if !failure_is_limit_exhaustion(&failure.body) {
+                failover_budget += 1;
+            }
             last_failure = Some(failure);
             continue;
         }
@@ -3084,6 +3193,7 @@ pub async fn handle_relay(
                 .monitor
                 .record_error(member.id(), status_code, "upstream server error");
             last_failure = Some(extract_failure(resp, status_code).await);
+            failover_budget += 1;
             continue;
         }
 
@@ -3106,6 +3216,7 @@ pub async fn handle_relay(
                     "model not supported by account",
                 );
                 last_failure = Some(failure);
+                failover_budget += 1;
                 continue;
             }
         }
@@ -3120,6 +3231,7 @@ pub async fn handle_relay(
                 .monitor
                 .record_error(member.id(), status_code, "forbidden denial");
             last_failure = Some(failure);
+            failover_budget += 1;
             continue;
         }
 
@@ -3133,6 +3245,7 @@ pub async fn handle_relay(
                 .monitor
                 .record_error(member.id(), status_code, "auth failed");
             last_failure = Some(failure);
+            failover_budget += 1;
             continue;
         }
 
@@ -3177,6 +3290,17 @@ pub async fn handle_relay(
         .unwrap_or((None, None));
 
     let response = match last_failure {
+        Some(final_fail) if failure_is_limit_exhaustion(&final_fail.body) => {
+            // Every eligible account was tried and durably benched on the
+            // same model cap. Hand the client a deterministic 503 with the
+            // earliest known reset instead of the last upstream 429 body, so
+            // agents can fall back immediately and retry on schedule.
+            let canonical_model = route
+                .as_ref()
+                .map(|r| r.canonical_model.as_str())
+                .or(plan.model.as_deref());
+            exhaustion_failure_response(&pool, canonical_model)
+        }
         Some(final_fail) => body_response(
             final_fail.status,
             final_fail.content_type.as_deref(),

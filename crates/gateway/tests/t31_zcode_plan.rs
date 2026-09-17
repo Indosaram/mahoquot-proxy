@@ -252,14 +252,12 @@ async fn zcode_plan_biz_error_inside_200_maps_to_429() {
     let gateway = spawn_gateway(&temp_dir).await;
 
     let response = send_messages(&gateway, "glm-5.3-flash").await;
-    assert_eq!(response.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+    // The in-200 biz 1005 maps to a 429 and benches the account; with the
+    // pool exhausted the client sees the deterministic 503 instead.
+    assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
     let payload: Value = response.json().await.unwrap();
-    assert_eq!(payload["error"]["type"], "rate_limit_error");
-    assert_eq!(payload["error"]["code"], 1005);
-    assert!(payload["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("1005"));
+    assert_eq!(payload["error"]["type"], "quota_exhausted");
+    assert_eq!(payload["error"]["code"], "MODEL_QUOTA_EXHAUSTED");
 
     std::fs::remove_dir_all(temp_dir).ok();
 }

@@ -334,8 +334,13 @@ async fn test_t3_limit_exhaustion_429_records_no_account_error() {
         .send()
         .await
         .unwrap();
-    assert_eq!(res.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
-    res.bytes().await.unwrap();
+    // The pool is exhausted, so the client gets a deterministic 503 with the
+    // earliest known reset — the raw upstream 429 body must not leak.
+    assert_eq!(res.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert!(res.headers().get("retry-after").is_some());
+    let payload: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(payload["error"]["type"], "quota_exhausted");
+    assert_eq!(payload["error"]["code"], "MODEL_QUOTA_EXHAUSTED");
 
     // Then: the account is benched but carries NO error banner
     let acct_a = state.find_member("a").expect("member a exists");
@@ -818,6 +823,271 @@ async fn server_error_failover_keeps_health_and_moves_to_the_next_account() {
         "5xx must leave health unchanged, was {:?}",
         acct_a.health()
     );
+
+    drop(client);
+    for shutdown in shutdowns {
+        shutdown.send(()).unwrap();
+    }
+    for server in servers {
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    drop(state);
+    std::fs::remove_dir_all(&temp_dir).unwrap();
+}
+
+#[tokio::test]
+async fn test_t3_limit_exhaustion_walks_pool_beyond_max_failover() {
+    let mut servers = Vec::new();
+    let mut shutdowns = Vec::new();
+    // Given: three accounts whose upstreams answer a cline daily-cap 429 and
+    // one healthy account — with max_failover only 2.
+    let mut cap_urls: Vec<String> = Vec::new();
+    for _ in 0..3 {
+        let listener = bind_fixture_listener().await;
+        let port = listener.local_addr().unwrap().port();
+        cap_urls.push(format!("http://127.0.0.1:{port}"));
+        let app = Router::new().route(
+            common::CODEX_PATH,
+            post(|| async {
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [("Retry-After", "300")],
+                    "{\"error\":{\"code\":\"INFERENCE_CAP_ERROR\",\"message\":\"Error 429: Daily free limit reached on model z-ai/glm-5.3-flash. Try again in 8h 48m\"}}",
+                )
+            }),
+        );
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        shutdowns.push(shutdown);
+        servers.push(tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    stopped.await.unwrap();
+                })
+                .await
+                .unwrap();
+        }));
+    }
+    let ok_listener = bind_fixture_listener().await;
+    let ok_port = ok_listener.local_addr().unwrap().port();
+    let sse_body = common::codex_sse("ok");
+    let app_ok = Router::new().route(
+        common::CODEX_PATH,
+        post(move || {
+            let sse_body = sse_body.clone();
+            async move {
+                (
+                    StatusCode::OK,
+                    [("Content-Type", "text/event-stream")],
+                    sse_body,
+                )
+            }
+        }),
+    );
+    let (shutdown, stopped) = tokio::sync::oneshot::channel();
+    shutdowns.push(shutdown);
+    servers.push(tokio::spawn(async move {
+        axum::serve(ok_listener, app_ok)
+            .with_graceful_shutdown(async {
+                stopped.await.unwrap();
+            })
+            .await
+            .unwrap();
+    }));
+
+    let temp_dir = unique_temp_dir("qgw-test-t3walk");
+    for (index, url) in cap_urls.iter().enumerate() {
+        let id = format!("w{index}");
+        let json = create_auth_file_json(
+            &id,
+            &format!("acc_{id}"),
+            &format!("token_{id}"),
+            Some(url),
+        );
+        std::fs::write(temp_dir.join(format!("codex-{id}-plus.json")), json).unwrap();
+    }
+    let ok_json = create_auth_file_json(
+        "wok",
+        "acc_wok",
+        "token_wok",
+        Some(&format!("http://127.0.0.1:{ok_port}")),
+    );
+    std::fs::write(temp_dir.join("codex-wok-plus.json"), ok_json).unwrap();
+
+    let config = GatewayConfig {
+        usage_poll_secs: 120,
+        port: 0,
+        auth_dir: temp_dir.clone(),
+        config_path: temp_dir.join("config.yaml"),
+        strategy: Strategy::FillFirst,
+        max_failover: 2,
+        log_level: "info".to_string(),
+        api_keys: mahoquot_gateway::inbound::ApiKeys::default(),
+        models_env: None,
+        refresh_url: mahoquot_providers::refresh::REFRESH_TOKEN_URL.to_string(),
+        auth_refresh_enabled: true,
+        ..Default::default()
+    };
+
+    let state = Arc::new(AppState::new(&config).unwrap());
+    let app = create_app(state.clone());
+    let gw_listener = bind_fixture_listener().await;
+    let gw_port = gw_listener.local_addr().unwrap().port();
+    let (shutdown, stopped) = tokio::sync::oneshot::channel();
+    shutdowns.push(shutdown);
+    servers.push(tokio::spawn(async move {
+        axum::serve(gw_listener, app)
+            .with_graceful_shutdown(async {
+                stopped.await.unwrap();
+            })
+            .await
+            .unwrap();
+    }));
+
+    let client = reqwest::Client::new();
+    let gw_url = format!("http://127.0.0.1:{gw_port}/v1/chat/completions");
+
+    // When: one request walks the pool
+    let res = client
+        .post(&gw_url)
+        .header("Content-Type", "application/json")
+        .body(common::OPENAI_REQUEST)
+        .send()
+        .await
+        .unwrap();
+
+    // Then: exhaustion 429s must not consume the failover budget — the
+    // request rides past the budget cap onto the healthy account.
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    assert!(res.text().await.unwrap().contains("data: [DONE]"));
+    for index in 0..3 {
+        let id = format!("w{index}");
+        let member = state.find_member(&id).expect("capped member exists");
+        assert!(
+            matches!(member.health(), Health::Cooldown { .. }),
+            "{id} must be benched, was {:?}",
+            member.health()
+        );
+    }
+
+    drop(client);
+    for shutdown in shutdowns {
+        shutdown.send(()).unwrap();
+    }
+    for server in servers {
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    drop(state);
+    std::fs::remove_dir_all(&temp_dir).unwrap();
+}
+
+#[tokio::test]
+async fn test_t3_plain_429_budget_still_caps_pool_walk() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let mut servers = Vec::new();
+    let mut shutdowns = Vec::new();
+    // Given: three accounts whose upstreams always answer a PLAIN 429 (no
+    // exhaustion signature) and max_failover = 2.
+    let mut counts: Vec<Arc<AtomicUsize>> = Vec::new();
+    let mut plain_urls: Vec<String> = Vec::new();
+    for _ in 0..3 {
+        let listener = bind_fixture_listener().await;
+        let port = listener.local_addr().unwrap().port();
+        plain_urls.push(format!("http://127.0.0.1:{port}"));
+        let count = Arc::new(AtomicUsize::new(0));
+        counts.push(count.clone());
+        let app = Router::new().route(
+            common::CODEX_PATH,
+            post(move || {
+                let count = count.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        [("Retry-After", "300")],
+                        "{\"error\":\"rate limited\"}",
+                    )
+                }
+            }),
+        );
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        shutdowns.push(shutdown);
+        servers.push(tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    stopped.await.unwrap();
+                })
+                .await
+                .unwrap();
+        }));
+    }
+
+    let temp_dir = unique_temp_dir("qgw-test-t3budget");
+    for (index, url) in plain_urls.iter().enumerate() {
+        let id = format!("p{index}");
+        let json = create_auth_file_json(
+            &id,
+            &format!("acc_{id}"),
+            &format!("token_{id}"),
+            Some(url),
+        );
+        std::fs::write(temp_dir.join(format!("codex-{id}-plus.json")), json).unwrap();
+    }
+
+    let config = GatewayConfig {
+        usage_poll_secs: 120,
+        port: 0,
+        auth_dir: temp_dir.clone(),
+        config_path: temp_dir.join("config.yaml"),
+        strategy: Strategy::FillFirst,
+        max_failover: 2,
+        log_level: "info".to_string(),
+        api_keys: mahoquot_gateway::inbound::ApiKeys::default(),
+        models_env: None,
+        refresh_url: mahoquot_providers::refresh::REFRESH_TOKEN_URL.to_string(),
+        auth_refresh_enabled: true,
+        ..Default::default()
+    };
+
+    let state = Arc::new(AppState::new(&config).unwrap());
+    let app = create_app(state.clone());
+    let gw_listener = bind_fixture_listener().await;
+    let gw_port = gw_listener.local_addr().unwrap().port();
+    let (shutdown, stopped) = tokio::sync::oneshot::channel();
+    shutdowns.push(shutdown);
+    servers.push(tokio::spawn(async move {
+        axum::serve(gw_listener, app)
+            .with_graceful_shutdown(async {
+                stopped.await.unwrap();
+            })
+            .await
+            .unwrap();
+    }));
+
+    let client = reqwest::Client::new();
+    let gw_url = format!("http://127.0.0.1:{gw_port}/v1/chat/completions");
+
+    // When: one request faces a pool of shared-limiter 429s
+    let res = client
+        .post(&gw_url)
+        .header("Content-Type", "application/json")
+        .body(common::OPENAI_REQUEST)
+        .send()
+        .await
+        .unwrap();
+
+    // Then: the raw 429 still passes through, and the failover budget
+    // (max_failover = 2) caps the walk — the third account is never hit.
+    assert_eq!(res.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(counts[0].load(Ordering::SeqCst), 1, "account 0 hit once");
+    assert_eq!(counts[1].load(Ordering::SeqCst), 1, "account 1 hit once");
+    assert_eq!(counts[2].load(Ordering::SeqCst), 0, "account 2 never hit");
 
     drop(client);
     for shutdown in shutdowns {
