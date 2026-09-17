@@ -1637,12 +1637,9 @@ async fn test_devin_relay_late_error_exactly_once_failure_and_retained_health() 
         Health::AuthFailed,
         "health must be AuthFailed after late unauthenticated error"
     );
-    let last_err_a = gw_a.state.monitor.last_error("late-unauth").expect("must record last error in monitor");
-    assert_eq!(last_err_a.status, 401, "monitor error status must be 401");
-    assert_eq!(
-        last_err_a.message,
-        "unauthenticated request to upstream",
-        "monitor error message must be retained safe Connect error, not generic cancellation"
+    assert!(
+        gw_a.state.monitor.last_error("late-unauth").is_none(),
+        "late transport-class errors must not paint the account with an error banner"
     );
 
     task_a.abort();
@@ -1726,12 +1723,9 @@ async fn test_devin_relay_late_error_exactly_once_failure_and_retained_health() 
         matches!(member_b.health(), Health::Cooldown { .. }),
         "health must be Cooldown after late resource_exhausted error"
     );
-    let last_err_b = gw_b.state.monitor.last_error("late-exhaust").expect("must record last error in monitor");
-    assert_eq!(last_err_b.status, 429, "monitor error status must be 429");
-    assert_eq!(
-        last_err_b.message,
-        "upstream quota or rate limit exhausted",
-        "monitor error message must be retained safe Connect error"
+    assert!(
+        gw_b.state.monitor.last_error("late-exhaust").is_none(),
+        "late quota exhaustion must not paint the account with an error banner"
     );
 
     task_b.abort();

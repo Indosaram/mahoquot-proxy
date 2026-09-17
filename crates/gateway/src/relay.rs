@@ -168,19 +168,16 @@ impl StreamCapture {
                     state.router.feedback(current.id(), Outcome::Success);
                 }
                 state.metrics.served.fetch_add(1, Ordering::Relaxed);
-            } else if let Some((code, msg)) = connect_error {
-                // Connect error in EndStream: fail exactly once, preserve status and health
+            } else if let Some((code, _msg)) = connect_error {
+                // Connect error in EndStream: fail exactly once, preserve status and
+                // health. No persistent error banner: transport-class failures show
+                // up via the bench/cooldown state, the request log, and counters.
                 status = connect_code_to_http_status(&code).as_u16();
                 outcome.member.record_fail();
                 if let Some(ref current) = current_pool_member {
                     if !Arc::ptr_eq(&outcome.member.fail_count, &current.fail_count) {
                         current.record_fail();
                     }
-                    state.monitor.record_error(
-                        current.id(),
-                        status,
-                        msg.as_deref().unwrap_or("upstream error"),
-                    );
                     if code == "resource_exhausted" {
                         let now_ms = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
@@ -203,17 +200,14 @@ impl StreamCapture {
                     outcome.member.set_health(Health::AuthFailed);
                 }
             } else {
-                // Client cancellation / premature disconnect / incomplete stream
+                // Client cancellation / premature disconnect / incomplete stream.
+                // Client-driven cancellations are routine agent behavior, not an
+                // account fault — no persistent error banner.
                 outcome.member.record_fail();
                 if let Some(ref current) = current_pool_member {
                     if !Arc::ptr_eq(&outcome.member.fail_count, &current.fail_count) {
                         current.record_fail();
                     }
-                    state.monitor.record_error(
-                        current.id(),
-                        if status == 200 { 499 } else { status },
-                        "stream terminated prematurely or canceled by client",
-                    );
                 }
                 if status == 200 {
                     status = 499;
@@ -1421,17 +1415,11 @@ async fn record_cooldown(
     bench_exhausted_quota(member, effective_model.as_deref().or(model), until_unix_ms);
     member.record_fail();
     state.metrics.failed_over.fetch_add(1, Ordering::Relaxed);
-    if failure_is_limit_exhaustion(&failure.body) {
-        // Limit exhaustion is an expected operating state: the cooldown deadline
-        // (and the cline quota bucket) already carry the reset information. It
-        // must not paint the account with an error banner, and a stale banner
-        // from an older failure must not linger either.
-        state.monitor.clear_error(member.id());
-    } else {
-        state
-            .monitor
-            .record_error(member.id(), status_code, "upstream error");
-    }
+    // Rate limiting — exhaustion or not — is an expected operating state: the
+    // bench already surfaces as a cooldown in every UI surface, so a
+    // persistent error banner here would only paint quota-exhausted accounts
+    // with noise. A stale banner from an older failure must not linger either.
+    state.monitor.clear_error(member.id());
     failure
 }
 
@@ -2865,12 +2853,6 @@ pub async fn handle_relay(
                             401,
                             &format!("refresh failed: {e}"),
                         );
-                    } else {
-                        state.monitor.record_error(
-                            member.id(),
-                            502,
-                            &format!("refresh network error: {e}"),
-                        );
                     }
                     member.record_fail();
                     state.metrics.failed_over.fetch_add(1, Ordering::Relaxed);
@@ -2919,9 +2901,10 @@ pub async fn handle_relay(
                     .scheduler
                     .record_non_auth_failure(member.id(), &state.pool.load().members);
                 state.metrics.failed_over.fetch_add(1, Ordering::Relaxed);
-                state
-                    .monitor
-                    .record_error(member.id(), 502, &format!("request error: {e}"));
+                // No persistent error banner for transport-class failures: the
+                // request log, counters, and scheduler streaks carry them. A
+                // banner here would repaint quota-exhausted accounts with
+                // "error sending request" noise on every retry.
                 if member.kind() == crate::account::ProviderKind::Devin && e.is_ambiguous() {
                     return json_error(
                         StatusCode::GATEWAY_TIMEOUT,
@@ -2960,14 +2943,9 @@ pub async fn handle_relay(
                             cursor_reply = retry_exchange.cursor_reply;
                             status_code = resp.status().as_u16();
                         }
-                        Err(e) => {
+                        Err(_) => {
                             member.record_fail();
                             state.metrics.failed_over.fetch_add(1, Ordering::Relaxed);
-                            state.monitor.record_error(
-                                member.id(),
-                                502,
-                                &format!("retry error: {e}"),
-                            );
                             failover_budget += 1;
                             continue;
                         }
@@ -2980,12 +2958,6 @@ pub async fn handle_relay(
                             member.id(),
                             status_code,
                             &format!("refresh failed: {e}"),
-                        );
-                    } else {
-                        state.monitor.record_error(
-                            member.id(),
-                            502,
-                            &format!("refresh network error: {e}"),
                         );
                     }
                     member.record_fail();
@@ -3125,9 +3097,10 @@ pub async fn handle_relay(
 
                     member.record_fail();
                     state.metrics.failed_over.fetch_add(1, Ordering::Relaxed);
-                    state
-                        .monitor
-                        .record_error(member.id(), mapped_status.as_u16(), description);
+                    // Stream protocol anomalies are transport-class noise; the
+                    // mapped failure still reaches the client and the request
+                    // log. A persistent banner would just linger on accounts
+                    // that recover moments later.
 
                     if code == "resource_exhausted" {
                         let now_ms = SystemTime::now()
@@ -3183,15 +3156,13 @@ pub async fn handle_relay(
         if (500..=504).contains(&status_code) {
             // Contract: ServerError leaves health unchanged. The account is
             // excluded from this request's remaining attempts, but a transient
-            // upstream 5xx never benches it for other requests.
+            // upstream 5xx never benches it for other requests — and never
+            // leaves a lingering error banner on it either.
             member.record_fail();
             state
                 .scheduler
                 .record_non_auth_failure(member.id(), &state.pool.load().members);
             state.metrics.failed_over.fetch_add(1, Ordering::Relaxed);
-            state
-                .monitor
-                .record_error(member.id(), status_code, "upstream server error");
             last_failure = Some(extract_failure(resp, status_code).await);
             failover_budget += 1;
             continue;

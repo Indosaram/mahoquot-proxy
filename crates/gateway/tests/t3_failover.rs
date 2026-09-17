@@ -369,7 +369,7 @@ async fn test_t3_limit_exhaustion_429_records_no_account_error() {
 }
 
 #[tokio::test]
-async fn test_t3_plain_429_still_records_account_error() {
+async fn test_t3_plain_429_passes_through_without_banner() {
     let mut servers = Vec::new();
     let mut shutdowns = Vec::new();
     // Given: the upstream answers 429 with a generic body (no limit signature)
@@ -449,10 +449,11 @@ async fn test_t3_plain_429_still_records_account_error() {
     assert_eq!(res.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
     res.bytes().await.unwrap();
 
-    // Then: the account error IS recorded (banner still works for real faults)
+    // Then: the raw 429 still passes through, but no error banner is left on
+    // the account — rate limiting is an operating state, not a fault.
     assert!(
-        state.monitor.last_error("a").is_some(),
-        "a plain 429 must still surface an account error"
+        state.monitor.last_error("a").is_none(),
+        "a plain 429 must not paint the account with an error banner"
     );
 
     drop(client);
