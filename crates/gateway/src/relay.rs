@@ -1778,40 +1778,49 @@ fn eligible_indices(
     let requested_model = requested_model.unwrap_or(&route.canonical_model);
     let (prefix, _) = parse_model_prefix(requested_model);
     let mut eligible = Vec::new();
-    for provider in &route.provider_classes {
-        let indices: Vec<usize> = pool
-            .members
+    for (index, member) in pool.members.iter().enumerate() {
+        if !member.health().is_available(now_ms) {
+            continue;
+        }
+        if !state.scheduler.permits(member.id()) {
+            continue;
+        }
+        if !member_matches_api_key_binding(member, api_key_binding) {
+            continue;
+        }
+        if !crate::models_route::member_matches_scope(member, scoped_key) {
+            continue;
+        }
+        match prefix {
+            Some(ModelPrefix::Anthropic) => {
+                if member.kind() != crate::account::ProviderKind::Claude || member.is_nekos_relay() {
+                    continue;
+                }
+            }
+            Some(ModelPrefix::Nekos) => {
+                if member.kind() != crate::account::ProviderKind::Claude || !member.is_nekos_relay() {
+                    continue;
+                }
+            }
+            None => {}
+        }
+        let Some(provider) = route
+            .provider_classes
             .iter()
-            .enumerate()
-            .filter(|(_, member)| member.health().is_available(now_ms))
-            .filter(|(_, member)| state.scheduler.permits(member.id()))
-            .filter(|(_, member)| member_matches_api_key_binding(member, api_key_binding))
-            .filter(|(_, member)| crate::models_route::member_matches_scope(member, scoped_key))
-            .filter(|(_, member)| match prefix {
-                Some(ModelPrefix::Anthropic) => {
-                    member.kind() == crate::account::ProviderKind::Claude
-                        && !member.is_nekos_relay()
-                }
-                Some(ModelPrefix::Nekos) => {
-                    member.kind() == crate::account::ProviderKind::Claude && member.is_nekos_relay()
-                }
-                None => true,
-            })
-            .filter(|(_, member)| {
-                member_provider_id(member).as_ref() == Some(&provider.binding.provider_id)
-            })
-            .filter(|(_, member)| {
-                account_declares_binding_model(
-                    pool,
-                    member,
-                    requested_model,
-                    &route.canonical_model,
-                    provider,
-                )
-            })
-            .map(|(index, _)| index)
-            .collect();
-        eligible.extend(indices);
+            .find(|provider| member_provider_id(member).as_ref() == Some(&provider.binding.provider_id))
+        else {
+            continue;
+        };
+        if !account_declares_binding_model(
+            pool,
+            member,
+            requested_model,
+            &route.canonical_model,
+            provider,
+        ) {
+            continue;
+        }
+        eligible.push(index);
     }
     eligible
 }
@@ -1823,9 +1832,7 @@ fn select_index(
     eligible: &[usize],
     exclude: &[usize],
 ) -> Option<usize> {
-    // If there is an active session affinity key pointing to an eligible, non-excluded
-    // member, select that member's provider group first so session affinity survives across turns.
-    let target_provider = hint
+    let bound_member_provider = hint
         .affinity_key
         .as_deref()
         .and_then(|key| state.router.bound_affinity_member(key))
@@ -1838,14 +1845,34 @@ fn select_index(
                         && pool.members.get(idx).map(|m| m.id()) == Some(&bound_id)
                 })
                 .and_then(|idx| member_provider_id(pool.members.get(idx)?))
-        })
-        .or_else(|| {
-            let first_index = eligible
-                .iter()
-                .copied()
-                .find(|index| !exclude.contains(index))?;
-            member_provider_id(pool.members.get(first_index)?)
-        })?;
+        });
+
+    if bound_member_provider.is_none() {
+        let mut candidates: Vec<Arc<dyn PoolMember>> = Vec::with_capacity(eligible.len());
+        let mut origin: Vec<usize> = Vec::with_capacity(eligible.len());
+        for &index in eligible {
+            if exclude.contains(&index) {
+                continue;
+            }
+            let member = pool.members.get(index)?;
+            candidates.push(member.clone());
+            origin.push(index);
+        }
+        return state
+            .router
+            .select(&candidates, hint)
+            .and_then(|idx| origin.get(idx).copied());
+    }
+
+    // If there is an active session affinity key pointing to an eligible, non-excluded
+    // member, select that member's provider group first so session affinity survives across turns.
+    let target_provider = bound_member_provider.or_else(|| {
+        let first_index = eligible
+            .iter()
+            .copied()
+            .find(|index| !exclude.contains(index))?;
+        member_provider_id(pool.members.get(first_index)?)
+    })?;
 
     let mut candidates: Vec<Arc<dyn PoolMember>> = Vec::with_capacity(eligible.len());
     let mut origin: Vec<usize> = Vec::with_capacity(eligible.len());
@@ -2450,6 +2477,8 @@ fn affinity_key(headers: &HeaderMap) -> Option<String> {
         "thread-id",
         "x-codex-parent-thread-id",
         "x-session-id",
+        "x-session-affinity",
+        "x-client-request-id",
         "conversation_id",
         "x-conversation-id",
         "anthropic-client-session",
@@ -2516,6 +2545,35 @@ fn body_affinity_key(body: &[u8]) -> Option<String> {
         if user.starts_with("session_") || user.starts_with("conv_") || user.starts_with("thread_")
         {
             return Some(format!("body-id-{user}"));
+        }
+    }
+
+    // In chat completions requests, bind affinity on the first user message content.
+    // Different sessions sharing an identical system prompt prelude will have distinct
+    // first user turns, preventing pool-wide account collision.
+    if let Some(messages) = obj.get("messages").and_then(|m| m.as_array()) {
+        for msg in messages {
+            if msg.get("role").and_then(|r| r.as_str()) == Some("user") {
+                if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
+                    let trimmed = content.trim();
+                    if !trimmed.is_empty() {
+                        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                        hasher.write(trimmed.as_bytes());
+                        return Some(format!("body-first-user-{:016x}", hasher.finish()));
+                    }
+                } else if let Some(parts) = msg.get("content").and_then(|c| c.as_array()) {
+                    for part in parts {
+                        if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                            let trimmed = text.trim();
+                            if !trimmed.is_empty() {
+                                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                                hasher.write(trimmed.as_bytes());
+                                return Some(format!("body-first-user-{:016x}", hasher.finish()));
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -3228,6 +3286,19 @@ mod routing_tests {
         // User string that does not match prefixes
         assert_eq!(body_affinity_key(br#"{"user":"regular_user"}"#), None);
 
+        // First user message extraction differentiates sessions sharing identical system prompts
+        let sess_a = br#"{"messages":[{"role":"system","content":"Shared persona instructions"},{"role":"user","content":"Task A: audit"}]}"#;
+        let sess_b = br#"{"messages":[{"role":"system","content":"Shared persona instructions"},{"role":"user","content":"Task B: refactor"}]}"#;
+        let key_a = body_affinity_key(sess_a);
+        let key_b = body_affinity_key(sess_b);
+        assert!(key_a.is_some(), "key_a should be extracted");
+        assert!(key_b.is_some(), "key_b should be extracted");
+        assert_ne!(key_a, key_b, "sessions with distinct first user turns must not collide");
+
+        // User message with multipart array content
+        let sess_multipart = br#"{"messages":[{"role":"system","content":"Sys"},{"role":"user","content":[{"type":"text","text":"Task A: audit"}]}]}"#;
+        assert_eq!(body_affinity_key(sess_multipart), key_a, "multipart text matches plain text content");
+
         // Blank, empty, or missing
         assert_eq!(body_affinity_key(br#"{"conversation_id":""}"#), None);
         assert_eq!(body_affinity_key(br#"{"conversation_id":"  "}"#), None);
@@ -3794,6 +3865,159 @@ mod routing_tests {
             &state,
         );
         assert_eq!(eligible, vec![nekos_idx]);
+
+        std::fs::remove_dir_all(auth_dir).ok();
+    }
+
+    #[test]
+    fn eligible_indices_preserves_pool_members_list_order_across_providers() {
+        let auth_dir = std::env::temp_dir().join(format!(
+            "mahoquot-routing-order-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&auth_dir).expect("create auth dir");
+
+        let cred_z = serde_json::json!({
+            "type": "generic",
+            "identity_slug": "zeta-account",
+            "provider": "zeta-provider",
+            "label": "Zeta",
+            "adapter": "openai-chat",
+            "base_url": "http://127.0.0.1:9",
+            "api_key": "fixture-z",
+            "models": ["shared-model"]
+        })
+        .to_string();
+        let cred_a = serde_json::json!({
+            "type": "generic",
+            "identity_slug": "alpha-account",
+            "provider": "alpha-provider",
+            "label": "Alpha",
+            "adapter": "openai-chat",
+            "base_url": "http://127.0.0.1:9",
+            "api_key": "fixture-a",
+            "models": ["shared-model"]
+        })
+        .to_string();
+
+        let file_z = "generic-zeta.json";
+        let file_a = "generic-alpha.json";
+        std::fs::write(auth_dir.join(file_z), cred_z).expect("write z");
+        std::fs::write(auth_dir.join(file_a), cred_a).expect("write a");
+
+        // Explicit SST account order: zeta first, then alpha
+        let order = serde_json::json!([file_z, file_a]);
+        std::fs::write(
+            auth_dir.join(".mahoquot-account-order.json"),
+            serde_json::to_vec(&order).unwrap(),
+        )
+        .expect("write order");
+
+        let config = GatewayConfig {
+            auth_dir: auth_dir.clone(),
+            config_path: auth_dir.join("config.yaml"),
+            auth_refresh_enabled: false,
+            ..GatewayConfig::default()
+        };
+        let state = AppState::new(&config).expect("state");
+        let pool = state.pool.load_full();
+
+        assert_eq!(pool.members.len(), 2);
+        assert_eq!(pool.members[0].provider_name(), "zeta-provider");
+        assert_eq!(pool.members[1].provider_name(), "alpha-provider");
+
+        let route = resolve_route(&pool, Some("shared-model"), None)
+            .unwrap()
+            .unwrap();
+
+        let eligible = eligible_indices(
+            &pool,
+            Some(&route),
+            Some("shared-model"),
+            0,
+            None,
+            None,
+            &state,
+        );
+        // Must strictly preserve pool.members list order [0, 1] across providers
+        assert_eq!(eligible, vec![0, 1]);
+
+        std::fs::remove_dir_all(auth_dir).ok();
+    }
+
+    #[test]
+    fn fill_first_selects_across_different_providers_in_pool_order() {
+        let auth_dir = std::env::temp_dir().join(format!(
+            "mahoquot-routing-fill-first-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&auth_dir).expect("create auth dir");
+
+        let cred_cline = serde_json::json!({
+            "type": "generic",
+            "identity_slug": "cline-account",
+            "provider": "cline",
+            "label": "Cline",
+            "adapter": "openai-chat",
+            "base_url": "http://127.0.0.1:9",
+            "api_key": "fixture-cline",
+        })
+        .to_string();
+        let cred_antigravity = credential("antigravity");
+
+        let file_cline = "generic-cline.json";
+        let file_antigravity = "antigravity-test.json";
+        std::fs::write(auth_dir.join(file_cline), cred_cline).expect("write cline");
+        std::fs::write(auth_dir.join(file_antigravity), cred_antigravity)
+            .expect("write antigravity");
+
+        // Explicit SST account order: cline first, then antigravity
+        let order = serde_json::json!([file_cline, file_antigravity]);
+        std::fs::write(
+            auth_dir.join(".mahoquot-account-order.json"),
+            serde_json::to_vec(&order).unwrap(),
+        )
+        .expect("write order");
+
+        let config = GatewayConfig {
+            auth_dir: auth_dir.clone(),
+            config_path: auth_dir.join("config.yaml"),
+            auth_refresh_enabled: false,
+            ..GatewayConfig::default()
+        };
+        let state = AppState::new(&config).expect("state");
+        state.router.set_strategy(mahoquot_types::Strategy::FillFirst);
+        let pool = state.pool.load_full();
+
+        assert_eq!(pool.members.len(), 2);
+        assert_eq!(pool.members[0].provider_name(), "cline");
+        assert_eq!(pool.members[1].provider_name(), "antigravity");
+
+        let hint = SessionHint {
+            affinity_key: None,
+        };
+        let eligible = vec![0, 1];
+
+        // With exclude = &[], verify member 0 is selected.
+        let selected =
+            select_index(&state, &pool, &hint, &eligible, &[]).expect("member 0 selected");
+        assert_eq!(selected, 0);
+
+        // With exclude = &[0] (simulating failover/exclusion), verify member 1 (the other provider) is selected.
+        let selected_failover =
+            select_index(&state, &pool, &hint, &eligible, &[0]).expect("member 1 selected");
+        assert_eq!(selected_failover, 1);
+
+        // With affinity key bound to member 1, session affinity stays sticky across turns even when member 0 is not excluded.
+        let hint_affinity = SessionHint {
+            affinity_key: Some("test-affinity-session".to_string()),
+        };
+        let bound_sel = select_index(&state, &pool, &hint_affinity, &eligible, &[0]).expect("bind member 1");
+        assert_eq!(bound_sel, 1);
+        let sticky_sel = select_index(&state, &pool, &hint_affinity, &eligible, &[]).expect("sticky member 1");
+        assert_eq!(sticky_sel, 1);
 
         std::fs::remove_dir_all(auth_dir).ok();
     }

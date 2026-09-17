@@ -145,7 +145,11 @@ pub fn sanitize_session_id(raw: &str) -> String {
 }
 
 pub fn build_http_client(proxy_url: Option<&str>) -> anyhow::Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder().tcp_nodelay(true);
+    let mut builder = reqwest::Client::builder()
+        .tcp_nodelay(true)
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .pool_max_idle_per_host(32)
+        .tcp_keepalive(Some(std::time::Duration::from_secs(60)));
     if let Some(url) = proxy_url {
         if !url.trim().is_empty() {
             let proxy = reqwest::Proxy::all(url.trim())
