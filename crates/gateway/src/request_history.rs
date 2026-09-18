@@ -7,10 +7,10 @@
 //! are intentionally not importable as request events.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, params_from_iter, types::Value, Connection, OptionalExtension};
 
@@ -278,6 +278,11 @@ pub struct HistoryService {
     metrics: Arc<crate::metrics::GatewayMetrics>,
 }
 
+/// Transient history faults (queue overflow, one failed batch) auto-expire:
+/// the flag stays honest about "still failing" while healing once the fault
+/// stops recurring, instead of smearing one burst across the whole uptime.
+const DEGRADED_RECOVERY_WINDOW_MS: i64 = 10 * 60 * 1000;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryHealth {
     pub ready: bool,
@@ -300,6 +305,7 @@ enum IngestCommand {
 struct HistoryHealthState {
     ready: AtomicBool,
     degraded: AtomicBool,
+    last_degraded_unix_ms: AtomicI64,
     queue_capacity: usize,
     queue_depth: AtomicU64,
     enqueued_events: AtomicU64,
@@ -377,6 +383,7 @@ impl HistoryService {
         let health = Arc::new(HistoryHealthState {
             ready: AtomicBool::new(false),
             degraded: AtomicBool::new(false),
+            last_degraded_unix_ms: AtomicI64::new(0),
             queue_capacity,
             queue_depth: AtomicU64::new(0),
             enqueued_events: AtomicU64::new(0),
@@ -443,6 +450,13 @@ impl HistoryService {
                                 .fetch_add(written as u64, Ordering::Relaxed);
                         }
                         Err(error) => {
+                            let now_ms = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .map(|d| d.as_millis() as i64)
+                                .unwrap_or(0);
+                            worker_health
+                                .last_degraded_unix_ms
+                                .store(now_ms, Ordering::Relaxed);
                             worker_health.degraded.store(true, Ordering::Relaxed);
                             worker_health
                                 .database_failures
@@ -504,6 +518,11 @@ impl HistoryService {
     }
 
     fn drop_event(&self, message: &str) {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        self.health.last_degraded_unix_ms.store(now_ms, Ordering::Relaxed);
         self.health.degraded.store(true, Ordering::Relaxed);
         self.health.dropped_events.fetch_add(1, Ordering::Relaxed);
         self.metrics.history_dropped.fetch_add(1, Ordering::Relaxed);
@@ -515,9 +534,20 @@ impl HistoryService {
     }
 
     pub fn health(&self) -> HistoryHealth {
+        let raw_degraded = self.health.degraded.load(Ordering::Relaxed);
+        let degraded = raw_degraded
+            && (self.sender.is_none() || {
+                // The store is gone forever — the flag must stay lit.
+                let last = self.health.last_degraded_unix_ms.load(Ordering::Relaxed);
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                now_ms - last < DEGRADED_RECOVERY_WINDOW_MS
+            });
         HistoryHealth {
             ready: self.health.ready.load(Ordering::Relaxed),
-            degraded: self.health.degraded.load(Ordering::Relaxed),
+            degraded,
             queue_capacity: self.health.queue_capacity,
             queue_depth: self.health.queue_depth.load(Ordering::Relaxed),
             enqueued_events: self.health.enqueued_events.load(Ordering::Relaxed),
