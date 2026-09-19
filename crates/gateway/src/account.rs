@@ -954,6 +954,9 @@ pub struct AccountMember {
     pub refresh_lock: Arc<tokio::sync::Mutex<()>>,
     pub unsupported_models: Arc<RwLock<Vec<String>>>,
     pub usage: Arc<RwLock<crate::usage::AccountUsage>>,
+    /// Rolling 24h token-budget state for Cline free accounts; a fresh
+    /// independent tracker for every other provider.
+    pub cline_tracker: Arc<crate::cline_usage::ClineDailyTracker>,
     pub devin_catalog: arc_swap::ArcSwapOption<crate::devin_catalog::DevinAccountCatalogState>,
     pub devin_discovery_seq: Arc<AtomicU64>,
 }
@@ -1003,6 +1006,7 @@ impl AccountMember {
             refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
             unsupported_models: Arc::new(RwLock::new(Vec::new())),
             usage: Arc::new(RwLock::new(Default::default())),
+            cline_tracker: crate::cline_usage::ClineDailyTracker::from_env(),
             devin_catalog: arc_swap::ArcSwapOption::empty(),
             devin_discovery_seq: Arc::new(AtomicU64::new(0)),
         }
@@ -1030,6 +1034,10 @@ impl AccountMember {
                 *guard = Health::Available;
             }
         }
+    }
+
+    pub fn cline_tracker(&self) -> &crate::cline_usage::ClineDailyTracker {
+        &self.cline_tracker
     }
 
     pub fn usage_snapshot(&self) -> crate::usage::AccountUsage {
@@ -1210,6 +1218,7 @@ impl AccountMember {
             refresh_lock: Arc::clone(&self.refresh_lock),
             unsupported_models: Arc::clone(&self.unsupported_models),
             usage: Arc::clone(&self.usage),
+            cline_tracker: Arc::clone(&self.cline_tracker),
             devin_catalog: arc_swap::ArcSwapOption::new(new_catalog),
             devin_discovery_seq: Arc::clone(&self.devin_discovery_seq),
         }
@@ -2180,6 +2189,7 @@ pub fn load_account_members(auth_dir: &Path) -> anyhow::Result<Vec<Arc<AccountMe
             refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
             unsupported_models: Arc::new(RwLock::new(Vec::new())),
             usage: Arc::new(RwLock::new(Default::default())),
+            cline_tracker: crate::cline_usage::ClineDailyTracker::from_env(),
             devin_catalog: arc_swap::ArcSwapOption::empty(),
             devin_discovery_seq: Arc::new(AtomicU64::new(0)),
         }));

@@ -302,6 +302,9 @@ async fn main() -> anyhow::Result<()> {
 
     let state = Arc::new(AppState::new(&config)?);
     mahoquot_gateway::warmup::spawn_warmup_loop(state.clone(), std::time::Duration::from_secs(15));
+    // Resume each Cline account's 24h token budget from the durable history
+    // so a restart does not hand back a partially spent budget.
+    mahoquot_gateway::cline_usage::seed_cline_trackers_from_history(&state);
     if should_warn_for_unauthenticated_bind(&bind_addr, state.api_keys.is_empty()) {
         warn!(
             bind_addr = %bind_addr,

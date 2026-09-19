@@ -384,6 +384,7 @@ async fn record_request_outcome(state: &AppState, record: OutcomeRecord<'_>) {
     .to_string();
     // The live tail is always fed; file persistence is the only gated part.
     state.log_tail.push(line.clone());
+    track_cline_daily_usage(state, &record, timestamp);
     let settings = state.settings.current();
     if !settings.logging_to_file {
         return;
@@ -393,6 +394,43 @@ async fn record_request_outcome(state: &AppState, record: OutcomeRecord<'_>) {
         crate::management::observability::append_log_line(&settings, &line);
     })
     .await;
+}
+
+/// Cline daily-budget tracking: count served tokens, surface live usage in
+/// the account's quota bucket, and bench proactively at the threshold so the
+/// upstream cap 429 never reaches a client.
+fn track_cline_daily_usage(state: &AppState, record: &OutcomeRecord<'_>, timestamp: i64) {
+    if record.status != 200 {
+        return;
+    }
+    let Some(usage) = record.token_usage else {
+        return;
+    };
+    let Some(account) = record.account else {
+        return;
+    };
+    let pool = state.pool.load();
+    let Some(member) = pool.members.iter().find(|m| m.id() == account).cloned() else {
+        return;
+    };
+    drop(pool);
+    if member.provider_name() != "cline" {
+        return;
+    }
+    let tracker = member.cline_tracker();
+    let crossed = tracker.observe(usage.total_tokens(), timestamp);
+    let reset_unix = tracker.estimated_reset_unix();
+    if reset_unix <= timestamp {
+        return;
+    }
+    let Some(model) = record.model else {
+        return;
+    };
+    let percent = tracker.used_percent().unwrap_or(0.0);
+    record_cline_quota_bucket(&member, model, reset_unix - timestamp, timestamp, percent);
+    if crossed {
+        bench_exhausted_quota(&member, Some(model), reset_unix * 1000);
+    }
 }
 
 /// Mirror a scoped key's live token counter into the settings document.
@@ -1339,6 +1377,7 @@ pub(crate) fn record_cline_quota_bucket(
     model: &str,
     reset_seconds: i64,
     now_unix: i64,
+    used_percent: f64,
 ) {
     let reset_at_unix = now_unix + reset_seconds;
     let mut usage = member.usage_snapshot();
@@ -1366,7 +1405,7 @@ pub(crate) fn record_cline_quota_bucket(
         .iter_mut()
         .find(|b| b.bucket_id.as_deref() == Some(model))
     {
-        bucket.used_percent = Some(100.0);
+        bucket.used_percent = Some(used_percent);
         bucket.reset_at_unix = Some(reset_at_unix);
         bucket.display_name = Some(bucket_label);
     } else {
@@ -1374,7 +1413,7 @@ pub(crate) fn record_cline_quota_bucket(
             bucket_id: Some(model.to_string()),
             display_name: Some(bucket_label),
             window: Some("Daily".to_string()),
-            used_percent: Some(100.0),
+            used_percent: Some(used_percent),
             reset_at_unix: Some(reset_at_unix),
         });
     }
@@ -1403,7 +1442,10 @@ async fn record_cooldown(
     let (effective_model, until_unix_ms) = if member.provider_name() == "cline" {
         if let Some((cap_model, reset_secs)) = parse_cline_cap_error(&failure.body) {
             let deadline_ms = cooldown_deadline_ms(now_ms, reset_secs);
-            record_cline_quota_bucket(member, &cap_model, reset_secs, now_ms / 1000);
+            record_cline_quota_bucket(member, &cap_model, reset_secs, now_ms / 1000, 100.0);
+            // Upstream named the exact reset: reconcile the 24h tracker so the
+            // estimate is exact and the budget counts as consumed.
+            member.cline_tracker().on_cap_429(now_ms / 1000 + reset_secs);
             (Some(cap_model), deadline_ms)
         } else {
             (model.map(ToString::to_string), header_until_unix_ms)
