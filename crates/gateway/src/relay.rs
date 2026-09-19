@@ -1371,6 +1371,14 @@ fn failure_is_limit_exhaustion(body: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
+/// The only Cline free model whose daily cap is surfaced as a UI quota
+/// bucket. Other pooled models keep their full health/cooldown and daily
+/// budget tracking, but their caps never render an "(Daily limit)" bucket.
+fn is_cline_quota_display_model(model: &str) -> bool {
+    let bare = model.rsplit('/').next().unwrap_or(model);
+    bare == "glm-5.3-flash"
+}
+
 /// Updates the member's `AccountUsage` with a QuotaGroup bucket representing the Cline model limit.
 pub(crate) fn record_cline_quota_bucket(
     member: &AccountMember,
@@ -1379,6 +1387,9 @@ pub(crate) fn record_cline_quota_bucket(
     now_unix: i64,
     used_percent: f64,
 ) {
+    if !is_cline_quota_display_model(model) {
+        return;
+    }
     let reset_at_unix = now_unix + reset_seconds;
     let mut usage = member.usage_snapshot();
     let group_name = "Cline Free Limits".to_string();

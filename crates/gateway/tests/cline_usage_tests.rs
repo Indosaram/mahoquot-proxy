@@ -245,3 +245,124 @@ async fn cline_daily_budget_benches_exhausted_account_proactively() {
     }
     std::fs::remove_dir_all(&temp_dir).unwrap();
 }
+
+/// Only the display model keeps a "(Daily limit)" quota bucket. A served
+/// request on any other pooled Cline model updates the shared daily budget
+/// tracker but never creates or updates a bucket for that model.
+#[tokio::test]
+async fn cline_quota_bucket_surfaces_only_the_display_model() {
+    let mut servers = Vec::new();
+    let mut shutdowns = Vec::new();
+
+    let listener = bind_fixture_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|_: axum::body::Bytes| async {
+            (
+                StatusCode::OK,
+                [("content-type", "application/json")],
+                usage_body(1_000),
+            )
+        }),
+    );
+    let (shutdown, stopped) = tokio::sync::oneshot::channel();
+    shutdowns.push(shutdown);
+    servers.push(tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                stopped.await.unwrap();
+            })
+            .await
+            .unwrap();
+    }));
+
+    let temp_dir = unique_temp_dir("qgw-cline-quota-display-test");
+    std::fs::write(
+        temp_dir.join("generic-cline-a.json"),
+        cline_account(port, "[\"z-ai/glm-5.3-flash\",\"z-ai/glm-4.7\"]"),
+    )
+    .unwrap();
+
+    let config = GatewayConfig {
+        usage_poll_secs: 120,
+        port: 0,
+        auth_dir: temp_dir.clone(),
+        config_path: temp_dir.join("config.yaml"),
+        strategy: Strategy::FillFirst,
+        max_failover: 3,
+        log_level: "info".to_string(),
+        api_keys: mahoquot_gateway::inbound::ApiKeys::default(),
+        models_env: None,
+        refresh_url: mahoquot_providers::refresh::REFRESH_TOKEN_URL.to_string(),
+        auth_refresh_enabled: false,
+        ..Default::default()
+    };
+
+    let state = Arc::new(AppState::new(&config).unwrap());
+    let app = create_app(state.clone());
+    let gw_listener = bind_fixture_listener().await;
+    let gw_port = gw_listener.local_addr().unwrap().port();
+    let (gw_shutdown, gw_stopped) = tokio::sync::oneshot::channel();
+    shutdowns.push(gw_shutdown);
+    servers.push(tokio::spawn(async move {
+        axum::serve(gw_listener, app)
+            .with_graceful_shutdown(async {
+                gw_stopped.await.unwrap();
+            })
+            .await
+            .unwrap();
+    }));
+
+    let client = reqwest::Client::new();
+    let gw_url = format!("http://127.0.0.1:{gw_port}/v1/chat/completions");
+    for model in ["z-ai/glm-5.3-flash", "z-ai/glm-4.7"] {
+        let res = client
+            .post(&gw_url)
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": false
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "model {model} must serve");
+    }
+
+    let member = state.find_member("generic-cline-a").expect("member a");
+    let usage = member.usage_snapshot();
+    let groups = usage
+        .groups
+        .iter()
+        .filter(|g| g.display_name.as_deref() == Some("Cline Free Limits"))
+        .count();
+    assert_eq!(groups, 1, "exactly one cline free-limits group");
+    let group = usage
+        .groups
+        .iter()
+        .find(|g| g.display_name.as_deref() == Some("Cline Free Limits"))
+        .unwrap();
+    let ids: Vec<_> = group
+        .buckets
+        .iter()
+        .filter_map(|b| b.bucket_id.as_deref())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["z-ai/glm-5.3-flash"],
+        "only the display model renders a bucket"
+    );
+    let bucket = &group.buckets[0];
+    assert_eq!(bucket.display_name.as_deref(), Some("z-ai/glm-5.3-flash (Daily limit)"));
+    assert!(bucket.used_percent.is_some(), "live usage is reported");
+
+    for shutdown in shutdowns {
+        let _ = shutdown.send(());
+    }
+    for server in servers {
+        let _ = server.await;
+    }
+    std::fs::remove_dir_all(&temp_dir).unwrap();
+}
