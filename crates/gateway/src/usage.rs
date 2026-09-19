@@ -100,10 +100,18 @@ impl AccountUsage {
     /// Once the reset deadline lapses, the inferred 100% quota has expired and
     /// becomes unknown (`used_percent: None`), never fabricated zero.
     /// If an account has other model buckets whose reset deadline is still in the
-    /// future, those active buckets remain intact.
+    /// future, those active buckets remain intact — except buckets for models
+    /// outside the display filter, which are dropped so only the surfaced
+    /// model's bucket ever renders, even one restored from a previous run.
     pub fn expire_stale_cline_limits(&mut self, now_unix: i64) {
         for group in &mut self.groups {
             if group.display_name.as_deref() == Some("Cline Free Limits") {
+                group.buckets.retain(|bucket| {
+                    bucket
+                        .bucket_id
+                        .as_deref()
+                        .is_some_and(crate::relay::is_cline_quota_display_model)
+                });
                 for bucket in &mut group.buckets {
                     if bucket.reset_at_unix.is_some_and(|reset| reset <= now_unix) {
                         bucket.used_percent = None;

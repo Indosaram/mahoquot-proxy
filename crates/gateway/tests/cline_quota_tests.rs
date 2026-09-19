@@ -250,11 +250,11 @@ fn test_cline_stats_normalizes_expired_health_and_preserves_future_and_disabled(
 }
 
 #[test]
-fn test_cline_stale_usage_becomes_unknown_not_zero_and_preserves_other_model() {
+fn test_cline_stale_usage_expires_and_drops_non_display_models() {
     let cline_member = create_cline_account(
         "cline-usage-test",
         "http://127.0.0.1:18899",
-        vec!["m-expired".to_string(), "m-active".to_string()],
+        vec!["z-ai/glm-5.3-flash".to_string(), "z-ai/glm-5.3".to_string()],
     );
 
     let now_unix = 1_700_000_000;
@@ -267,15 +267,15 @@ fn test_cline_stale_usage_becomes_unknown_not_zero_and_preserves_other_model() {
             models: Some("Cline Free Models".to_string()),
             buckets: vec![
                 QuotaBucket {
-                    bucket_id: Some("m-expired".to_string()),
-                    display_name: Some("m-expired (Daily limit)".to_string()),
+                    bucket_id: Some("z-ai/glm-5.3-flash".to_string()),
+                    display_name: Some("z-ai/glm-5.3-flash (Daily limit)".to_string()),
                     window: Some("Daily".to_string()),
                     used_percent: Some(100.0),
                     reset_at_unix: Some(past_reset),
                 },
                 QuotaBucket {
-                    bucket_id: Some("m-active".to_string()),
-                    display_name: Some("m-active (Daily limit)".to_string()),
+                    bucket_id: Some("z-ai/glm-5.3".to_string()),
+                    display_name: Some("z-ai/glm-5.3 (Daily limit)".to_string()),
                     window: Some("Daily".to_string()),
                     used_percent: Some(100.0),
                     reset_at_unix: Some(future_reset),
@@ -292,23 +292,24 @@ fn test_cline_stale_usage_becomes_unknown_not_zero_and_preserves_other_model() {
     usage.expire_stale_cline_limits(now_unix);
 
     let group = &usage.groups[0];
-    let b_expired = group.buckets.iter().find(|b| b.bucket_id.as_deref() == Some("m-expired")).unwrap();
-    let b_active = group.buckets.iter().find(|b| b.bucket_id.as_deref() == Some("m-active")).unwrap();
+    // Non-display models are dropped entirely, even while unexpired
+    assert_eq!(
+        group.buckets.iter().find(|b| b.bucket_id.as_deref() == Some("z-ai/glm-5.3")),
+        None,
+        "non-display model buckets must never render"
+    );
+    let b_display = group
+        .buckets
+        .iter()
+        .find(|b| b.bucket_id.as_deref() == Some("z-ai/glm-5.3-flash"))
+        .expect("display model bucket is kept");
 
     // Expired bucket must become unknown (used_percent: None), NOT fabricated zero
     assert_eq!(
-        b_expired.used_percent, None,
+        b_display.used_percent, None,
         "expired Cline usage must be unknown (None), never fabricated 0"
     );
-    assert_eq!(b_expired.reset_at_unix, None);
-
-    // Active bucket with future reset must preserve 100% exhaustion
-    assert_eq!(
-        b_active.used_percent,
-        Some(100.0),
-        "unexpired Cline model exhaustion must remain preserved"
-    );
-    assert_eq!(b_active.reset_at_unix, Some(future_reset));
+    assert_eq!(b_display.reset_at_unix, None);
 }
 
 #[test]

@@ -1374,7 +1374,7 @@ fn failure_is_limit_exhaustion(body: &[u8]) -> bool {
 /// The only Cline free model whose daily cap is surfaced as a UI quota
 /// bucket. Other pooled models keep their full health/cooldown and daily
 /// budget tracking, but their caps never render an "(Daily limit)" bucket.
-fn is_cline_quota_display_model(model: &str) -> bool {
+pub(crate) fn is_cline_quota_display_model(model: &str) -> bool {
     let bare = model.rsplit('/').next().unwrap_or(model);
     bare == "glm-5.3-flash"
 }
