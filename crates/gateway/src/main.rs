@@ -310,6 +310,9 @@ async fn main() -> anyhow::Result<()> {
     state
         .telemetry
         .spawn_flush_worker(std::time::Duration::from_secs(10));
+    // Keeps the Gemini replay ledger on disk across restarts without ever
+    // writing from a request task.
+    let signature_ledger_worker = state.signature_ledger.spawn_persistence_worker();
     mahoquot_gateway::quota::spawn_usage_poller(
         Arc::clone(&state),
         std::time::Duration::from_secs(config.usage_poll_secs),
@@ -320,5 +323,15 @@ async fn main() -> anyhow::Result<()> {
     info!(bind_addr = %bind_addr, port = config.port, "listening");
 
     let shutdown = state.shutdown.clone();
-    run_server(listener, app, async move { shutdown.notified().await }).await
+    let result = run_server(listener, app, async move { shutdown.notified().await }).await;
+    // Final snapshot before the process exits, so a replay that arrived inside
+    // the coalescing window is not lost.
+    state.signature_ledger.shutdown();
+    if tokio::time::timeout(std::time::Duration::from_secs(5), signature_ledger_worker)
+        .await
+        .is_err()
+    {
+        let _ = state.signature_ledger.flush_blocking();
+    }
+    result
 }

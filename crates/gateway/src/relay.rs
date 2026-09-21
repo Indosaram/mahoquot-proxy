@@ -360,7 +360,9 @@ async fn record_request_outcome(state: &AppState, record: OutcomeRecord<'_>) {
         input_tokens: token_usage.input_tokens,
         output_tokens: token_usage.output_tokens,
         cached_input_tokens: token_usage.cached_input_tokens,
+        cached_input_tokens_known: token_usage.cached_input_tokens_known,
         cache_write_tokens: token_usage.cache_write_tokens,
+        cache_write_tokens_known: token_usage.cache_write_tokens_known,
         reasoning_tokens: token_usage.reasoning_tokens,
         total_tokens: token_usage.total_tokens(),
         latency_ms: record.elapsed_ms,
@@ -461,6 +463,7 @@ struct UpstreamTarget {
     body: Bytes,
     protocol: compat::Protocol,
     headers: Option<Vec<(String, String)>>,
+    replay: Option<compat::signature_ledger::ReplayScope>,
 }
 
 struct UpstreamExchange {
@@ -482,6 +485,21 @@ struct ResolvedRoute {
     provider_classes: Vec<ResolvedProviderClass>,
 }
 
+fn normalize_developer_role(value: &mut serde_json::Value) {
+    if let Some(messages) = value.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        for msg in messages {
+            if let Some(msg_obj) = msg.as_object_mut() {
+                if msg_obj.get("role").and_then(|r| r.as_str()) == Some("developer") {
+                    msg_obj.insert(
+                        "role".to_string(),
+                        serde_json::Value::String("system".to_string()),
+                    );
+                }
+            }
+        }
+    }
+}
+
 fn body_with_model(body: &Bytes, model: &str) -> Bytes {
     let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) else {
         return body.clone();
@@ -493,6 +511,7 @@ fn body_with_model(body: &Bytes, model: &str) -> Bytes {
         "model".to_string(),
         serde_json::Value::String(model.to_string()),
     );
+    normalize_developer_role(&mut value);
     Bytes::from(value.to_string())
 }
 
@@ -504,7 +523,41 @@ fn openai_body_with_model(plan: &RelayPlan, model: &str) -> Option<serde_json::V
             serde_json::Value::String(model.to_string()),
         );
     }
+    normalize_developer_role(&mut body);
     Some(body)
+}
+
+/// Stable CLIProxyAPI-compatible Gemini session id: `-` + a 63-bit suffix of
+/// SHA-256 over the caller-provided affinity identity, never the raw header.
+fn gemini_session_id(identity: &str) -> String {
+    let digest = crate::request_history::sha256(identity.as_bytes());
+    let mut value = u64::from_be_bytes(digest[..8].try_into().unwrap_or([0; 8]));
+    value &= 0x7FFF_FFFF_FFFF_FFFF;
+    format!("-{value}")
+}
+
+/// Antigravity replay identity for a caller that sends no session header: the
+/// first user text of the request. This mirrors CLIProxyAPI's
+/// `generateStableSessionID` and OpenCodex's fallback anchor; the value is
+/// hashed before it reaches the wire, so the text itself never leaves.
+fn body_session_anchor(body: &serde_json::Value) -> Option<String> {
+    let messages = body.get("messages")?.as_array()?;
+    for message in messages {
+        if message.get("role").and_then(serde_json::Value::as_str) != Some("user") {
+            continue;
+        }
+        let text = match message.get("content") {
+            Some(serde_json::Value::String(text)) => Some(text.as_str()),
+            Some(serde_json::Value::Array(parts)) => parts
+                .iter()
+                .find_map(|part| part.get("text").and_then(serde_json::Value::as_str)),
+            _ => None,
+        };
+        if let Some(text) = text.map(str::trim).filter(|text| !text.is_empty()) {
+            return Some(format!("body-{text}"));
+        }
+    }
+    None
 }
 
 fn resolve_target(
@@ -513,15 +566,18 @@ fn resolve_target(
     selected_token: &str,
     plan: &RelayPlan,
     upstream_model: &str,
+    session_affinity: Option<&str>,
+    state: &AppState,
 ) -> Result<UpstreamTarget, String> {
     if plan.mode == RelayMode::Image {
         let base = member.upstream_override.as_deref().unwrap_or_default();
         return Ok(UpstreamTarget {
-            url: crate::url::join_provider_path(base, &plan.upstream_path),
-            body: body_with_model(&plan.original_body, upstream_model),
-            protocol: compat::Protocol::Codex,
-            headers: None,
-        });
+                    url: crate::url::join_provider_path(base, &plan.upstream_path),
+                    body: body_with_model(&plan.original_body, upstream_model),
+                    protocol: compat::Protocol::Codex,
+                    headers: None,
+                    replay: None,
+                });
     }
 
     if plan.mode == RelayMode::GeminiCountTokens {
@@ -540,13 +596,14 @@ fn resolve_target(
         }
         let wrapped = serde_json::json!({ "request": gemini });
         return Ok(UpstreamTarget {
-            url: crate::url::build_antigravity_count_tokens_url(
-                member.upstream_override.as_deref(),
-            ),
-            body: Bytes::from(wrapped.to_string()),
-            protocol: compat::Protocol::Antigravity,
-            headers: None,
-        });
+                    url: crate::url::build_antigravity_count_tokens_url(
+                        member.upstream_override.as_deref(),
+                    ),
+                    body: Bytes::from(wrapped.to_string()),
+                    protocol: compat::Protocol::Antigravity,
+                    headers: None,
+                    replay: None,
+                });
     }
 
     if plan.mode == RelayMode::GeminiNative {
@@ -596,6 +653,7 @@ fn resolve_target(
                     ),
                     ("connect-protocol-version".to_string(), "1".to_string()),
                 ]),
+                replay: None,
             });
         }
 
@@ -609,18 +667,30 @@ fn resolve_target(
         let gemini: serde_json::Value = serde_json::from_slice(&plan.body)
             .map_err(|e| format!("invalid gemini request: {e}"))?;
         let model = upstream_model.to_string();
+        let session_id = session_affinity.map(gemini_session_id);
         let mut inner = gemini.clone();
         if let Some(obj) = inner.as_object_mut() {
             obj.remove("model");
             obj.remove("stream");
+            // Same stable cohort id the chat path sends, so a Gemini-speaking
+            // client is not the one caller that looks session-less upstream.
+            if let Some(session_id) = session_id.as_deref() {
+                obj.insert("sessionId".to_string(), serde_json::json!(session_id));
+            }
         }
         let wrapped = crate::v1beta::wrap_for_antigravity(&model, &project, &inner);
         return Ok(UpstreamTarget {
-            url: crate::url::build_antigravity_url(member.upstream_override.as_deref()),
-            body: Bytes::from(wrapped.to_string()),
-            protocol: compat::Protocol::Antigravity,
-            headers: None,
-        });
+                    url: crate::url::build_antigravity_url(member.upstream_override.as_deref()),
+                    body: Bytes::from(wrapped.to_string()),
+                    protocol: compat::Protocol::Antigravity,
+                    headers: None,
+                    // The client speaks Gemini and carries its own signatures in
+                    // it; the scope is here so the response still lands in the
+                    // ledger this session reads back from.
+                    replay: session_id
+                        .as_deref()
+                        .map(|session_id| state.signature_ledger.scope(upstream_model, session_id)),
+                });
     }
 
     if member.kind() != crate::account::ProviderKind::Antigravity {
@@ -673,6 +743,7 @@ fn resolve_target(
                     ),
                     ("connect-protocol-version".to_string(), "1".to_string()),
                 ]),
+                replay: None,
             });
         }
         if member.kind() == crate::account::ProviderKind::Vertex {
@@ -694,15 +765,16 @@ fn resolve_target(
                 "/v1/projects/{project}/locations/{location}/publishers/google/models/{model}:{action}"
             );
             return Ok(UpstreamTarget {
-                url: crate::url::build_provider_url(
-                    member.kind(),
-                    member.upstream_override.as_deref(),
-                    &path,
-                ),
-                body: Bytes::from(compat::gemini::openai_to_gemini(&openai)?.to_string()),
-                protocol: compat::Protocol::Antigravity,
-                headers: None,
-            });
+                        url: crate::url::build_provider_url(
+                            member.kind(),
+                            member.upstream_override.as_deref(),
+                            &path,
+                        ),
+                        body: Bytes::from(compat::gemini::openai_to_gemini(&openai)?.to_string()),
+                        protocol: compat::Protocol::Antigravity,
+                        headers: None,
+                        replay: None,
+                    });
         }
         if member.kind() == crate::account::ProviderKind::Generic {
             let adapter = member
@@ -722,30 +794,32 @@ fn resolve_target(
                 };
                 let path = format!("/v1beta/models/{model}:{action}");
                 return Ok(UpstreamTarget {
-                    url: crate::url::build_provider_url(
-                        member.kind(),
-                        member.upstream_override.as_deref(),
-                        &path,
-                    ),
-                    body: Bytes::from(compat::gemini::openai_to_gemini(&openai_body)?.to_string()),
-                    protocol: compat::Protocol::Antigravity,
-                    headers: None,
-                });
+                            url: crate::url::build_provider_url(
+                                member.kind(),
+                                member.upstream_override.as_deref(),
+                                &path,
+                            ),
+                            body: Bytes::from(compat::gemini::openai_to_gemini(&openai_body)?.to_string()),
+                            protocol: compat::Protocol::Antigravity,
+                            headers: None,
+                            replay: None,
+                        });
             }
             if adapter == "anthropic" {
                 return Ok(UpstreamTarget {
-                    url: crate::url::build_provider_url(
-                        member.kind(),
-                        member.upstream_override.as_deref(),
-                        "/v1/messages",
-                    ),
-                    body: Bytes::from(
-                        serde_json::to_vec(&compat::claude::openai_to_anthropic(&openai_body)?)
-                            .map_err(|error| error.to_string())?,
-                    ),
-                    protocol: compat::Protocol::Anthropic,
-                    headers: None,
-                });
+                            url: crate::url::build_provider_url(
+                                member.kind(),
+                                member.upstream_override.as_deref(),
+                                "/v1/messages",
+                            ),
+                            body: Bytes::from(
+                                serde_json::to_vec(&compat::claude::openai_to_anthropic(&openai_body)?)
+                                    .map_err(|error| error.to_string())?,
+                            ),
+                            protocol: compat::Protocol::Anthropic,
+                            headers: None,
+                            replay: None,
+                        });
             }
             if adapter == "mimo-free" {
                 let endpoint = member.upstream_override.clone().unwrap_or_default();
@@ -758,11 +832,12 @@ fn resolve_target(
                 let mut body = openai_body.clone();
                 compat::mimo::inject_system_marker(&mut body);
                 return Ok(UpstreamTarget {
-                    url: endpoint,
-                    body: Bytes::from(body.to_string()),
-                    protocol: compat::Protocol::Codex,
-                    headers: None,
-                });
+                            url: endpoint,
+                            body: Bytes::from(body.to_string()),
+                            protocol: compat::Protocol::Codex,
+                            headers: None,
+                            replay: None,
+                        });
             }
             if adapter == "openai-responses" || adapter == "azure-openai" {
                 let url = crate::url::build_provider_url(
@@ -783,54 +858,58 @@ fn resolve_target(
                     body: plan.body.clone(),
                     protocol: compat::Protocol::Codex,
                     headers: None,
+                    replay: None,
                 });
             }
             return Ok(UpstreamTarget {
-                url: crate::url::build_provider_url(
-                    member.kind(),
-                    member.upstream_override.as_deref(),
-                    "/v1/chat/completions",
-                ),
-                body: body_with_model(&plan.original_body, upstream_model),
-                protocol: compat::Protocol::Codex,
-                headers: None,
-            });
+                        url: crate::url::build_provider_url(
+                            member.kind(),
+                            member.upstream_override.as_deref(),
+                            "/v1/chat/completions",
+                        ),
+                        body: body_with_model(&plan.original_body, upstream_model),
+                        protocol: compat::Protocol::Codex,
+                        headers: None,
+                        replay: None,
+                    });
         }
         if member.kind() == crate::account::ProviderKind::Cursor {
             let openai = openai_body_with_model(plan, upstream_model)
                 .ok_or_else(|| "Cursor requires an OpenAI-shaped request".to_string())?;
             return Ok(UpstreamTarget {
-                url: crate::url::build_provider_url(
-                    member.kind(),
-                    member.upstream_override.as_deref(),
-                    "/agent.v1.AgentService/Run",
-                ),
-                body: Bytes::from(compat::cursor::openai_to_cursor_connect(&openai)?),
-                protocol: compat::Protocol::Cursor,
-                headers: None,
-            });
+                        url: crate::url::build_provider_url(
+                            member.kind(),
+                            member.upstream_override.as_deref(),
+                            "/agent.v1.AgentService/Run",
+                        ),
+                        body: Bytes::from(compat::cursor::openai_to_cursor_connect(&openai)?),
+                        protocol: compat::Protocol::Cursor,
+                        headers: None,
+                        replay: None,
+                    });
         }
         if member.kind() == crate::account::ProviderKind::Kiro {
             let openai = openai_body_with_model(plan, upstream_model)
                 .ok_or_else(|| "Kiro requires an OpenAI-shaped request".to_string())?;
             return Ok(UpstreamTarget {
-                url: mahoquot_providers::kiro_generate_url(
-                    member.upstream_override.as_deref(),
-                    member
-                        .kiro_region()
-                        .as_deref()
-                        .unwrap_or(mahoquot_providers::KIRO_DEFAULT_REGION),
-                ),
-                body: Bytes::from(
-                    serde_json::to_vec(&compat::kiro::openai_to_kiro_with_profile(
-                        &openai,
-                        member.kiro_profile_arn().as_deref(),
-                    )?)
-                    .map_err(|e| e.to_string())?,
-                ),
-                protocol: compat::Protocol::Kiro,
-                headers: None,
-            });
+                        url: mahoquot_providers::kiro_generate_url(
+                            member.upstream_override.as_deref(),
+                            member
+                                .kiro_region()
+                                .as_deref()
+                                .unwrap_or(mahoquot_providers::KIRO_DEFAULT_REGION),
+                        ),
+                        body: Bytes::from(
+                            serde_json::to_vec(&compat::kiro::openai_to_kiro_with_profile(
+                                &openai,
+                                member.kiro_profile_arn().as_deref(),
+                            )?)
+                            .map_err(|e| e.to_string())?,
+                        ),
+                        protocol: compat::Protocol::Kiro,
+                        headers: None,
+                        replay: None,
+                    });
         }
         if matches!(
             member.kind(),
@@ -873,18 +952,20 @@ fn resolve_target(
                 body,
                 protocol: compat::Protocol::Anthropic,
                 headers: None,
+                replay: None,
             });
         }
         return Ok(UpstreamTarget {
-            url: crate::url::build_provider_url(
-                member.kind(),
-                member.upstream_override.as_deref(),
-                &plan.upstream_path,
-            ),
-            body: body_with_model(&plan.body, upstream_model),
-            protocol: compat::Protocol::Codex,
-            headers: None,
-        });
+                    url: crate::url::build_provider_url(
+                        member.kind(),
+                        member.upstream_override.as_deref(),
+                        &plan.upstream_path,
+                    ),
+                    body: body_with_model(&plan.body, upstream_model),
+                    protocol: compat::Protocol::Codex,
+                    headers: None,
+                    replay: None,
+                });
     }
 
     let openai_body = openai_body_with_model(plan, upstream_model)
@@ -892,14 +973,30 @@ fn resolve_target(
     let project = member
         .project_id()
         .ok_or_else(|| "antigravity account missing project_id".to_string())?;
-    let translated = compat::openai_to_antigravity(&openai_body, &project)?;
+    let session_identity = session_affinity
+        .map(str::to_string)
+        .or_else(|| body_session_anchor(&openai_body));
+    let replay = session_identity
+        .filter(|_| member.kind() == crate::account::ProviderKind::Antigravity)
+        .map(|identity| {
+            state
+                .signature_ledger
+                .scope(upstream_model, &gemini_session_id(&identity))
+        });
+    let translated = match &replay {
+        Some(replay) => {
+            compat::openai_to_antigravity_with_replay(&openai_body, &project, replay)?
+        }
+        None => compat::openai_to_antigravity(&openai_body, &project)?,
+    };
 
     Ok(UpstreamTarget {
-        url: crate::url::build_antigravity_url(member.upstream_override.as_deref()),
-        body: Bytes::from(translated.to_string()),
-        protocol: compat::Protocol::Antigravity,
-        headers: None,
-    })
+                url: crate::url::build_antigravity_url(member.upstream_override.as_deref()),
+                body: Bytes::from(translated.to_string()),
+                protocol: compat::Protocol::Antigravity,
+                headers: None,
+                replay,
+            })
 }
 
 #[derive(Debug)]
@@ -1449,7 +1546,41 @@ fn is_account_scoped_model_rejection(status_code: u16, body: &[u8]) -> bool {
         || text.contains("MONTHLY_REQUEST_COUNT")
 }
 
-fn build_plan(mode: RelayMode, req_path: &str, body_bytes: Bytes) -> Result<RelayPlan, String> {
+fn build_plan(
+    mode: RelayMode,
+    req_path: &str,
+    body_bytes: Bytes,
+    prompt_cache_key: Option<&str>,
+) -> Result<RelayPlan, String> {
+    // TEMP diagnostic (remove after cache-key investigation): which inbound path
+    // reaches build_plan, whether a stable prompt_cache_key was derived, and
+    // whether the request PREFIX (head 48KB) is stable across turns of one key.
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/mq_ck_dbg.log")
+    {
+        use std::io::Write as _;
+        let head_hash = {
+            let digest = crate::request_history::sha256(
+                &body_bytes.as_ref()[..body_bytes.len().min(49152)],
+            );
+            digest[..8].iter().map(|b| format!("{b:02x}")).collect::<String>()
+        };
+        let _ = writeln!(
+            f,
+            "{} path={} key={} model={} len={} head={}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            req_path,
+            prompt_cache_key.map(|k| format!("yes:{}", &k[..8.min(k.len())])).unwrap_or("none".into()),
+            compat::extract_model(body_bytes.as_ref()).unwrap_or_default(),
+            body_bytes.len(),
+            head_hash,
+        );
+    }
     match mode {
         RelayMode::Native => Ok(RelayPlan {
             upstream_path: req_path.to_string(),
@@ -1476,7 +1607,9 @@ fn build_plan(mode: RelayMode, req_path: &str, body_bytes: Bytes) -> Result<Rela
                 .map_err(|e| format!("invalid anthropic request: {e}"))?;
             let openai = compat::anthropic_to_openai(&anthropic)?;
             let openai_bytes = Bytes::from(openai.to_string());
-            let translated = compat::openai_to_codex(&openai_bytes).map_err(|e| e.to_string())?;
+            let translated =
+                compat::openai_to_codex_with_cache_key(&openai_bytes, prompt_cache_key)
+                    .map_err(|e| e.to_string())?;
             Ok(RelayPlan {
                 upstream_path: compat::CODEX_PATH.to_string(),
                 body: Bytes::from(translated.body),
@@ -1532,7 +1665,7 @@ fn build_plan(mode: RelayMode, req_path: &str, body_bytes: Bytes) -> Result<Rela
             })
         }
         RelayMode::OpenAiCompat | RelayMode::LegacyCompletions => {
-            match compat::openai_to_codex(&body_bytes) {
+            match compat::openai_to_codex_with_cache_key(&body_bytes, prompt_cache_key) {
                 Ok(translated) => Ok(RelayPlan {
                     upstream_path: compat::CODEX_PATH.to_string(),
                     body: Bytes::from(translated.body),
@@ -2467,6 +2600,28 @@ async fn finish_success(
 /// Identify the conversation a request belongs to, so successive turns keep
 /// landing on the same upstream account. Codex and Anthropic clients both send a
 /// stable per-session id; without one the request routes by plain round-robin.
+/// Stable per-session prompt cache key for Codex-bound translations. OpenAI
+/// routes implicit prompt caching by `prompt_cache_key`; without it every turn
+/// re-bills the full prompt even when pinned to the same account (observed
+/// live on 2026-09-21: astra/sol turns missing back-to-back at 5-10s gaps).
+/// Identity mirrors routing affinity — session header first, then the
+/// conversation-stable body identity — but deliberately EXCLUDES the
+/// body-prefix fallback whose 2 KiB head hash collides across sessions
+/// sharing a system prompt head: herding them into one cache key would route
+/// every session into the same cache shard and recreate the thrash this
+/// field prevents. Rendered as the first 32 hex chars of SHA-256 (bounded
+/// length/charset), matching opencodex's key derivation.
+fn prompt_cache_key_for(headers: &HeaderMap, original_body: &[u8]) -> Option<String> {
+    let identity = affinity_key(headers).or_else(|| body_affinity_key(original_body))?;
+    let digest = crate::request_history::sha256(identity.as_bytes());
+    let mut key = String::with_capacity(32);
+    for byte in digest.iter().take(16) {
+        use std::fmt::Write as _;
+        let _ = write!(key, "{byte:02x}");
+    }
+    Some(key)
+}
+
 fn affinity_key(headers: &HeaderMap) -> Option<String> {
     for name in [
         "x-claude-code-session-id",
@@ -2647,7 +2802,8 @@ pub async fn handle_relay(
         .unwrap_or(0);
     let created = now_ms / 1000;
 
-    let plan = match build_plan(mode, req_path, body_bytes) {
+    let prompt_cache_key = prompt_cache_key_for(headers, body_bytes.as_ref());
+    let plan = match build_plan(mode, req_path, body_bytes, prompt_cache_key.as_deref()) {
         Ok(plan) => plan,
         Err(message) => return json_error(StatusCode::BAD_REQUEST, &message),
     };
@@ -2719,11 +2875,10 @@ pub async fn handle_relay(
     // happened to answer with a buffered HTTP failure: transport and
     // proactive-refresh failures end an attempt without an HTTP response.
     let mut last_attempted: Option<(&'static str, String)> = None;
-    let hint = SessionHint {
-        affinity_key: affinity_key(headers)
-            .or_else(|| body_affinity_key(plan.original_body.as_ref()))
-            .or_else(|| body_prefix_affinity_key(plan.original_body.as_ref())),
-    };
+    let affinity = affinity_key(headers)
+        .or_else(|| body_affinity_key(plan.original_body.as_ref()))
+        .or_else(|| body_prefix_affinity_key(plan.original_body.as_ref()));
+    let hint = SessionHint { affinity_key: affinity.clone() };
     // Accounts already tried in this request. 5xx and transport failures leave
     // health untouched (per contract), so exclusion is what forces the next
     // attempt onto a distinct account even when session affinity binds the
@@ -2780,7 +2935,15 @@ pub async fn handle_relay(
             .map(|provider| provider.upstream_model.as_str())
             .or(plan.model.as_deref())
             .unwrap_or_default();
-        let target = match resolve_target(&pool, &member, &member_at, &plan, upstream_model) {
+        let target = match resolve_target(
+            &pool,
+            &member,
+            &member_at,
+            &plan,
+            upstream_model,
+            affinity.as_deref(),
+            state.as_ref(),
+        ) {
             Ok(t) => t,
             Err(message) => return json_error(StatusCode::BAD_REQUEST, &message),
         };
@@ -2900,6 +3063,7 @@ pub async fn handle_relay(
                 compat::ProtocolSession {
                     protocol: target.protocol,
                     cursor_reply,
+                    replay: target.replay,
                 },
             )
             .await
@@ -4020,5 +4184,37 @@ mod routing_tests {
         assert_eq!(sticky_sel, 1);
 
         std::fs::remove_dir_all(auth_dir).ok();
+    }
+
+    #[test]
+    fn prompt_cache_key_derives_from_session_header() {
+        use axum::http::{HeaderMap, HeaderValue};
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", HeaderValue::from_static("sess-a"));
+        let body = br#"{"messages":[{"role":"user","content":"hello"}]}"#;
+        let key = prompt_cache_key_for(&headers, body).expect("header identity yields key");
+        assert_eq!(key.len(), 32, "bounded 32-hex key mirrors opencodex derivation");
+        assert_eq!(
+            key,
+            prompt_cache_key_for(&headers, body).unwrap(),
+            "stable across consecutive turns of one session"
+        );
+    }
+
+    #[test]
+    fn prompt_cache_key_falls_back_to_first_user_message() {
+        use axum::http::HeaderMap;
+        let headers = HeaderMap::new();
+        let body =
+            br#"{"messages":[{"role":"system","content":"sys"},{"role":"user","content":"first-turn-unique-42"}]}"#;
+        let key = prompt_cache_key_for(&headers, body).expect("body identity yields key");
+        assert_eq!(key.len(), 32);
+        let other =
+            br#"{"messages":[{"role":"user","content":"a-different-first-turn"}]}"#;
+        assert_ne!(
+            key,
+            prompt_cache_key_for(&headers, other).unwrap(),
+            "distinct first user turns must not collide into one cache key"
+        );
     }
 }

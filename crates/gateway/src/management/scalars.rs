@@ -83,6 +83,19 @@ pub async fn apply_edit(
     }
     match outcome {
         Ok(_) => {
+            match state.settings.current().routing.strategy.as_str() {
+                "fill-first" => {
+                    state.set_routing_strategy(mahoquot_types::Strategy::FillFirst);
+                }
+                "round-robin" => {
+                    state.set_routing_strategy(mahoquot_types::Strategy::StrictRoundRobin);
+                }
+                other => {
+                    if let Some(strat) = super::scalar_table::parse_routing_strategy(other) {
+                        state.set_routing_strategy(strat);
+                    }
+                }
+            }
             note_edit(&state, "config updated");
             saved()
         }
@@ -280,5 +293,85 @@ mod tests {
         let result = clear(&mut settings, None);
         // then upstream's missing-provider error is returned
         assert!(matches!(result, Err(Refusal::Message("missing provider"))));
+    }
+
+    #[test]
+    fn parse_routing_strategy_maps_aliases_and_rejects_invalid() {
+        use super::super::scalar_table::parse_routing_strategy;
+        use mahoquot_types::Strategy;
+
+        assert_eq!(parse_routing_strategy("fill-first"), Some(Strategy::FillFirst));
+        assert_eq!(parse_routing_strategy("Fill-First"), Some(Strategy::FillFirst));
+        assert_eq!(parse_routing_strategy("ff"), Some(Strategy::FillFirst));
+        assert_eq!(parse_routing_strategy("round-robin"), Some(Strategy::StrictRoundRobin));
+        assert_eq!(parse_routing_strategy("rr"), Some(Strategy::StrictRoundRobin));
+        assert_eq!(parse_routing_strategy("RoundRobin"), Some(Strategy::StrictRoundRobin));
+        assert_eq!(parse_routing_strategy(""), None);
+        assert_eq!(parse_routing_strategy("   "), None);
+        assert_eq!(parse_routing_strategy("nonsense"), None);
+    }
+
+    #[test]
+    fn app_state_initializes_strategy_from_settings() {
+        use mahoquot_types::Strategy;
+
+        let dir = std::env::temp_dir().join(format!("test-state-init-routing-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.yaml");
+
+        let mut settings = Settings::default();
+        settings.routing.strategy = "fill-first".to_string();
+        settings.persist(&config_path).unwrap();
+
+        let config = crate::config::GatewayConfig {
+            auth_dir: dir.clone(),
+            config_path: config_path.clone(),
+            strategy: Strategy::StrictRoundRobin,
+            ..Default::default()
+        };
+        let state = AppState::new(&config).unwrap();
+        assert_eq!(state.router.strategy(), Strategy::FillFirst);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn write_scalar_updates_router_strategy() {
+        use mahoquot_types::Strategy;
+
+        let dir = std::env::temp_dir().join(format!("test-scalar-routing-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = crate::config::GatewayConfig {
+            auth_dir: dir.clone(),
+            config_path: dir.join("config.yaml"),
+            strategy: Strategy::StrictRoundRobin,
+            ..Default::default()
+        };
+        let state = Arc::new(AppState::new(&config).unwrap());
+        assert_eq!(state.router.strategy(), Strategy::StrictRoundRobin);
+
+        let scalar = find("/routing/strategy").expect("registered");
+
+        // Update to fill-first
+        let raw = bytes::Bytes::from(r#"{"value":"fill-first"}"#);
+        let resp = write_scalar(Arc::clone(&state), scalar, raw).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(state.router.strategy(), Strategy::FillFirst);
+        assert_eq!(state.settings.current().routing.strategy, "fill-first");
+
+        // Update to round-robin
+        let raw = bytes::Bytes::from(r#"{"value":"round-robin"}"#);
+        let resp = write_scalar(Arc::clone(&state), scalar, raw).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(state.router.strategy(), Strategy::StrictRoundRobin);
+        assert_eq!(state.settings.current().routing.strategy, "round-robin");
+
+        // Invalid strategy rejected and router strategy unchanged
+        let raw = bytes::Bytes::from(r#"{"value":"invalid-strategy"}"#);
+        let resp = write_scalar(Arc::clone(&state), scalar, raw).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(state.router.strategy(), Strategy::StrictRoundRobin);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

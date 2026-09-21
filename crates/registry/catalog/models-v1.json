@@ -281,6 +281,37 @@
         "context_limit": "250000"
       }
     },
+    "claude-opus-5": {
+      "id": "claude-opus-5",
+      "owned_by": "anthropic",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "claude": {
+          "provider_id": "claude",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1000000"
+      }
+    },
     "claude-sonnet-4-5": {
       "id": "claude-sonnet-4-5",
       "owned_by": "anthropic",

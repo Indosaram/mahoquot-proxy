@@ -93,8 +93,10 @@ fn test_t9_live_captured_frame_decodes_to_text_and_usage() {
                 completion_tokens: 2,
                 total_tokens: 68,
                 cached_tokens: 0,
+                cached_tokens_known: false,
                 reasoning_tokens: 60,
                 cache_write_tokens: 0,
+                cache_write_tokens_known: false,
             })
         }
     );

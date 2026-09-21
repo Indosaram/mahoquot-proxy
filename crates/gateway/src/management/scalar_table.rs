@@ -1,3 +1,4 @@
+use mahoquot_types::Strategy;
 use serde_json::{json, Value};
 
 use super::settings::Settings;
@@ -70,6 +71,19 @@ pub fn normalize_routing_strategy(raw: &str) -> Option<&'static str> {
         "" | "round-robin" | "roundrobin" | "rr" => Some("round-robin"),
         "weighted-round-robin" | "weightedroundrobin" | "wrr" => Some("weighted-round-robin"),
         "fill-first" | "fillfirst" | "ff" => Some("fill-first"),
+        _ => None,
+    }
+}
+
+/// Parse a raw strategy string into the typed `Strategy` enum, mapping upstream aliases.
+/// Returns `None` for empty input or unsupported strategies.
+pub fn parse_routing_strategy(raw: &str) -> Option<Strategy> {
+    if raw.trim().is_empty() {
+        return None;
+    }
+    match normalize_routing_strategy(raw)? {
+        "fill-first" => Some(Strategy::FillFirst),
+        "round-robin" => Some(Strategy::StrictRoundRobin),
         _ => None,
     }
 }

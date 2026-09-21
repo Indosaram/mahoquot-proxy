@@ -2,7 +2,7 @@ use base64::Engine as _;
 use serde_json::{json, Map, Value};
 
 use super::events::{CodexEvent, Usage};
-use super::signature_ledger;
+use super::signature_ledger::{self, ReplayScope};
 
 const SIGNATURE_ID_SEPARATOR: char = '#';
 const GEMINI_SKIP_THOUGHT_SIGNATURE_VALIDATOR: &str = "skip_thought_signature_validator";
@@ -101,6 +101,22 @@ fn extract_text_from_parts(parts: Option<&Value>) -> String {
 }
 
 pub fn gemini_to_openai(req: &Value, model: &str) -> Result<Value, String> {
+    gemini_to_openai_inner(req, model, None)
+}
+
+pub fn gemini_to_openai_with_replay(
+    req: &Value,
+    model: &str,
+    replay: &ReplayScope,
+) -> Result<Value, String> {
+    gemini_to_openai_inner(req, model, Some(replay))
+}
+
+fn gemini_to_openai_inner(
+    req: &Value,
+    model: &str,
+    replay: Option<&ReplayScope>,
+) -> Result<Value, String> {
     let mut out_messages = Vec::new();
 
     // 1. System instructions
@@ -157,8 +173,8 @@ pub fn gemini_to_openai(req: &Value, model: &str) -> Result<Value, String> {
                             .filter(|id| !id.is_empty())
                             .map(str::to_string)
                             .unwrap_or_else(|| signature_ledger::synthetic_call_id(name));
-                        if let Some(ref sig) = reasoning_sig {
-                            signature_ledger::remember(&call_id, name, &args.to_string(), sig);
+                        if let (Some(replay), Some(sig)) = (replay, reasoning_sig.as_ref()) {
+                            replay.remember(&call_id, name, &args.to_string(), sig);
                         }
                         tool_calls.push(json!({
                             "id": call_id,
@@ -304,10 +320,18 @@ pub fn gemini_to_openai(req: &Value, model: &str) -> Result<Value, String> {
 }
 
 pub fn openai_to_gemini(body: &Value) -> Result<Value, String> {
-    openai_to_gemini_inner(body, false)
+    openai_to_gemini_inner(body, false, None)
 }
 
-fn openai_to_gemini_inner(body: &Value, claude_tools: bool) -> Result<Value, String> {
+pub fn openai_to_gemini_with_replay(body: &Value, replay: &ReplayScope) -> Result<Value, String> {
+    openai_to_gemini_inner(body, false, Some(replay))
+}
+
+fn openai_to_gemini_inner(
+    body: &Value,
+    claude_tools: bool,
+    replay: Option<&ReplayScope>,
+) -> Result<Value, String> {
     let model = body
         .get("model")
         .and_then(Value::as_str)
@@ -369,7 +393,9 @@ fn openai_to_gemini_inner(body: &Value, claude_tools: bool) -> Result<Value, Str
                                 .and_then(Value::as_str)
                                 .map(str::to_string)
                         })
-                        .or_else(|| signature_ledger::recall(&plain_id, name, &arguments));
+                        .or_else(|| {
+                            replay.and_then(|replay| replay.recall(&plain_id, name, &arguments))
+                        });
                     let base_id = if plain_id.is_empty() {
                         let generated = format!("call_{name}_{generated_call_index}");
                         generated_call_index += 1;
@@ -497,6 +523,13 @@ fn openai_to_gemini_inner(body: &Value, claude_tools: bool) -> Result<Value, Str
 
     let mut request = Map::new();
     request.insert("contents".to_string(), Value::Array(contents));
+
+    // Antigravity threads reasoning state per conversation, so a replayed
+    // signature is only accepted under the session that produced it. The id is
+    // the caller's stable scope id, never anything forwarded from ingress.
+    if let Some(session_id) = replay.map(ReplayScope::session_id).filter(|id| !id.is_empty()) {
+        request.insert("sessionId".to_string(), json!(session_id));
+    }
 
     if !system_parts.is_empty() {
         request.insert(
@@ -683,6 +716,22 @@ fn sanitize_claude_schema_for_gemini(value: &mut Value) -> Result<(), String> {
 }
 
 pub fn openai_to_antigravity(body: &Value, project_id: &str) -> Result<Value, String> {
+    openai_to_antigravity_inner(body, project_id, None)
+}
+
+pub fn openai_to_antigravity_with_replay(
+    body: &Value,
+    project_id: &str,
+    replay: &ReplayScope,
+) -> Result<Value, String> {
+    openai_to_antigravity_inner(body, project_id, Some(replay))
+}
+
+fn openai_to_antigravity_inner(
+    body: &Value,
+    project_id: &str,
+    replay: Option<&ReplayScope>,
+) -> Result<Value, String> {
     let model = body
         .get("model")
         .and_then(Value::as_str)
@@ -690,16 +739,39 @@ pub fn openai_to_antigravity(body: &Value, project_id: &str) -> Result<Value, St
 
     // Antigravity uses Gemini's wire format even when its actual validator is
     // Anthropic. Keep this repair out of native Gemini and non-Claude models.
-    let request = openai_to_gemini_inner(body, model.starts_with("claude-"))?;
+    let request = openai_to_gemini_inner(body, model.starts_with("claude-"), replay)?;
 
+    // The envelope carries the client-identity fields the real Antigravity
+    // client sends; CLIProxyAPI and OpenCodex both mirror them.
     Ok(json!({
         "model": model,
+        "userAgent": "antigravity",
+        "requestType": "agent",
         "project": project_id,
+        "requestId": format!("agent-{}", uuid::Uuid::new_v4()),
         "request": request,
     }))
 }
 
 pub fn gemini_json_to_openai(body: &Value, model: &str, created: i64) -> Value {
+    gemini_json_to_openai_inner(body, model, created, None)
+}
+
+pub fn gemini_json_to_openai_with_replay(
+    body: &Value,
+    model: &str,
+    created: i64,
+    replay: &ReplayScope,
+) -> Value {
+    gemini_json_to_openai_inner(body, model, created, Some(replay))
+}
+
+fn gemini_json_to_openai_inner(
+    body: &Value,
+    model: &str,
+    created: i64,
+    replay: Option<&ReplayScope>,
+) -> Value {
     let response = body.get("response").unwrap_or(body);
     let candidate = response
         .get("candidates")
@@ -734,8 +806,8 @@ pub fn gemini_json_to_openai(body: &Value, model: &str, created: i64) -> Value {
                     .and_then(Value::as_str)
                     .map(str::to_string)
                     .or_else(|| pending_signature.clone());
-                if let Some(signature) = signature.as_deref() {
-                    signature_ledger::remember(&id, name, &args, signature);
+                if let (Some(replay), Some(signature)) = (replay, signature.as_deref()) {
+                    replay.remember(&id, name, &args, signature);
                 }
                 tool_calls.push(json!({
                     "id": id,
@@ -915,11 +987,19 @@ pub struct GeminiDecoder {
     usage: Option<Usage>,
     completed: bool,
     pending_signature: Option<String>,
+    replay: Option<ReplayScope>,
 }
 
 impl GeminiDecoder {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_replay(replay: ReplayScope) -> Self {
+        Self {
+            replay: Some(replay),
+            ..Self::default()
+        }
     }
 
     pub fn decode(&mut self, payload: &[u8], out: &mut Vec<CodexEvent>) {
@@ -970,19 +1050,22 @@ impl GeminiDecoder {
                 .get("totalTokenCount")
                 .and_then(Value::as_u64)
                 .unwrap_or(prompt + completion);
+            // A cache read is known only when the metric is numerically
+            // present: zero is a measurement, absent is unknown. Gemini emits
+            // no cache-write metric at all, so that one is never known.
+            let cached = usage.get("cachedContentTokenCount").and_then(Value::as_u64);
             self.usage = Some(Usage {
                 prompt_tokens: prompt,
                 completion_tokens: completion,
                 total_tokens: total,
-                cached_tokens: usage
-                    .get("cachedContentTokenCount")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
+                cached_tokens: cached.unwrap_or(0),
+                cached_tokens_known: cached.is_some(),
                 reasoning_tokens: usage
                     .get("thoughtsTokenCount")
                     .and_then(Value::as_u64)
                     .unwrap_or(0),
                 cache_write_tokens: 0,
+                cache_write_tokens_known: false,
             });
         }
 
@@ -1023,8 +1106,10 @@ impl GeminiDecoder {
                     let call_id = native_id
                         .map(str::to_string)
                         .unwrap_or_else(|| signature_ledger::synthetic_call_id(name));
-                    if let Some(signature) = signature.as_deref() {
-                        signature_ledger::remember(&call_id, name, &args, signature);
+                    if let (Some(replay), Some(signature)) =
+                        (self.replay.as_ref(), signature.as_deref())
+                    {
+                        replay.remember(&call_id, name, &args, signature);
                     }
                     out.push(CodexEvent::ToolCallBegin {
                         output_index,
@@ -1347,20 +1432,22 @@ mod signature_tests {
             ]}}]
         });
 
-        let out = gemini_json_to_openai(&response, "gemini-3.7-flash-high", 0);
+        let ledger = signature_ledger::SignatureLedger::in_memory();
+        let replay = ledger.scope("gemini-3.7-flash-high", "session-json-park");
+        let out =
+            gemini_json_to_openai_with_replay(&response, "gemini-3.7-flash-high", 0, &replay);
         let id = out["choices"][0]["message"]["tool_calls"][0]["id"]
             .as_str()
             .expect("tool call id");
         assert_eq!(id, "native-call-17");
-        assert_eq!(
-            signature_ledger::recall(id, "todo", "{}").as_deref(),
-            Some("SIGJSON")
-        );
+        assert_eq!(replay.recall(id, "todo", "{}").as_deref(), Some("SIGJSON"));
     }
 
     #[test]
     fn decoder_parks_the_signature_under_the_native_call_id() {
-        let mut decoder = GeminiDecoder::new();
+        let ledger = signature_ledger::SignatureLedger::in_memory();
+        let replay = ledger.scope("gemini-3.8-flash-high", "session-stream-park");
+        let mut decoder = GeminiDecoder::with_replay(replay.clone());
         let mut out = Vec::new();
         decoder.decode(
             br#"{"candidates":[{"content":{"parts":[{"functionCall":{"id":"native-stream-23","name":"todo","args":{}},"thoughtSignature":"SIGSTREAM"}]}}]}"#,
@@ -1373,14 +1460,16 @@ mod signature_tests {
         let call_id = begin.expect("tool call begin");
         assert_eq!(call_id, "native-stream-23");
         assert_eq!(
-            signature_ledger::recall(&call_id, "todo", "{}").as_deref(),
+            replay.recall(&call_id, "todo", "{}").as_deref(),
             Some("SIGSTREAM")
         );
     }
 
     #[test]
     fn a_parked_signature_replays_into_the_next_request() {
-        let mut decoder = GeminiDecoder::new();
+        let ledger = signature_ledger::SignatureLedger::in_memory();
+        let replay = ledger.scope("gemini-3.8-flash-high", "session-replay");
+        let mut decoder = GeminiDecoder::with_replay(replay.clone());
         let mut out = Vec::new();
         decoder.decode(
             br#"{"candidates":[{"content":{"parts":[{"functionCall":{"id":"replay-native-1","name":"bash","args":{"command":"ls"}},"thoughtSignature":"SIGREPLAY"}]}}]}"#,
@@ -1405,11 +1494,162 @@ mod signature_tests {
                 { "role": "tool", "tool_call_id": call_id, "content": "out" }
             ]
         });
-        let request = openai_to_gemini(&body).expect("translate");
+        let request = openai_to_gemini_with_replay(&body, &replay).expect("translate");
         assert_eq!(
             request["contents"][1]["parts"][0]["thoughtSignature"],
             "SIGREPLAY"
         );
+    }
+
+    #[test]
+    fn a_signature_parked_under_one_session_never_replays_into_another() {
+        let ledger = signature_ledger::SignatureLedger::in_memory();
+        let first = ledger.scope("gemini-3.8-flash-high", "session-one");
+        let second = ledger.scope("gemini-3.8-flash-high", "session-two");
+        let other_model = ledger.scope("gemini-3.7-flash-high", "session-one");
+        let mut decoder = GeminiDecoder::with_replay(first.clone());
+        let mut out = Vec::new();
+        decoder.decode(
+            br#"{"candidates":[{"content":{"parts":[{"functionCall":{"id":"scoped-1","name":"bash","args":{}},"thoughtSignature":"SIGSCOPED"}]}}]}"#,
+            &mut out,
+        );
+        let body = json!({
+            "model": "gemini-3.8-flash-high",
+            "messages": [
+                { "role": "user", "content": "go" },
+                { "role": "assistant", "tool_calls": [{
+                    "id": "scoped-1", "type": "function",
+                    "function": { "name": "bash", "arguments": "{}" }
+                }]},
+                { "role": "tool", "tool_call_id": "scoped-1", "content": "out" }
+            ]
+        });
+
+        assert_eq!(
+            openai_to_gemini_with_replay(&body, &first).expect("translate")["contents"][1]["parts"]
+                [0]["thoughtSignature"],
+            "SIGSCOPED"
+        );
+        for foreign in [&second, &other_model] {
+            assert_eq!(
+                openai_to_gemini_with_replay(&body, foreign).expect("translate")["contents"][1]
+                    ["parts"][0]["thoughtSignature"],
+                GEMINI_SKIP_THOUGHT_SIGNATURE_VALIDATOR,
+                "another model or session must not inherit a parked signature"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unscoped_conversion_parks_nothing_and_replays_nothing() {
+        let ledger = signature_ledger::SignatureLedger::in_memory();
+        let mut decoder = GeminiDecoder::new();
+        let mut out = Vec::new();
+        decoder.decode(
+            br#"{"candidates":[{"content":{"parts":[{"functionCall":{"id":"unscoped-1","name":"bash","args":{}},"thoughtSignature":"SIGUNSCOPED"}]}}]}"#,
+            &mut out,
+        );
+        assert_eq!(ledger.write_count(), 0);
+        assert!(ledger.is_empty());
+    }
+
+    #[test]
+    fn a_scoped_request_carries_a_stable_session_id_and_an_unscoped_one_omits_it() {
+        let ledger = signature_ledger::SignatureLedger::in_memory();
+        let replay = ledger.scope("gemini-3.8-flash-high", "session-wire-1");
+        let body = json!({
+            "model": "gemini-3.8-flash-high",
+            "messages": [{ "role": "user", "content": "hello" }]
+        });
+
+        let first = openai_to_gemini_with_replay(&body, &replay).expect("translate");
+        let second = openai_to_gemini_with_replay(&body, &replay).expect("translate");
+        assert_eq!(first["sessionId"], "session-wire-1");
+        assert_eq!(
+            first["sessionId"], second["sessionId"],
+            "the session id must be stable across requests in one session"
+        );
+
+        let other = ledger.scope("gemini-3.8-flash-high", "session-wire-2");
+        assert_eq!(
+            openai_to_gemini_with_replay(&body, &other).expect("translate")["sessionId"],
+            "session-wire-2"
+        );
+        assert!(
+            openai_to_gemini(&body)
+                .expect("translate")
+                .get("sessionId")
+                .is_none(),
+            "an unscoped conversion must not invent a session id"
+        );
+    }
+
+    #[test]
+    fn an_antigravity_request_nests_the_session_id_under_request() {
+        let ledger = signature_ledger::SignatureLedger::in_memory();
+        let replay = ledger.scope("gemini-3.8-flash-high", "session-antigravity");
+        let body = json!({
+            "model": "gemini-3.8-flash-high",
+            "messages": [{ "role": "user", "content": "hello" }]
+        });
+
+        let out = openai_to_antigravity_with_replay(&body, "project-1", &replay).expect("translate");
+        assert_eq!(out["request"]["sessionId"], "session-antigravity");
+        assert_eq!(out["project"], "project-1");
+        assert!(out.get("sessionId").is_none());
+        assert!(openai_to_antigravity(&body, "project-1")
+            .expect("translate")["request"]
+            .get("sessionId")
+            .is_none());
+    }
+
+    #[test]
+    fn a_present_cache_read_metric_is_known_and_an_absent_one_is_not() {
+        let decode_usage = |payload: Value| {
+            let mut decoder = GeminiDecoder::new();
+            let mut out = Vec::new();
+            decoder.decode(payload.to_string().as_bytes(), &mut out);
+            out.into_iter().find_map(|event| match event {
+                CodexEvent::Completed { usage } => usage,
+                _ => None,
+            })
+        };
+
+        let reported = decode_usage(json!({
+            "candidates": [{ "content": { "parts": [] }, "finishReason": "STOP" }],
+            "usageMetadata": {
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 4,
+                "cachedContentTokenCount": 0
+            }
+        }))
+        .expect("usage");
+        assert!(reported.cached_tokens_known, "a reported zero is a measurement");
+        assert_eq!(reported.cached_tokens, 0);
+        assert!(!reported.cache_write_tokens_known);
+
+        let absent = decode_usage(json!({
+            "candidates": [{ "content": { "parts": [] }, "finishReason": "STOP" }],
+            "usageMetadata": { "promptTokenCount": 10, "candidatesTokenCount": 4 }
+        }))
+        .expect("usage");
+        assert!(
+            !absent.cached_tokens_known,
+            "an absent metric is unknown, not a zero"
+        );
+        assert_eq!(absent.cached_tokens, 0);
+
+        let hit = decode_usage(json!({
+            "candidates": [{ "content": { "parts": [] }, "finishReason": "STOP" }],
+            "usageMetadata": {
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 4,
+                "cachedContentTokenCount": 7
+            }
+        }))
+        .expect("usage");
+        assert!(hit.cached_tokens_known);
+        assert_eq!(hit.cached_tokens, 7);
     }
 
     #[test]
@@ -1422,12 +1662,14 @@ mod signature_tests {
             ]}}]
         });
 
-        let out = gemini_json_to_openai(&response, "gemini-3.8-flash-high", 0);
+        let ledger = signature_ledger::SignatureLedger::in_memory();
+        let replay = ledger.scope("gemini-3.8-flash-high", "session-large");
+        let out = gemini_json_to_openai_with_replay(&response, "gemini-3.8-flash-high", 0, &replay);
         let id = out["choices"][0]["message"]["tool_calls"][0]["id"]
             .as_str()
             .expect("tool call id");
         assert_eq!(id, "native-large-1");
-        assert_eq!(signature_ledger::recall(id, "eval", "{}"), Some(signature));
+        assert_eq!(replay.recall(id, "eval", "{}"), Some(signature));
     }
 
     #[test]
@@ -1452,7 +1694,9 @@ mod signature_tests {
 
     #[test]
     fn a_reused_call_id_with_other_arguments_does_not_replay_a_stale_signature() {
-        signature_ledger::remember("stale-native-1", "eval", "{\"offset\":10}", "SIGSTALE");
+        let ledger = signature_ledger::SignatureLedger::in_memory();
+        let replay = ledger.scope("gemini-3.8-flash-high", "session-stale");
+        replay.remember("stale-native-1", "eval", "{\"offset\":10}", "SIGSTALE");
         let body = json!({
             "model": "gemini-3.8-flash-high",
             "messages": [
@@ -1464,7 +1708,7 @@ mod signature_tests {
                 { "role": "tool", "tool_call_id": "stale-native-1", "content": "out" }
             ]
         });
-        let request = openai_to_gemini(&body).expect("translate");
+        let request = openai_to_gemini_with_replay(&body, &replay).expect("translate");
         assert_eq!(
             request["contents"][1]["parts"][0]["thoughtSignature"],
             GEMINI_SKIP_THOUGHT_SIGNATURE_VALIDATOR
@@ -1518,7 +1762,9 @@ mod signature_tests {
 
     #[test]
     fn decoder_carries_a_standalone_signature_part_into_the_next_call_id() {
-        let mut decoder = GeminiDecoder::new();
+        let ledger = signature_ledger::SignatureLedger::in_memory();
+        let replay = ledger.scope("gemini-3.8-flash-high", "session-pending");
+        let mut decoder = GeminiDecoder::with_replay(replay.clone());
         let mut out = Vec::new();
         decoder.decode(
             br#"{"candidates":[{"content":{"parts":[
@@ -1532,14 +1778,18 @@ mod signature_tests {
             _ => None,
         });
         assert_eq!(
-            signature_ledger::recall(&begin.expect("tool call begin"), "todo", "{}").as_deref(),
+            replay
+                .recall(&begin.expect("tool call begin"), "todo", "{}")
+                .as_deref(),
             Some("SIGPENDING")
         );
     }
 
     #[test]
     fn decoder_shares_a_pending_signature_across_parallel_calls() {
-        let mut decoder = GeminiDecoder::new();
+        let ledger = signature_ledger::SignatureLedger::in_memory();
+        let replay = ledger.scope("gemini-3.8-flash-high", "session-parallel");
+        let mut decoder = GeminiDecoder::with_replay(replay.clone());
         let mut out = Vec::new();
         decoder.decode(
             br#"{"candidates":[{"content":{"parts":[
@@ -1563,11 +1813,11 @@ mod signature_tests {
             .collect();
         assert_eq!(ids.len(), 2);
         assert_eq!(
-            signature_ledger::recall(&ids[0], "bash", "{}").as_deref(),
+            replay.recall(&ids[0], "bash", "{}").as_deref(),
             Some("SIGBLOCK")
         );
         assert_eq!(
-            signature_ledger::recall(&ids[1], "edit", "{}").as_deref(),
+            replay.recall(&ids[1], "edit", "{}").as_deref(),
             Some("SIGBLOCK")
         );
     }

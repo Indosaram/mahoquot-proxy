@@ -92,8 +92,11 @@ use events::{CodexEvent, SseParser};
 use render::{Aggregator, ChunkRenderer, GeminiChunkRenderer, DONE_FRAME};
 
 pub use claude::{anthropic_to_openai, estimate_input_tokens, messages_payload};
-pub use gemini::{openai_to_antigravity, GeminiDecoder};
-pub use request::{extract_model, openai_to_codex, TranslateError, TranslatedRequest};
+pub use gemini::{openai_to_antigravity, openai_to_antigravity_with_replay, GeminiDecoder};
+pub use request::{
+    extract_model, openai_to_codex, openai_to_codex_with_cache_key, TranslateError,
+    TranslatedRequest,
+};
 pub use responses::{
     responses_response, responses_to_openai, ResponsesError, ResponsesStreamRenderer,
 };
@@ -174,6 +177,7 @@ pub enum Protocol {
 pub struct ProtocolSession {
     pub protocol: Protocol,
     pub cursor_reply: Option<tokio::sync::mpsc::UnboundedSender<Bytes>>,
+    pub replay: Option<signature_ledger::ReplayScope>,
 }
 
 struct ProtocolParser {
@@ -190,15 +194,38 @@ impl ProtocolParser {
         Self::with_cursor_reply(protocol, None)
     }
 
+    /// Builds the parser a relayed reply is decoded with. An Antigravity
+    /// upstream emits the `thoughtSignature` that must come back on the next
+    /// turn, so the decoder writes it into the same scope the request was
+    /// translated with.
+    fn with_session(session: &ProtocolSession) -> Self {
+        Self::with_parts(
+            session.protocol,
+            session.cursor_reply.clone(),
+            session.replay.clone(),
+        )
+    }
+
     fn with_cursor_reply(
         protocol: Protocol,
         cursor_reply: Option<tokio::sync::mpsc::UnboundedSender<Bytes>>,
+    ) -> Self {
+        Self::with_parts(protocol, cursor_reply, None)
+    }
+
+    fn with_parts(
+        protocol: Protocol,
+        cursor_reply: Option<tokio::sync::mpsc::UnboundedSender<Bytes>>,
+        replay: Option<signature_ledger::ReplayScope>,
     ) -> Self {
         Self {
             sse: SseParser::default(),
             gemini: match protocol {
                 Protocol::Codex => None,
-                Protocol::Antigravity => Some(gemini::GeminiDecoder::new()),
+                Protocol::Antigravity => Some(match replay {
+                    Some(replay) => gemini::GeminiDecoder::with_replay(replay),
+                    None => gemini::GeminiDecoder::new(),
+                }),
                 Protocol::Anthropic => None,
                 Protocol::Kiro => None,
                 Protocol::Cursor => None,
@@ -353,10 +380,14 @@ pub fn streaming_body(params: StreamingBodyParams) -> Body {
         upstream_capture,
         devin_outcome,
     } = params;
+    let parser = ProtocolParser::with_session(&session);
     let renderer = match shape {
-        ReplyShape::Gemini => {
-            StreamRenderer::Gemini(Box::new(GeminiChunkRenderer::new(model, created)))
-        }
+        ReplyShape::Gemini => StreamRenderer::Gemini(Box::new(match session.replay {
+            Some(replay) => {
+                GeminiChunkRenderer::with_replay(model, created, replay)
+            }
+            None => GeminiChunkRenderer::new(model, created),
+        })),
         ReplyShape::Anthropic => StreamRenderer::Anthropic(Box::new(
             claude::AnthropicStreamRenderer::new(model, created),
         )),
@@ -367,7 +398,7 @@ pub fn streaming_body(params: StreamingBodyParams) -> Body {
     };
     let mut state = TranslateState {
         upstream,
-        parser: ProtocolParser::with_cursor_reply(session.protocol, session.cursor_reply),
+        parser,
         renderer,
         pending: VecDeque::new(),
         drained: false,
@@ -455,7 +486,9 @@ fn capture_stream_usage(
             input_tokens: usage.prompt_tokens,
             output_tokens: usage.completion_tokens,
             cached_input_tokens: usage.cached_tokens,
+            cached_input_tokens_known: usage.cached_tokens_known,
             cache_write_tokens: usage.cache_write_tokens,
+            cache_write_tokens_known: usage.cache_write_tokens_known,
             reasoning_tokens: usage.reasoning_tokens,
         });
 }
@@ -472,7 +505,7 @@ pub async fn collect_stream_with_replies(
     ),
     String,
 > {
-    let mut parser = ProtocolParser::with_cursor_reply(session.protocol, session.cursor_reply);
+    let mut parser = ProtocolParser::with_session(&session);
     let mut raw = first.to_vec();
     let mut events = Vec::new();
     parser.push(&first, &mut events);
@@ -489,7 +522,9 @@ pub async fn collect_stream_with_replies(
             input_tokens: completed.prompt_tokens,
             output_tokens: completed.completion_tokens,
             cached_input_tokens: completed.cached_tokens,
+            cached_input_tokens_known: completed.cached_tokens_known,
             cache_write_tokens: completed.cache_write_tokens,
+            cache_write_tokens_known: completed.cache_write_tokens_known,
             reasoning_tokens: completed.reasoning_tokens,
         }),
         _ => None,
@@ -525,12 +560,16 @@ pub fn aggregate(
     protocol: Protocol,
     shape: ReplyShape,
 ) -> Result<Value, String> {
-    let mut parser = ProtocolParser::new(protocol);
+    // One response in, one response out: the ledger exists only for this call,
+    // so a signature that arrived on the body is re-emitted on it (the Gemini
+    // shape needs it back on the functionCall) without outliving the aggregate.
+    let replay = signature_ledger::SignatureLedger::in_memory().scope(&model, "");
+    let mut parser = ProtocolParser::with_parts(protocol, None, Some(replay.clone()));
     let mut events = Vec::new();
     parser.push(raw, &mut events);
     parser.finish(&mut events);
 
-    let mut aggregator = Aggregator::new(model, created);
+    let mut aggregator = Aggregator::new(model, created).with_replay(replay);
     for event in events {
         aggregator.push(event);
     }

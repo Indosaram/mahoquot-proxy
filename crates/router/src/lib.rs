@@ -10,10 +10,28 @@
 //! - Router is pure selection: health transitions are owned by the caller.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mahoquot_types::{PoolMember, SessionHint, Strategy};
+
+const STRATEGY_STRICT_ROUND_ROBIN: u8 = 0;
+const STRATEGY_FILL_FIRST: u8 = 1;
+
+fn strategy_to_u8(strategy: Strategy) -> u8 {
+    match strategy {
+        Strategy::StrictRoundRobin => STRATEGY_STRICT_ROUND_ROBIN,
+        Strategy::FillFirst => STRATEGY_FILL_FIRST,
+    }
+}
+
+fn u8_to_strategy(val: u8) -> Strategy {
+    match val {
+        STRATEGY_FILL_FIRST => Strategy::FillFirst,
+        _ => Strategy::StrictRoundRobin,
+    }
+}
 
 #[derive(Default, Debug)]
 struct RouterState {
@@ -33,16 +51,20 @@ const AFFINITY_MAX_IDLE: u64 = 10_000;
 
 #[derive(Default, Debug)]
 pub struct Router {
-    strategy: Strategy,
+    strategy: AtomicU8,
     state: Mutex<RouterState>,
 }
 
 impl Router {
     pub fn new(strategy: Strategy) -> Self {
         Self {
-            strategy,
+            strategy: AtomicU8::new(strategy_to_u8(strategy)),
             state: Mutex::new(RouterState::default()),
         }
+    }
+
+    pub fn set_strategy(&self, strategy: Strategy) {
+        self.strategy.store(strategy_to_u8(strategy), Ordering::SeqCst);
     }
 
     /// Index into `members` of the next member to serve, or None if none available.
@@ -74,7 +96,7 @@ impl Router {
             }
         }
 
-        match self.strategy {
+        match self.strategy() {
             Strategy::FillFirst => {
                 let chosen_idx = members
                     .iter()
@@ -142,7 +164,7 @@ impl Router {
     pub fn feedback(&self, _id: &str, _outcome: mahoquot_types::Outcome) {}
 
     pub fn strategy(&self) -> Strategy {
-        self.strategy
+        u8_to_strategy(self.strategy.load(Ordering::SeqCst))
     }
 
     /// Retrieve the member ID bound to an affinity key, if any.
@@ -379,5 +401,66 @@ mod red_tests {
         ]);
         let next = r.select(&healthy, &keyed("conv-1")).expect("failover");
         assert_ne!(next, first);
+    }
+
+    #[test]
+    fn test_dynamic_strategy_switch() {
+        let p = pool(&[("a", Health::Available), ("b", Health::Available)]);
+        let r = Router::new(Strategy::StrictRoundRobin);
+        let hint = SessionHint::default();
+
+        assert_eq!(r.strategy(), Strategy::StrictRoundRobin);
+
+        // 1. Send requests across 2 candidates under StrictRoundRobin: observe round-robin rotation.
+        let mut last_seq = 0u64;
+        let first = p[r.select(&p, &hint).expect("select 1")].id().to_string();
+        let seq1 = r.state.lock().unwrap().seq;
+        assert!(seq1 > last_seq, "sequence must increase monotonically");
+        last_seq = seq1;
+
+        let second = p[r.select(&p, &hint).expect("select 2")].id().to_string();
+        let seq2 = r.state.lock().unwrap().seq;
+        assert!(seq2 > last_seq, "sequence must increase monotonically");
+        last_seq = seq2;
+
+        assert_ne!(first, second, "must alternate between a and b under RoundRobin");
+
+        let third = p[r.select(&p, &hint).expect("select 3")].id().to_string();
+        let seq3 = r.state.lock().unwrap().seq;
+        assert!(seq3 > last_seq, "sequence must increase monotonically");
+        last_seq = seq3;
+        assert_eq!(third, first, "must wrap around to the first candidate under RoundRobin");
+
+        let fourth = p[r.select(&p, &hint).expect("select 4")].id().to_string();
+        let seq4 = r.state.lock().unwrap().seq;
+        assert!(seq4 > last_seq, "sequence must increase monotonically");
+        last_seq = seq4;
+        assert_eq!(fourth, second, "must alternate back to the second candidate under RoundRobin");
+
+        // 2. Call router.set_strategy(Strategy::FillFirst).
+        r.set_strategy(Strategy::FillFirst);
+
+        // Stale state probe: immediately returns the newly set Strategy without cached delay.
+        assert_eq!(r.strategy(), Strategy::FillFirst, "strategy getter must immediately reflect FillFirst");
+
+        // 3. Send subsequent requests: observe immediate switch to pinning to the first candidate (FillFirst behavior).
+        for i in 0..6 {
+            let picked = p[r.select(&p, &hint).expect("select under FillFirst")].id().to_string();
+            let curr_seq = r.state.lock().unwrap().seq;
+            assert!(curr_seq > last_seq, "sequence must remain monotonic across strategy switch (iteration {i})");
+            last_seq = curr_seq;
+            assert_eq!(picked, "a", "FillFirst must always pin to the first available member (iteration {i})");
+        }
+
+        // 4. Switch back to StrictRoundRobin: ensure immediate effect and sequence monotonicity.
+        r.set_strategy(Strategy::StrictRoundRobin);
+        assert_eq!(r.strategy(), Strategy::StrictRoundRobin, "strategy getter must immediately reflect StrictRoundRobin");
+
+        // Under StrictRoundRobin, 'b' was served less recently than 'a' (which was picked 6 times),
+        // so 'b' must be picked next.
+        let next = p[r.select(&p, &hint).expect("select under resumed RoundRobin")].id().to_string();
+        let curr_seq = r.state.lock().unwrap().seq;
+        assert!(curr_seq > last_seq, "sequence must remain monotonic when switching back to RoundRobin");
+        assert_eq!(next, "b", "resumed RoundRobin must pick candidate b because candidate a was repeatedly served");
     }
 }

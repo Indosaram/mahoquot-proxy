@@ -676,7 +676,9 @@ impl DevinDecoder {
                 completion_tokens: output,
                 total_tokens: input + output,
                 cached_tokens: usage.cache_read_tokens.unwrap_or(0),
+                cached_tokens_known: usage.cache_read_tokens.is_some(),
                 cache_write_tokens: usage.cache_write_tokens.unwrap_or(0),
+                cache_write_tokens_known: usage.cache_write_tokens.is_some(),
                 reasoning_tokens: 0,
             });
         }

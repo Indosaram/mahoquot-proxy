@@ -16,17 +16,21 @@ fn frame(payload: &Value) -> Bytes {
 }
 
 fn usage_value(usage: &Usage) -> Value {
-    json!({
+    let mut value = json!({
         "prompt_tokens": usage.prompt_tokens,
         "completion_tokens": usage.completion_tokens,
         "total_tokens": usage.total_tokens,
-        "prompt_tokens_details": {
-            "cached_tokens": usage.cached_tokens,
-        },
         "completion_tokens_details": {
             "reasoning_tokens": usage.reasoning_tokens,
         },
-    })
+    });
+    if usage.cached_tokens_known {
+        value["prompt_tokens_details"]["cached_tokens"] = json!(usage.cached_tokens);
+    }
+    if usage.cache_write_tokens_known {
+        value["prompt_tokens_details"]["cache_write_tokens"] = json!(usage.cache_write_tokens);
+    }
+    value
 }
 
 /// Gemini-native SSE. CP streams upstream-shaped frames here rather than
@@ -42,6 +46,7 @@ pub struct GeminiChunkRenderer {
     /// the terminal event); text and reasoning deltas stream out immediately.
     open_calls: Vec<ToolAccumulator>,
     output_limit_reached: bool,
+    replay: Option<super::signature_ledger::ReplayScope>,
 }
 
 impl GeminiChunkRenderer {
@@ -52,6 +57,18 @@ impl GeminiChunkRenderer {
             terminated: false,
             open_calls: Vec::new(),
             output_limit_reached: false,
+            replay: None,
+        }
+    }
+
+    pub fn with_replay(
+        model: String,
+        created: i64,
+        replay: super::signature_ledger::ReplayScope,
+    ) -> Self {
+        Self {
+            replay: Some(replay),
+            ..Self::new(model, created)
         }
     }
 
@@ -77,6 +94,9 @@ impl GeminiChunkRenderer {
                 "totalTokenCount": u.total_tokens,
                 "thoughtsTokenCount": u.reasoning_tokens,
             });
+            if u.cached_tokens_known {
+                payload["usageMetadata"]["cachedContentTokenCount"] = json!(u.cached_tokens);
+            }
         }
         frame(&payload)
     }
@@ -115,8 +135,10 @@ impl GeminiChunkRenderer {
             };
 
             let mut part = json!({"functionCall":{"id":tool.call_id,"name":tool.name,"args":parsed}});
-            if let Some(signature) =
-                super::signature_ledger::recall(&tool.call_id, &tool.name, &parsed.to_string())
+            if let Some(signature) = self
+                .replay
+                .as_ref()
+                .and_then(|replay| replay.recall(&tool.call_id, &tool.name, &parsed.to_string()))
             {
                 part["thoughtSignature"] = json!(signature);
             }
@@ -412,6 +434,9 @@ pub struct Aggregator {
     usage: Option<Usage>,
     failure: Option<String>,
     output_limit_reached: bool,
+    /// Set when the caller has a signature source, so the Gemini-shaped reply
+    /// can put `thoughtSignature` back on the calls that arrived with one.
+    replay: Option<super::signature_ledger::ReplayScope>,
 }
 
 impl Aggregator {
@@ -428,7 +453,13 @@ impl Aggregator {
             usage: None,
             failure: None,
             output_limit_reached: false,
+            replay: None,
         }
+    }
+
+    pub fn with_replay(mut self, replay: super::signature_ledger::ReplayScope) -> Self {
+        self.replay = Some(replay);
+        self
     }
 
     pub fn push(&mut self, event: CodexEvent) {
@@ -496,7 +527,13 @@ impl Aggregator {
     /// Gemini-native shape for the `/v1beta` surface, which nests text under
     /// `candidates[].content.parts[]` instead of `choices[]`.
     pub fn into_gemini(self) -> Value {
-        let mut renderer = GeminiChunkRenderer::new(self.model.clone(), self.created);
+        let replay = self.replay;
+        let mut renderer = match replay {
+            Some(replay) => {
+                GeminiChunkRenderer::with_replay(self.model.clone(), self.created, replay)
+            }
+            None => GeminiChunkRenderer::new(self.model.clone(), self.created),
+        };
         let mut parts = Vec::new();
         for event in self.native_events {
             for frame in renderer.render(event) {
@@ -538,6 +575,9 @@ impl Aggregator {
                 "totalTokenCount": usage.total_tokens,
                 "thoughtsTokenCount": usage.reasoning_tokens,
             });
+            if usage.cached_tokens_known {
+                payload["usageMetadata"]["cachedContentTokenCount"] = json!(usage.cached_tokens);
+            }
         }
         payload
     }
@@ -595,6 +635,27 @@ impl Aggregator {
 #[cfg(test)]
 mod openai_stream_tests {
     use super::*;
+
+    #[test]
+    fn cache_presence_render_omits_missing_but_retains_zero_and_positive() {
+        for value in [None, Some(0), Some(17)] {
+            // Given normalized usage retaining upstream presence.
+            let usage = Usage {
+                prompt_tokens: 30, completion_tokens: 2, total_tokens: 32,
+                cached_tokens: value.unwrap_or(0), cached_tokens_known: value.is_some(),
+                cache_write_tokens: value.unwrap_or(0), cache_write_tokens_known: value.is_some(),
+                reasoning_tokens: 0,
+            };
+            // When rendered to client usage.
+            let wire = usage_value(&usage);
+            // Then missing fields stay absent while genuine zeros survive.
+            assert_eq!(wire.pointer("/prompt_tokens_details/cached_tokens").and_then(Value::as_u64), value);
+            assert_eq!(wire.pointer("/prompt_tokens_details/cache_write_tokens").and_then(Value::as_u64), value);
+            let mut aggregate = Aggregator::new("gemini".into(), 1);
+            aggregate.push(CodexEvent::Completed { usage: Some(usage) });
+            assert_eq!(aggregate.into_gemini().pointer("/usageMetadata/cachedContentTokenCount").and_then(Value::as_u64), value);
+        }
+    }
 
     fn payloads(frames: Vec<Bytes>) -> Vec<Value> {
         frames
@@ -660,8 +721,10 @@ mod gemini_stream_tests {
             completion_tokens: 1,
             total_tokens: 92,
             cached_tokens: 0,
+            cached_tokens_known: false,
             reasoning_tokens: 86,
             cache_write_tokens: 0,
+            cache_write_tokens_known: false,
         }
     }
 

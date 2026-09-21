@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mahoquot_router::Router;
-use mahoquot_types::{Health, PoolMember};
+use mahoquot_types::{Health, PoolMember, Strategy};
 
 use crate::account::{load_account_members, AccountMember};
 use crate::config::GatewayConfig;
@@ -187,6 +187,7 @@ pub struct AppState {
     pub settings: Arc<SettingsStore>,
     pub scheduler: crate::scheduler::SchedulerRegistry,
     pub history: crate::request_history::HistoryService,
+    pub signature_ledger: Arc<crate::compat::signature_ledger::SignatureLedger>,
     pub telemetry: Arc<TelemetryStore>,
     /// Live in-memory log tail, always fed regardless of `logging-to-file`.
     pub log_tail: LogTail,
@@ -267,6 +268,14 @@ impl AppState {
             config.as_settings(),
         )?);
 
+        let initial_strategy = match settings.current().routing.strategy.as_str() {
+            "fill-first" => Strategy::FillFirst,
+            "round-robin" => Strategy::StrictRoundRobin,
+            other => crate::management::scalar_table::parse_routing_strategy(other)
+                .unwrap_or(config.strategy),
+        };
+        router.set_strategy(initial_strategy);
+
         let initial_settings = settings.current();
         let base_proxy = crate::proxy_policy::base_proxy_url(&initial_settings);
         let http_client = crate::proxy_policy::build_http_client(base_proxy)
@@ -311,6 +320,11 @@ impl AppState {
             config.history_queue_capacity,
             config.history_batch_size,
             Arc::clone(&metrics),
+        );
+        let signature_ledger = crate::compat::signature_ledger::SignatureLedger::open(
+            config
+                .auth_dir
+                .join(crate::compat::signature_ledger::DEFAULT_SNAPSHOT_FILE),
         );
         if let Ok(store) = history.store() {
             if let Err(error) = store.prune(
@@ -388,6 +402,7 @@ impl AppState {
             settings,
             scheduler,
             history,
+            signature_ledger,
             telemetry,
             log_tail: LogTail::default(),
             usage_samples: crate::usage::UsageSampleStore::load(
@@ -426,6 +441,10 @@ impl AppState {
             devin_cache: Arc::new(crate::devin_catalog::DevinDiscoveryCache::new()),
             finalizer_notifiers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         })
+    }
+
+    pub fn set_routing_strategy(&self, strategy: mahoquot_types::Strategy) {
+        self.router.set_strategy(strategy);
     }
 
     pub fn find_member(&self, id: &str) -> Option<Arc<AccountMember>> {

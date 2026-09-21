@@ -1,7 +1,10 @@
 use mahoquot_gateway::compat::{
     self,
     events::{CodexEvent, SseParser},
-    gemini::{gemini_json_to_openai, openai_to_gemini, GeminiDecoder},
+    gemini::{
+        gemini_json_to_openai_with_replay, openai_to_gemini_with_replay, GeminiDecoder,
+    },
+    signature_ledger::SignatureLedger,
 };
 use serde_json::json;
 mod common;
@@ -208,6 +211,7 @@ async fn terminal_stream_drops_upstream_without_waiting_for_eof() {
             session: compat::ProtocolSession {
                 protocol: compat::Protocol::Codex,
                 cursor_reply: None,
+                replay: None,
             },
             upstream_capture: None,
             devin_outcome: None,
@@ -558,19 +562,26 @@ fn gemini_wrapped_error_is_terminal_even_with_later_stop() {
 
 #[test]
 fn gemini_thinking_text_signature_replays_into_tool_history() {
-    let reply = gemini_json_to_openai(
+    // A signature is replayed only inside the scope that captured it: the
+    // ledger is per model + session, never process-global.
+    let replay_scope = SignatureLedger::in_memory().scope("fixture", "review-think");
+    let reply = gemini_json_to_openai_with_replay(
         &json!({"candidates":[{"content":{"parts":[
         {"text":"think", "thought":true, "thoughtSignature":"SIG-THINK-REVIEW"},
         {"functionCall":{"id":"review-think", "name":"lookup", "args":{}}}
     ]}, "finishReason":"STOP"}]}),
         "fixture",
         0,
+        &replay_scope,
     );
     assert_eq!(reply["choices"][0]["message"]["reasoning_content"], "think");
-    let replay = openai_to_gemini(&json!({"model":"fixture", "messages":[
-        reply["choices"][0]["message"].clone(),
-        {"role":"tool","tool_call_id":"review-think","content":"ok"}
-    ]}))
+    let replay = openai_to_gemini_with_replay(
+        &json!({"model":"fixture", "messages":[
+            reply["choices"][0]["message"].clone(),
+            {"role":"tool","tool_call_id":"review-think","content":"ok"}
+        ]}),
+        &replay_scope,
+    )
     .unwrap();
     assert_eq!(
         replay["contents"][0]["parts"][0]["thoughtSignature"],
@@ -587,18 +598,21 @@ fn gemini_parallel_calls_keep_order_all_received_signatures_and_results() {
         if let Some(sig) = second_signature {
             second["thoughtSignature"] = json!(sig);
         }
-        let reply = gemini_json_to_openai(
+        let replay_scope = SignatureLedger::in_memory().scope("fixture", suffix);
+        let reply = gemini_json_to_openai_with_replay(
             &json!({"candidates":[{"content":{"parts":[
             {"functionCall":{"id":a,"name":"read","args":{"n":1}},"thoughtSignature":"SIG-FIRST"}, second
         ]},"finishReason":"STOP"}]}),
             "fixture",
             0,
+            &replay_scope,
         );
-        let replay = openai_to_gemini(
+        let replay = openai_to_gemini_with_replay(
             &json!({"model":"fixture","messages":[reply["choices"][0]["message"].clone(),
                 {"role":"tool","tool_call_id":a,"content":"one"},
                 {"role":"tool","tool_call_id":b,"content":"two"}
             ]}),
+            &replay_scope,
         )
         .unwrap();
         let parts = &replay["contents"][0]["parts"];

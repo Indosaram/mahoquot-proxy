@@ -958,13 +958,52 @@ pub struct ResponseTokenUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_input_tokens: u64,
+    pub cached_input_tokens_known: bool,
     pub cache_write_tokens: u64,
+    pub cache_write_tokens_known: bool,
     pub reasoning_tokens: u64,
 }
 
 impl ResponseTokenUsage {
     pub fn total_tokens(self) -> u64 {
         self.input_tokens.saturating_add(self.output_tokens)
+    }
+}
+
+#[cfg(test)]
+mod cache_presence_tests {
+    use super::*;
+
+    #[test]
+    fn cache_presence_distinguishes_missing_zero_and_positive_wire_values() {
+        for value in [None, Some(0), Some(17)] {
+            for gemini in [false, true] {
+                // Given a real provider usage shape with optional cache reporting.
+                let mut usage = if gemini {
+                    serde_json::json!({"promptTokenCount": 30, "candidatesTokenCount": 2})
+                } else {
+                    serde_json::json!({"prompt_tokens": 30, "completion_tokens": 2})
+                };
+                if let Some(value) = value {
+                    if gemini {
+                        usage["cachedContentTokenCount"] = value.into();
+                    } else {
+                        usage["prompt_tokens_details"] = serde_json::json!({"cached_tokens": value});
+                    }
+                }
+                let body = if gemini {
+                    serde_json::json!({"usageMetadata": usage})
+                } else {
+                    serde_json::json!({"usage": usage})
+                }.to_string();
+                // When the relay capture extracts usage.
+                let parsed = extract_response_token_usage(body.as_bytes(), body.as_bytes()).unwrap();
+                // Then the count and its presence are independent.
+                assert_eq!(parsed.cached_input_tokens, value.unwrap_or(0));
+                assert_eq!(parsed.cached_input_tokens_known, value.is_some());
+                assert!(!parsed.cache_write_tokens_known);
+            }
+        }
     }
 }
 
@@ -981,8 +1020,7 @@ pub fn extract_response_token_usage(head: &[u8], tail: &[u8]) -> Option<Response
             .or_else(|| {
                 nested_object_number(&usage, "prompt_tokens_details", "cached_tokens")
             })
-            .or_else(|| object_number(&usage, &["cache_read_input_tokens", "cache_read_tokens"]))
-            .unwrap_or(0);
+            .or_else(|| object_number(&usage, &["cache_read_input_tokens", "cache_read_tokens"]));
             let cache_write_tokens = nested_object_number(
                 &usage,
                 "prompt_tokens_details",
@@ -1014,12 +1052,14 @@ pub fn extract_response_token_usage(head: &[u8], tail: &[u8]) -> Option<Response
                     ],
                 )
             })
-            .unwrap_or(0);
+            ;
             return Some(ResponseTokenUsage {
                 input_tokens: prompt.unwrap_or(0),
                 output_tokens: completion.unwrap_or(0),
-                cached_input_tokens,
-                cache_write_tokens,
+                cached_input_tokens: cached_input_tokens.unwrap_or(0),
+                cached_input_tokens_known: cached_input_tokens.is_some(),
+                cache_write_tokens: cache_write_tokens.unwrap_or(0),
+                cache_write_tokens_known: cache_write_tokens.is_some(),
                 reasoning_tokens: nested_object_number(
                     &usage,
                     "output_tokens_details",
@@ -1056,12 +1096,14 @@ pub fn extract_response_token_usage(head: &[u8], tail: &[u8]) -> Option<Response
                     ],
                 )
             })
-            .unwrap_or(0);
+            ;
             return Some(ResponseTokenUsage {
                 input_tokens: object_number(&usage, &["input_tokens"]).unwrap_or(0),
                 output_tokens: object_number(&usage, &["output_tokens"]).unwrap_or(0),
                 cached_input_tokens: cached,
-                cache_write_tokens,
+                cached_input_tokens_known: true,
+                cache_write_tokens: cache_write_tokens.unwrap_or(0),
+                cache_write_tokens_known: cache_write_tokens.is_some(),
                 reasoning_tokens: nested_object_number(
                     &usage,
                     "output_tokens_details",
@@ -1080,7 +1122,9 @@ pub fn extract_response_token_usage(head: &[u8], tail: &[u8]) -> Option<Response
                 output_tokens: completion.unwrap_or(0),
                 cached_input_tokens: object_number(&usage, &["cachedContentTokenCount"])
                     .unwrap_or(0),
+                cached_input_tokens_known: object_number(&usage, &["cachedContentTokenCount"]).is_some(),
                 cache_write_tokens: 0,
+                cache_write_tokens_known: false,
                 reasoning_tokens: object_number(&usage, &["thoughtsTokenCount"]).unwrap_or(0),
             });
         }
@@ -1093,8 +1137,10 @@ pub fn extract_response_token_usage(head: &[u8], tail: &[u8]) -> Option<Response
             output_tokens: output.unwrap_or(0),
             cached_input_tokens: last_number_after(head, b"\"cache_read_input_tokens\"")
                 .unwrap_or(0),
+            cached_input_tokens_known: last_number_after(head, b"\"cache_read_input_tokens\"").is_some(),
             cache_write_tokens: last_number_after(head, b"\"cache_creation_input_tokens\"")
                 .unwrap_or(0),
+            cache_write_tokens_known: last_number_after(head, b"\"cache_creation_input_tokens\"").is_some(),
             reasoning_tokens: 0,
         });
     }

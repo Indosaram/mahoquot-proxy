@@ -162,6 +162,8 @@ fn totals_json(totals: &crate::request_history::HistoryTotals) -> Value {
         "input-tokens": totals.input_tokens,
         "output-tokens": totals.output_tokens,
         "cached-input-tokens": totals.cached_input_tokens,
+        "cached-input-tokens-known-requests": totals.cached_input_tokens_known_requests,
+        "cache-write-tokens-known-requests": totals.cache_write_tokens_known_requests,
         "cache-write-tokens": totals.cache_write_tokens,
         "reasoning-tokens": totals.reasoning_tokens,
         "total-tokens": totals.total_tokens,
@@ -184,6 +186,8 @@ fn event_json(event: &crate::request_history::HistoryEventRow) -> Value {
         "input-tokens": event.input_tokens,
         "output-tokens": event.output_tokens,
         "cached-input-tokens": event.cached_input_tokens,
+        "cached-input-tokens-known": event.cached_input_tokens_known,
+        "cache-write-tokens-known": event.cache_write_tokens_known,
         "cache-write-tokens": event.cache_write_tokens,
         "reasoning-tokens": event.reasoning_tokens,
         "total-tokens": event.total_tokens,
@@ -556,4 +560,20 @@ pub fn history_routes() -> Router<Arc<AppState>> {
             "/prices/{model}",
             axum::routing::put(put_price).delete(delete_price),
         )
+}
+
+#[cfg(test)]
+mod cache_presence_tests {
+    use super::*;
+
+    #[test]
+    fn cache_presence_api_does_not_fabricate_known_zero() {
+        // Given an aggregate with no cache observations.
+        let totals = crate::request_history::HistoryTotals::default();
+        // When converted to the management wire contract.
+        let wire = totals_json(&totals);
+        // Then coverage is explicit, independent of the retained numeric sum.
+        assert_eq!(wire["cached-input-tokens-known-requests"], 0);
+        assert_eq!(wire["cache-write-tokens-known-requests"], 0);
+    }
 }
