@@ -73,6 +73,7 @@ struct StreamedOutcome {
     provider: String,
     model: Option<String>,
     key_identifier: Option<String>,
+    session: Option<String>,
     scoped_entry: Option<Arc<crate::state::ScopedKeyEntry>>,
     upstream_capture: Option<Arc<std::sync::Mutex<Option<crate::usage::ResponseTokenUsage>>>>,
     devin_outcome: Option<Arc<std::sync::Mutex<Option<compat::devin::DevinOutcome>>>>,
@@ -232,6 +233,7 @@ impl StreamCapture {
                 account: Some(outcome.member.id()),
                 model: outcome.model.as_deref(),
                 key_identifier: outcome.key_identifier.as_deref(),
+                session: outcome.session.as_deref(),
                 scoped_entry: outcome.scoped_entry.as_deref(),
                 status,
                 success,
@@ -325,6 +327,7 @@ struct OutcomeRecord<'a> {
     account: Option<&'a str>,
     model: Option<&'a str>,
     key_identifier: Option<&'a str>,
+    session: Option<&'a str>,
     scoped_entry: Option<&'a crate::state::ScopedKeyEntry>,
     status: u16,
     success: bool,
@@ -355,6 +358,7 @@ async fn record_request_outcome(state: &AppState, record: OutcomeRecord<'_>) {
         provider: record.provider.to_string(),
         model: record.model.unwrap_or("unknown").to_string(),
         key_identifier: record.key_identifier.map(ToString::to_string),
+        session_identifier: record.session.map(ToString::to_string),
         status_code: record.status,
         succeeded: record.success,
         input_tokens: token_usage.input_tokens,
@@ -527,9 +531,11 @@ fn openai_body_with_model(plan: &RelayPlan, model: &str) -> Option<serde_json::V
     Some(body)
 }
 
-/// Stable CLIProxyAPI-compatible Gemini session id: `-` + a 63-bit suffix of
+/// Stable CLIProxyAPI-compatible session id: `-` + a 63-bit suffix of
 /// SHA-256 over the caller-provided affinity identity, never the raw header.
-fn gemini_session_id(identity: &str) -> String {
+/// The same value labels a history row, so a row and the signature ledger
+/// entry it produced (keyed on model + this id) can be joined.
+fn session_digest(identity: &str) -> String {
     let digest = crate::request_history::sha256(identity.as_bytes());
     let mut value = u64::from_be_bytes(digest[..8].try_into().unwrap_or([0; 8]));
     value &= 0x7FFF_FFFF_FFFF_FFFF;
@@ -667,7 +673,7 @@ fn resolve_target(
         let gemini: serde_json::Value = serde_json::from_slice(&plan.body)
             .map_err(|e| format!("invalid gemini request: {e}"))?;
         let model = upstream_model.to_string();
-        let session_id = session_affinity.map(gemini_session_id);
+        let session_id = session_affinity.map(session_digest);
         let mut inner = gemini.clone();
         if let Some(obj) = inner.as_object_mut() {
             obj.remove("model");
@@ -981,7 +987,7 @@ fn resolve_target(
         .map(|identity| {
             state
                 .signature_ledger
-                .scope(upstream_model, &gemini_session_id(&identity))
+                .scope(upstream_model, &session_digest(&identity))
         });
     let translated = match &replay {
         Some(replay) => {
@@ -2878,6 +2884,16 @@ pub async fn handle_relay(
     let affinity = affinity_key(headers)
         .or_else(|| body_affinity_key(plan.original_body.as_ref()))
         .or_else(|| body_prefix_affinity_key(plan.original_body.as_ref()));
+    let session = affinity
+        .as_deref()
+        .map(session_digest)
+        .or_else(|| {
+            // Mirror the ledger's identity chain: a caller with no session
+            // header still anchors on its first user message, and the history
+            // row must carry the same label the ledger entries are keyed on.
+            let value: serde_json::Value = serde_json::from_slice(&plan.original_body).ok()?;
+            body_session_anchor(&value).map(|anchor| session_digest(&anchor))
+        });
     let hint = SessionHint { affinity_key: affinity.clone() };
     // Accounts already tried in this request. 5xx and transport failures leave
     // health untouched (per contract), so exclusion is what forces the next
@@ -3095,6 +3111,7 @@ pub async fn handle_relay(
                                         account: Some(member.id()),
                                         model: plan.model.as_deref(),
                                         key_identifier: key_identifier.as_deref(),
+                                        session: session.as_deref(),
                                         scoped_entry: scoped_entry.as_deref(),
                                         status: StatusCode::BAD_GATEWAY.as_u16(),
                                         success: false,
@@ -3132,6 +3149,7 @@ pub async fn handle_relay(
                                 account: Some(member.id()),
                                 model: plan.model.as_deref(),
                                 key_identifier: key_identifier.as_deref(),
+                                session: session.as_deref(),
                                 scoped_entry: scoped_entry.as_deref(),
                                 status: status_code,
                                 success: true,
@@ -3155,6 +3173,7 @@ pub async fn handle_relay(
                         provider: member.kind().as_str().to_string(),
                         model: plan.model.clone(),
                         key_identifier: key_identifier.clone(),
+                        session: session.clone(),
                         scoped_entry: scoped_entry.clone(),
                         upstream_capture,
                         devin_outcome,
@@ -3311,6 +3330,7 @@ pub async fn handle_relay(
                 account: Some(member.id()),
                 model: plan.model.as_deref(),
                 key_identifier: key_identifier.as_deref(),
+                session: session.as_deref(),
                 scoped_entry: scoped_entry.as_deref(),
                 status: failure.status.as_u16(),
                 success: false,
@@ -3360,6 +3380,7 @@ pub async fn handle_relay(
             account: failure_account.as_deref(),
             model: plan.model.as_deref(),
             key_identifier: key_identifier.as_deref(),
+            session: session.as_deref(),
             scoped_entry: scoped_entry.as_deref(),
             status: response.status().as_u16(),
             success: false,

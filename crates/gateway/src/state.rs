@@ -752,6 +752,7 @@ impl AppState {
             ttft: self.monitor.ttft_percentiles(),
             accounts,
             history: self.telemetry.snapshot(),
+            signature_ledger: self.signature_ledger.stats(),
         }
     }
 }

@@ -59,9 +59,27 @@ pub struct SignatureLedger {
     dirty: AtomicBool,
     writes: AtomicU64,
     persists: AtomicU64,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    unsigned_replays: AtomicU64,
     wake: tokio::sync::Notify,
     persisted: tokio::sync::Notify,
     shutdown: AtomicBool,
+}
+
+/// Counters a monitoring surface can read without touching the store itself:
+/// `misses` counts replayed calls whose signature was no longer held, and
+/// `unsigned_replays` counts the turns that went upstream carrying the
+/// `skip_thought_signature_validator` sentinel instead.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LedgerStats {
+    pub entries: usize,
+    pub bytes: usize,
+    pub writes: u64,
+    pub persists: u64,
+    pub hits: u64,
+    pub misses: u64,
+    pub unsigned_replays: u64,
 }
 
 impl SignatureLedger {
@@ -89,6 +107,9 @@ impl SignatureLedger {
             dirty: AtomicBool::new(false),
             writes: AtomicU64::new(0),
             persists: AtomicU64::new(0),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            unsigned_replays: AtomicU64::new(0),
             wake: tokio::sync::Notify::new(),
             persisted: tokio::sync::Notify::new(),
             shutdown: AtomicBool::new(false),
@@ -117,6 +138,18 @@ impl SignatureLedger {
 
     pub fn persist_count(&self) -> u64 {
         self.persists.load(Ordering::Relaxed)
+    }
+
+    pub fn stats(&self) -> LedgerStats {
+        LedgerStats {
+            entries: self.len(),
+            bytes: self.bytes(),
+            writes: self.write_count(),
+            persists: self.persist_count(),
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            unsigned_replays: self.unsigned_replays.load(Ordering::Relaxed),
+        }
     }
 
     pub fn snapshot_path(&self) -> Option<&Path> {
@@ -253,8 +286,24 @@ impl ReplayScope {
         if call_id.is_empty() {
             return None;
         }
+        let found = self
+            .ledger
+            .recall(&self.key(call_id, name), &canonical_arguments(arguments));
+        let counter = if found.is_some() {
+            &self.ledger.hits
+        } else {
+            &self.ledger.misses
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        found
+    }
+
+    /// A replayed call had no signature to reuse, so the request goes upstream
+    /// with the `skip_thought_signature_validator` sentinel.
+    pub fn record_unsigned_replay(&self) {
         self.ledger
-            .recall(&self.key(call_id, name), &canonical_arguments(arguments))
+            .unsigned_replays
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     fn key(&self, call_id: &str, name: &str) -> String {

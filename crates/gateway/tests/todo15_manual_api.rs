@@ -69,7 +69,7 @@ async fn manual_api_driver() {
             account_identifier: if selected { "account-a" } else { "account-b" }.to_string(),
             provider: if selected { "codex" } else { "claude" }.to_string(),
             model: if selected { "gpt-5.6" } else { "claude-4" }.to_string(),
-            key_identifier: Some(if selected { "key-a" } else { "key-b" }.to_string()),
+            key_identifier: Some(if selected { "key-a" } else { "key-b" }.to_string()), session_identifier: None,
             status_code: if selected { 429 } else { 200 },
             succeeded: !selected,
             input_tokens: 10 + index,

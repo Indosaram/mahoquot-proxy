@@ -336,3 +336,21 @@ fn synthetic_ids_never_repeat() {
     assert_ne!(first, second);
     assert!(first.starts_with("call_eval_"));
 }
+
+#[test]
+fn stats_count_replay_hits_misses_and_unsigned_replays() {
+    let ledger = SignatureLedger::with_config(LedgerConfig::default());
+    let scope = scope(&ledger);
+    scope.remember("call-1", "tool", "{}", "SIG-1");
+
+    assert_eq!(scope.recall("call-1", "tool", "{}").as_deref(), Some("SIG-1"));
+    assert_eq!(scope.recall("call-2", "tool", "{}"), None);
+    // An empty call id never reaches the store and must not be counted.
+    assert_eq!(scope.recall("", "tool", "{}"), None);
+    scope.record_unsigned_replay();
+
+    let stats = ledger.stats();
+    assert_eq!(stats.hits, 1, "hits: {stats:?}");
+    assert_eq!(stats.misses, 1, "misses: {stats:?}");
+    assert_eq!(stats.unsigned_replays, 1, "unsigned_replays: {stats:?}");
+}

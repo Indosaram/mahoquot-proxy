@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use rusqlite::{params, params_from_iter, types::Value, Connection, OptionalExtension};
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const DEFAULT_MAX_SIZE_BYTES: u64 = 512 * 1024 * 1024;
@@ -136,6 +136,12 @@ pub struct UsageEvent {
     pub provider: String,
     pub model: String,
     pub key_identifier: Option<String>,
+    /// Digest of the caller's session identity (never the raw header or body
+    /// value). For Antigravity it is the same id the upstream request carried,
+    /// which is what the signature ledger is keyed on; `None` means the caller
+    /// sent no session identity at all.
+    #[serde(default)]
+    pub session_identifier: Option<String>,
     pub status_code: u16,
     pub succeeded: bool,
     pub input_tokens: u64,
@@ -234,6 +240,8 @@ pub struct HistoryEventRow {
     pub provider: String,
     pub model: String,
     pub key_identifier: Option<String>,
+    #[serde(default, rename = "session")]
+    pub session_identifier: Option<String>,
     pub status_code: u16,
     pub succeeded: bool,
     pub input_tokens: u64,
@@ -891,6 +899,19 @@ fn migrate(connection: &mut Connection) -> Result<(), HistoryError> {
         transaction.pragma_update(None, "user_version", 3)?;
         transaction.commit()?;
     }
+    if current < 4 {
+        let transaction = connection.transaction()?;
+        // Nullable on purpose: rows written before this column existed, or by a
+        // caller that sent no session identity, must stay distinguishable from
+        // a session whose digest happens to look empty.
+        transaction.execute_batch("ALTER TABLE usage_events ADD COLUMN session_identifier TEXT;")?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at_ms) VALUES (4, ?1)",
+            [unix_time_ms()],
+        )?;
+        transaction.pragma_update(None, "user_version", 4)?;
+        transaction.commit()?;
+    }
     Ok(())
 }
 
@@ -1115,9 +1136,9 @@ fn insert_event(connection: &Connection, event: &UsageEvent) -> Result<bool, His
             status_code, succeeded, input_tokens, output_tokens, cached_input_tokens,
             reasoning_tokens, total_tokens, latency_ms, created_at_ms,
             estimated_cost_usd, price_version, cache_write_tokens,
-            cached_input_tokens_known, cache_write_tokens_known
+            cached_input_tokens_known, cache_write_tokens_known, session_identifier
          ) VALUES (
-            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21
          )",
         params![
             event.event_id,
@@ -1140,6 +1161,7 @@ fn insert_event(connection: &Connection, event: &UsageEvent) -> Result<bool, His
             to_sql_i64(event.cache_write_tokens, "cache_write_tokens")?,
             event.cached_input_tokens_known,
             event.cache_write_tokens_known,
+            event.session_identifier,
         ],
     )?;
     Ok(changed == 1)
@@ -1164,7 +1186,8 @@ const EVENT_SELECT: &str =
          e.key_identifier, e.status_code, e.succeeded, e.input_tokens, e.output_tokens, \
          e.cached_input_tokens, e.reasoning_tokens, e.total_tokens, e.latency_ms, \
          e.estimated_cost_usd, e.price_version, e.cache_write_tokens, \
-         e.cached_input_tokens_known, e.cache_write_tokens_known FROM usage_events e";
+         e.cached_input_tokens_known, e.cache_write_tokens_known, e.session_identifier \
+         FROM usage_events e";
 
 fn read_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryEventRow> {
     Ok(HistoryEventRow {
@@ -1188,6 +1211,7 @@ fn read_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryEventRow> 
         cache_write_tokens: row.get::<_, i64>(17)? as u64,
         cached_input_tokens_known: row.get(18)?,
         cache_write_tokens_known: row.get(19)?,
+        session_identifier: row.get(20)?,
     })
 }
 
@@ -1927,6 +1951,7 @@ pub mod tests {
             provider: fixture.provider.to_string(),
             model: fixture.model.to_string(),
             key_identifier: Some(fixture.key.to_string()),
+            session_identifier: None,
             status_code: fixture.status_code,
             succeeded: fixture.status_code < 400,
             input_tokens: fixture.input_tokens,
@@ -2232,6 +2257,15 @@ mod extended_tests {
         previous_connection
             .pragma_update(None, "user_version", 1)
             .unwrap();
+        // A row written before the session column existed: the v4 migration
+        // must carry it forward untouched.
+        previous_connection
+            .execute(
+                "INSERT INTO usage_events(event_id, occurred_at_ms, account_identifier, provider, model, key_identifier, status_code, succeeded, input_tokens, output_tokens, cached_input_tokens, reasoning_tokens, total_tokens, latency_ms, created_at_ms)
+                 VALUES ('pre-v4-row', 100, 'a', 'p', 'm', NULL, 200, 1, 0, 0, 0, 0, 0, 0, 100)",
+                [],
+            )
+            .unwrap();
         drop(previous_connection);
 
         let migrated = ready(&previous.0);
@@ -2251,6 +2285,34 @@ mod extended_tests {
             }))
             .unwrap();
         assert_cost(migrated.totals().unwrap().estimated_cost_usd, 1.0);
+
+        // The v4 session column landed on a database born at v1: a row that
+        // existed before the column reads back as NULL, and a labeled row
+        // round-trips through the new column.
+        let legacy_row = migrated
+            .detail("pre-v4-row")
+            .expect("legacy detail")
+            .expect("pre-v4 row");
+        assert_eq!(legacy_row.session_identifier, None);
+        let mut labeled = event(EventFixture {
+            event_id: "labeled",
+            occurred_at_ms: 200,
+            account: "a",
+            provider: "p",
+            model: "m",
+            key: "k",
+            status_code: 200,
+            input_tokens: 1,
+            output_tokens: 1,
+            cached_input_tokens: 0,
+        });
+        labeled.session_identifier = Some("-123".to_string());
+        migrated.insert(&labeled).expect("labeled insert");
+        let labeled_row = migrated
+            .detail("labeled")
+            .expect("labeled detail")
+            .expect("labeled row");
+        assert_eq!(labeled_row.session_identifier.as_deref(), Some("-123"));
     }
 
     #[test]
@@ -2566,6 +2628,7 @@ mod extended_tests {
             provider: "anthropic".to_string(),
             model: "claude-3-5-sonnet".to_string(),
             key_identifier: None,
+            session_identifier: Some("-12345".to_string()),
             status_code: 200,
             succeeded: true,
             input_tokens: 100,
@@ -2591,6 +2654,7 @@ mod extended_tests {
             provider: "anthropic".to_string(),
             model: "claude-3-5-sonnet".to_string(),
             key_identifier: None,
+            session_identifier: Some("-12345".to_string()),
             status_code: 200,
             succeeded: true,
             input_tokens: 100,
@@ -2607,6 +2671,7 @@ mod extended_tests {
         };
         let row_json = serde_json::to_string(&row).unwrap();
         assert!(row_json.contains("\"cache-write-tokens\":30"));
+        assert!(row_json.contains("\"session\":\"-12345\""));
         let deserialized_row: HistoryEvent = serde_json::from_str(&row_json).unwrap();
         assert_eq!(deserialized_row.cache_write_tokens, 30);
 

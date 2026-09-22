@@ -422,6 +422,9 @@ fn openai_to_gemini_inner(
                             "thoughtSignature": signature,
                         }));
                     } else if !first_function_call_seen {
+                        if let Some(replay) = replay {
+                            replay.record_unsigned_replay();
+                        }
                         parts.push(json!({
                             "functionCall": { "id": outbound_id, "name": name, "args": args },
                             "thoughtSignature": GEMINI_SKIP_THOUGHT_SIGNATURE_VALIDATOR,

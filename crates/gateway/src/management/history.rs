@@ -180,6 +180,7 @@ fn event_json(event: &crate::request_history::HistoryEventRow) -> Value {
         "account": event.account_identifier,
         "provider": event.provider,
         "model": event.model,
+        "session": event.session_identifier,
         "key-label": event.key_identifier,
         "status": event.status_code,
         "succeeded": event.succeeded,
