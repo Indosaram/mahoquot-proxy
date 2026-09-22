@@ -16,6 +16,8 @@ pub struct AnthropicDecoder {
     output_tokens: u64,
     cache_read_tokens: u64,
     cache_write_tokens: u64,
+    cache_read_tokens_known: bool,
+    cache_write_tokens_known: bool,
     next_tool_index: u64,
 }
 
@@ -37,6 +39,8 @@ impl AnthropicDecoder {
                 self.input_tokens = usage["input_tokens"].as_u64().unwrap_or(0);
                 self.cache_read_tokens = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
                 self.cache_write_tokens = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+                self.cache_read_tokens_known = usage["cache_read_input_tokens"].as_u64().is_some();
+                self.cache_write_tokens_known = usage["cache_creation_input_tokens"].as_u64().is_some();
                 out.push(CodexEvent::Created {
                     response_id: value["message"]["id"]
                         .as_str()
@@ -102,8 +106,10 @@ impl AnthropicDecoder {
                         completion_tokens: self.output_tokens,
                         total_tokens: self.input_tokens + self.output_tokens,
                         cached_tokens: self.cache_read_tokens,
+                        cached_tokens_known: self.cache_read_tokens_known,
                         reasoning_tokens: 0,
                         cache_write_tokens: self.cache_write_tokens,
+                        cache_write_tokens_known: self.cache_write_tokens_known,
                     }),
                 });
             }

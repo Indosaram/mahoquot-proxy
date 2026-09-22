@@ -49,9 +49,10 @@ fn runtime_maintenance_prunes_expired_records_at_exact_clock_trigger() {
             occurred_at_ms: now - if index < 100 { 10 * 86_400_000 } else { 3_600_000 },
             account_identifier: "fixture-account".into(),
             provider: "codex".into(), model: "fixture-model".into(),
-            key_identifier: None, status_code: 200, succeeded: true,
+            key_identifier: None, session_identifier: None, status_code: 200, succeeded: true,
             input_tokens: 1, output_tokens: 1, cached_input_tokens: 0,
-            cache_write_tokens: 0,
+            cached_input_tokens_known: false, cache_write_tokens: 0,
+            cache_write_tokens_known: false,
             reasoning_tokens: 0, total_tokens: 2, latency_ms: 1,
         }).unwrap();
     }
@@ -88,9 +89,11 @@ fn runtime_maintenance_enforces_configured_size_cap_without_retention() {
         store.insert(&UsageEvent {
             event_id: format!("cap-{index}"), occurred_at_ms: index,
             account_identifier: "fixture-account".into(), provider: "codex".into(),
-            model: "m".repeat(20_000), key_identifier: None,
+            model: "m".repeat(20_000), key_identifier: None, session_identifier: None,
             status_code: 200, succeeded: true, input_tokens: 1, output_tokens: 1,
-            cached_input_tokens: 0, cache_write_tokens: 0, reasoning_tokens: 0, total_tokens: 2, latency_ms: 1,
+            cached_input_tokens: 0, cached_input_tokens_known: false,
+            cache_write_tokens: 0, cache_write_tokens_known: false,
+            reasoning_tokens: 0, total_tokens: 2, latency_ms: 1,
         }).unwrap();
     }
     assert_eq!(store.totals().unwrap().requests, 10);
@@ -324,13 +327,15 @@ async fn full_channel_is_nonblocking() {
             account_identifier: "history-account".to_string(),
             provider: "codex".to_string(),
             model: "gpt-5.1-codex".to_string(),
-            key_identifier: Some("key-label".to_string()),
+            key_identifier: Some("key-label".to_string()), session_identifier: None,
             status_code: 200,
             succeeded: true,
             input_tokens: 1,
             output_tokens: 1,
             cached_input_tokens: 0,
+            cached_input_tokens_known: false,
             cache_write_tokens: 0,
+            cache_write_tokens_known: false,
             reasoning_tokens: 0,
             total_tokens: 2,
             latency_ms: 1,
@@ -419,13 +424,15 @@ async fn cancelled_clear_preserves_rows() {
         account_identifier: "history-account".to_string(),
         provider: "codex".to_string(),
         model: "gpt-5.1-codex".to_string(),
-        key_identifier: Some("key-label".to_string()),
+        key_identifier: Some("key-label".to_string()), session_identifier: None,
         status_code: 200,
         succeeded: true,
         input_tokens: 1,
         output_tokens: 1,
         cached_input_tokens: 0,
+        cached_input_tokens_known: false,
         cache_write_tokens: 0,
+        cache_write_tokens_known: false,
         reasoning_tokens: 0,
         total_tokens: 2,
         latency_ms: 1,
@@ -468,13 +475,15 @@ async fn confirmed_filtered_clear_deletes_only_the_selected_scope() {
             account_identifier: account.to_string(),
             provider: "codex".to_string(),
             model: "gpt-5.1-codex".to_string(),
-            key_identifier: Some("key-label".to_string()),
+            key_identifier: Some("key-label".to_string()), session_identifier: None,
             status_code: 200,
             succeeded: true,
             input_tokens: 1,
             output_tokens: 1,
             cached_input_tokens: 0,
+            cached_input_tokens_known: false,
             cache_write_tokens: 0,
+            cache_write_tokens_known: false,
             reasoning_tokens: 0,
             total_tokens: 2,
             latency_ms: 1,
@@ -567,13 +576,15 @@ fn enqueue_event(
         account_identifier: account.to_string(),
         provider: provider.to_string(),
         model: model.to_string(),
-        key_identifier: Some(key.to_string()),
+        key_identifier: Some(key.to_string()), session_identifier: None,
         status_code: status,
         succeeded: status < 400,
         input_tokens: 100 + index,
         output_tokens: 20 + index,
         cached_input_tokens: index % 11,
+        cached_input_tokens_known: false,
         cache_write_tokens: 0,
+        cache_write_tokens_known: false,
         reasoning_tokens: index % 7,
         total_tokens: 120 + index * 2,
         latency_ms: 50 + index,
@@ -1004,13 +1015,15 @@ async fn one_invalid_event_does_not_discard_the_valid_events_in_its_batch() {
         account_identifier: "history-account".to_string(),
         provider: "codex".to_string(),
         model: "gpt-5.1-codex".to_string(),
-        key_identifier: Some(id.to_string()),
+        key_identifier: Some(id.to_string()), session_identifier: None,
         status_code: 200,
         succeeded: true,
         input_tokens: 1,
         output_tokens: 1,
         cached_input_tokens: 0,
+        cached_input_tokens_known: false,
         cache_write_tokens: 0,
+        cache_write_tokens_known: false,
         reasoning_tokens: 0,
         total_tokens: 2,
         latency_ms: 1,
@@ -1057,13 +1070,15 @@ async fn export_is_bounded_instead_of_returning_every_row() {
             account_identifier: "history-account".to_string(),
             provider: "codex".to_string(),
             model: "gpt-5.1-codex".to_string(),
-            key_identifier: Some("key-label".to_string()),
+            key_identifier: Some("key-label".to_string()), session_identifier: None,
             status_code: 200,
             succeeded: true,
             input_tokens: 1,
             output_tokens: 1,
             cached_input_tokens: 0,
+            cached_input_tokens_known: false,
             cache_write_tokens: 0,
+            cache_write_tokens_known: false,
             reasoning_tokens: 0,
             total_tokens: 2,
             latency_ms: 1,
@@ -1099,4 +1114,86 @@ async fn export_is_bounded_instead_of_returning_every_row() {
         "export returned {} rows for {stored} stored: it must be capped, not grow with the table",
         events.len()
     );
+}
+
+#[tokio::test]
+async fn session_identifier_round_trips_through_store_and_management_wire() {
+    let fixture = fixture("session-column", None, 64);
+
+    let labeled = UsageEvent {
+        event_id: "session-labeled".to_string(),
+        occurred_at_ms: 1_700_000_000_000,
+        account_identifier: "history-account".to_string(),
+        provider: "codex".to_string(),
+        model: "gpt-5.1-codex".to_string(),
+        key_identifier: None,
+        session_identifier: Some("-123".to_string()),
+        status_code: 200,
+        succeeded: true,
+        input_tokens: 1,
+        output_tokens: 1,
+        cached_input_tokens: 0,
+        cached_input_tokens_known: false,
+        cache_write_tokens: 0,
+        cache_write_tokens_known: false,
+        reasoning_tokens: 0,
+        total_tokens: 2,
+        latency_ms: 1,
+    };
+    assert!(fixture.state.history.enqueue(labeled.clone()));
+    let mut unlabeled = labeled.clone();
+    unlabeled.event_id = "session-unlabeled".to_string();
+    unlabeled.session_identifier = None;
+    assert!(fixture.state.history.enqueue(unlabeled));
+    fixture.state.history.flush().expect("history flush");
+
+    // Store: the labeled row keeps its session, the other reads back NULL.
+    let store = fixture.state.history.store().expect("history store");
+    let labeled_row = store
+        .detail("session-labeled")
+        .expect("labeled detail")
+        .expect("labeled row");
+    assert_eq!(labeled_row.session_identifier.as_deref(), Some("-123"));
+    let unlabeled_row = store
+        .detail("session-unlabeled")
+        .expect("unlabeled detail")
+        .expect("unlabeled row");
+    assert_eq!(unlabeled_row.session_identifier, None);
+
+    // Management wire: list and detail expose the same value as "session".
+    let events_response = fixture
+        .app
+        .clone()
+        .oneshot(authed_request(
+            "GET",
+            "/v0/management/history/events?limit=10",
+            Body::empty(),
+        ))
+        .await
+        .expect("history events");
+    assert_eq!(events_response.status(), StatusCode::OK);
+    let events = json(events_response).await;
+    let rows = events["events"].as_array().expect("event rows");
+    let row = |id: &str| {
+        rows.iter()
+            .find(|row| row["event-id"] == id)
+            .unwrap_or_else(|| panic!("row {id} missing from {events}"))
+            .clone()
+    };
+    assert_eq!(row("session-labeled")["session"], "-123");
+    assert_eq!(row("session-unlabeled")["session"], Value::Null);
+
+    let detail_response = fixture
+        .app
+        .clone()
+        .oneshot(authed_request(
+            "GET",
+            "/v0/management/history/events/session-labeled",
+            Body::empty(),
+        ))
+        .await
+        .expect("history detail");
+    assert_eq!(detail_response.status(), StatusCode::OK);
+    let detail = json(detail_response).await;
+    assert_eq!(detail["event"]["session"], "-123");
 }

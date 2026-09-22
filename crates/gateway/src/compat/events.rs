@@ -6,8 +6,10 @@ pub struct Usage {
     pub completion_tokens: u64,
     pub total_tokens: u64,
     pub cached_tokens: u64,
+    pub cached_tokens_known: bool,
     pub reasoning_tokens: u64,
     pub cache_write_tokens: u64,
+    pub cache_write_tokens_known: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -237,5 +239,29 @@ fn parse_usage(usage: &Value) -> Usage {
             .and_then(Value::as_u64)
             .unwrap_or(0),
         cache_write_tokens: 0,
+        cached_tokens_known: usage.pointer("/input_tokens_details/cached_tokens").and_then(Value::as_u64).is_some(),
+        cache_write_tokens_known: false,
+    }
+}
+
+#[cfg(test)]
+mod cache_presence_tests {
+    use super::*;
+
+    #[test]
+    fn cache_presence_distinguishes_response_usage_values() {
+        for value in [None, Some(0), Some(17)] {
+            // Given optional Responses cache details.
+            let mut wire = serde_json::json!({"input_tokens": 30, "output_tokens": 2});
+            if let Some(value) = value {
+                wire["input_tokens_details"] = serde_json::json!({"cached_tokens": value});
+            }
+            // When usage is normalized.
+            let usage = parse_usage(&wire);
+            // Then absence is not a reported zero.
+            assert_eq!(usage.cached_tokens, value.unwrap_or(0));
+            assert_eq!(usage.cached_tokens_known, value.is_some());
+            assert!(!usage.cache_write_tokens_known);
+        }
     }
 }

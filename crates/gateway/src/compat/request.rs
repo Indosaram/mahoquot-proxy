@@ -16,6 +16,19 @@ pub struct TranslatedRequest {
 }
 
 pub fn openai_to_codex(raw: &[u8]) -> Result<TranslatedRequest, TranslateError> {
+    openai_to_codex_with_cache_key(raw, None)
+}
+
+/// Same translation with an optional stable `prompt_cache_key`. OpenAI-side
+/// implicit prompt caching is routed by this field: without it consecutive
+/// turns of one conversation land on unrelated cache shards and report
+/// `cached_tokens: 0` on an identical prefix (opencodex devlog 090 observed
+/// the same on the ChatGPT backend). Callers must pass a stable per-session
+/// identity; never a per-request or head-hash value.
+pub fn openai_to_codex_with_cache_key(
+    raw: &[u8],
+    prompt_cache_key: Option<&str>,
+) -> Result<TranslatedRequest, TranslateError> {
     let root: Value =
         serde_json::from_slice(raw).map_err(|e| TranslateError::Json(e.to_string()))?;
     let obj = root.as_object().ok_or(TranslateError::Missing("body"))?;
@@ -44,6 +57,9 @@ pub fn openai_to_codex(raw: &[u8]) -> Result<TranslatedRequest, TranslateError> 
     out.insert("input".into(), Value::Array(input));
     out.insert("stream".into(), Value::Bool(true));
     out.insert("store".into(), Value::Bool(false));
+    if let Some(key) = prompt_cache_key.map(str::trim).filter(|key| !key.is_empty()) {
+        out.insert("prompt_cache_key".into(), Value::String(key.to_string()));
+    }
 
     if let Some(tools) = obj.get("tools").and_then(Value::as_array) {
         let mapped = map_tools(tools);
@@ -93,7 +109,7 @@ fn split_messages(messages: &[Value]) -> (String, Vec<Value>) {
             "tool" | "function" => input.push(json!({
                 "type": "function_call_output",
                 "call_id": msg.get("tool_call_id").and_then(Value::as_str).unwrap_or_default(),
-                "output": flatten_text(msg.get("content")),
+                "output": tool_output(msg.get("content")),
             })),
             "assistant" => {
                 let text = flatten_text(msg.get("content"));
@@ -138,16 +154,37 @@ fn flatten_text(content: Option<&Value>) -> String {
     }
 }
 
+fn tool_output(content: Option<&Value>) -> Value {
+    // Responses supports multimodal function_call_output arrays. Flattening a
+    // screenshot tool's result to text silently removes its images (and turns
+    // an image-only result into an empty string). Keep text-only outputs in the
+    // existing string format, but preserve image-bearing results in call order.
+    if matches!(content, Some(Value::Array(_))) {
+        let parts = user_parts(content);
+        if parts.iter().any(|part| part["type"] == "input_image") {
+            return Value::Array(parts);
+        }
+    }
+    Value::String(flatten_text(content))
+}
+
 fn user_parts(content: Option<&Value>) -> Vec<Value> {
     match content {
         Some(Value::Array(parts)) => parts
             .iter()
             .filter_map(|part| match part.get("type").and_then(Value::as_str) {
-                Some("image_url") => part
-                    .get("image_url")
-                    .and_then(|u| u.get("url"))
-                    .and_then(Value::as_str)
-                    .map(|url| json!({"type": "input_image", "image_url": url})),
+                Some("image_url") => {
+                    let image = part.get("image_url")?;
+                    let url = image.get("url")?.as_str()?;
+                    let mut mapped = json!({"type": "input_image", "image_url": url});
+                    // Preserve the caller's preprocessing choice. Dropping high
+                    // or low lets the backend choose auto instead, which can
+                    // change image sizing, token use, and acceptance limits.
+                    if let Some(detail) = image.get("detail") {
+                        mapped["detail"] = detail.clone();
+                    }
+                    Some(mapped)
+                }
                 _ => part
                     .get("text")
                     .and_then(Value::as_str)
@@ -198,4 +235,42 @@ pub fn extract_model(raw: &[u8]) -> Option<String> {
         .get("model")
         .and_then(Value::as_str)
         .map(ToString::to_string)
+}
+
+#[cfg(test)]
+mod prompt_cache_key_tests {
+    use super::*;
+
+    fn sample_body() -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "model": "gpt-6-astra",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn injects_stable_prompt_cache_key_when_provided() {
+        let translated = openai_to_codex_with_cache_key(&sample_body(), Some("abc123")).unwrap();
+        let body: Value = serde_json::from_slice(&translated.body).unwrap();
+        assert_eq!(
+            body.get("prompt_cache_key"),
+            Some(&Value::String("abc123".into()))
+        );
+    }
+
+    #[test]
+    fn omits_prompt_cache_key_without_identity() {
+        let translated = openai_to_codex(&sample_body()).unwrap();
+        let body: Value = serde_json::from_slice(&translated.body).unwrap();
+        assert!(body.get("prompt_cache_key").is_none());
+    }
+
+    #[test]
+    fn blank_prompt_cache_key_is_omitted() {
+        let translated = openai_to_codex_with_cache_key(&sample_body(), Some("   ")).unwrap();
+        let body: Value = serde_json::from_slice(&translated.body).unwrap();
+        assert!(body.get("prompt_cache_key").is_none());
+    }
 }

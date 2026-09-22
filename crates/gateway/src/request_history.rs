@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, params_from_iter, types::Value, Connection, OptionalExtension};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 4;
 const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const DEFAULT_MAX_SIZE_BYTES: u64 = 512 * 1024 * 1024;
@@ -115,6 +115,10 @@ pub struct HistoryTotals {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_input_tokens: u64,
+    #[serde(default)]
+    pub cached_input_tokens_known_requests: u64,
+    #[serde(default)]
+    pub cache_write_tokens_known_requests: u64,
     #[serde(rename = "cache-write-tokens", default)]
     pub cache_write_tokens: u64,
     pub reasoning_tokens: u64,
@@ -132,11 +136,21 @@ pub struct UsageEvent {
     pub provider: String,
     pub model: String,
     pub key_identifier: Option<String>,
+    /// Digest of the caller's session identity (never the raw header or body
+    /// value). For Antigravity it is the same id the upstream request carried,
+    /// which is what the signature ledger is keyed on; `None` means the caller
+    /// sent no session identity at all.
+    #[serde(default)]
+    pub session_identifier: Option<String>,
     pub status_code: u16,
     pub succeeded: bool,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_input_tokens: u64,
+    #[serde(default)]
+    pub cached_input_tokens_known: bool,
+    #[serde(default)]
+    pub cache_write_tokens_known: bool,
     #[serde(rename = "cache-write-tokens", default)]
     pub cache_write_tokens: u64,
     pub reasoning_tokens: u64,
@@ -226,11 +240,17 @@ pub struct HistoryEventRow {
     pub provider: String,
     pub model: String,
     pub key_identifier: Option<String>,
+    #[serde(default, rename = "session")]
+    pub session_identifier: Option<String>,
     pub status_code: u16,
     pub succeeded: bool,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_input_tokens: u64,
+    #[serde(default)]
+    pub cached_input_tokens_known: bool,
+    #[serde(default)]
+    pub cache_write_tokens_known: bool,
     #[serde(rename = "cache-write-tokens", default)]
     pub cache_write_tokens: u64,
     pub reasoning_tokens: u64,
@@ -894,6 +914,34 @@ fn migrate(connection: &mut Connection) -> Result<(), HistoryError> {
         transaction.commit()?;
     }
     init_schema(connection);
+    if current < 3 {
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(
+            "ALTER TABLE usage_events ADD COLUMN cached_input_tokens_known INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE usage_events ADD COLUMN cache_write_tokens_known INTEGER NOT NULL DEFAULT 0;
+             UPDATE usage_events SET cached_input_tokens_known=(cached_input_tokens > 0),
+                                     cache_write_tokens_known=(cache_write_tokens > 0);",
+        )?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at_ms) VALUES (3, ?1)",
+            [unix_time_ms()],
+        )?;
+        transaction.pragma_update(None, "user_version", 3)?;
+        transaction.commit()?;
+    }
+    if current < 4 {
+        let transaction = connection.transaction()?;
+        // Nullable on purpose: rows written before this column existed, or by a
+        // caller that sent no session identity, must stay distinguishable from
+        // a session whose digest happens to look empty.
+        transaction.execute_batch("ALTER TABLE usage_events ADD COLUMN session_identifier TEXT;")?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at_ms) VALUES (4, ?1)",
+            [unix_time_ms()],
+        )?;
+        transaction.pragma_update(None, "user_version", 4)?;
+        transaction.commit()?;
+    }
     Ok(())
 }
 
@@ -1117,9 +1165,10 @@ fn insert_event(connection: &Connection, event: &UsageEvent) -> Result<bool, His
             event_id, occurred_at_ms, account_identifier, provider, model, key_identifier,
             status_code, succeeded, input_tokens, output_tokens, cached_input_tokens,
             reasoning_tokens, total_tokens, latency_ms, created_at_ms,
-            estimated_cost_usd, price_version, cache_write_tokens
+            estimated_cost_usd, price_version, cache_write_tokens,
+            cached_input_tokens_known, cache_write_tokens_known, session_identifier
          ) VALUES (
-            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21
          )",
         params![
             event.event_id,
@@ -1140,6 +1189,9 @@ fn insert_event(connection: &Connection, event: &UsageEvent) -> Result<bool, His
             estimated_cost_usd,
             price_version,
             to_sql_i64(event.cache_write_tokens, "cache_write_tokens")?,
+            event.cached_input_tokens_known,
+            event.cache_write_tokens_known,
+            event.session_identifier,
         ],
     )?;
     Ok(changed == 1)
@@ -1163,7 +1215,9 @@ const EVENT_SELECT: &str =
     "SELECT e.id, e.event_id, e.occurred_at_ms, e.account_identifier, e.provider, e.model, \
          e.key_identifier, e.status_code, e.succeeded, e.input_tokens, e.output_tokens, \
          e.cached_input_tokens, e.reasoning_tokens, e.total_tokens, e.latency_ms, \
-         e.estimated_cost_usd, e.price_version, e.cache_write_tokens FROM usage_events e";
+         e.estimated_cost_usd, e.price_version, e.cache_write_tokens, \
+         e.cached_input_tokens_known, e.cache_write_tokens_known, e.session_identifier \
+         FROM usage_events e";
 
 fn read_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryEventRow> {
     Ok(HistoryEventRow {
@@ -1185,6 +1239,9 @@ fn read_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryEventRow> 
         estimated_cost_usd: row.get(15)?,
         price_version: row.get(16)?,
         cache_write_tokens: row.get::<_, i64>(17)? as u64,
+        cached_input_tokens_known: row.get(18)?,
+        cache_write_tokens_known: row.get(19)?,
+        session_identifier: row.get(20)?,
     })
 }
 
@@ -1451,7 +1508,9 @@ fn query_history(
             COALESCE(SUM(total_tokens), 0),
             COALESCE(SUM(latency_ms), 0),
             COALESCE(AVG(latency_ms), 0.0),
-            COALESCE(SUM(estimated_cost_usd), 0.0)
+            COALESCE(SUM(estimated_cost_usd), 0.0),
+            COALESCE(SUM(cached_input_tokens_known), 0),
+            COALESCE(SUM(cache_write_tokens_known), 0)
          FROM usage_events e{where_sql}"
     );
     let totals = connection.query_row(
@@ -1482,6 +1541,8 @@ fn read_totals(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryTotals> {
         total_latency_ms: row.get::<_, i64>(9)? as u64,
         average_latency_ms: row.get(10)?,
         estimated_cost_usd: row.get(11)?,
+        cached_input_tokens_known_requests: row.get::<_, i64>(12)? as u64,
+        cache_write_tokens_known_requests: row.get::<_, i64>(13)? as u64,
     })
 }
 
@@ -1540,7 +1601,9 @@ fn query_groups(
             COALESCE(SUM(total_tokens), 0),
             COALESCE(SUM(latency_ms), 0),
             COALESCE(AVG(latency_ms), 0.0),
-            COALESCE(SUM(estimated_cost_usd), 0.0)
+            COALESCE(SUM(estimated_cost_usd), 0.0),
+            COALESCE(SUM(cached_input_tokens_known), 0),
+            COALESCE(SUM(cache_write_tokens_known), 0)
          FROM usage_events e{where_sql}
          GROUP BY {group_sql}
          ORDER BY {group_sql}"
@@ -1577,6 +1640,8 @@ fn query_groups(
                 total_latency_ms: row.get::<_, i64>(totals_start + 9)? as u64,
                 average_latency_ms: row.get(totals_start + 10)?,
                 estimated_cost_usd: row.get(totals_start + 11)?,
+                cached_input_tokens_known_requests: row.get::<_, i64>(totals_start + 12)? as u64,
+                cache_write_tokens_known_requests: row.get::<_, i64>(totals_start + 13)? as u64,
             },
         })
     })?;
@@ -1769,7 +1834,7 @@ pub fn stable_key_identifier(raw_api_key: &str) -> String {
 
 // Small self-contained SHA-256 implementation keeps key material one-way
 // without adding another cryptography dependency to the gateway.
-fn sha256(input: &[u8]) -> [u8; 32] {
+pub fn sha256(input: &[u8]) -> [u8; 32] {
     const K: [u32; 64] = [
         0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
         0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
@@ -1916,11 +1981,14 @@ pub mod tests {
             provider: fixture.provider.to_string(),
             model: fixture.model.to_string(),
             key_identifier: Some(fixture.key.to_string()),
+            session_identifier: None,
             status_code: fixture.status_code,
             succeeded: fixture.status_code < 400,
             input_tokens: fixture.input_tokens,
             output_tokens: fixture.output_tokens,
             cached_input_tokens: fixture.cached_input_tokens,
+            cached_input_tokens_known: true,
+            cache_write_tokens_known: false,
             cache_write_tokens: 0,
             reasoning_tokens: fixture.output_tokens / 2,
             total_tokens: fixture.input_tokens + fixture.output_tokens,
@@ -2068,6 +2136,68 @@ pub mod tests {
     }
 
     #[test]
+    fn cache_presence_roundtrips_and_counts_partial_totals() {
+        // Given missing, reported-zero, and reported-positive usage.
+        let path = TestPath::new("cache-presence");
+        let history = ready(&path.0);
+        for (id, count, known) in [("missing", 0, false), ("zero", 0, true), ("positive", 17, true)] {
+            let mut usage = event(EventFixture {
+                event_id: id, occurred_at_ms: 1, account: "a", provider: "p",
+                model: "m", key: "k", status_code: 200,
+                input_tokens: 30, output_tokens: 2, cached_input_tokens: count,
+            });
+            usage.cached_input_tokens_known = known;
+            usage.cache_write_tokens = count;
+            usage.cache_write_tokens_known = known;
+            history.insert(&usage).unwrap();
+        }
+        // When persisted rows and aggregates are read.
+        for (id, count, known) in [("missing", 0, false), ("zero", 0, true), ("positive", 17, true)] {
+            let row = history.detail(id).unwrap().unwrap();
+            // Then both cache dimensions preserve presence, including explicit zero.
+            assert_eq!((row.cached_input_tokens, row.cached_input_tokens_known), (count, known));
+            assert_eq!((row.cache_write_tokens, row.cache_write_tokens_known), (count, known));
+        }
+        let result = history.query(&HistoryQuery {
+            group_by: vec![GroupDimension::Provider], ..HistoryQuery::default()
+        }).unwrap();
+        for totals in [&result.totals, &result.groups[0].totals] {
+            assert_eq!(totals.cached_input_tokens, 17);
+            assert_eq!(totals.cache_write_tokens, 17);
+            assert_eq!(totals.cached_input_tokens_known_requests, 2);
+            assert_eq!(totals.cache_write_tokens_known_requests, 2);
+            assert_eq!(totals.requests, 3);
+        }
+    }
+
+    #[test]
+    fn cache_presence_migration_keeps_legacy_zero_ambiguous() {
+        // Given a version-two database whose zero counters have no presence evidence.
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(MIGRATION_V1).unwrap();
+        connection.execute_batch(MIGRATION_V2).unwrap();
+        init_schema(&connection);
+        connection.pragma_update(None, "user_version", 2).unwrap();
+        for (id, count) in [("zero", 0), ("positive", 17)] {
+            connection.execute(
+                "INSERT INTO usage_events(event_id, occurred_at_ms, account_identifier, provider, model,
+                 status_code, succeeded, created_at_ms, cached_input_tokens, cache_write_tokens)
+                 VALUES (?1, 1, 'a', 'p', 'm', 200, 1, 1, ?2, ?2)",
+                params![id, count],
+            ).unwrap();
+        }
+        // When migration runs, including an idempotent reopen.
+        migrate(&mut connection).unwrap();
+        migrate(&mut connection).unwrap();
+        // Then only historically positive counters are known.
+        for (id, known) in [("zero", false), ("positive", true)] {
+            let row = detail_event(&connection, id).unwrap().unwrap();
+            assert_eq!(row.cached_input_tokens_known, known);
+            assert_eq!(row.cache_write_tokens_known, known);
+        }
+    }
+
+    #[test]
     fn duplicate_event_id_is_idempotent() {
         let path = TestPath::new("duplicate");
         let history = ready(&path.0);
@@ -2157,6 +2287,15 @@ mod extended_tests {
         previous_connection
             .pragma_update(None, "user_version", 1)
             .unwrap();
+        // A row written before the session column existed: the v4 migration
+        // must carry it forward untouched.
+        previous_connection
+            .execute(
+                "INSERT INTO usage_events(event_id, occurred_at_ms, account_identifier, provider, model, key_identifier, status_code, succeeded, input_tokens, output_tokens, cached_input_tokens, reasoning_tokens, total_tokens, latency_ms, created_at_ms)
+                 VALUES ('pre-v4-row', 100, 'a', 'p', 'm', NULL, 200, 1, 0, 0, 0, 0, 0, 0, 100)",
+                [],
+            )
+            .unwrap();
         drop(previous_connection);
 
         let migrated = ready(&previous.0);
@@ -2176,6 +2315,34 @@ mod extended_tests {
             }))
             .unwrap();
         assert_cost(migrated.totals().unwrap().estimated_cost_usd, 1.0);
+
+        // The v4 session column landed on a database born at v1: a row that
+        // existed before the column reads back as NULL, and a labeled row
+        // round-trips through the new column.
+        let legacy_row = migrated
+            .detail("pre-v4-row")
+            .expect("legacy detail")
+            .expect("pre-v4 row");
+        assert_eq!(legacy_row.session_identifier, None);
+        let mut labeled = event(EventFixture {
+            event_id: "labeled",
+            occurred_at_ms: 200,
+            account: "a",
+            provider: "p",
+            model: "m",
+            key: "k",
+            status_code: 200,
+            input_tokens: 1,
+            output_tokens: 1,
+            cached_input_tokens: 0,
+        });
+        labeled.session_identifier = Some("-123".to_string());
+        migrated.insert(&labeled).expect("labeled insert");
+        let labeled_row = migrated
+            .detail("labeled")
+            .expect("labeled detail")
+            .expect("labeled row");
+        assert_eq!(labeled_row.session_identifier.as_deref(), Some("-123"));
     }
 
     #[test]
@@ -2491,12 +2658,15 @@ mod extended_tests {
             provider: "anthropic".to_string(),
             model: "claude-3-5-sonnet".to_string(),
             key_identifier: None,
+            session_identifier: Some("-12345".to_string()),
             status_code: 200,
             succeeded: true,
             input_tokens: 100,
             output_tokens: 50,
             cached_input_tokens: 20,
+            cached_input_tokens_known: true,
             cache_write_tokens: 30,
+            cache_write_tokens_known: true,
             reasoning_tokens: 0,
             total_tokens: 150,
             latency_ms: 200,
@@ -2514,12 +2684,15 @@ mod extended_tests {
             provider: "anthropic".to_string(),
             model: "claude-3-5-sonnet".to_string(),
             key_identifier: None,
+            session_identifier: Some("-12345".to_string()),
             status_code: 200,
             succeeded: true,
             input_tokens: 100,
             output_tokens: 50,
             cached_input_tokens: 20,
+            cached_input_tokens_known: true,
             cache_write_tokens: 30,
+            cache_write_tokens_known: true,
             reasoning_tokens: 0,
             total_tokens: 150,
             latency_ms: 200,
@@ -2528,6 +2701,7 @@ mod extended_tests {
         };
         let row_json = serde_json::to_string(&row).unwrap();
         assert!(row_json.contains("\"cache-write-tokens\":30"));
+        assert!(row_json.contains("\"session\":\"-12345\""));
         let deserialized_row: HistoryEvent = serde_json::from_str(&row_json).unwrap();
         assert_eq!(deserialized_row.cache_write_tokens, 30);
 

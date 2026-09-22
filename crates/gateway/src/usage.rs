@@ -96,13 +96,6 @@ pub struct AccountUsage {
 }
 
 impl AccountUsage {
-    /// Inferred Cline free limits exist only while their daily 429 cap is active.
-    /// Once the reset deadline lapses, the inferred 100% quota has expired and
-    /// becomes unknown (`used_percent: None`), never fabricated zero.
-    /// If an account has other model buckets whose reset deadline is still in the
-    /// future, those active buckets remain intact — except buckets for models
-    /// outside the display filter, which are dropped so only the surfaced
-    /// model's bucket ever renders, even one restored from a previous run.
     pub fn expire_stale_cline_limits(&mut self, now_unix: i64) {
         for group in &mut self.groups {
             if group.display_name.as_deref() == Some("Cline Free Limits") {
@@ -588,10 +581,7 @@ pub fn parse_kiro_usage_summary(body: &serde_json::Value, now_unix: i64) -> Acco
 /// window first, weekly second). Unknown window types are skipped so a new
 /// upstream window cannot break the reading, while a present-but-wrong field
 /// is a broken response and yields `None`.
-pub fn parse_clinepass_usage_summary(
-    body: &serde_json::Value,
-    now_unix: i64,
-) -> Option<AccountUsage> {
+pub fn parse_clinepass_usage_summary(body: &serde_json::Value, now_unix: i64) -> Option<AccountUsage> {
     if body.get("success").and_then(|v| v.as_bool()) != Some(true) {
         return None;
     }
@@ -987,7 +977,9 @@ pub struct ResponseTokenUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_input_tokens: u64,
+    pub cached_input_tokens_known: bool,
     pub cache_write_tokens: u64,
+    pub cache_write_tokens_known: bool,
     pub reasoning_tokens: u64,
 }
 
@@ -997,58 +989,96 @@ impl ResponseTokenUsage {
     }
 }
 
+#[cfg(test)]
+mod cache_presence_tests {
+    use super::*;
+
+    #[test]
+    fn cache_presence_distinguishes_missing_zero_and_positive_wire_values() {
+        for value in [None, Some(0), Some(17)] {
+            for gemini in [false, true] {
+                // Given a real provider usage shape with optional cache reporting.
+                let mut usage = if gemini {
+                    serde_json::json!({"promptTokenCount": 30, "candidatesTokenCount": 2})
+                } else {
+                    serde_json::json!({"prompt_tokens": 30, "completion_tokens": 2})
+                };
+                if let Some(value) = value {
+                    if gemini {
+                        usage["cachedContentTokenCount"] = value.into();
+                    } else {
+                        usage["prompt_tokens_details"] = serde_json::json!({"cached_tokens": value});
+                    }
+                }
+                let body = if gemini {
+                    serde_json::json!({"usageMetadata": usage})
+                } else {
+                    serde_json::json!({"usage": usage})
+                }.to_string();
+                // When the relay capture extracts usage.
+                let parsed = extract_response_token_usage(body.as_bytes(), body.as_bytes()).unwrap();
+                // Then the count and its presence are independent.
+                assert_eq!(parsed.cached_input_tokens, value.unwrap_or(0));
+                assert_eq!(parsed.cached_input_tokens_known, value.is_some());
+                assert!(!parsed.cache_write_tokens_known);
+            }
+        }
+    }
+}
+
 pub fn extract_response_token_usage(head: &[u8], tail: &[u8]) -> Option<ResponseTokenUsage> {
     if let Some(usage) = last_balanced_object(tail, b"\"usage\"") {
         let prompt = object_number(&usage, &["prompt_tokens"]);
         let completion = object_number(&usage, &["completion_tokens"]);
         if prompt.is_some() || completion.is_some() {
-            let cached_input_tokens =
-                nested_object_number(&usage, "input_tokens_details", "cached_tokens")
-                    .or_else(|| {
-                        nested_object_number(&usage, "prompt_tokens_details", "cached_tokens")
-                    })
-                    .or_else(|| {
-                        object_number(&usage, &["cache_read_input_tokens", "cache_read_tokens"])
-                    })
-                    .unwrap_or(0);
-            let cache_write_tokens =
-                nested_object_number(&usage, "prompt_tokens_details", "cache_creation_tokens")
-                    .or_else(|| {
-                        nested_object_number(&usage, "prompt_tokens_details", "cache_write_tokens")
-                    })
-                    .or_else(|| {
-                        nested_object_number(
-                            &usage,
-                            "prompt_tokens_details",
-                            "cache_creation_input_tokens",
-                        )
-                    })
-                    .or_else(|| {
-                        nested_object_number(
-                            &usage,
-                            "input_tokens_details",
-                            "cache_creation_tokens",
-                        )
-                    })
-                    .or_else(|| {
-                        nested_object_number(&usage, "input_tokens_details", "cache_write_tokens")
-                    })
-                    .or_else(|| {
-                        object_number(
-                            &usage,
-                            &[
-                                "cache_creation_input_tokens",
-                                "cache_write_tokens",
-                                "cache_creation_tokens",
-                            ],
-                        )
-                    })
-                    .unwrap_or(0);
+            let cached_input_tokens = nested_object_number(
+                &usage,
+                "input_tokens_details",
+                "cached_tokens",
+            )
+            .or_else(|| {
+                nested_object_number(&usage, "prompt_tokens_details", "cached_tokens")
+            })
+            .or_else(|| object_number(&usage, &["cache_read_input_tokens", "cache_read_tokens"]));
+            let cache_write_tokens = nested_object_number(
+                &usage,
+                "prompt_tokens_details",
+                "cache_creation_tokens",
+            )
+            .or_else(|| {
+                nested_object_number(&usage, "prompt_tokens_details", "cache_write_tokens")
+            })
+            .or_else(|| {
+                nested_object_number(
+                    &usage,
+                    "prompt_tokens_details",
+                    "cache_creation_input_tokens",
+                )
+            })
+            .or_else(|| {
+                nested_object_number(&usage, "input_tokens_details", "cache_creation_tokens")
+            })
+            .or_else(|| {
+                nested_object_number(&usage, "input_tokens_details", "cache_write_tokens")
+            })
+            .or_else(|| {
+                object_number(
+                    &usage,
+                    &[
+                        "cache_creation_input_tokens",
+                        "cache_write_tokens",
+                        "cache_creation_tokens",
+                    ],
+                )
+            })
+            ;
             return Some(ResponseTokenUsage {
                 input_tokens: prompt.unwrap_or(0),
                 output_tokens: completion.unwrap_or(0),
-                cached_input_tokens,
-                cache_write_tokens,
+                cached_input_tokens: cached_input_tokens.unwrap_or(0),
+                cached_input_tokens_known: cached_input_tokens.is_some(),
+                cache_write_tokens: cache_write_tokens.unwrap_or(0),
+                cache_write_tokens_known: cache_write_tokens.is_some(),
                 reasoning_tokens: nested_object_number(
                     &usage,
                     "output_tokens_details",
@@ -1067,27 +1097,32 @@ pub fn extract_response_token_usage(head: &[u8], tail: &[u8]) -> Option<Response
         // branch must never swallow Claude's head-side `cache_read_input_tokens`.
         if let Some(cached) = nested_object_number(&usage, "input_tokens_details", "cached_tokens")
         {
-            let cache_write_tokens =
-                nested_object_number(&usage, "input_tokens_details", "cache_creation_tokens")
-                    .or_else(|| {
-                        nested_object_number(&usage, "input_tokens_details", "cache_write_tokens")
-                    })
-                    .or_else(|| {
-                        object_number(
-                            &usage,
-                            &[
-                                "cache_creation_input_tokens",
-                                "cache_write_tokens",
-                                "cache_creation_tokens",
-                            ],
-                        )
-                    })
-                    .unwrap_or(0);
+            let cache_write_tokens = nested_object_number(
+                &usage,
+                "input_tokens_details",
+                "cache_creation_tokens",
+            )
+            .or_else(|| {
+                nested_object_number(&usage, "input_tokens_details", "cache_write_tokens")
+            })
+            .or_else(|| {
+                object_number(
+                    &usage,
+                    &[
+                        "cache_creation_input_tokens",
+                        "cache_write_tokens",
+                        "cache_creation_tokens",
+                    ],
+                )
+            })
+            ;
             return Some(ResponseTokenUsage {
                 input_tokens: object_number(&usage, &["input_tokens"]).unwrap_or(0),
                 output_tokens: object_number(&usage, &["output_tokens"]).unwrap_or(0),
                 cached_input_tokens: cached,
-                cache_write_tokens,
+                cached_input_tokens_known: true,
+                cache_write_tokens: cache_write_tokens.unwrap_or(0),
+                cache_write_tokens_known: cache_write_tokens.is_some(),
                 reasoning_tokens: nested_object_number(
                     &usage,
                     "output_tokens_details",
@@ -1106,7 +1141,9 @@ pub fn extract_response_token_usage(head: &[u8], tail: &[u8]) -> Option<Response
                 output_tokens: completion.unwrap_or(0),
                 cached_input_tokens: object_number(&usage, &["cachedContentTokenCount"])
                     .unwrap_or(0),
+                cached_input_tokens_known: object_number(&usage, &["cachedContentTokenCount"]).is_some(),
                 cache_write_tokens: 0,
+                cache_write_tokens_known: false,
                 reasoning_tokens: object_number(&usage, &["thoughtsTokenCount"]).unwrap_or(0),
             });
         }
@@ -1119,8 +1156,10 @@ pub fn extract_response_token_usage(head: &[u8], tail: &[u8]) -> Option<Response
             output_tokens: output.unwrap_or(0),
             cached_input_tokens: last_number_after(head, b"\"cache_read_input_tokens\"")
                 .unwrap_or(0),
+            cached_input_tokens_known: last_number_after(head, b"\"cache_read_input_tokens\"").is_some(),
             cache_write_tokens: last_number_after(head, b"\"cache_creation_input_tokens\"")
                 .unwrap_or(0),
+            cache_write_tokens_known: last_number_after(head, b"\"cache_creation_input_tokens\"").is_some(),
             reasoning_tokens: 0,
         });
     }
@@ -1451,9 +1490,6 @@ pub fn parse_relay_usage(payload: &serde_json::Value) -> Option<RelayUsageTotals
 /// used_percent: 0.8, reset_at: "2026-09-09T10:17:04.331725"}`.
 /// `used_percent` is already a percent (0.8 == 0.8% used), and `reset_at`
 /// is a bare naive UTC timestamp with fractional seconds and no suffix.
-/// Higher relay tiers also publish per-model limits that repeat a window with
-/// a non-null `model_filter`; those are a separate pool from the account-wide
-/// entry that shares the window name.
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 struct RelayLimit {
     #[serde(default)]
@@ -1464,8 +1500,6 @@ struct RelayLimit {
     used_percent: Option<f64>,
     #[serde(default)]
     reset_at: Option<String>,
-    #[serde(default)]
-    model_filter: Option<String>,
 }
 
 /// Parses the bare naive UTC timestamps the relay emits (`reset_at` has no
@@ -1515,29 +1549,13 @@ pub fn parse_relay_account_usage(
         .filter_map(|limit| {
             let window = limit.limit_window?;
             relay_limit_minutes(&window)?;
-            // A per-model limit repeats an account-wide window name. Keeping
-            // the filter in the id and label stops the two pools from reading
-            // as one duplicated row.
-            let model_filter = limit
-                .model_filter
-                .as_deref()
-                .map(str::trim)
-                .filter(|f| !f.is_empty());
             Some(QuotaBucket {
-                bucket_id: Some(match model_filter {
-                    Some(filter) => format!(
-                        "{}-{window}-{filter}",
-                        limit.limit_type.as_deref().unwrap_or("limit")
-                    ),
-                    None => format!(
-                        "{}-{window}",
-                        limit.limit_type.as_deref().unwrap_or("limit")
-                    ),
-                }),
-                display_name: Some(match model_filter {
-                    Some(filter) => format!("{} · {filter}", relay_limit_label(&window)),
-                    None => relay_limit_label(&window).to_string(),
-                }),
+                bucket_id: Some(format!(
+                    "{}-{}",
+                    limit.limit_type.as_deref().unwrap_or("limit"),
+                    window
+                )),
+                display_name: Some(relay_limit_label(&window).to_string()),
                 window: Some(window),
                 used_percent: limit.used_percent.map(|p| p.clamp(0.0, 100.0)),
                 reset_at_unix: limit.reset_at.as_deref().and_then(parse_naive_unix),
@@ -1555,12 +1573,7 @@ pub fn parse_relay_account_usage(
     let window_of = |name: &str| -> QuotaWindow {
         buckets
             .iter()
-            // The account-wide pool governs rotation; a per-model bucket is a
-            // narrower limit and must not stand in for the whole account.
-            .find(|b| {
-                b.window.as_deref() == Some(name)
-                    && b.display_name.as_deref() == Some(relay_limit_label(name))
-            })
+            .find(|b| b.window.as_deref() == Some(name))
             .map(|b| QuotaWindow {
                 used_percent: b.used_percent,
                 window_minutes: b.window.as_deref().and_then(relay_limit_minutes),
@@ -1667,10 +1680,7 @@ mod tests {
         assert_eq!(usage.plan_type.as_deref(), Some("ClinePass"));
         assert_eq!(usage.groups.len(), 1);
         assert_eq!(usage.groups[0].buckets.len(), 3);
-        assert_eq!(
-            usage.groups[0].buckets[0].display_name.as_deref(),
-            Some("5-hour")
-        );
+        assert_eq!(usage.groups[0].buckets[0].display_name.as_deref(), Some("5-hour"));
         assert_eq!(usage.groups[0].buckets[0].used_percent, Some(40.0));
         assert_eq!(usage.primary.window_minutes, Some(300));
         assert_eq!(usage.primary.used_percent, Some(40.0));
@@ -1682,21 +1692,12 @@ mod tests {
     #[test]
     fn clinepass_rejects_failed_or_malformed_payloads() {
         let now = 1_800_000_000;
-        assert!(parse_clinepass_usage_summary(
-            &serde_json::json!({"success": false, "data": {"limits": []}}),
-            now
-        )
-        .is_none());
-        assert!(parse_clinepass_usage_summary(
-            &serde_json::json!({"success": true, "data": {"limits": []}}),
-            now
-        )
-        .is_none());
+        assert!(parse_clinepass_usage_summary(&serde_json::json!({"success": false, "data": {"limits": []}}), now).is_none());
+        assert!(parse_clinepass_usage_summary(&serde_json::json!({"success": true, "data": {"limits": []}}), now).is_none());
         assert!(parse_clinepass_usage_summary(
             &serde_json::json!({"success": true, "data": {"limits": [{"type": "five_hour"}]}}),
             now
-        )
-        .is_none());
+        ).is_none());
         let unknown_only = serde_json::json!({"success": true, "data": {"limits": [{"type": "yearly", "percentUsed": 1.0}]}});
         assert!(parse_clinepass_usage_summary(&unknown_only, now).is_none());
     }
@@ -2333,8 +2334,8 @@ mod tests {
             .expect("weekly bucket");
         assert!((weekly.used_percent.unwrap() - 94.19).abs() < 1e-6);
         assert_eq!(weekly.reset_at_unix, Some(1_789_035_424)); // 2026-09-10T10:17:04Z naive UTC
-                                                               // and the flat pair follows the shared short/long convention so the
-                                                               // scheduler and rotation logic read truthful windows
+        // and the flat pair follows the shared short/long convention so the
+        // scheduler and rotation logic read truthful windows
         assert_eq!(usage.primary.window_minutes, Some(180));
         assert!((usage.primary.used_percent.unwrap() - 0.8).abs() < 1e-6);
         assert_eq!(usage.secondary.window_minutes, Some(10_080));
@@ -2343,54 +2344,12 @@ mod tests {
     }
 
     #[test]
-    fn per_model_relay_limits_do_not_collide_with_the_account_wide_pool() {
-        // given a higher-tier payload that repeats daily/weekly with a
-        // model_filter: those are a narrower pool, not the account's own
-        let payload: serde_json::Value = serde_json::from_str(
-            r#"{"request_count":124273,"total_tokens":28125326690,
-                "cached_input_tokens":27956835558,"total_cost_usd":66068.46316,
-                "limits":[
-                 {"limit_type":"cost_usd","limit_window":"3h","used_percent":3.7,
-                  "model_filter":null,"reset_at":"2026-09-14T15:34:30.940247"},
-                 {"limit_type":"cost_usd","limit_window":"daily","used_percent":36.34,
-                  "model_filter":null,"reset_at":"2026-09-15T06:34:30.940247"},
-                 {"limit_type":"cost_usd","limit_window":"weekly","used_percent":68.11,
-                  "model_filter":null,"reset_at":"2026-09-15T06:34:30.940247"},
-                 {"limit_type":"cost_usd","limit_window":"daily","used_percent":62.49,
-                  "model_filter":"fable","reset_at":"2026-09-15T06:34:30.940247"},
-                 {"limit_type":"cost_usd","limit_window":"weekly","used_percent":61.87,
-                  "model_filter":"fable","reset_at":"2026-09-15T06:34:30.940247"}]}"#,
-        )
-        .unwrap();
-        let totals = parse_relay_usage(&payload).expect("totals");
-        // when the snapshot is built
-        let usage = parse_relay_account_usage(&payload, totals, Vec::new(), 1_789_390_000);
-        // then every limit is rendered, with the filtered ones distinguishable
-        let buckets = &usage.groups[0].buckets;
-        assert_eq!(buckets.len(), 5);
-        let ids: Vec<&str> = buckets
-            .iter()
-            .filter_map(|b| b.bucket_id.as_deref())
-            .collect();
-        assert!(ids.contains(&"cost_usd-weekly"));
-        assert!(ids.contains(&"cost_usd-weekly-fable"));
-        let labels: Vec<&str> = buckets
-            .iter()
-            .filter_map(|b| b.display_name.as_deref())
-            .collect();
-        assert!(labels.contains(&"Weekly · fable"));
-        // and the flat pair still reports the account-wide pool, never the
-        // narrower per-model one that shares its window name
-        assert!((usage.secondary.used_percent.unwrap() - 68.11).abs() < 1e-6);
-        assert_eq!(usage.secondary.limit_name.as_deref(), Some("Weekly"));
-        assert!((usage.primary.used_percent.unwrap() - 3.7).abs() < 1e-6);
-    }
-
-    #[test]
     fn relay_limits_tolerate_missing_or_unknown_windows() {
         // given a payload with no limits array at all
-        let payload: serde_json::Value =
-            serde_json::from_str(r#"{"request_count":1,"total_tokens":2}"#).unwrap();
+        let payload: serde_json::Value = serde_json::from_str(
+            r#"{"request_count":1,"total_tokens":2}"#,
+        )
+        .unwrap();
         let totals = parse_relay_usage(&payload).expect("totals");
         // when the snapshot is built
         let usage = parse_relay_account_usage(&payload, totals, Vec::new(), 7);

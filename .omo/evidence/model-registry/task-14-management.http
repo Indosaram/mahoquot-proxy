@@ -13,9 +13,9 @@ access-control-allow-origin: *
 access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
 access-control-allow-headers: Authorization, Content-Type
 content-length: 284
-date: Fri, 18 Sep 2026 23:45:35 GMT
+date: Tue, 22 Sep 2026 01:04:01 GMT
 
-{"source":"embedded_fallback","catalog-version":1,"generation":1,"generated-at":null,"loaded-at":1789775135,"stale":false,"last-refresh":{"outcome":"never","attempted-at":null,"duration-ms":null,"rejection-reason":null},"provider-count":15,"model-count":104,"refresh-in-flight":false}
+{"source":"embedded_fallback","catalog-version":1,"generation":1,"generated-at":null,"loaded-at":1790039041,"stale":false,"last-refresh":{"outcome":"never","attempted-at":null,"duration-ms":null,"rejection-reason":null},"provider-count":15,"model-count":105,"refresh-in-flight":false}
 
 ---
 
@@ -33,7 +33,7 @@ access-control-allow-origin: *
 access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
 access-control-allow-headers: Authorization, Content-Type
 content-length: 70
-date: Fri, 18 Sep 2026 23:45:35 GMT
+date: Tue, 22 Sep 2026 01:04:01 GMT
 
 {"error":{"message":"invalid api key","type":"invalid_request_error"}}
 
@@ -55,9 +55,9 @@ access-control-allow-origin: *
 access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
 access-control-allow-headers: Authorization, Content-Type
 content-length: 327
-date: Fri, 18 Sep 2026 23:45:35 GMT
+date: Tue, 22 Sep 2026 01:04:01 GMT
 
-{"accepted":true,"coalesced":false,"state":{"source":"embedded_fallback","catalog-version":1,"generation":1,"generated-at":null,"loaded-at":1789775135,"stale":false,"last-refresh":{"outcome":"never","attempted-at":null,"duration-ms":null,"rejection-reason":null},"provider-count":15,"model-count":104,"refresh-in-flight":true}}
+{"accepted":true,"coalesced":false,"state":{"source":"embedded_fallback","catalog-version":1,"generation":1,"generated-at":null,"loaded-at":1790039041,"stale":false,"last-refresh":{"outcome":"never","attempted-at":null,"duration-ms":null,"rejection-reason":null},"provider-count":15,"model-count":105,"refresh-in-flight":true}}
 
 ---
 
@@ -77,9 +77,9 @@ access-control-allow-origin: *
 access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
 access-control-allow-headers: Authorization, Content-Type
 content-length: 327
-date: Fri, 18 Sep 2026 23:45:35 GMT
+date: Tue, 22 Sep 2026 01:04:01 GMT
 
-{"accepted":false,"coalesced":true,"state":{"source":"embedded_fallback","catalog-version":1,"generation":1,"generated-at":null,"loaded-at":1789775135,"stale":false,"last-refresh":{"outcome":"never","attempted-at":null,"duration-ms":null,"rejection-reason":null},"provider-count":15,"model-count":104,"refresh-in-flight":true}}
+{"accepted":false,"coalesced":true,"state":{"source":"embedded_fallback","catalog-version":1,"generation":1,"generated-at":null,"loaded-at":1790039041,"stale":false,"last-refresh":{"outcome":"never","attempted-at":null,"duration-ms":null,"rejection-reason":null},"provider-count":15,"model-count":105,"refresh-in-flight":true}}
 
 ---
 
@@ -98,6 +98,6 @@ access-control-allow-origin: *
 access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
 access-control-allow-headers: Authorization, Content-Type
 content-length: 290
-date: Fri, 18 Sep 2026 23:45:35 GMT
+date: Tue, 22 Sep 2026 01:04:01 GMT
 
-{"source":"remote_signed","catalog-version":101,"generation":2,"generated-at":1789775135,"loaded-at":1789775135,"stale":false,"last-refresh":{"outcome":"success","attempted-at":1789775135,"duration-ms":6,"rejection-reason":null},"provider-count":1,"model-count":1,"refresh-in-flight":false}
+{"source":"remote_signed","catalog-version":101,"generation":2,"generated-at":1790039041,"loaded-at":1790039041,"stale":false,"last-refresh":{"outcome":"success","attempted-at":1790039041,"duration-ms":9,"rejection-reason":null},"provider-count":1,"model-count":1,"refresh-in-flight":false}

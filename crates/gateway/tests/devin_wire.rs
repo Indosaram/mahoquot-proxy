@@ -396,8 +396,10 @@ fn stream_decodes_thinking_signature_redaction_text_tool_and_usage() {
                     completion_tokens: 20,
                     total_tokens: 30,
                     cached_tokens: 5,
+                    cached_tokens_known: true,
                     reasoning_tokens: 0,
                     cache_write_tokens: 6,
+                    cache_write_tokens_known: true,
                 }),
             },
         ],
@@ -1103,6 +1105,7 @@ async fn defect_3_compat_stream_rejects_same_chunk_and_split_terminal_junk() {
         session: ProtocolSession {
             protocol: Protocol::Devin,
             cursor_reply: None,
+            replay: None,
         },
         upstream_capture: None,
         devin_outcome: None,
@@ -1132,6 +1135,7 @@ async fn defect_3_compat_stream_rejects_same_chunk_and_split_terminal_junk() {
         session: ProtocolSession {
             protocol: Protocol::Devin,
             cursor_reply: None,
+            replay: None,
         },
         upstream_capture: None,
         devin_outcome: None,

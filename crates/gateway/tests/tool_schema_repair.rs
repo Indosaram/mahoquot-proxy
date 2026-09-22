@@ -108,7 +108,7 @@ fn tools_14_existing_object_type_still_gets_required_array() {
 }
 
 #[test]
-fn tools_14_nested_objects_arrays_and_unions_preserve_optional_fields() {
+fn tools_14_nested_objects_arrays_and_flattened_unions_keep_optional_fields() {
     let request = tools_14_request(json!({
         "properties": {
             "options": {"properties": {"enabled": {"type": "boolean"}}},
@@ -137,9 +137,96 @@ fn tools_14_nested_objects_arrays_and_unions_preserve_optional_fields() {
         assert_eq!(rows["items"]["type"], "object");
         assert_eq!(rows["items"]["required"], json!(["label"]));
         assert_eq!(rows["items"]["properties"]["count"]["type"], "integer");
-        let choice = &schema["properties"]["choice"]["anyOf"];
-        assert_eq!(choice[0]["required"], json!([]));
-        assert_eq!(choice[1], json!({"type": "null"}));
+        // The strict Vertex-hosted validator rejects anyOf/oneOf unions, so
+        // the nullable union collapses to its non-null object branch.
+        let choice = &schema["properties"]["choice"];
+        assert!(choice.get("anyOf").is_none(), "union survived: {choice}");
+        assert_eq!(choice["type"], "object");
+        assert_eq!(choice["properties"]["tag"]["type"], "string");
+        assert_eq!(choice["required"], json!([]));
+    }
+}
+
+#[test]
+fn tools_14_nullable_union_drops_property_from_required() {
+    let request = tools_14_request(json!({
+        "properties": {
+            "path": {"type": "string"},
+            "offset": {
+                "anyOf": [{"type": "number"}, {"type": "null"}],
+                "default": 1,
+                "description": "Line number to start reading from (1-indexed)"
+            }
+        },
+        "required": ["path", "offset"]
+    }));
+    for schema in [direct_schema(&request), bridge_schema(&request)] {
+        // The property becomes truly optional instead of required-and-null.
+        assert_eq!(schema["required"], json!(["path"]));
+        let offset = &schema["properties"]["offset"];
+        assert!(offset.get("anyOf").is_none(), "union survived: {offset}");
+        assert_eq!(offset["type"], "number");
+        assert_eq!(
+            offset["description"],
+            "Line number to start reading from (1-indexed)"
+        );
+    }
+    // The union node's default annotation survives onto the flattened branch
+    // on the direct path; the Gemini transport strips it (proto constraint).
+    assert_eq!(
+        direct_schema(&request)["properties"]["offset"]["default"],
+        json!(1)
+    );
+    assert!(
+        bridge_schema(&request)["properties"]["offset"]
+            .get("default")
+            .is_none()
+    );
+}
+
+#[test]
+fn tools_14_all_object_union_merges_and_mixed_union_keeps_first_branch() {
+    let request = tools_14_request(json!({
+        "properties": {
+            "shutdown": {"anyOf": [
+                {
+                    "properties": {
+                        "type": {"const": "shutdown_request", "type": "string"},
+                        "reason": {"type": "string"}
+                    },
+                    "required": ["type"]
+                },
+                {
+                    "properties": {
+                        "approve": {"type": "boolean"},
+                        "type": {"const": "shutdown_response", "type": "string"}
+                    },
+                    "required": ["type", "approve"]
+                }
+            ]},
+            "message": {"anyOf": [
+                {"type": "string"},
+                {"anyOf": [
+                    {"properties": {"a": {"type": "string"}}, "required": ["a"]},
+                    {"properties": {"b": {"type": "number"}}, "required": []}
+                ]}
+            ]}
+        },
+        "required": ["message", "shutdown"]
+    }));
+    for schema in [direct_schema(&request), bridge_schema(&request)] {
+        // Both object variants merge into one schema; only the shared
+        // required name survives the intersection.
+        let shutdown = &schema["properties"]["shutdown"];
+        assert!(shutdown.get("anyOf").is_none(), "union survived: {shutdown}");
+        assert_eq!(shutdown["type"], "object");
+        assert_eq!(shutdown["properties"]["reason"]["type"], "string");
+        assert_eq!(shutdown["properties"]["approve"]["type"], "boolean");
+        assert_eq!(shutdown["required"], json!(["type"]));
+        // Mixed object/primitive unions keep the first branch.
+        let message = &schema["properties"]["message"];
+        assert!(message.get("anyOf").is_none(), "union survived: {message}");
+        assert_eq!(message["type"], "string");
     }
 }
 

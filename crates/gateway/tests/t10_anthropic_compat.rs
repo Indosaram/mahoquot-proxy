@@ -122,8 +122,10 @@ fn test_t10_response_shape_matches_anthropic() {
         completion_tokens: 2,
         total_tokens: 8,
         cached_tokens: 0,
+        cached_tokens_known: false,
         reasoning_tokens: 0,
         cache_write_tokens: 0,
+        cache_write_tokens_known: false,
     };
     let payload = messages_payload(
         "msg_1",
@@ -181,8 +183,10 @@ fn test_t10_stream_emits_anthropic_event_sequence() {
                 completion_tokens: 2,
                 total_tokens: 8,
                 cached_tokens: 0,
+                cached_tokens_known: false,
                 reasoning_tokens: 0,
                 cache_write_tokens: 0,
+                cache_write_tokens_known: false,
             }),
         },
     ];

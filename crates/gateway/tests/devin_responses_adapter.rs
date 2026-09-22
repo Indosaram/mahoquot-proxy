@@ -388,8 +388,10 @@ fn test_streaming_lifecycle_text_turn() {
             completion_tokens: 5,
             total_tokens: 20,
             cached_tokens: 2,
+            cached_tokens_known: false,
             reasoning_tokens: 0,
             cache_write_tokens: 0,
+            cache_write_tokens_known: false,
         }),
     }));
 
@@ -471,8 +473,10 @@ fn test_streaming_lifecycle_tool_call_turn() {
             completion_tokens: 10,
             total_tokens: 40,
             cached_tokens: 0,
+            cached_tokens_known: false,
             reasoning_tokens: 0,
             cache_write_tokens: 0,
+            cache_write_tokens_known: false,
         }),
     }));
 
@@ -615,8 +619,10 @@ fn test_streaming_output_limit_vs_failure() {
             completion_tokens: 2048,
             total_tokens: 2058,
             cached_tokens: 0,
+            cached_tokens_known: false,
             reasoning_tokens: 0,
             cache_write_tokens: 0,
+            cache_write_tokens_known: false,
         }),
     }));
 
@@ -667,8 +673,10 @@ fn test_streaming_usage_unknown_vs_zero() {
             completion_tokens: 0,
             total_tokens: 0,
             cached_tokens: 0,
+            cached_tokens_known: false,
             reasoning_tokens: 0,
             cache_write_tokens: 0,
+            cache_write_tokens_known: false,
         }),
     });
     let parsed_zero = parse_sse_frames(&frames_zero);
@@ -719,8 +727,10 @@ fn test_nonstream_json_equivalent_to_stream_lifecycle() {
                 completion_tokens: 18,
                 total_tokens: 60,
                 cached_tokens: 10,
+                cached_tokens_known: false,
                 reasoning_tokens: 5,
                 cache_write_tokens: 0,
+            cache_write_tokens_known: false,
             }),
         },
     ];

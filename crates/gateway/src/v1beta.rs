@@ -105,7 +105,11 @@ pub fn contents_not_specified() -> Value {
 pub fn wrap_for_antigravity(model: &str, project_id: &str, body: &Value) -> Value {
     json!({
         "model": model,
+        // Client-identity fields the real Antigravity client sends.
+        "userAgent": "antigravity",
+        "requestType": "agent",
         "project": project_id,
+        "requestId": format!("agent-{}", uuid::Uuid::new_v4()),
         "request": body.clone(),
     })
 }
@@ -186,11 +190,16 @@ mod tests {
     }
 
     #[test]
-    fn envelope_passes_the_client_body_through_untranslated() {
+    fn envelope_carries_the_antigravity_client_identity_fields() {
         let body = json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}]});
         let wrapped = wrap_for_antigravity("gemini-3-flash", "proj-1", &body);
         assert_eq!(wrapped["model"], "gemini-3-flash");
         assert_eq!(wrapped["project"], "proj-1");
         assert_eq!(wrapped["request"], body);
+        assert_eq!(wrapped["userAgent"], "antigravity");
+        assert_eq!(wrapped["requestType"], "agent");
+        assert!(wrapped["requestId"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("agent-") && id.len() > "agent-".len()));
     }
 }

@@ -146,4 +146,9 @@ pub struct AdminStatsResponse {
     pub ttft: TtftSnapshot,
     pub accounts: Vec<AccountStats>,
     pub history: Vec<TelemetryBucket>,
+    /// Replay health for Gemini thought signatures: a growing `misses` or
+    /// `unsigned_replays` count is what turns into upstream-visible prefix
+    /// mutation, so it belongs next to the request counters.
+    #[serde(default)]
+    pub signature_ledger: crate::compat::signature_ledger::LedgerStats,
 }

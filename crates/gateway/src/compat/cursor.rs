@@ -261,8 +261,11 @@ impl CursorDecoder {
                         completion_tokens: usage.output_tokens,
                         total_tokens: usage.input_tokens + usage.output_tokens,
                         cached_tokens: usage.cache_read_tokens + usage.cache_write_tokens,
+                        cached_tokens_known: usage.cache_read_tokens > 0
+                            || usage.cache_write_tokens > 0,
                         reasoning_tokens: usage.reasoning_tokens,
                         cache_write_tokens: usage.cache_write_tokens,
+                        cache_write_tokens_known: usage.cache_write_tokens > 0,
                     }),
                 });
             }
@@ -379,8 +382,10 @@ impl CursorDecoder {
                 completion_tokens: self.output_tokens,
                 total_tokens: self.output_tokens,
                 cached_tokens: 0,
+                cached_tokens_known: false,
                 reasoning_tokens: 0,
                 cache_write_tokens: 0,
+                cache_write_tokens_known: false,
             }),
         });
     }
