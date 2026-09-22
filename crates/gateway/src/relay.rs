@@ -396,9 +396,14 @@ async fn record_request_outcome(state: &AppState, record: OutcomeRecord<'_>) {
     .await;
 }
 
-/// Cline daily-budget tracking: count served tokens, surface live usage in
-/// the account's quota bucket, and bench proactively at the threshold so the
-/// upstream cap 429 never reaches a client.
+/// Cline daily-budget tracking: count served tokens and surface the running
+/// estimate in the account's quota bucket.
+///
+/// Display only. The 24h budget is the gateway's own guess at an allowance it
+/// does not meter and upstream never confirms, so it must not withhold an
+/// account from routing: benching on an estimate throws away real capacity and
+/// turns a healthy account into a 503. Exhaustion is upstream's call, made
+/// through the cap 429 that `record_cooldown` benches on.
 fn track_cline_daily_usage(state: &AppState, record: &OutcomeRecord<'_>, timestamp: i64) {
     if record.status != 200 {
         return;
@@ -418,7 +423,7 @@ fn track_cline_daily_usage(state: &AppState, record: &OutcomeRecord<'_>, timesta
         return;
     }
     let tracker = member.cline_tracker();
-    let crossed = tracker.observe(usage.total_tokens(), timestamp);
+    tracker.observe(usage.total_tokens(), timestamp);
     let reset_unix = tracker.estimated_reset_unix();
     if reset_unix <= timestamp {
         return;
@@ -426,11 +431,12 @@ fn track_cline_daily_usage(state: &AppState, record: &OutcomeRecord<'_>, timesta
     let Some(model) = record.model else {
         return;
     };
-    let percent = tracker.used_percent().unwrap_or(0.0);
+    // 100% is reserved for an upstream-confirmed cap: `record_cooldown` passes
+    // it literally on a cap 429, and every UI surface reads it as real
+    // exhaustion. An estimate that ran past the reference budget must stay
+    // below that mark, or a still-routable account renders as benched.
+    let percent = tracker.used_percent().unwrap_or(0.0).min(99.9);
     record_cline_quota_bucket(&member, model, reset_unix - timestamp, timestamp, percent);
-    if crossed {
-        bench_exhausted_quota(&member, Some(model), reset_unix * 1000);
-    }
 }
 
 /// Mirror a scoped key's live token counter into the settings document.
@@ -511,6 +517,21 @@ struct ResolvedRoute {
     provider_classes: Vec<ResolvedProviderClass>,
 }
 
+fn normalize_developer_role(value: &mut serde_json::Value) {
+    if let Some(messages) = value.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        for msg in messages {
+            if let Some(msg_obj) = msg.as_object_mut() {
+                if msg_obj.get("role").and_then(|r| r.as_str()) == Some("developer") {
+                    msg_obj.insert(
+                        "role".to_string(),
+                        serde_json::Value::String("system".to_string()),
+                    );
+                }
+            }
+        }
+    }
+}
+
 fn body_with_model(body: &Bytes, model: &str) -> Bytes {
     let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) else {
         return body.clone();
@@ -522,6 +543,7 @@ fn body_with_model(body: &Bytes, model: &str) -> Bytes {
         "model".to_string(),
         serde_json::Value::String(model.to_string()),
     );
+    normalize_developer_role(&mut value);
     Bytes::from(value.to_string())
 }
 
@@ -533,6 +555,7 @@ fn openai_body_with_model(plan: &RelayPlan, model: &str) -> Option<serde_json::V
             serde_json::Value::String(model.to_string()),
         );
     }
+    normalize_developer_role(&mut body);
     Some(body)
 }
 
@@ -1084,7 +1107,35 @@ async fn send_upstream(
             Some(tx),
         )
     } else {
-        (req_builder.body(body_bytes.clone()).send().await?, None)
+        let request = req_builder.body(body_bytes.clone());
+        let replay = if member.kind() == crate::account::ProviderKind::Generic
+            && matches!(member.provider_name().as_str(), "b-ai" | "b.ai")
+        {
+            request.try_clone()
+        } else {
+            None
+        };
+        let mut response = request.send().await?;
+        if let Some(replay) = replay {
+            if response.status() == StatusCode::BAD_REQUEST {
+                let status = response.status();
+                let response_headers = response.headers().clone();
+                let bytes = response.bytes().await?;
+                let retryable = serde_json::from_slice::<serde_json::Value>(&bytes)
+                    .ok()
+                    .is_some_and(|value| {
+                        value["error"]["code"] == "400001"
+                            && value["error"]["type"] == "gateway_error"
+                            && value["error"]["message"] == "The request is invalid: read body failed. Please check the request body, required fields, and request format."
+                    });
+                response = if retryable {
+                    replay.send().await?
+                } else {
+                    rebuild_plan_response(status, &response_headers, &bytes)
+                };
+            }
+        }
+        (response, None)
     };
     let elapsed_ms = req_start.elapsed().as_secs_f64() * 1000.0;
     state.monitor.record_ttft(member.id(), elapsed_ms);

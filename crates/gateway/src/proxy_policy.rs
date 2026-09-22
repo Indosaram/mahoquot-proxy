@@ -102,7 +102,7 @@ pub fn format_session_proxy_url(
     let username = if sticky {
         let sanitized = sanitize_session_id(member_id);
         if ttl_secs > 0 {
-            let bucket = now_unix / ttl_secs;
+            let bucket = (now_unix + session_phase_offset(&sanitized, ttl_secs)) / ttl_secs;
             format!("sess={sanitized}-b{bucket};any=1")
         } else {
             format!("sess={sanitized};any=1")
@@ -118,6 +118,27 @@ pub fn format_session_proxy_url(
     let path = if path.is_empty() { "/" } else { path };
 
     format!("{scheme}://{username}:x@{host}{port}{path}")
+}
+
+/// Spreads sticky-session rotation evenly across the TTL window.
+///
+/// A bare `now / ttl` bucket flips for every account on the same global
+/// instant, so the whole pool asks the egress proxy for a fresh session at
+/// once. Every one of those needs a new WireGuard handshake, and a burst that
+/// size trips the VPN provider's per-key association limit — after which *every*
+/// slot fails to handshake and the proxy serves nothing until the limit clears.
+/// Offsetting each session by a stable hash of its own id turns that
+/// synchronized cliff into one rotation at a time.
+fn session_phase_offset(session_id: &str, ttl_secs: u64) -> u64 {
+    // FNV-1a: allocation-free and stable across processes and toolchain
+    // releases, which `DefaultHasher` explicitly does not promise. A phase that
+    // moved between restarts would re-synchronise the pool it exists to spread.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in session_id.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash % ttl_secs
 }
 
 pub fn sanitize_session_id(raw: &str) -> String {
@@ -298,13 +319,79 @@ mod tests {
             global_proxy_url: "http://127.0.0.1:3128".to_string(),
             providers,
         };
-        let url1 = runtime.session_proxy_url("cline", "acc1", 1000).unwrap();
-        let url2 = runtime.session_proxy_url("cline", "acc1", 1199).unwrap();
-        let url3 = runtime.session_proxy_url("cline", "acc1", 1200).unwrap();
+        // acc1's own window start, so the assertions do not depend on where its
+        // phase offset happens to fall.
+        let offset = session_phase_offset("acc1", 600);
+        let start = 600 * 3 - offset;
+        let url1 = runtime.session_proxy_url("cline", "acc1", start).unwrap();
+        let url2 = runtime
+            .session_proxy_url("cline", "acc1", start + 599)
+            .unwrap();
+        let url3 = runtime
+            .session_proxy_url("cline", "acc1", start + 600)
+            .unwrap();
 
-        assert_eq!(url1, "http://sess=acc1-b1;any=1:x@127.0.0.1:3128/");
-        assert_eq!(url2, url1);
-        assert_eq!(url3, "http://sess=acc1-b2;any=1:x@127.0.0.1:3128/");
+        assert_eq!(url1, "http://sess=acc1-b3;any=1:x@127.0.0.1:3128/");
+        assert_eq!(url2, url1, "same window keeps the same sticky session");
+        assert_eq!(url3, "http://sess=acc1-b4;any=1:x@127.0.0.1:3128/");
+    }
+
+    #[test]
+    fn sticky_rotation_is_phase_spread_across_accounts() {
+        let mut providers = BTreeMap::new();
+        providers.insert(
+            "cline".to_string(),
+            ProviderProxyPolicy {
+                enabled: true,
+                sticky: true,
+                ttl_secs: 600,
+                url: String::new(),
+            },
+        );
+        let runtime = ProxyRuntime {
+            global_proxy_url: "http://127.0.0.1:3128".to_string(),
+            providers,
+        };
+
+        // Every account rotating on one instant is what stampedes the egress
+        // pool, so no second may carry more than a small share of a 60-account
+        // fleet's rotations.
+        let accounts: Vec<String> = (0..60).map(|i| format!("cline-user-{i:04}")).collect();
+        let mut rotations_per_second = BTreeMap::new();
+        for account in &accounts {
+            let mut previous = runtime.session_proxy_url("cline", account, 100_000).unwrap();
+            for second in 100_001..100_601u64 {
+                let current = runtime.session_proxy_url("cline", account, second).unwrap();
+                if current != previous {
+                    *rotations_per_second.entry(second).or_insert(0usize) += 1;
+                    previous = current;
+                }
+            }
+        }
+
+        assert_eq!(
+            rotations_per_second.values().sum::<usize>(),
+            accounts.len(),
+            "each account rotates exactly once per TTL window"
+        );
+        let busiest = rotations_per_second.values().copied().max().unwrap_or(0);
+        assert!(
+            busiest <= 3,
+            "rotations must stay spread across the window, busiest second had {busiest}"
+        );
+    }
+
+    #[test]
+    fn session_phase_offset_is_stable_and_bounded() {
+        for id in ["acc1", "cline-user-ofz76h06-superwiki-net", ""] {
+            let offset = session_phase_offset(id, 600);
+            assert_eq!(offset, session_phase_offset(id, 600), "offset must be stable");
+            assert!(offset < 600, "offset must stay inside the TTL window");
+        }
+        assert_ne!(
+            session_phase_offset("acc1", 600),
+            session_phase_offset("acc2", 600)
+        );
     }
 
     #[test]

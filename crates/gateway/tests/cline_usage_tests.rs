@@ -1,7 +1,7 @@
-//! Cline daily-budget tracking: served tokens accumulate per account, the
-//! quota bucket surfaces live usage with the estimated 24h reset, and the
-//! account is benched proactively at the threshold so the upstream cap 429
-//! never reaches a client.
+//! Cline daily-budget tracking: served tokens accumulate per account and the
+//! quota bucket surfaces the running estimate with the estimated 24h reset.
+//! The estimate is display-only — it never withholds an account from routing,
+//! because only the upstream cap 429 knows the real allowance.
 
 mod common;
 
@@ -48,7 +48,7 @@ fn cline_account(port: u16, models: &str) -> String {
 }
 
 #[tokio::test]
-async fn cline_daily_budget_benches_exhausted_account_proactively() {
+async fn cline_daily_budget_reports_usage_without_capping_the_account() {
     let mut servers = Vec::new();
     let mut shutdowns = Vec::new();
     let now_unix = SystemTime::now()
@@ -56,8 +56,9 @@ async fn cline_daily_budget_benches_exhausted_account_proactively() {
         .unwrap()
         .as_secs() as i64;
 
-    // Server A: serves 8M tokens per request — two requests cross the 95%
-    // proactive-bench threshold of the 15.2M daily budget.
+    // Server A: serves 8M tokens per request — two requests put the account
+    // past the 15.2M daily budget estimate. Upstream keeps answering 200, so
+    // the gateway must keep routing to it.
     let listener_a = bind_fixture_listener().await;
     let port_a = listener_a.local_addr().unwrap().port();
     let hits_a = Arc::new(AtomicUsize::new(0));
@@ -171,7 +172,7 @@ async fn cline_daily_budget_benches_exhausted_account_proactively() {
         "stream": false
     });
 
-    // Request 1: account A serves 8M tokens (52.6% of budget) — no bench yet.
+    // Request 1: account A serves 8M tokens (52.6% of the budget estimate).
     let res = client
         .post(&gw_url)
         .header("Content-Type", "application/json")
@@ -181,8 +182,8 @@ async fn cline_daily_budget_benches_exhausted_account_proactively() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
 
-    // Request 2: A serves another 8M — 16M crosses the threshold. The record
-    // is finalized synchronously, so the bench is visible immediately.
+    // Request 2: A serves another 8M — 16M is past the whole budget estimate.
+    // The record is finalized synchronously, so usage is visible immediately.
     let res = client
         .post(&gw_url)
         .header("Content-Type", "application/json")
@@ -191,12 +192,21 @@ async fn cline_daily_budget_benches_exhausted_account_proactively() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
+
+    // The usage window opened when the first record landed — somewhere between
+    // test start (`now_unix`) and this response returning. Pin the estimated
+    // reset to that range: a fixed tolerance around `now_unix` would fail on a
+    // loaded machine whenever fixture setup took longer than the slack.
+    let requests_done_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
 
     let member_a = state.find_member("generic-cline-a").expect("member a");
     let model = "z-ai/glm-5.3-flash";
     assert!(
-        !member_a.group_available(model, now_unix),
-        "A must be benched for the model after crossing the budget threshold"
+        member_a.group_available(model, now_unix),
+        "an over-budget estimate must not bench the account: only upstream caps"
     );
     let usage = member_a.usage_snapshot();
     let group = usage
@@ -211,17 +221,19 @@ async fn cline_daily_budget_benches_exhausted_account_proactively() {
         .expect("model bucket");
     let used_percent = bucket.used_percent.expect("live usage is reported");
     assert!(
-        (used_percent - 100.0).abs() < 0.01,
-        "16M of 15.2M must clamp to 100%, got {used_percent}"
+        used_percent > 99.0 && used_percent < 100.0,
+        "an over-budget estimate reports just under 100%: 100% is reserved for \
+         an upstream-confirmed cap, got {used_percent}"
     );
     let reset_at = bucket.reset_at_unix.expect("estimated reset is reported");
     assert!(
-        reset_at > now_unix + 86_399 && reset_at <= now_unix + 86_401,
-        "reset must estimate window start + 24h, got {reset_at} vs now {now_unix}"
+        reset_at >= now_unix + 86_400 && reset_at <= requests_done_unix + 86_400,
+        "reset must estimate window start + 24h within [test start, requests done] \
+         + 24h, got {reset_at} vs now {now_unix}..{requests_done_unix}"
     );
 
-    // Request 3: the benched account must be skipped without any upstream
-    // 429 — B serves the request directly.
+    // Request 3: A is still the FillFirst head and still routable, so it keeps
+    // serving. The estimate reports exhaustion; it does not enforce it.
     let res = client
         .post(&gw_url)
         .header("Content-Type", "application/json")
@@ -232,10 +244,14 @@ async fn cline_daily_budget_benches_exhausted_account_proactively() {
     assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(
         hits_a.load(Ordering::SeqCst),
-        2,
-        "A serves exactly the two pre-threshold requests"
+        3,
+        "A keeps serving past its budget estimate"
     );
-    assert_eq!(hits_b.load(Ordering::SeqCst), 1, "B serves the third");
+    assert_eq!(
+        hits_b.load(Ordering::SeqCst),
+        0,
+        "B is never needed while upstream still accepts A"
+    );
 
     for shutdown in shutdowns {
         let _ = shutdown.send(());

@@ -3,21 +3,23 @@
 //! Cline free accounts carry a rolling 24-hour token cap (~15.2M tokens per
 //! account) that upstream only reveals as a hard `INFERENCE_CAP_ERROR` 429.
 //! The gateway counts served tokens per account, opens the 24-hour window at
-//! the first observed use (real traffic or a warmup probe), estimates the
+//! the first observed use (real traffic or a warmup probe), and estimates the
 //! next reset as window start + 24h — reconciled to the exact upstream reset
-//! the moment a cap 429 names it — and benches the account proactively once
-//! the budget threshold is crossed, so the 429 never reaches a client.
+//! the moment a cap 429 names it.
+//!
+//! This tracking is **display-only**. The budget is a local estimate of an
+//! allowance the gateway does not own: it is not metered per model, upstream
+//! never confirms it, and a request the gateway refuses on its own estimate is
+//! capacity thrown away. Only upstream decides exhaustion, via the cap 429 that
+//! benches the quota group it names.
 
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Approximate daily free-token budget of one Cline account.
+/// Approximate daily free-token budget of one Cline account. A display
+/// reference for the usage estimate only — never a routing gate.
 pub const DEFAULT_CLINE_DAILY_TOKEN_BUDGET: u64 = 15_200_000;
-/// Bench proactively at this fraction (per-mille) of the budget so the
-/// upstream 429 never fires: 95% by default, tunable via
-/// `CLINE_PROACTIVE_BENCH_PERMILLE`.
-pub const DEFAULT_PROACTIVE_BENCH_PERMILLE: u64 = 950;
 const DAY_SECS: i64 = 86_400;
 
 pub struct ClineDailyTracker {
@@ -28,7 +30,6 @@ pub struct ClineDailyTracker {
     reset_override_unix: AtomicI64,
     seeded: AtomicBool,
     budget_tokens: AtomicU64,
-    bench_threshold_permille: AtomicU64,
 }
 
 fn now_unix() -> i64 {
@@ -44,21 +45,16 @@ impl ClineDailyTracker {
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(DEFAULT_CLINE_DAILY_TOKEN_BUDGET);
-        let permille = std::env::var("CLINE_PROACTIVE_BENCH_PERMILLE")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(DEFAULT_PROACTIVE_BENCH_PERMILLE);
-        Self::with_config(budget, permille)
+        Self::with_config(budget)
     }
 
-    pub fn with_config(budget_tokens: u64, bench_threshold_permille: u64) -> Arc<Self> {
+    pub fn with_config(budget_tokens: u64) -> Arc<Self> {
         Arc::new(Self {
             used_tokens: AtomicU64::new(0),
             window_start_unix: AtomicI64::new(0),
             reset_override_unix: AtomicI64::new(0),
             seeded: AtomicBool::new(false),
             budget_tokens: AtomicU64::new(budget_tokens),
-            bench_threshold_permille: AtomicU64::new(bench_threshold_permille),
         })
     }
 
@@ -70,7 +66,8 @@ impl ClineDailyTracker {
         self.used_tokens.load(Ordering::Relaxed)
     }
 
-    /// Reported usage fraction, clamped at 100%. `None` when no budget is set.
+    /// Reported usage fraction against the reference budget, clamped at 100%.
+    /// An estimate for display; it gates nothing. `None` when no budget is set.
     pub fn used_percent(&self) -> Option<f64> {
         let budget = self.budget_tokens.load(Ordering::Relaxed);
         if budget == 0 {
@@ -136,19 +133,15 @@ impl ClineDailyTracker {
         }
     }
 
-    /// Record a served request's tokens. Returns true when the account has
-    /// crossed the proactive-bench threshold and the caller should bench it
-    /// until the estimated reset.
-    pub fn observe(&self, tokens: u64, now_unix: i64) -> bool {
+    /// Record a served request's tokens into the display estimate. Accounting
+    /// only: crossing the reference budget never benches the account, because
+    /// the gateway does not own this allowance.
+    pub fn observe(&self, tokens: u64, now_unix: i64) {
         self.rollover_if_lapsed(now_unix);
         if self.window_start_unix.load(Ordering::Relaxed) == 0 {
             self.window_start_unix.store(now_unix, Ordering::Relaxed);
         }
         self.used_tokens.fetch_add(tokens, Ordering::Relaxed);
-        let budget = self.budget_tokens.load(Ordering::Relaxed) as u128;
-        let threshold_permille = self.bench_threshold_permille.load(Ordering::Relaxed) as u128;
-        self.used_tokens.load(Ordering::Relaxed) as u128 * 1000
-            >= budget * threshold_permille
     }
 
     /// Reconcile with an upstream cap 429: it names the exact reset time, so
@@ -216,19 +209,21 @@ mod tests {
     use super::*;
 
     fn tracker() -> Arc<ClineDailyTracker> {
-        ClineDailyTracker::with_config(1000, 950)
+        ClineDailyTracker::with_config(1000)
     }
 
     #[test]
-    fn observe_accumulates_and_crosses_threshold() {
+    fn observe_accumulates_without_capping() {
         let now = now_unix();
         let t = tracker();
-        assert!(!t.observe(500, now));
-        assert!(!t.observe(400, now + 1));
-        assert!(t.observe(60, now + 2), "960/1000 crosses the 950 permille mark");
-        assert_eq!(t.used_tokens(), 960);
+        t.observe(500, now);
+        t.observe(400, now + 1);
+        // Past the old 95% mark and past the budget itself: accounting only,
+        // the tracker never signals the caller to bench.
+        t.observe(600, now + 2);
+        assert_eq!(t.used_tokens(), 1500);
         assert_eq!(t.estimated_reset_unix(), now + DAY_SECS);
-        assert_eq!(t.used_percent(), Some(96.0));
+        assert_eq!(t.used_percent(), Some(100.0), "display clamps at 100%");
     }
 
     #[test]
@@ -238,7 +233,7 @@ mod tests {
         t.observe(900, now);
         assert_eq!(t.estimated_reset_unix(), now + DAY_SECS);
         // 24h later: rollover clears, next observe opens a fresh window.
-        assert!(!t.observe(10, now + DAY_SECS + 5));
+        t.observe(10, now + DAY_SECS + 5);
         assert_eq!(t.used_tokens(), 10);
         assert_eq!(t.estimated_reset_unix(), now + DAY_SECS + 5 + DAY_SECS);
     }

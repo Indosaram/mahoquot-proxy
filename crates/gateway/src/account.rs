@@ -429,6 +429,79 @@ mod provider_kind_contract_tests {
     }
 
     #[test]
+    fn cline_credential_is_normalized_with_surface_headers_and_free_deepseek() {
+        let value: serde_json::Value = serde_json::from_str(
+            r#"{"provider":"cline","adapter":"openai-chat","base_url":"https://api.cline.bot/api/v1","models":["z-ai/glm-5.3-flash"]}"#,
+        )
+        .unwrap();
+        let ProviderAccount::Generic(account) =
+            provider_account_from_value(ProviderKind::Generic, value).unwrap()
+        else {
+            panic!("expected generic account");
+        };
+        assert_eq!(
+            account
+                .static_headers
+                .get("User-Agent")
+                .map(String::as_str),
+            Some("Cline/3.0.62")
+        );
+        assert_eq!(
+            account
+                .static_headers
+                .get("X-CLIENT-TYPE")
+                .map(String::as_str),
+            Some("cline-cli")
+        );
+        assert!(account.static_headers.contains_key("X-Task-ID"));
+        assert!(account
+            .models
+            .contains(&"cline-free/deepseek-v4.1-flash".to_string()));
+        assert!(account.models.contains(&"z-ai/glm-5.3-flash".to_string()));
+    }
+
+    #[test]
+    fn cline_normalization_preserves_authored_values_and_skips_other_providers() {
+        let foreign_value: serde_json::Value = serde_json::from_str(
+            r#"{"provider":"other","adapter":"openai-chat","base_url":"https://x.example","models":["m1"]}"#,
+        )
+        .unwrap();
+        let ProviderAccount::Generic(foreign) =
+            provider_account_from_value(ProviderKind::Generic, foreign_value).unwrap()
+        else {
+            panic!("expected generic account");
+        };
+        assert!(foreign.static_headers.is_empty());
+        assert_eq!(foreign.models, vec!["m1".to_string()]);
+
+        let authored_value: serde_json::Value = serde_json::from_str(
+            r#"{"provider":"cline","adapter":"openai-chat","base_url":"https://api.cline.bot/api/v1","models":["cline-free/deepseek-v4.1-flash"],"static_headers":{"User-Agent":"Cline/custom"}}"#,
+        )
+        .unwrap();
+        let ProviderAccount::Generic(authored) =
+            provider_account_from_value(ProviderKind::Generic, authored_value).unwrap()
+        else {
+            panic!("expected generic account");
+        };
+        assert_eq!(authored.static_headers.len(), 1);
+        assert_eq!(
+            authored
+                .static_headers
+                .get("User-Agent")
+                .map(String::as_str),
+            Some("Cline/custom")
+        );
+        assert_eq!(
+            authored
+                .models
+                .iter()
+                .filter(|model| *model == "cline-free/deepseek-v4.1-flash")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn gemini_rate_limit_leaves_third_party_models_routable() {
         let member = AccountMember::for_test(ProviderAccount::Antigravity(AntigravityAccount {
             email: "test@example.com".to_string(),
@@ -1793,6 +1866,44 @@ fn expired_at_is_past(expired: &str, now_unix: i64) -> bool {
     }
 }
 
+/// Cline's free-model endpoints reject bare API traffic with
+/// `403 ... only available via Cline product surfaces`, so a cline credential
+/// must carry the Cline client surface headers. The account pipeline writes
+/// files without them, which strands every newly enrolled account outside the
+/// free deepseek route (glm is unaffected). Normalize at load time: fill the
+/// canonical surface headers without ever overwriting authored ones, and make
+/// the free deepseek slug eligible for any cline account that declares a
+/// model list at all (an empty list already serves every model).
+fn normalize_cline_generic(account: &mut GenericAccount) {
+    if account.provider != "cline" {
+        return;
+    }
+    if account.static_headers.is_empty() {
+        account.static_headers.extend(
+            [
+                ("HTTP-Referer", "https://cline.bot"),
+                ("User-Agent", "Cline/3.0.62"),
+                ("X-CLIENT-TYPE", "cline-cli"),
+                ("X-CLIENT-VERSION", "3.0.62"),
+                ("X-CORE-VERSION", "3.0.62"),
+                ("X-IS-MULTIROOT", "false"),
+                ("X-PLATFORM", "cli"),
+                ("X-PLATFORM-VERSION", "3.0.62"),
+                ("X-Title", "Cline"),
+            ]
+            .map(|(key, value)| (key.to_string(), value.to_string())),
+        );
+        account
+            .static_headers
+            .insert("X-Task-ID".to_string(), uuid::Uuid::new_v4().to_string());
+    }
+    const FREE_DEEPSEEK: &str = "cline-free/deepseek-v4.1-flash";
+    if !account.models.is_empty() && !account.models.iter().any(|model| model == FREE_DEEPSEEK)
+    {
+        account.models.push(FREE_DEEPSEEK.to_string());
+    }
+}
+
 fn provider_account_from_value(
     kind: ProviderKind,
     value: serde_json::Value,
@@ -1806,7 +1917,11 @@ fn provider_account_from_value(
         ProviderKind::Zcode => ProviderAccount::Zcode(serde_json::from_value(value)?),
         ProviderKind::Vertex => ProviderAccount::Vertex(serde_json::from_value(value)?),
         ProviderKind::Devin => ProviderAccount::Devin(serde_json::from_value(value)?),
-        ProviderKind::Generic => ProviderAccount::Generic(serde_json::from_value(value)?),
+        ProviderKind::Generic => {
+            let mut account: GenericAccount = serde_json::from_value(value)?;
+            normalize_cline_generic(&mut account);
+            ProviderAccount::Generic(account)
+        }
     })
 }
 
