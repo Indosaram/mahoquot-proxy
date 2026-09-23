@@ -705,15 +705,18 @@ fn new_state() -> String {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or_default();
-    let mut rand_tail = [0u8; 8];
+    // Exactly 64 hex chars (24 nanos + 40 random): the ZCode plan gateway
+    // validates the cli/init + cli/poll bearer as randomBytes(32) and rejects
+    // any other length with 400 {code:3004, msg:"invalid_flow"}.
+    let mut rand_tail = [0u8; 20];
     use rand::RngCore;
     rand::thread_rng().fill_bytes(&mut rand_tail);
-    format!("{nanos:024x}{}", hex::encode(rand_tail))
+    format!("{nanos:024x}{}", hex::encode(&rand_tail))
 }
 
 mod hex {
-    pub fn encode(bytes: [u8; 8]) -> String {
-        let mut s = String::with_capacity(16);
+    pub fn encode(bytes: &[u8]) -> String {
+        let mut s = String::with_capacity(bytes.len() * 2);
         for b in bytes {
             s.push_str(&format!("{b:02x}"));
         }
@@ -2480,6 +2483,14 @@ mod tests {
         let second = new_state();
         assert_ne!(first, second);
         assert!(!first.is_empty());
+        // ZCode plan gateway contract: bearer must be exactly 64 hex chars
+        // (randomBytes(32)); anything else is rejected as invalid_flow (3004).
+        assert_eq!(first.len(), 64, "state must be 64 hex chars");
+        assert!(
+            first.chars().all(|c| c.is_ascii_hexdigit()),
+            "state must be hex"
+        );
+        assert_eq!(second.len(), 64);
     }
 
     #[test]
