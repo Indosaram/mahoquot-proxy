@@ -1508,12 +1508,13 @@ fn failure_is_limit_exhaustion(body: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
-/// The only Cline free model whose daily cap is surfaced as a UI quota
-/// bucket. Other pooled models keep their full health/cooldown and daily
-/// budget tracking, but their caps never render an "(Daily limit)" bucket.
+/// The Cline free models whose daily caps are surfaced as UI quota buckets
+/// (glm and deepseek, per product tracking). Other pooled models keep their
+/// full health/cooldown and daily budget tracking, but their caps never
+/// render an "(Daily limit)" bucket.
 pub(crate) fn is_cline_quota_display_model(model: &str) -> bool {
     let bare = model.rsplit('/').next().unwrap_or(model);
-    bare == "glm-5.3-flash"
+    bare == "glm-5.3-flash" || bare == "deepseek-v4.1-flash"
 }
 
 /// Updates the member's `AccountUsage` with a QuotaGroup bucket representing the Cline model limit.

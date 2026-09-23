@@ -262,9 +262,10 @@ async fn cline_daily_budget_reports_usage_without_capping_the_account() {
     std::fs::remove_dir_all(&temp_dir).unwrap();
 }
 
-/// Only the display model keeps a "(Daily limit)" quota bucket. A served
-/// request on any other pooled Cline model updates the shared daily budget
-/// tracker but never creates or updates a bucket for that model.
+/// The display models (glm and deepseek) keep a "(Daily limit)" quota
+/// bucket. A served request on any other pooled Cline model updates the
+/// shared daily budget tracker but never creates or updates a bucket for
+/// that model.
 #[tokio::test]
 async fn cline_quota_bucket_surfaces_only_the_display_model() {
     let mut servers = Vec::new();
@@ -296,7 +297,10 @@ async fn cline_quota_bucket_surfaces_only_the_display_model() {
     let temp_dir = unique_temp_dir("qgw-cline-quota-display-test");
     std::fs::write(
         temp_dir.join("generic-cline-a.json"),
-        cline_account(port, "[\"z-ai/glm-5.3-flash\",\"z-ai/glm-4.7\"]"),
+        cline_account(
+            port,
+            "[\"z-ai/glm-5.3-flash\",\"z-ai/glm-4.7\",\"cline-free/deepseek-v4.1-flash\"]",
+        ),
     )
     .unwrap();
 
@@ -332,7 +336,11 @@ async fn cline_quota_bucket_surfaces_only_the_display_model() {
 
     let client = reqwest::Client::new();
     let gw_url = format!("http://127.0.0.1:{gw_port}/v1/chat/completions");
-    for model in ["z-ai/glm-5.3-flash", "z-ai/glm-4.7"] {
+    for model in [
+        "z-ai/glm-5.3-flash",
+        "z-ai/glm-4.7",
+        "cline-free/deepseek-v4.1-flash",
+    ] {
         let res = client
             .post(&gw_url)
             .header("Content-Type", "application/json")
@@ -367,12 +375,18 @@ async fn cline_quota_bucket_surfaces_only_the_display_model() {
         .collect();
     assert_eq!(
         ids,
-        vec!["z-ai/glm-5.3-flash"],
-        "only the display model renders a bucket"
+        vec!["z-ai/glm-5.3-flash", "cline-free/deepseek-v4.1-flash"],
+        "glm and deepseek render buckets; every other model stays hidden"
     );
     let bucket = &group.buckets[0];
     assert_eq!(bucket.display_name.as_deref(), Some("z-ai/glm-5.3-flash (Daily limit)"));
     assert!(bucket.used_percent.is_some(), "live usage is reported");
+    let deepseek = &group.buckets[1];
+    assert_eq!(
+        deepseek.display_name.as_deref(),
+        Some("cline-free/deepseek-v4.1-flash (Daily limit)")
+    );
+    assert!(deepseek.used_percent.is_some(), "deepseek usage is reported");
 
     for shutdown in shutdowns {
         let _ = shutdown.send(());
