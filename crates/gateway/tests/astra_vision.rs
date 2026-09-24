@@ -249,7 +249,7 @@ async fn astra_chat_user_image_reaches_codex_without_image_generation_capability
             json!([{"role": "user", "content": [
                 {"type": "image_url", "image_url": {"url": PNG}}
             ]}]),
-            json!([{"role": "user", "content": [
+            json!([{"type": "message", "role": "user", "content": [
                 {"type": "input_image", "image_url": PNG}
             ]}]),
             stream,
@@ -266,7 +266,7 @@ async fn astra_chat_user_image_detail_reaches_codex() {
                 {"type": "text", "text": "Read the screenshot"},
                 {"type": "image_url", "image_url": {"url": PNG, "detail": "high"}}
             ]}]),
-            json!([{"role": "user", "content": [
+            json!([{"type": "message", "role": "user", "content": [
                 {"type": "input_text", "text": "Read the screenshot"},
                 {"type": "input_image", "image_url": PNG, "detail": "high"}
             ]}]),
@@ -287,7 +287,7 @@ async fn astra_chat_image_tool_result_reaches_codex() {
                 ]),
             ),
             json!([
-                {"role": "user", "content": [{"type": "input_text", "text": "Read the screenshot"}]},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Read the screenshot"}]},
                 {"type": "function_call", "call_id": "call_image", "name": "read_image", "arguments": "{}"},
                 {"type": "function_call_output", "call_id": "call_image", "output": [
                     {"type": "input_image", "image_url": PNG, "detail": "original"}

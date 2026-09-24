@@ -115,6 +115,7 @@ fn split_messages(messages: &[Value]) -> (String, Vec<Value>) {
                 let text = flatten_text(msg.get("content"));
                 if !text.is_empty() {
                     input.push(json!({
+                        "type": "message",
                         "role": "assistant",
                         "content": [{"type": "output_text", "text": text}],
                     }));
@@ -134,6 +135,7 @@ fn split_messages(messages: &[Value]) -> (String, Vec<Value>) {
                 }
             }
             _ => input.push(json!({
+                "type": "message",
                 "role": "user",
                 "content": user_parts(msg.get("content")),
             })),
@@ -272,5 +274,23 @@ mod prompt_cache_key_tests {
         let translated = openai_to_codex_with_cache_key(&sample_body(), Some("   ")).unwrap();
         let body: Value = serde_json::from_slice(&translated.body).unwrap();
         assert!(body.get("prompt_cache_key").is_none());
+    }
+
+    #[test]
+    fn messages_have_explicit_type_message() {
+        let body = serde_json::json!({
+            "model": "gpt-6-sol",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"}
+            ]
+        });
+        let translated = openai_to_codex(&serde_json::to_vec(&body).unwrap()).unwrap();
+        let val: Value = serde_json::from_slice(&translated.body).unwrap();
+        let input = val["input"].as_array().unwrap();
+        assert_eq!(input[0]["type"], "message");
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[1]["type"], "message");
+        assert_eq!(input[1]["role"], "assistant");
     }
 }

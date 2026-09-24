@@ -428,15 +428,17 @@ fn track_cline_daily_usage(state: &AppState, record: &OutcomeRecord<'_>, timesta
     if member.provider_name() != "cline" {
         return;
     }
-    let tracker = member.cline_tracker();
+    let Some(model) = record.model else {
+        return;
+    };
+    let Some(tracker) = member.cline_trackers().for_model(model) else {
+        return;
+    };
     tracker.observe(usage.total_tokens(), timestamp);
     let reset_unix = tracker.estimated_reset_unix();
     if reset_unix <= timestamp {
         return;
     }
-    let Some(model) = record.model else {
-        return;
-    };
     // 100% is reserved for an upstream-confirmed cap: `record_cooldown` passes
     // it literally on a cap 429, and every UI surface reads it as real
     // exhaustion. An estimate that ran past the reference budget must stay
@@ -1124,6 +1126,28 @@ async fn send_upstream(
         }
     }
 
+    // ChatGPT-backend prompt-cache affinity rides the session_id HEADER (codex
+    // clients always send their session uuid; devlog 090 follow-up: body-level
+    // prompt_cache_key alone still yielded cached_tokens:0). Synthesize a stable
+    // per-session uuid from the same cache key for Codex-bound upstream requests.
+    if member.kind() == crate::account::ProviderKind::Codex {
+        if let Some(cache_key) = codex_session_cache_key(headers, body_bytes) {
+            let session_uuid = uuid_from_hex(&cache_key);
+            if !member_headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("session_id"))
+            {
+                member_headers.push(("session_id".to_string(), session_uuid.clone()));
+            }
+            if !member_headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("session-id"))
+            {
+                member_headers.push(("session-id".to_string(), session_uuid));
+            }
+        }
+    }
+
     let plan_replay = (member.kind() == crate::account::ProviderKind::Zcode).then(|| {
         crate::plan_captcha::ReplayPieces {
             client: &client,
@@ -1493,7 +1517,7 @@ pub(crate) fn parse_cline_cap_error(body: &[u8]) -> Option<(String, i64)> {
 /// cooldown deadline already surfaces, so it must not be recorded as an
 /// account error.
 fn failure_is_limit_exhaustion(body: &[u8]) -> bool {
-    if parse_cline_cap_error(body).is_some() {
+    if parse_cline_cap_error(body).is_some() || failure_is_insufficient_credits(body) {
         return true;
     }
     serde_json::from_slice::<serde_json::Value>(body)
@@ -1508,13 +1532,34 @@ fn failure_is_limit_exhaustion(body: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
+/// Cline answers 402 `insufficient_credits` when a free-tier account's
+/// overflow is billed against an empty paid Credits balance. Like a daily
+/// cap, the exhaustion is confirmed by upstream and scoped to the account.
+fn failure_is_insufficient_credits(body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|parsed| {
+            parsed
+                .get("code")
+                .and_then(serde_json::Value::as_str)
+                .map(|code| code == "insufficient_credits")
+                .or_else(|| {
+                    parsed
+                        .get("error")
+                        .and_then(|error| error.get("code"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(|code| code == "insufficient_credits")
+                })
+        })
+        .unwrap_or(false)
+}
+
 /// The Cline free models whose daily caps are surfaced as UI quota buckets
 /// (glm and deepseek, per product tracking). Other pooled models keep their
 /// full health/cooldown and daily budget tracking, but their caps never
 /// render an "(Daily limit)" bucket.
 pub(crate) fn is_cline_quota_display_model(model: &str) -> bool {
-    let bare = model.rsplit('/').next().unwrap_or(model);
-    bare == "glm-5.3-flash" || bare == "deepseek-v4.1-flash"
+    crate::cline_usage::cline_quota_lane(model).is_some()
 }
 
 /// Updates the member's `AccountUsage` with a QuotaGroup bucket representing the Cline model limit.
@@ -1594,7 +1639,10 @@ async fn record_cooldown(
             record_cline_quota_bucket(member, &cap_model, reset_secs, now_ms / 1000, 100.0);
             // Upstream named the exact reset: reconcile the 24h tracker so the
             // estimate is exact and the budget counts as consumed.
-            member.cline_tracker().on_cap_429(now_ms / 1000 + reset_secs);
+            if let Some(tracker) = member.cline_trackers().for_model(&cap_model) {
+                tracker.on_cap_429(now_ms / 1000 + reset_secs);
+            }
+            persist_cline_cap_event(state, member, &cap_model, now_ms, now_ms / 1000 + reset_secs);
             (Some(cap_model), deadline_ms)
         } else {
             (model.map(ToString::to_string), header_until_unix_ms)
@@ -1626,6 +1674,31 @@ fn bench_exhausted_quota(member: &AccountMember, model: Option<&str>, until_unix
         return;
     }
     member.set_health(Health::Cooldown { until_unix_ms });
+}
+
+/// Persist an upstream-confirmed cap's exact reset so a restart can restore
+/// the exhausted bucket without waiting for the next 429. Display-only: a
+/// history failure must never affect routing.
+fn persist_cline_cap_event(
+    state: &AppState,
+    member: &AccountMember,
+    model: &str,
+    now_ms: i64,
+    reset_at_unix: i64,
+) {
+    let event = crate::request_history::ClineCapEvent {
+        account_identifier: member.id.clone(),
+        model: model.to_string(),
+        cap_at_ms: now_ms,
+        reset_at_unix,
+    };
+    let Ok(store) = state.history.store() else {
+        return;
+    };
+    let store = store.clone();
+    tokio::task::spawn_blocking(move || {
+        let _ = store.record_cline_cap(&event);
+    });
 }
 
 fn content_type_of(resp: &reqwest::Response) -> Option<String> {
@@ -2861,6 +2934,43 @@ fn prompt_cache_key_for(headers: &HeaderMap, original_body: &[u8]) -> Option<Str
     Some(key)
 }
 
+/// Format a 32-hex cache key as a uuid-shaped session id (version/variant nibbles forced).
+/// Mirrors opencodex `uuidFromHex` (devlog 090).
+pub fn uuid_from_hex(hex32: &str) -> String {
+    let mut h = String::with_capacity(32);
+    for c in hex32.chars() {
+        if c.is_ascii_hexdigit() {
+            h.push(c.to_ascii_lowercase());
+            if h.len() == 32 {
+                break;
+            }
+        }
+    }
+    while h.len() < 32 {
+        h.push('0');
+    }
+    format!(
+        "{}-{}-4{}-8{}-{}",
+        &h[0..8],
+        &h[8..12],
+        &h[13..16],
+        &h[17..20],
+        &h[20..32]
+    )
+}
+
+fn codex_session_cache_key(headers: &HeaderMap, body_bytes: &[u8]) -> Option<String> {
+    if let Ok(serde_json::Value::Object(map)) = serde_json::from_slice::<serde_json::Value>(body_bytes) {
+        if let Some(key) = map.get("prompt_cache_key").and_then(serde_json::Value::as_str) {
+            let key = key.trim();
+            if !key.is_empty() {
+                return Some(key.to_string());
+            }
+        }
+    }
+    prompt_cache_key_for(headers, body_bytes)
+}
+
 fn affinity_key(headers: &HeaderMap) -> Option<String> {
     for name in [
         "x-claude-code-session-id",
@@ -3095,13 +3205,20 @@ pub async fn handle_relay(
     let max_attempts = std::cmp::min(eligible.len(), state.max_failover);
     if max_attempts == 0 {
         let model = plan.model.as_deref().unwrap_or_default();
-        if !pool.members.is_empty() && route.is_some_and(|route| route.provider_classes.is_empty())
+        if !pool.members.is_empty() && route.as_ref().is_some_and(|route| route.provider_classes.is_empty())
         {
             return body_response(
                 StatusCode::BAD_REQUEST,
                 Some("application/json"),
                 Bytes::from(crate::capability::unknown_provider(model).to_string()),
             );
+        }
+        let canonical_model = route
+            .as_ref()
+            .map(|r| r.canonical_model.as_str())
+            .or(plan.model.as_deref());
+        if earliest_exhaustion_reset_unix_secs(&pool, canonical_model).is_some() {
+            return exhaustion_failure_response(&pool, canonical_model);
         }
         return json_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -3486,6 +3603,68 @@ pub async fn handle_relay(
             continue;
         }
 
+        if status_code == 429 {
+            let failure =
+                record_cooldown(resp, &member, status_code, plan.model.as_deref(), &state).await;
+            // A limit-exhaustion 429 durably benches this account (hours, per
+            // the upstream reset), so it cannot repeat here: keep walking the
+            // pool without spending the failover budget. Any other 429 stays
+            // budgeted — it may be a shared limiter that every account hits.
+            if !failure_is_limit_exhaustion(&failure.body) {
+                failover_budget += 1;
+            }
+            last_failure = Some(failure);
+            continue;
+        }
+
+        if status_code == 402 {
+            let failure = extract_failure(resp, status_code).await;
+            // Cline bills a free-tier account's overflow to paid Credits; a
+            // $0 balance answers 402 insufficient_credits on a model the
+            // account has otherwise exhausted. That is account-scoped, like
+            // the daily cap: bench the model lane until the daily reset and
+            // keep walking the pool without spending the failover budget.
+            if failure_is_insufficient_credits(&failure.body)
+                && plan
+                    .model
+                    .as_deref()
+                    .is_some_and(crate::relay::is_cline_quota_display_model)
+            {
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
+                    .unwrap_or(0);
+                let now_unix = now_ms / 1000;
+                if let Some((cap_model, reset_secs)) =
+                    crate::relay::parse_cline_cap_error(&failure.body)
+                        .or_else(|| {
+                            Some((
+                                plan.model.clone().unwrap_or_default(),
+                                crate::cline_usage::DAY_SECS,
+                            ))
+                        })
+                {
+                    record_cline_quota_bucket(
+                        &member,
+                        &cap_model,
+                        reset_secs,
+                        now_unix,
+                        100.0,
+                    );
+                    if let Some(tracker) = member.cline_trackers().for_model(&cap_model) {
+                        tracker.on_cap_429(now_unix + reset_secs);
+                    }
+                    persist_cline_cap_event(&state, &member, &cap_model, now_ms, now_unix + reset_secs);
+                    bench_exhausted_quota(&member, Some(&cap_model), (now_unix + reset_secs) * 1000);
+                }
+                last_failure = Some(failure);
+                continue;
+            }
+            last_failure = Some(failure);
+            failover_budget += 1;
+            continue;
+        }
+
         if (500..=504).contains(&status_code) {
             // Contract: ServerError leaves health unchanged. The account is
             // excluded from this request's remaining attempts, but a transient
@@ -3683,6 +3862,20 @@ mod limit_exhaustion_tests {
         assert!(!failure_is_limit_exhaustion(br#"{"error":"rate limited"}"#));
         assert!(!failure_is_limit_exhaustion(br#"{"error":{"code":1006}}"#));
         assert!(!failure_is_limit_exhaustion(b"not json"));
+    }
+
+    #[test]
+    fn insufficient_credits_bodies_are_detected() {
+        assert!(failure_is_insufficient_credits(
+            br#"{"code":"insufficient_credits","message":"Insufficient balance","current_balance":0.0}"#
+        ));
+        assert!(failure_is_insufficient_credits(
+            br#"{"error":{"code":"insufficient_credits","message":"Insufficient balance"}}"#
+        ));
+        assert!(!failure_is_insufficient_credits(
+            br#"{"code":"other_error","message":"nope"}"#
+        ));
+        assert!(!failure_is_insufficient_credits(b"not json"));
     }
 }
 

@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, params_from_iter, types::Value, Connection, OptionalExtension};
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const DEFAULT_MAX_SIZE_BYTES: u64 = 512 * 1024 * 1024;
@@ -284,6 +284,16 @@ pub struct ImportRecord {
     pub event_count: u64,
 }
 
+/// One upstream-confirmed Cline daily-cap 429, persisted so the exact reset
+/// time survives gateway restarts (display-only; routing re-benches from it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClineCapEvent {
+    pub account_identifier: String,
+    pub model: String,
+    pub cap_at_ms: i64,
+    pub reset_at_unix: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct RequestHistory {
     worker: Arc<WorkerHandle>,
@@ -389,6 +399,8 @@ enum Command {
     RecordImport(ImportRecord, Reply<bool>),
     SchemaVersion(Reply<i64>),
     Explain(HistoryQuery, Reply<Vec<String>>),
+    RecordClineCap(ClineCapEvent, Reply<bool>),
+    ListClineCaps(Vec<String>, Reply<Vec<ClineCapEvent>>),
     Shutdown,
 }
 
@@ -788,6 +800,14 @@ impl RequestHistory {
         self.request(|reply| Command::RecordImport(record.clone(), reply))
     }
 
+    pub fn record_cline_cap(&self, event: &ClineCapEvent) -> Result<bool, HistoryError> {
+        self.request(|reply| Command::RecordClineCap(event.clone(), reply))
+    }
+
+    pub fn cline_caps(&self, accounts: &[String]) -> Result<Vec<ClineCapEvent>, HistoryError> {
+        self.request(|reply| Command::ListClineCaps(accounts.to_vec(), reply))
+    }
+
     pub fn schema_version(&self) -> Result<i64, HistoryError> {
         self.request(Command::SchemaVersion)
     }
@@ -942,6 +962,16 @@ fn migrate(connection: &mut Connection) -> Result<(), HistoryError> {
         transaction.pragma_update(None, "user_version", 4)?;
         transaction.commit()?;
     }
+    if current < 5 {
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(MIGRATION_V5)?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at_ms) VALUES (5, ?1)",
+            [unix_time_ms()],
+        )?;
+        transaction.pragma_update(None, "user_version", 5)?;
+        transaction.commit()?;
+    }
     Ok(())
 }
 
@@ -952,6 +982,18 @@ pub fn init_schema(conn: &Connection) {
     )
     .ok();
 }
+
+const MIGRATION_V5: &str = r#"
+CREATE TABLE cline_cap_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_identifier TEXT NOT NULL,
+    model TEXT NOT NULL,
+    cap_at_ms INTEGER NOT NULL,
+    reset_at_unix INTEGER NOT NULL
+);
+CREATE INDEX idx_cline_cap_account_time ON cline_cap_events(account_identifier, reset_at_unix);
+CREATE INDEX idx_cline_cap_time ON cline_cap_events(reset_at_unix);
+"#;
 
 const MIGRATION_V1: &str = r#"
 CREATE TABLE usage_events (
@@ -1093,6 +1135,45 @@ fn worker_loop(
             }
             Command::Prune(now_ms, policy, reply) => {
                 let _ = reply.send(prune_events(&mut connection, path, now_ms, policy));
+            }
+            Command::RecordClineCap(event, reply) => {
+                let result = connection
+                    .execute(
+                        "INSERT INTO cline_cap_events(account_identifier, model, cap_at_ms, reset_at_unix) \
+                         VALUES (?1, ?2, ?3, ?4)",
+                        params![event.account_identifier, event.model, event.cap_at_ms, event.reset_at_unix],
+                    )
+                    .map(|_| true)
+                    .map_err(HistoryError::from);
+                let _ = reply.send(result);
+            }
+            Command::ListClineCaps(accounts, reply) => {
+                let result = (|| -> Result<Vec<ClineCapEvent>, HistoryError> {
+                    // Latest cap per (account, model): a newer 429 always
+                    // supersedes an older reset for the same lane.
+                    let mut statement = connection.prepare(
+                        "SELECT account_identifier, model, cap_at_ms, MAX(reset_at_unix) \
+                         FROM cline_cap_events WHERE reset_at_unix > ?1 GROUP BY account_identifier, model",
+                    )?;
+                    let rows = statement
+                        .query_map(params![unix_time_ms() / 1000], |row| {
+                            Ok(ClineCapEvent {
+                                account_identifier: row.get(0)?,
+                                model: row.get(1)?,
+                                cap_at_ms: row.get(2)?,
+                                reset_at_unix: row.get(3)?,
+                            })
+                        })?
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let filtered: Vec<ClineCapEvent> = rows
+                        .into_iter()
+                        .filter(|event| {
+                            accounts.is_empty() || accounts.iter().any(|a| a == &event.account_identifier)
+                        })
+                        .collect();
+                    Ok(filtered)
+                })();
+                let _ = reply.send(result);
             }
             Command::SetMetadata(key, value, reply) => {
                 let result = connection
@@ -2710,5 +2791,56 @@ mod extended_tests {
         history.insert(&event).unwrap();
         let totals = history.totals().unwrap();
         assert_eq!(totals.cache_write_tokens, 30);
+    }
+
+    #[test]
+    fn cline_cap_events_round_trip_and_future_filter() {
+        let path = TestPath::new("cline-cap-events");
+        let history = ready(&path.0);
+        let now_ms = unix_time_ms();
+        let expired = ClineCapEvent {
+            account_identifier: "cline-user-a@example".to_string(),
+            model: "z-ai/glm-5.3-flash".to_string(),
+            cap_at_ms: now_ms - 86_400_000,
+            reset_at_unix: now_ms / 1000 - 3600,
+        };
+        let live = ClineCapEvent {
+            account_identifier: "cline-user-b@example".to_string(),
+            model: "cline-free/deepseek-v4.1-flash".to_string(),
+            cap_at_ms: now_ms - 1_000,
+            reset_at_unix: now_ms / 1000 + 7_200,
+        };
+        history.record_cline_cap(&expired).unwrap();
+        history.record_cline_cap(&live).unwrap();
+        history.record_cline_cap(&live).unwrap();
+
+        let all = history.cline_caps(&[]).unwrap();
+        assert_eq!(all.len(), 1, "only the future-reset cap is listed");
+        assert_eq!(all[0], live);
+
+        let scoped = history.cline_caps(&["cline-user-b@example".to_string()]).unwrap();
+        assert_eq!(scoped.len(), 1);
+        let empty = history.cline_caps(&["cline-user-z@example".to_string()]).unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn cline_cap_migration_creates_table_on_old_database() {
+        let path = TestPath::new("cline-cap-migration");
+        {
+            let connection = Connection::open(&path.0).unwrap();
+            connection
+                .execute_batch("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at_ms INTEGER NOT NULL); PRAGMA user_version=4;")
+                .unwrap();
+        }
+        let history = ready(&path.0);
+        let event = ClineCapEvent {
+            account_identifier: "cline-user-c@example".to_string(),
+            model: "z-ai/glm-5.3-flash".to_string(),
+            cap_at_ms: unix_time_ms(),
+            reset_at_unix: unix_time_ms() / 1000 + 60,
+        };
+        history.record_cline_cap(&event).unwrap();
+        assert_eq!(history.cline_caps(&[]).unwrap().len(), 1);
     }
 }

@@ -262,10 +262,10 @@ async fn cline_daily_budget_reports_usage_without_capping_the_account() {
     std::fs::remove_dir_all(&temp_dir).unwrap();
 }
 
-/// The display models (glm and deepseek) keep a "(Daily limit)" quota
-/// bucket. A served request on any other pooled Cline model updates the
-/// shared daily budget tracker but never creates or updates a bucket for
-/// that model.
+/// The display models (glm and deepseek) keep independent "(Daily limit)"
+/// quota buckets backed by separate token trackers. A served request on any
+/// other pooled Cline model never creates a bucket, and its tokens move
+/// neither display model's estimate.
 #[tokio::test]
 async fn cline_quota_bucket_surfaces_only_the_display_model() {
     let mut servers = Vec::new();
@@ -275,11 +275,25 @@ async fn cline_quota_bucket_surfaces_only_the_display_model() {
     let port = listener.local_addr().unwrap().port();
     let app = Router::new().route(
         "/v1/chat/completions",
-        post(|_: axum::body::Bytes| async {
+        post(|body: axum::body::Bytes| async move {
+            let model = serde_json::from_slice::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("model")
+                        .and_then(|model| model.as_str())
+                        .map(ToString::to_string)
+                })
+                .unwrap_or_default();
+            let tokens = match model.as_str() {
+                "z-ai/glm-5.3-flash" => 6_000_000,
+                "z-ai/glm-4.7" => 7_000_000,
+                _ => 2_000_000,
+            };
             (
                 StatusCode::OK,
                 [("content-type", "application/json")],
-                usage_body(1_000),
+                usage_body(tokens),
             )
         }),
     );
@@ -380,13 +394,27 @@ async fn cline_quota_bucket_surfaces_only_the_display_model() {
     );
     let bucket = &group.buckets[0];
     assert_eq!(bucket.display_name.as_deref(), Some("z-ai/glm-5.3-flash (Daily limit)"));
-    assert!(bucket.used_percent.is_some(), "live usage is reported");
+    let glm_used = bucket.used_percent.expect("live usage is reported");
     let deepseek = &group.buckets[1];
     assert_eq!(
         deepseek.display_name.as_deref(),
         Some("cline-free/deepseek-v4.1-flash (Daily limit)")
     );
-    assert!(deepseek.used_percent.is_some(), "deepseek usage is reported");
+    let ds_used = deepseek.used_percent.expect("deepseek usage is reported");
+    let glm_expect = 6_000_000.0 * 100.0 / 15_200_000.0;
+    let ds_expect = 2_000_000.0 * 100.0 / 15_200_000.0;
+    assert!(
+        (glm_used - glm_expect).abs() < 1e-9,
+        "glm lane counts only glm-served tokens: got {glm_used}, want {glm_expect}"
+    );
+    assert!(
+        (ds_used - ds_expect).abs() < 1e-9,
+        "deepseek lane counts only deepseek-served tokens: got {ds_used}, want {ds_expect}"
+    );
+    assert!(
+        glm_used > ds_used,
+        "lanes are independent: {glm_used} must exceed {ds_used}"
+    );
 
     for shutdown in shutdowns {
         let _ = shutdown.send(());

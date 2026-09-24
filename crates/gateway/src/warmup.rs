@@ -482,7 +482,9 @@ async fn execute(state: &Arc<AppState>, id: &str, automatic: bool) -> WarmupResu
             if m.provider_name() == "cline" {
                 if let Some((cap_model, secs)) = crate::relay::parse_cline_cap_error(&bytes) {
                     crate::relay::record_cline_quota_bucket(&m, &cap_model, secs, now(), 100.0);
-                    m.cline_tracker().on_cap_429(now() + secs);
+                    if let Some(tracker) = m.cline_trackers().for_model(&cap_model) {
+                        tracker.on_cap_429(now() + secs);
+                    }
                 }
             }
             let (quota_model, deadline) = crate::relay::parse_cline_cap_error(&bytes)
@@ -528,7 +530,9 @@ async fn execute(state: &Arc<AppState>, id: &str, automatic: bool) -> WarmupResu
             // A successful probe is the account's first use of its 24h
             // daily-cap window: anchor the reset estimate at warmup time.
             if valid && m.provider_name() == "cline" {
-                m.cline_tracker().anchor_window(now());
+                if let Some(tracker) = m.cline_trackers().for_model(&model) {
+                    tracker.anchor_window(now());
+                }
             }
         }
         Ok(Err(e)) => out.detail = Some(e),

@@ -20,7 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Approximate daily free-token budget of one Cline account. A display
 /// reference for the usage estimate only — never a routing gate.
 pub const DEFAULT_CLINE_DAILY_TOKEN_BUDGET: u64 = 15_200_000;
-const DAY_SECS: i64 = 86_400;
+pub const DAY_SECS: i64 = 86_400;
 
 pub struct ClineDailyTracker {
     used_tokens: AtomicU64,
@@ -40,14 +40,6 @@ fn now_unix() -> i64 {
 }
 
 impl ClineDailyTracker {
-    pub fn from_env() -> Arc<Self> {
-        let budget = std::env::var("CLINE_DAILY_TOKEN_BUDGET")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(DEFAULT_CLINE_DAILY_TOKEN_BUDGET);
-        Self::with_config(budget)
-    }
-
     pub fn with_config(budget_tokens: u64) -> Arc<Self> {
         Arc::new(Self {
             used_tokens: AtomicU64::new(0),
@@ -118,11 +110,16 @@ impl ClineDailyTracker {
         if self.seeded.swap(true, Ordering::Relaxed) {
             return;
         }
-        if self.window_start_unix.load(Ordering::Relaxed) == 0 && window_start_unix > 0 {
-            self.window_start_unix
-                .store(window_start_unix, Ordering::Relaxed);
+        // A window that has already lapsed must not be resurrected: seeding an
+        // expired window would emit a stale display bucket until the next
+        // rollover check, so it is dropped here instead.
+        if window_start_unix > 0 && window_start_unix + DAY_SECS > now_unix() {
+            if self.window_start_unix.load(Ordering::Relaxed) == 0 {
+                self.window_start_unix
+                    .store(window_start_unix, Ordering::Relaxed);
+            }
+            self.used_tokens.fetch_max(sum_tokens, Ordering::Relaxed);
         }
-        self.used_tokens.fetch_max(sum_tokens, Ordering::Relaxed);
     }
 
     /// Anchor the window at `now` (warmup probe success) when it is closed.
@@ -162,7 +159,64 @@ impl ClineDailyTracker {
     }
 }
 
-/// Seed every Cline account's tracker from the durable request history at
+#[derive(Clone)]
+pub struct ClineTrackers {
+    glm: Arc<ClineDailyTracker>,
+    deepseek: Arc<ClineDailyTracker>,
+}
+
+impl ClineTrackers {
+    pub fn from_env() -> Self {
+        Self {
+            glm: ClineDailyTracker::with_config(budget_env("CLINE_GLM_DAILY_TOKEN_BUDGET")),
+            deepseek: ClineDailyTracker::with_config(budget_env(
+                "CLINE_DEEPSEEK_DAILY_TOKEN_BUDGET",
+            )),
+        }
+    }
+
+    pub fn with_budgets(glm_tokens: u64, deepseek_tokens: u64) -> Self {
+        Self {
+            glm: ClineDailyTracker::with_config(glm_tokens),
+            deepseek: ClineDailyTracker::with_config(deepseek_tokens),
+        }
+    }
+
+    pub fn for_model(&self, model: &str) -> Option<&ClineDailyTracker> {
+        match cline_quota_lane(model)? {
+            ClineQuotaLane::Glm => Some(&self.glm),
+            ClineQuotaLane::Deepseek => Some(&self.deepseek),
+        }
+    }
+}
+
+pub enum ClineQuotaLane {
+    Glm,
+    Deepseek,
+}
+
+pub fn cline_quota_lane(model: &str) -> Option<ClineQuotaLane> {
+    let bare = model.rsplit('/').next().unwrap_or(model);
+    match bare {
+        "glm-5.3-flash" => Some(ClineQuotaLane::Glm),
+        "deepseek-v4.1-flash" => Some(ClineQuotaLane::Deepseek),
+        _ => None,
+    }
+}
+
+fn budget_env(specific: &str) -> u64 {
+    std::env::var(specific)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .or_else(|| {
+            std::env::var("CLINE_DAILY_TOKEN_BUDGET")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+        })
+        .unwrap_or(DEFAULT_CLINE_DAILY_TOKEN_BUDGET)
+}
+
+/// Seed every Cline account's per-model trackers from the durable request history at
 /// gateway startup, so a restart resumes from real served tokens instead of
 /// restarting the budget from zero.
 pub fn seed_cline_trackers_from_history(state: &std::sync::Arc<crate::state::AppState>) {
@@ -188,20 +242,92 @@ pub fn seed_cline_trackers_from_history(state: &std::sync::Arc<crate::state::App
                 Ok(store) => store.export(&query).unwrap_or_default(),
                 Err(_) => continue,
             };
-            if rows.is_empty() {
-                member.cline_tracker().seed_from_history(0, 0);
-                continue;
+            let mut sums = [0u64; 2];
+            let mut earliest = [0i64; 2];
+            for row in &rows {
+                let lane = match cline_quota_lane(&row.model) {
+                    Some(ClineQuotaLane::Glm) => 0,
+                    Some(ClineQuotaLane::Deepseek) => 1,
+                    None => continue,
+                };
+                sums[lane] = sums[lane].saturating_add(row.total_tokens);
+                let occurred = row.occurred_at_ms / 1000;
+                if occurred > 0 && (earliest[lane] == 0 || occurred < earliest[lane]) {
+                    earliest[lane] = occurred;
+                }
             }
-            let sum: u64 = rows.iter().map(|row| row.total_tokens).sum();
-            let earliest = rows
-                .iter()
-                .map(|row| row.occurred_at_ms)
-                .min()
-                .unwrap_or(0)
-                / 1000;
-            member.cline_tracker().seed_from_history(sum, earliest);
+            let trackers = member.cline_trackers();
+            trackers.glm.seed_from_history(sums[0], earliest[0]);
+            trackers.deepseek.seed_from_history(sums[1], earliest[1]);
+            emit_seed_buckets(&state, &member, &trackers, now);
+            restore_cap_buckets(&state, &member, now).await;
         }
     });
+}
+
+/// Push a seeded tracker's display estimate into the account's usage buckets so
+/// the summary survives a restart without waiting for the next served request.
+fn emit_seed_buckets(
+    state: &std::sync::Arc<crate::state::AppState>,
+    member: &Arc<crate::account::AccountMember>,
+    trackers: &ClineTrackers,
+    now: i64,
+) {
+    for (model, tracker) in [
+        ("z-ai/glm-5.3-flash", &trackers.glm),
+        ("cline-free/deepseek-v4.1-flash", &trackers.deepseek),
+    ] {
+        let reset_unix = tracker.estimated_reset_unix();
+        if reset_unix <= now {
+            continue;
+        }
+        let Some(percent) = tracker.used_percent() else {
+            continue;
+        };
+        // 100% stays reserved for an upstream-confirmed cap, exactly like
+        // the live request path.
+        crate::relay::record_cline_quota_bucket(
+            member,
+            model,
+            reset_unix - now,
+            now,
+            percent.min(99.9),
+        );
+    }
+    let _ = state;
+}
+
+/// Re-apply persisted cap 429s whose reset is still in the future: the exact
+/// upstream reset time is the one signal a restart must not lose.
+async fn restore_cap_buckets(
+    state: &std::sync::Arc<crate::state::AppState>,
+    member: &Arc<crate::account::AccountMember>,
+    now: i64,
+) {
+    let Ok(store) = state.history.store() else {
+        return;
+    };
+    let account = member.id.clone();
+    let caps = match store.cline_caps(&[account]) {
+        Ok(caps) => caps,
+        Err(_) => return,
+    };
+    for cap in caps {
+        if cap.reset_at_unix <= now {
+            continue;
+        }
+        let Some(tracker) = member.cline_trackers().for_model(&cap.model) else {
+            continue;
+        };
+        tracker.on_cap_429(cap.reset_at_unix);
+        crate::relay::record_cline_quota_bucket(
+            member,
+            &cap.model,
+            cap.reset_at_unix - now,
+            now,
+            100.0,
+        );
+    }
 }
 
 #[cfg(test)]
@@ -280,5 +406,44 @@ mod tests {
         assert_eq!(t.estimated_reset_unix(), now + DAY_SECS);
         t.anchor_window(now + 100);
         assert_eq!(t.estimated_reset_unix(), now + DAY_SECS, "first anchor wins");
+    }
+
+    #[test]
+    fn lanes_track_tokens_independently() {
+        let set = ClineTrackers::with_budgets(1_000, 1_000);
+        let glm = set.for_model("z-ai/glm-5.3-flash").expect("glm lane");
+        let ds = set
+            .for_model("cline-free/deepseek-v4.1-flash")
+            .expect("deepseek lane");
+        glm.observe(900, now_unix());
+        assert_eq!(glm.used_percent(), Some(90.0), "glm lane absorbs only glm tokens");
+        assert_eq!(ds.used_percent(), Some(0.0), "deepseek lane stays untouched");
+        assert!(set.for_model("z-ai/glm-4.7").is_none(), "non-display models route nowhere");
+        let capped = set
+            .for_model("deepseek/deepseek-v4.1-flash")
+            .expect("vendor-prefixed cap id");
+        assert!(std::ptr::eq(capped, ds), "same lane under a vendor prefix");
+    }
+
+    #[test]
+    fn seeded_windows_emit_display_buckets_until_reset() {
+        let now = now_unix();
+        let set = ClineTrackers::with_budgets(1_000, 1_000);
+        let glm = set.for_model("z-ai/glm-5.3-flash").expect("glm lane");
+        let ds = set
+            .for_model("cline-free/deepseek-v4.1-flash")
+            .expect("deepseek lane");
+        glm.seed_from_history(500, now - 3_600);
+        assert_eq!(glm.used_percent(), Some(50.0));
+        assert_eq!(glm.estimated_reset_unix(), now - 3_600 + DAY_SECS);
+        assert_eq!(ds.used_percent(), Some(0.0), "untouched lane emits nothing");
+        let expired = ClineTrackers::with_budgets(1_000, 1_000);
+        let old = expired.for_model("z-ai/glm-5.3-flash").expect("glm lane");
+        old.seed_from_history(500, now - DAY_SECS - 3_600);
+        assert_eq!(
+            old.estimated_reset_unix(),
+            0,
+            "a lapsed window must not emit a bucket"
+        );
     }
 }
