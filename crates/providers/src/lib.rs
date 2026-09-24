@@ -28,21 +28,20 @@ pub use antigravity::{
     antigravity_client_id, antigravity_client_secret, antigravity_count_tokens_url,
     antigravity_quota_summary_url, antigravity_stream_url, derive_antigravity_slug_from_filename,
     is_antigravity_model, list_antigravity_auth_files, load_antigravity_account,
-    AntigravityAccount, ANTIGRAVITY_API_VERSION, ANTIGRAVITY_LOAD_BASE, ANTIGRAVITY_MODELS,
-    ANTIGRAVITY_TOKEN_URL, ANTIGRAVITY_UPSTREAM_BASE, ANTIGRAVITY_USER_AGENT,
+    AntigravityAccount, ANTIGRAVITY_API_VERSION, ANTIGRAVITY_LOAD_BASE, ANTIGRAVITY_TOKEN_URL,
+    ANTIGRAVITY_UPSTREAM_BASE, ANTIGRAVITY_USER_AGENT,
 };
 #[allow(deprecated)]
 pub use claude::{
     claude_messages_url, is_claude_model, list_claude_auth_files, ClaudeAccount,
-    CLAUDE_AUTHORIZE_URL, CLAUDE_BETA_HEADER, CLAUDE_MESSAGES_PATH, CLAUDE_MODELS, CLAUDE_SCOPES,
+    CLAUDE_AUTHORIZE_URL, CLAUDE_BETA_HEADER, CLAUDE_MESSAGES_PATH, CLAUDE_SCOPES,
     CLAUDE_TOKEN_URL, CLAUDE_UPSTREAM_BASE,
 };
 pub use codex::{is_codex_model, is_codex_model_in_snapshot};
 #[allow(deprecated)]
 pub use cursor::{
     cursor_chat_url, cursor_login_url, is_cursor_model, list_cursor_auth_files, CursorAccount,
-    CURSOR_CHAT_PATH, CURSOR_LOGIN_URL, CURSOR_MODELS, CURSOR_POLL_URL, CURSOR_REFRESH_URL,
-    CURSOR_UPSTREAM_BASE,
+    CURSOR_CHAT_PATH, CURSOR_LOGIN_URL, CURSOR_POLL_URL, CURSOR_REFRESH_URL, CURSOR_UPSTREAM_BASE,
 };
 #[allow(deprecated)]
 pub use devin::{
@@ -55,7 +54,7 @@ pub use devin::{
 pub use kiro::{
     is_kiro_model, kiro_generate_url, kiro_refresh_url, list_kiro_auth_files, KiroAccount,
     KiroAuthMode, KIRO_API_HOST_TEMPLATE, KIRO_DEFAULT_REGION, KIRO_GENERATE_PATH,
-    KIRO_IDC_REFRESH_TEMPLATE, KIRO_MODELS, KIRO_SOCIAL_REFRESH_TEMPLATE,
+    KIRO_IDC_REFRESH_TEMPLATE, KIRO_SOCIAL_REFRESH_TEMPLATE,
 };
 pub use mimo::{
     execute_mimo_bootstrap, is_mimo_endpoint, MIMO_BOOTSTRAP_URL, MIMO_CHAT_URL, MIMO_SOURCE,
@@ -71,7 +70,7 @@ pub use refresh_exec::{execute_cline_refresh, execute_cline_refresh_to, format_e
 #[allow(deprecated)]
 pub use vertex::{
     build_vertex_jwt_assertion, derive_vertex_slug_from_filename, execute_vertex_refresh,
-    is_vertex_model, list_vertex_auth_files, load_vertex_account, VertexAccount, VERTEX_MODELS,
+    is_vertex_model, list_vertex_auth_files, load_vertex_account, VertexAccount,
 };
 #[allow(deprecated)]
 pub use zcode::{
@@ -83,7 +82,7 @@ pub use zcode::{
     ZcodeCliInit, ZcodeCliPoll, ZcodeCustomerInfo, ZcodePlanBalanceRow, ZCODE_ANTHROPIC_BASE,
     ZCODE_ANTHROPIC_SDK_UA, ZCODE_API_BASE, ZCODE_API_KEY_NAME, ZCODE_APP_VERSION,
     ZCODE_CAPTCHA_BODY_MARKERS, ZCODE_CAPTCHA_PARAM_HEADER, ZCODE_LOGIN_URL, ZCODE_MESSAGES_PATH,
-    ZCODE_MODELS, ZCODE_OAUTH_AUTHORIZE_URL, ZCODE_OAUTH_BROKER_TOKEN_URL, ZCODE_OAUTH_CLIENT_ID,
+    ZCODE_OAUTH_AUTHORIZE_URL, ZCODE_OAUTH_BROKER_TOKEN_URL, ZCODE_OAUTH_CLIENT_ID,
     ZCODE_OAUTH_CLI_INIT_URL, ZCODE_OAUTH_CLI_POLL_PREFIX, ZCODE_OAUTH_REDIRECT_URI,
     ZCODE_PLAN_BILLING_BALANCE_URL, ZCODE_PLAN_MODEL_IDS, ZCODE_PLAN_ORIGIN, ZCODE_SDK_UA,
     ZCODE_USERINFO_URL,

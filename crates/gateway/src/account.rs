@@ -275,45 +275,29 @@ impl ProviderKind {
 #[allow(deprecated)]
 mod provider_kind_contract_tests {
     use super::*;
-    use mahoquot_providers::{ANTIGRAVITY_MODELS, CLAUDE_MODELS, VERTEX_MODELS, ZCODE_MODELS};
     use std::sync::Arc;
 
     #[test]
     fn characterization_codex_negative_space_exclusion() {
         let codex = ProviderKind::Codex;
 
-        // 1. Rejects all 13 Antigravity models
-        for model in ANTIGRAVITY_MODELS {
-            assert!(
-                !codex.serves_model(model),
-                "Codex must not serve Antigravity model {model}"
-            );
+        // 1..4. Rejects every model each other provider binds in the catalog.
+        for provider in [
+            mahoquot_registry::ProviderId::antigravity(),
+            mahoquot_registry::ProviderId::claude(),
+            mahoquot_registry::ProviderId::zcode(),
+            mahoquot_registry::ProviderId::vertex(),
+        ] {
+            let contribution =
+                mahoquot_registry::embedded_snapshot().contribution_for_provider(&provider);
+            for model_id in contribution.model_ids() {
+                let model = model_id.as_str();
+                assert!(
+                    !codex.serves_model(model),
+                    "Codex must not serve {provider:?} model {model}"
+                );
+            }
         }
-
-        // 2. Rejects all 12 Claude models
-        for model in CLAUDE_MODELS {
-            assert!(
-                !codex.serves_model(model),
-                "Codex must not serve Claude model {model}"
-            );
-        }
-
-        // 3. Rejects all 5 Zcode models
-        for model in ZCODE_MODELS {
-            assert!(
-                !codex.serves_model(model),
-                "Codex must not serve Zcode model {model}"
-            );
-        }
-
-        // 4. Rejects all 21 Vertex models
-        for model in VERTEX_MODELS {
-            assert!(
-                !codex.serves_model(model),
-                "Codex must not serve Vertex model {model}"
-            );
-        }
-
         // 5. Rejects cursor- and cursor/ prefixes
         assert!(!codex.serves_model("cursor-small"));
         assert!(!codex.serves_model("cursor-fast"));
@@ -358,14 +342,19 @@ mod provider_kind_contract_tests {
         assert!(!kiro.serves_model("claude-haiku-4-5-20251001"));
         assert!(!kiro.serves_model("kiro/non-existent-model"));
 
-        // Cursor serves cursor/ prefixed models, cursor- catalog, and reference models
+        // Cursor serves cursor/ prefixed models and its catalog-bound ids
         assert!(cursor.serves_model("cursor/auto"));
         assert!(cursor.serves_model("cursor/auto-cost"));
         assert!(cursor.serves_model("cursor/arbitrary-name"));
         assert!(cursor.serves_model("cursor-small"));
         assert!(cursor.serves_model("cursor-fast"));
-        assert!(cursor.serves_model("gpt-5.6-sol"));
-        assert!(cursor.serves_model("claude-sonnet-4-5-20250929"));
+
+        // Cursor must NOT claim models bound to other providers in the catalog:
+        // the removed hardcoded list claimed both an OpenAI model and a Claude
+        // model for Cursor, and routing either one there sends the request to
+        // the wrong upstream entirely.
+        assert!(!cursor.serves_model("gpt-5.6-sol"));
+        assert!(!cursor.serves_model("claude-sonnet-4-5-20250929"));
 
         // Cursor rejects unlisted models without cursor/ prefix
         assert!(!cursor.serves_model("gpt-5.5"));
@@ -440,10 +429,7 @@ mod provider_kind_contract_tests {
             panic!("expected generic account");
         };
         assert_eq!(
-            account
-                .static_headers
-                .get("User-Agent")
-                .map(String::as_str),
+            account.static_headers.get("User-Agent").map(String::as_str),
             Some("Cline/3.0.62")
         );
         assert_eq!(
@@ -1904,8 +1890,7 @@ fn normalize_cline_generic(account: &mut GenericAccount) {
             .insert("X-Task-ID".to_string(), uuid::Uuid::new_v4().to_string());
     }
     const FREE_DEEPSEEK: &str = "cline-free/deepseek-v4.1-flash";
-    if !account.models.is_empty() && !account.models.iter().any(|model| model == FREE_DEEPSEEK)
-    {
+    if !account.models.is_empty() && !account.models.iter().any(|model| model == FREE_DEEPSEEK) {
         account.models.push(FREE_DEEPSEEK.to_string());
     }
 }

@@ -26,9 +26,11 @@ pub struct WarmupResult {
     pub detail: Option<String>,
 }
 type Flight = Shared<BoxFuture<'static, WarmupResult>>;
+/// Last attempt time, the model that was probed, and its result.
+type WarmupHistoryEntry = (tokio::time::Instant, i64, Option<WarmupResult>);
 pub struct WarmupRunner {
     flights: Mutex<HashMap<String, Flight>>,
-    history: Mutex<HashMap<String, (tokio::time::Instant, i64, Option<WarmupResult>)>>,
+    history: Mutex<HashMap<String, WarmupHistoryEntry>>,
     limit: tokio::sync::Semaphore,
 }
 impl Default for WarmupRunner {
@@ -821,7 +823,7 @@ mod tests {
         });
         assert!(!due_at(&state, &member, start + Duration::from_secs(61)));
         let (active, reset_at) = is_quota_window_active(&member, "gpt-5.6-sol", now());
-        assert_eq!(active, true);
+        assert!(active);
         assert_eq!(reset_at, Some(now() + 18000));
 
         std::fs::remove_dir_all(dir).unwrap();

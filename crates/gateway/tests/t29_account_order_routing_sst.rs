@@ -115,7 +115,7 @@ async fn test_fill_first_routing_follows_accounts_view_order_sst() {
     let res1 = client
         .post(&chat_url)
         .header("Content-Type", "application/json")
-        .body(common::OPENAI_REQUEST)
+        .body(common::session_request("order-first"))
         .send()
         .await
         .unwrap();
@@ -141,7 +141,7 @@ async fn test_fill_first_routing_follows_accounts_view_order_sst() {
     let res2 = client
         .post(&chat_url)
         .header("Content-Type", "application/json")
-        .body(common::OPENAI_REQUEST)
+        .body(common::session_request("order-second"))
         .send()
         .await
         .unwrap();
@@ -308,16 +308,19 @@ async fn test_fill_first_cross_provider_account_order_sst() {
         .unwrap();
     assert_eq!(reorder_res.status(), reqwest::StatusCode::OK);
 
-    let shared_model_req = serde_json::json!({
-        "model": "shared-model",
-        "messages": [{"role": "user", "content": "hi"}]
-    })
-    .to_string();
+    let shared_model_req = |session: &str| {
+        serde_json::json!({
+            "model": "shared-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "session_id": session
+        })
+        .to_string()
+    };
 
     let res1 = client
         .post(&chat_url)
         .header("Content-Type", "application/json")
-        .body(shared_model_req.clone())
+        .body(shared_model_req("cross-order-1"))
         .send()
         .await
         .unwrap();
@@ -339,7 +342,7 @@ async fn test_fill_first_cross_provider_account_order_sst() {
     let res2 = client
         .post(&chat_url)
         .header("Content-Type", "application/json")
-        .body(shared_model_req)
+        .body(shared_model_req("cross-order-2"))
         .send()
         .await
         .unwrap();
@@ -497,16 +500,19 @@ async fn test_runtime_strategy_switch_sst() {
         .unwrap();
     assert_eq!(order_res.status(), reqwest::StatusCode::OK);
 
-    let shared_model_req = serde_json::json!({
-        "model": "shared-model",
-        "messages": [{"role": "user", "content": "hi"}]
-    })
-    .to_string();
+    let shared_model_req = |session: &str| {
+        serde_json::json!({
+            "model": "shared-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "session_id": session
+        })
+        .to_string()
+    };
 
     let res_rr1 = client
         .post(&chat_url)
         .header("Content-Type", "application/json")
-        .body(shared_model_req.clone())
+        .body(shared_model_req("switch-rr-1"))
         .send()
         .await
         .unwrap();
@@ -515,7 +521,7 @@ async fn test_runtime_strategy_switch_sst() {
     let res_rr2 = client
         .post(&chat_url)
         .header("Content-Type", "application/json")
-        .body(shared_model_req.clone())
+        .body(shared_model_req("switch-rr-2"))
         .send()
         .await
         .unwrap();
@@ -537,7 +543,7 @@ async fn test_runtime_strategy_switch_sst() {
     let res_ff1 = client
         .post(&chat_url)
         .header("Content-Type", "application/json")
-        .body(shared_model_req.clone())
+        .body(shared_model_req("switch-ff-1"))
         .send()
         .await
         .unwrap();
@@ -546,7 +552,7 @@ async fn test_runtime_strategy_switch_sst() {
     let res_ff2 = client
         .post(&chat_url)
         .header("Content-Type", "application/json")
-        .body(shared_model_req.clone())
+        .body(shared_model_req("switch-ff-2"))
         .send()
         .await
         .unwrap();
@@ -555,7 +561,7 @@ async fn test_runtime_strategy_switch_sst() {
     let res_ff3 = client
         .post(&chat_url)
         .header("Content-Type", "application/json")
-        .body(shared_model_req.clone())
+        .body(shared_model_req("switch-ff-3"))
         .send()
         .await
         .unwrap();
@@ -566,4 +572,3 @@ async fn test_runtime_strategy_switch_sst() {
 
     std::fs::remove_dir_all(&temp_dir).ok();
 }
-

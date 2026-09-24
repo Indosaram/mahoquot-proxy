@@ -264,9 +264,10 @@ impl WarmupProviderPolicy {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WarmupAccountPolicy {
+    #[default]
     Inherit,
     Off,
     Custom {
@@ -275,12 +276,6 @@ pub enum WarmupAccountPolicy {
         idle_secs: u64,
         min_interval_secs: u64,
     },
-}
-
-impl Default for WarmupAccountPolicy {
-    fn default() -> Self {
-        Self::Inherit
-    }
 }
 
 impl WarmupAccountPolicy {

@@ -90,12 +90,14 @@ async fn test_t1_rr_fairness() {
     let client = reqwest::Client::new();
     let gw_url = format!("http://127.0.0.1:{gw_port}/v1/chat/completions");
 
-    // When: 40 sequential POSTs
-    for _ in 0..40 {
+    // When: 40 sequential POSTs, each a distinct session. Identical bodies would
+    // be pinned to one account by prompt-cache affinity, which is the behaviour
+    // t1b/t1c assert; this test measures how the pool spreads separate sessions.
+    for index in 0..40 {
         let res = client
             .post(&gw_url)
             .header("Content-Type", "application/json")
-            .body(r#"{"model":"codex","stream":true,"messages":[{"role":"user","content":"hi"}]}"#)
+            .body(common::session_request(&format!("rr-{index}")))
             .send()
             .await
             .unwrap();
@@ -280,8 +282,7 @@ async fn test_t1c_body_json_session_affinity_keeps_small_conversations_on_one_ac
 
     let client = reqwest::Client::new();
     let gw_url = format!("http://127.0.0.1:{gw_port}/v1/chat/completions");
-    let small_body =
-        r#"{"model":"codex","conversation_id":"conv-test-affinity-42","messages":[{"role":"user","content":"turn"}]}"#;
+    let small_body = r#"{"model":"codex","conversation_id":"conv-test-affinity-42","messages":[{"role":"user","content":"turn"}]}"#;
 
     // When: 4 sequential requests with a small body and no session header
     for _ in 0..4 {

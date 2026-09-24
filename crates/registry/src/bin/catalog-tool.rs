@@ -449,6 +449,34 @@ fn cmd_canonicalize(args: CanonicalizeArgs) -> Result<()> {
     Ok(())
 }
 
+/// Write a secret file owner-only (0600) on unix, plain write elsewhere.
+///
+/// `OpenOptions::mode` only applies when the file is created, so an existing
+/// destination keeps whatever mode it already had. The permissions are therefore
+/// set explicitly on the opened handle, which also closes the window in which a
+/// pre-existing world-readable file still holds the secret.
+fn write_private_key(path: &Path, contents: String) -> Result<()> {
+    use std::io::Write as _;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("failed to create {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to restrict {}", path.display()))?;
+    }
+    file.write_all(contents.as_bytes())
+        .with_context(|| format!("failed to write {}", path.display()))
+}
+
 fn cmd_generate_key(args: GenerateKeyArgs) -> Result<()> {
     use rand::rngs::OsRng;
     let signing_key = SigningKey::generate(&mut OsRng);
@@ -467,7 +495,9 @@ fn cmd_generate_key(args: GenerateKeyArgs) -> Result<()> {
         }
     }
 
-    fs::write(&priv_path, format!("{}\n", priv_hex))?;
+    // The signing key is the root of trust for catalog distribution: create it
+    // owner-only rather than inheriting the ambient umask.
+    write_private_key(&priv_path, format!("{}\n", priv_hex))?;
     fs::write(&pub_path, format!("{}\n", pub_hex))?;
 
     println!("Generated Ed25519 keypair:");
@@ -486,5 +516,69 @@ fn main() -> Result<()> {
         Commands::Verify(args) => cmd_verify(args),
         Commands::Canonicalize(args) => cmd_canonicalize(args),
         Commands::GenerateKey(args) => cmd_generate_key(args),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_private_key_is_owner_only() {
+        // given a fresh keypair destination
+        let dir = std::env::temp_dir().join(format!(
+            "catalog-tool-key-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let prefix = dir.join("catalog-signing");
+
+        // when the key is generated
+        cmd_generate_key(GenerateKeyArgs {
+            output_prefix: prefix.clone(),
+        })
+        .expect("generate key");
+
+        // then the private key never inherits the ambient umask
+        let private = PathBuf::from(format!("{}.key", prefix.to_string_lossy()));
+        assert!(private.exists(), "private key written");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&private)
+                .expect("private key metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "private key mode was {mode:o}");
+        }
+
+        // and regenerating over a pre-existing loose file tightens it: OpenOptions
+        // `mode` only applies at creation, so an earlier 0644 key must not survive.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o644))
+                .expect("loosen for the regression case");
+            cmd_generate_key(GenerateKeyArgs {
+                output_prefix: prefix.clone(),
+            })
+            .expect("regenerate key");
+            let mode = std::fs::metadata(&private)
+                .expect("private key metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "regenerated key kept mode {mode:o}");
+        }
+        // and the public half is still readable
+        let public = PathBuf::from(format!("{}.pub", prefix.to_string_lossy()));
+        assert!(public.exists(), "public key written");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

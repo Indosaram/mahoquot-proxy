@@ -78,12 +78,13 @@ async fn test_t2_churn_via_force_health() {
     let client = reqwest::Client::new();
     let gw_url = format!("http://127.0.0.1:{gw_port}/v1/chat/completions");
 
-    // Burn 3 requests
-    for _ in 0..3 {
+    // Burn 3 requests (distinct sessions: identical bodies would be pinned to
+    // one account by prompt-cache affinity instead of spreading).
+    for index in 0..3 {
         let res = client
             .post(&gw_url)
             .header("Content-Type", "application/json")
-            .body(common::OPENAI_REQUEST)
+            .body(common::session_request(&format!("t2-burn-{index}")))
             .send()
             .await
             .unwrap();
@@ -102,11 +103,11 @@ async fn test_t2_churn_via_force_health() {
     );
 
     // Subsequent picks alternate remaining two evenly (8 requests: 4 to a, 4 to c)
-    for _ in 0..8 {
+    for index in 0..8 {
         let res = client
             .post(&gw_url)
             .header("Content-Type", "application/json")
-            .body(common::OPENAI_REQUEST)
+            .body(common::session_request(&format!("t2-bench-{index}")))
             .send()
             .await
             .unwrap();
@@ -120,11 +121,11 @@ async fn test_t2_churn_via_force_health() {
     state.force_health("b", Health::Available);
 
     // Then: b rejoins cycle evenly (3 requests => a, b, c each served +1)
-    for _ in 0..3 {
+    for index in 0..3 {
         let res = client
             .post(&gw_url)
             .header("Content-Type", "application/json")
-            .body(common::OPENAI_REQUEST)
+            .body(common::session_request(&format!("t2-rejoin-{index}")))
             .send()
             .await
             .unwrap();

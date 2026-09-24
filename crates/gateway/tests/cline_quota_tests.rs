@@ -86,7 +86,7 @@ fn test_cline_model_quota_group_isolation_and_antigravity_policy() {
     );
 
     let now_ms = 1_000_000;
-    let until_ms = now_ms + 3600_000;
+    let until_ms = now_ms + 3_600_000;
 
     assert!(cline_member.group_available("z-ai/glm-5.3-flash", now_ms));
     assert!(cline_member.group_available("claude-3-7-sonnet", now_ms));
@@ -726,4 +726,47 @@ async fn test_cline_malformed_body_safely_retains_header_fallback() {
         let _ = server.await;
     }
     std::fs::remove_dir_all(&temp_dir).unwrap();
+}
+
+#[tokio::test]
+async fn test_cline_bucket_deduplication_and_canonicalization() {
+    let member = create_cline_account(
+        "cline-dedup",
+        "http://127.0.0.1:18899",
+        vec!["z-ai/glm-5.3-flash".to_string(), "cline-free/deepseek-v4.1-flash".to_string()],
+    );
+
+    let now_sec = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    // 1. First record using gateway route name
+    mahoquot_gateway::relay::record_cline_quota_bucket(
+        &member,
+        "cline-free/deepseek-v4.1-flash",
+        3600,
+        now_sec,
+        50.0,
+    );
+    let u1 = member.usage_snapshot();
+    let g1 = u1.groups.iter().find(|g| g.display_name.as_deref() == Some("Cline Free Limits")).unwrap();
+    assert_eq!(g1.buckets.len(), 1);
+    assert_eq!(g1.buckets[0].bucket_id.as_deref(), Some("cline-free/deepseek-v4.1-flash"));
+
+    // 2. Upstream 429 returns with upstream name "deepseek/deepseek-v4.1-flash"
+    mahoquot_gateway::relay::record_cline_quota_bucket(
+        &member,
+        "deepseek/deepseek-v4.1-flash",
+        7200,
+        now_sec,
+        100.0,
+    );
+    let u2 = member.usage_snapshot();
+    let g2 = u2.groups.iter().find(|g| g.display_name.as_deref() == Some("Cline Free Limits")).unwrap();
+    // Must NOT have 2 buckets; should be exactly 1 deduplicated canonical bucket
+    assert_eq!(g2.buckets.len(), 1);
+    assert_eq!(g2.buckets[0].bucket_id.as_deref(), Some("cline-free/deepseek-v4.1-flash"));
+    assert_eq!(g2.buckets[0].used_percent, Some(100.0));
+    assert_eq!(g2.buckets[0].reset_at_unix, Some(now_sec + 7200));
 }

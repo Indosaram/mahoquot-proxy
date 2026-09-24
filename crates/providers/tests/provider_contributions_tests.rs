@@ -23,7 +23,7 @@ const LEGACY_ANTIGRAVITY_MODELS: [&str; 14] = [
     "gpt-oss-120b-medium",
 ];
 
-const LEGACY_CLAUDE_MODELS: [&str; 12] = [
+const LEGACY_CLAUDE_MODELS: [&str; 13] = [
     "claude-sonnet-4-6",
     "claude-sonnet-4-5",
     "claude-sonnet-4-5-20250929",
@@ -36,6 +36,7 @@ const LEGACY_CLAUDE_MODELS: [&str; 12] = [
     "claude-haiku-4-5-20251001",
     "claude-3-7-sonnet-20250219",
     "claude-3-5-sonnet-20241022",
+    "claude-opus-5",
 ];
 
 const LEGACY_CODEX_MODELS: [&str; 12] = [
@@ -156,7 +157,7 @@ fn test_claude_typed_contribution_and_capabilities() {
             "is_claude_model must return true for legacy model {id}"
         );
     }
-    assert_eq!(contrib.models.len(), 12);
+    assert_eq!(contrib.models.len(), 13);
 
     let thinking_caps = contrib
         .capability_profile("claude-opus-4-5-20251101-thinking")

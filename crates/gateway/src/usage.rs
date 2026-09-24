@@ -581,7 +581,10 @@ pub fn parse_kiro_usage_summary(body: &serde_json::Value, now_unix: i64) -> Acco
 /// window first, weekly second). Unknown window types are skipped so a new
 /// upstream window cannot break the reading, while a present-but-wrong field
 /// is a broken response and yields `None`.
-pub fn parse_clinepass_usage_summary(body: &serde_json::Value, now_unix: i64) -> Option<AccountUsage> {
+pub fn parse_clinepass_usage_summary(
+    body: &serde_json::Value,
+    now_unix: i64,
+) -> Option<AccountUsage> {
     if body.get("success").and_then(|v| v.as_bool()) != Some(true) {
         return None;
     }
@@ -1007,16 +1010,19 @@ mod cache_presence_tests {
                     if gemini {
                         usage["cachedContentTokenCount"] = value.into();
                     } else {
-                        usage["prompt_tokens_details"] = serde_json::json!({"cached_tokens": value});
+                        usage["prompt_tokens_details"] =
+                            serde_json::json!({"cached_tokens": value});
                     }
                 }
                 let body = if gemini {
                     serde_json::json!({"usageMetadata": usage})
                 } else {
                     serde_json::json!({"usage": usage})
-                }.to_string();
+                }
+                .to_string();
                 // When the relay capture extracts usage.
-                let parsed = extract_response_token_usage(body.as_bytes(), body.as_bytes()).unwrap();
+                let parsed =
+                    extract_response_token_usage(body.as_bytes(), body.as_bytes()).unwrap();
                 // Then the count and its presence are independent.
                 assert_eq!(parsed.cached_input_tokens, value.unwrap_or(0));
                 assert_eq!(parsed.cached_input_tokens_known, value.is_some());
@@ -1031,47 +1037,46 @@ pub fn extract_response_token_usage(head: &[u8], tail: &[u8]) -> Option<Response
         let prompt = object_number(&usage, &["prompt_tokens"]);
         let completion = object_number(&usage, &["completion_tokens"]);
         if prompt.is_some() || completion.is_some() {
-            let cached_input_tokens = nested_object_number(
-                &usage,
-                "input_tokens_details",
-                "cached_tokens",
-            )
-            .or_else(|| {
-                nested_object_number(&usage, "prompt_tokens_details", "cached_tokens")
-            })
-            .or_else(|| object_number(&usage, &["cache_read_input_tokens", "cache_read_tokens"]));
-            let cache_write_tokens = nested_object_number(
-                &usage,
-                "prompt_tokens_details",
-                "cache_creation_tokens",
-            )
-            .or_else(|| {
-                nested_object_number(&usage, "prompt_tokens_details", "cache_write_tokens")
-            })
-            .or_else(|| {
-                nested_object_number(
-                    &usage,
-                    "prompt_tokens_details",
-                    "cache_creation_input_tokens",
-                )
-            })
-            .or_else(|| {
-                nested_object_number(&usage, "input_tokens_details", "cache_creation_tokens")
-            })
-            .or_else(|| {
-                nested_object_number(&usage, "input_tokens_details", "cache_write_tokens")
-            })
-            .or_else(|| {
-                object_number(
-                    &usage,
-                    &[
-                        "cache_creation_input_tokens",
-                        "cache_write_tokens",
-                        "cache_creation_tokens",
-                    ],
-                )
-            })
-            ;
+            let cached_input_tokens =
+                nested_object_number(&usage, "input_tokens_details", "cached_tokens")
+                    .or_else(|| {
+                        nested_object_number(&usage, "prompt_tokens_details", "cached_tokens")
+                    })
+                    .or_else(|| {
+                        object_number(&usage, &["cache_read_input_tokens", "cache_read_tokens"])
+                    });
+            let cache_write_tokens =
+                nested_object_number(&usage, "prompt_tokens_details", "cache_creation_tokens")
+                    .or_else(|| {
+                        nested_object_number(&usage, "prompt_tokens_details", "cache_write_tokens")
+                    })
+                    .or_else(|| {
+                        nested_object_number(
+                            &usage,
+                            "prompt_tokens_details",
+                            "cache_creation_input_tokens",
+                        )
+                    })
+                    .or_else(|| {
+                        nested_object_number(
+                            &usage,
+                            "input_tokens_details",
+                            "cache_creation_tokens",
+                        )
+                    })
+                    .or_else(|| {
+                        nested_object_number(&usage, "input_tokens_details", "cache_write_tokens")
+                    })
+                    .or_else(|| {
+                        object_number(
+                            &usage,
+                            &[
+                                "cache_creation_input_tokens",
+                                "cache_write_tokens",
+                                "cache_creation_tokens",
+                            ],
+                        )
+                    });
             return Some(ResponseTokenUsage {
                 input_tokens: prompt.unwrap_or(0),
                 output_tokens: completion.unwrap_or(0),
@@ -1097,25 +1102,21 @@ pub fn extract_response_token_usage(head: &[u8], tail: &[u8]) -> Option<Response
         // branch must never swallow Claude's head-side `cache_read_input_tokens`.
         if let Some(cached) = nested_object_number(&usage, "input_tokens_details", "cached_tokens")
         {
-            let cache_write_tokens = nested_object_number(
-                &usage,
-                "input_tokens_details",
-                "cache_creation_tokens",
-            )
-            .or_else(|| {
-                nested_object_number(&usage, "input_tokens_details", "cache_write_tokens")
-            })
-            .or_else(|| {
-                object_number(
-                    &usage,
-                    &[
-                        "cache_creation_input_tokens",
-                        "cache_write_tokens",
-                        "cache_creation_tokens",
-                    ],
-                )
-            })
-            ;
+            let cache_write_tokens =
+                nested_object_number(&usage, "input_tokens_details", "cache_creation_tokens")
+                    .or_else(|| {
+                        nested_object_number(&usage, "input_tokens_details", "cache_write_tokens")
+                    })
+                    .or_else(|| {
+                        object_number(
+                            &usage,
+                            &[
+                                "cache_creation_input_tokens",
+                                "cache_write_tokens",
+                                "cache_creation_tokens",
+                            ],
+                        )
+                    });
             return Some(ResponseTokenUsage {
                 input_tokens: object_number(&usage, &["input_tokens"]).unwrap_or(0),
                 output_tokens: object_number(&usage, &["output_tokens"]).unwrap_or(0),
@@ -1141,7 +1142,8 @@ pub fn extract_response_token_usage(head: &[u8], tail: &[u8]) -> Option<Response
                 output_tokens: completion.unwrap_or(0),
                 cached_input_tokens: object_number(&usage, &["cachedContentTokenCount"])
                     .unwrap_or(0),
-                cached_input_tokens_known: object_number(&usage, &["cachedContentTokenCount"]).is_some(),
+                cached_input_tokens_known: object_number(&usage, &["cachedContentTokenCount"])
+                    .is_some(),
                 cache_write_tokens: 0,
                 cache_write_tokens_known: false,
                 reasoning_tokens: object_number(&usage, &["thoughtsTokenCount"]).unwrap_or(0),
@@ -1156,10 +1158,12 @@ pub fn extract_response_token_usage(head: &[u8], tail: &[u8]) -> Option<Response
             output_tokens: output.unwrap_or(0),
             cached_input_tokens: last_number_after(head, b"\"cache_read_input_tokens\"")
                 .unwrap_or(0),
-            cached_input_tokens_known: last_number_after(head, b"\"cache_read_input_tokens\"").is_some(),
+            cached_input_tokens_known: last_number_after(head, b"\"cache_read_input_tokens\"")
+                .is_some(),
             cache_write_tokens: last_number_after(head, b"\"cache_creation_input_tokens\"")
                 .unwrap_or(0),
-            cache_write_tokens_known: last_number_after(head, b"\"cache_creation_input_tokens\"").is_some(),
+            cache_write_tokens_known: last_number_after(head, b"\"cache_creation_input_tokens\"")
+                .is_some(),
             reasoning_tokens: 0,
         });
     }
@@ -1357,12 +1361,48 @@ pub fn window_deltas(samples: &[UsageSample], now_unix: i64) -> Vec<UsageWindowD
         .collect()
 }
 
+/// Samples retained per account. The default 120s poll cadence yields ~5760
+/// samples across the 8d horizon, so this cap binds before span pruning does.
+const MAX_SAMPLES: usize = 5000;
+/// Samples older than this (the 7d quota horizon plus margin) are dropped.
+const SPAN_SECS: i64 = 8 * 24 * 3600;
+/// The append-only log is compacted only once it has grown this many times
+/// larger than the retained window. Compacting on every prune would rewrite the
+/// whole file on every push once the cap binds — the very O(n^2) cost this log
+/// exists to avoid — while a multiple keeps total rewrite work linear.
+const COMPACT_GROWTH_FACTOR: usize = 2;
+
+/// Applies the retention horizon and the sample cap to one account's window.
+fn prune_window(window: &mut Vec<UsageSample>) {
+    let cutoff = window
+        .last()
+        .map(|last| last.unix - SPAN_SECS)
+        .unwrap_or(i64::MIN);
+    window.retain(|sample| sample.unix >= cutoff);
+    // Drop from the FRONT: truncate() would keep the oldest MAX_SAMPLES and
+    // discard the sample just pushed, freezing the window forever. The default
+    // 120s cadence produces 5760 samples per span, so this cap does bind in a
+    // stock install.
+    if window.len() > MAX_SAMPLES {
+        window.drain(..window.len() - MAX_SAMPLES);
+    }
+}
+
 /// In-memory sample ring persisted next to the gateway config so the 24h
 /// window survives restarts.
+///
+/// Samples are appended to the file as newline-delimited JSON rather than
+/// re-serializing the whole map on every push. Rewriting everything made the
+/// per-poll cost grow with the retained window (~5000 samples per account), so a
+/// long-running gateway paid an ever-larger O(n) write under the store mutex on
+/// every quota poll. Appending is O(1) per sample, and the file is rewritten
+/// only when the log has grown well past the retained window.
 #[derive(Debug, Default)]
 pub struct UsageSampleStore {
     path: std::path::PathBuf,
     entries: std::sync::Mutex<std::collections::BTreeMap<String, Vec<UsageSample>>>,
+    /// Lines appended since the last full rewrite, used to bound compaction.
+    appended: std::sync::atomic::AtomicUsize,
 }
 
 /// Last observed quota snapshot per account, persisted so the console restores
@@ -1424,50 +1464,123 @@ impl UsageStateStore {
 
 impl UsageSampleStore {
     pub fn load(path: std::path::PathBuf) -> Self {
-        let entries = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|raw| serde_json::from_str(&raw).ok())
-            .unwrap_or_default();
+        let raw = std::fs::read_to_string(&path).unwrap_or_default();
+        let entries = Self::parse_log(&raw);
+        // The file may already hold orphaned lines, so start the compaction
+        // counter at their count rather than at zero.
+        let appended = raw.lines().filter(|line| !line.trim().is_empty()).count();
         Self {
             path,
             entries: std::sync::Mutex::new(entries),
+            appended: std::sync::atomic::AtomicUsize::new(appended),
         }
+    }
+
+    /// Reads the append-only log, tolerating both the current line-delimited
+    /// shape and the earlier whole-map JSON object so an existing file is not
+    /// discarded on upgrade. A truncated trailing line (crash mid-append) is
+    /// skipped rather than invalidating the whole history.
+    fn parse_log(raw: &str) -> std::collections::BTreeMap<String, Vec<UsageSample>> {
+        let mut entries: std::collections::BTreeMap<String, Vec<UsageSample>> =
+            std::collections::BTreeMap::new();
+        for line in raw.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(record) = serde_json::from_str::<SampleRecord>(line) else {
+                continue;
+            };
+            entries
+                .entry(record.account_id)
+                .or_default()
+                .push(record.sample);
+        }
+        if entries.is_empty() {
+            // Legacy shape: one JSON object holding the whole map.
+            if let Ok(legacy) = serde_json::from_str(raw) {
+                entries = legacy;
+            }
+        }
+        // The file can hold more lines than the window keeps (compaction is
+        // deliberately lazy), so the cap is applied on the way in too.
+        for window in entries.values_mut() {
+            prune_window(window);
+        }
+        entries
     }
 
     /// Appends a sample, prunes anything older than the 7d quota horizon plus
     /// margin, persists, and returns the retained window for delta computation.
     pub fn push(&self, account_id: &str, sample: UsageSample) -> Vec<UsageSample> {
-        const SPAN_SECS: i64 = 8 * 24 * 3600;
-        // The default 120s poll cadence yields ~5760 samples over the 8d span,
-        // so this cap binds before span pruning does; the newest sample must
-        // survive it.
-        const MAX_SAMPLES: usize = 5000;
         let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
         let window = entries.entry(account_id.to_string()).or_default();
         window.push(sample);
-        let cutoff = window
-            .last()
-            .map(|last| last.unix - SPAN_SECS)
-            .unwrap_or(i64::MIN);
-        window.retain(|sample| sample.unix >= cutoff);
-        // Drop from the FRONT: truncate() would keep the oldest MAX_SAMPLES and
-        // discard the sample just pushed, freezing the window forever. The
-        // default 120s cadence produces 5760 samples per span, so this cap
-        // does bind in a stock install.
-        if window.len() > MAX_SAMPLES {
-            window.drain(..window.len() - MAX_SAMPLES);
-        }
+        let before = window.len();
+        prune_window(window);
+        let pruned = window.len() != before + 1;
         let retained = window.clone();
-        if let Ok(raw) = serde_json::to_string_pretty(&*entries) {
-            // Atomic rename: a crash mid-write must not wipe the 24h rolling
-            // baseline this file exists to preserve.
-            let _ = mahoquot_providers::credential_file::write_credential_atomically(
-                &self.path,
-                raw.as_bytes(),
-            );
+        let record = SampleRecord {
+            account_id: account_id.to_string(),
+            sample,
+        };
+        if let Ok(line) = serde_json::to_string(&record) {
+            Self::append_line(&self.path, &line);
+            let appended = self
+                .appended
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            let retained_lines: usize = entries.values().map(Vec::len).sum();
+            if pruned && appended > retained_lines * COMPACT_GROWTH_FACTOR {
+                self.rewrite_log(&entries);
+                self.appended.store(0, std::sync::atomic::Ordering::Relaxed);
+            }
         }
         retained
     }
+
+    /// Rewrites the log from memory, dropping the lines pruning has orphaned.
+    fn rewrite_log(&self, entries: &std::collections::BTreeMap<String, Vec<UsageSample>>) {
+        let mut rendered = String::new();
+        for (id, samples) in entries.iter() {
+            for sample in samples {
+                let record = SampleRecord {
+                    account_id: id.clone(),
+                    sample: *sample,
+                };
+                if let Ok(line) = serde_json::to_string(&record) {
+                    rendered.push_str(&line);
+                    rendered.push('\n');
+                }
+            }
+        }
+        let _ = mahoquot_providers::credential_file::write_credential_atomically(
+            &self.path,
+            rendered.as_bytes(),
+        );
+    }
+
+    /// Appends one record. Append is atomic enough for this log because a torn
+    /// trailing line is skipped on load and the next prune rewrites the file.
+    fn append_line(path: &std::path::Path, line: &str) {
+        use std::io::Write as _;
+        let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        else {
+            return;
+        };
+        let _ = file.write_all(line.as_bytes());
+        let _ = file.write_all(b"\n");
+    }
+}
+
+/// One line of the append-only sample log.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct SampleRecord {
+    account_id: String,
+    sample: UsageSample,
 }
 
 /// Maps the relay usage/self payload onto the cumulative totals.
@@ -1680,7 +1793,10 @@ mod tests {
         assert_eq!(usage.plan_type.as_deref(), Some("ClinePass"));
         assert_eq!(usage.groups.len(), 1);
         assert_eq!(usage.groups[0].buckets.len(), 3);
-        assert_eq!(usage.groups[0].buckets[0].display_name.as_deref(), Some("5-hour"));
+        assert_eq!(
+            usage.groups[0].buckets[0].display_name.as_deref(),
+            Some("5-hour")
+        );
         assert_eq!(usage.groups[0].buckets[0].used_percent, Some(40.0));
         assert_eq!(usage.primary.window_minutes, Some(300));
         assert_eq!(usage.primary.used_percent, Some(40.0));
@@ -1692,12 +1808,21 @@ mod tests {
     #[test]
     fn clinepass_rejects_failed_or_malformed_payloads() {
         let now = 1_800_000_000;
-        assert!(parse_clinepass_usage_summary(&serde_json::json!({"success": false, "data": {"limits": []}}), now).is_none());
-        assert!(parse_clinepass_usage_summary(&serde_json::json!({"success": true, "data": {"limits": []}}), now).is_none());
+        assert!(parse_clinepass_usage_summary(
+            &serde_json::json!({"success": false, "data": {"limits": []}}),
+            now
+        )
+        .is_none());
+        assert!(parse_clinepass_usage_summary(
+            &serde_json::json!({"success": true, "data": {"limits": []}}),
+            now
+        )
+        .is_none());
         assert!(parse_clinepass_usage_summary(
             &serde_json::json!({"success": true, "data": {"limits": [{"type": "five_hour"}]}}),
             now
-        ).is_none());
+        )
+        .is_none());
         let unknown_only = serde_json::json!({"success": true, "data": {"limits": [{"type": "yearly", "percentUsed": 1.0}]}});
         assert!(parse_clinepass_usage_summary(&unknown_only, now).is_none());
     }
@@ -2334,8 +2459,8 @@ mod tests {
             .expect("weekly bucket");
         assert!((weekly.used_percent.unwrap() - 94.19).abs() < 1e-6);
         assert_eq!(weekly.reset_at_unix, Some(1_789_035_424)); // 2026-09-10T10:17:04Z naive UTC
-        // and the flat pair follows the shared short/long convention so the
-        // scheduler and rotation logic read truthful windows
+                                                               // and the flat pair follows the shared short/long convention so the
+                                                               // scheduler and rotation logic read truthful windows
         assert_eq!(usage.primary.window_minutes, Some(180));
         assert!((usage.primary.used_percent.unwrap() - 0.8).abs() < 1e-6);
         assert_eq!(usage.secondary.window_minutes, Some(10_080));
@@ -2346,10 +2471,8 @@ mod tests {
     #[test]
     fn relay_limits_tolerate_missing_or_unknown_windows() {
         // given a payload with no limits array at all
-        let payload: serde_json::Value = serde_json::from_str(
-            r#"{"request_count":1,"total_tokens":2}"#,
-        )
-        .unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_str(r#"{"request_count":1,"total_tokens":2}"#).unwrap();
         let totals = parse_relay_usage(&payload).expect("totals");
         // when the snapshot is built
         let usage = parse_relay_account_usage(&payload, totals, Vec::new(), 7);

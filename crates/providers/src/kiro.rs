@@ -52,18 +52,6 @@ pub fn is_kiro_model(model: &str) -> bool {
     is_kiro_model_in_snapshot(embedded_snapshot(), model)
 }
 
-#[deprecated(note = "query catalog/registry for models instead")]
-pub const KIRO_MODELS: &[&str] = &[
-    "auto",
-    "claude-sonnet-4.6",
-    "claude-opus-4.6",
-    "claude-haiku-4.5",
-    "claude-sonnet-4-5-20250929",
-    "claude-sonnet-4-5-20250929-thinking",
-    "claude-haiku-4-5-20251001",
-    "claude-haiku-4-5-20251001-thinking",
-];
-
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum KiroAuthMode {

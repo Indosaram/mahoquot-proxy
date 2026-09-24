@@ -259,7 +259,7 @@ pub fn seed_cline_trackers_from_history(state: &std::sync::Arc<crate::state::App
             let trackers = member.cline_trackers();
             trackers.glm.seed_from_history(sums[0], earliest[0]);
             trackers.deepseek.seed_from_history(sums[1], earliest[1]);
-            emit_seed_buckets(&state, &member, &trackers, now);
+            emit_seed_buckets(&state, &member, trackers, now);
             restore_cap_buckets(&state, &member, now).await;
         }
     });
@@ -327,6 +327,7 @@ async fn restore_cap_buckets(
             now,
             100.0,
         );
+        member.set_group_cooldown(&cap.model, cap.reset_at_unix * 1000);
     }
 }
 

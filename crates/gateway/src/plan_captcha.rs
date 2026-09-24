@@ -241,7 +241,7 @@ mod sidecar_handshake_tests {
         let script = dir.join("solver.sh");
         std::fs::write(
             &script,
-            &format!(
+            format!(
                 "#!/bin/sh\necho started > {}\ncat > /dev/null\nprintf '%s\\n' '{{\"ok\":true,\"param\":\"p\"}}'\n",
                 marker.display()
             ),

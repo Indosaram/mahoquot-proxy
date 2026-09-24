@@ -21,7 +21,8 @@ pub const CLAUDE_SCOPES: &str = "org:create_api_key user:profile user:inference"
 /// Required on inference calls made with an OAuth token. Both flags are
 /// load-bearing: the first selects the Claude Code surface, the second the
 /// OAuth token format. Prompt caching requires `prompt-caching-2024-07-31`.
-pub const CLAUDE_BETA_HEADER: &str = "claude-code-20250219,oauth-2025-04-20,prompt-caching-2024-07-31";
+pub const CLAUDE_BETA_HEADER: &str =
+    "claude-code-20250219,oauth-2025-04-20,prompt-caching-2024-07-31";
 
 pub const CLAUDE_UPSTREAM_BASE: &str = "https://api.anthropic.com";
 pub const CLAUDE_MESSAGES_PATH: &str = "/v1/messages";
@@ -51,22 +52,6 @@ pub fn is_claude_model_in_snapshot(snapshot: &RegistrySnapshot, model: &str) -> 
 pub fn is_claude_model(model: &str) -> bool {
     is_claude_model_in_snapshot(embedded_snapshot(), model)
 }
-
-#[deprecated(note = "query catalog/registry for models instead")]
-pub const CLAUDE_MODELS: &[&str] = &[
-    "claude-sonnet-4-6",
-    "claude-sonnet-4-5",
-    "claude-sonnet-4-5-20250929",
-    "claude-sonnet-4-5-20250929-thinking",
-    "claude-opus-4-6",
-    "claude-opus-4-5",
-    "claude-opus-4-5-20251101",
-    "claude-opus-4-5-20251101-thinking",
-    "claude-haiku-4-5",
-    "claude-haiku-4-5-20251001",
-    "claude-3-7-sonnet-20250219",
-    "claude-3-5-sonnet-20241022",
-];
 
 /// Build the messages endpoint, honouring a test/proxy override base.
 pub fn claude_messages_url(upstream_base: &str) -> String {

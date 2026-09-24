@@ -197,14 +197,8 @@ async fn zcode_plan_request_carries_client_identity_and_body() {
     assert_eq!(header("x-title").as_deref(), Some("Z Code@cli"));
     assert_eq!(header("x-zcode-agent").as_deref(), Some("glm"));
     assert_eq!(header("x-zcode-session-type").as_deref(), Some("main"));
-    assert_eq!(
-        header("x-client-language").is_some_and(|v| !v.is_empty()),
-        true
-    );
-    assert_eq!(
-        header("x-client-timezone").is_some_and(|v| !v.is_empty()),
-        true
-    );
+    assert!(header("x-client-language").is_some_and(|v| !v.is_empty()));
+    assert!(header("x-client-timezone").is_some_and(|v| !v.is_empty()));
     assert!(header("x-platform").unwrap_or_default().contains('-'));
     assert!(header("x-request-id").unwrap_or_default().len() >= 32);
     assert!(header("x-zcode-trace-id").unwrap_or_default().len() >= 32);
@@ -225,7 +219,7 @@ async fn zcode_plan_request_carries_client_identity_and_body() {
         .contains("You are powered by the model named GLM-5.3-Flash."));
     assert_eq!(system[0]["cache_control"]["type"], "ephemeral");
     assert_eq!(sent.body["metadata"]["user_id"], "usr-42");
-    assert_eq!(header("x-request-id").as_deref().unwrap().len() >= 32, true);
+    assert!(header("x-request-id").as_deref().unwrap().len() >= 32);
 
     let last_message = &sent.body["messages"].as_array().unwrap()[0];
     let block = &last_message["content"].as_array().unwrap()[0];

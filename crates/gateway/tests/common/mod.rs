@@ -45,6 +45,19 @@ pub const CODEX_PATH: &str = "/backend-api/codex/responses";
 pub const OPENAI_REQUEST: &str =
     r#"{"model":"codex","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
 
+/// A request body carrying an explicit session identity.
+///
+/// The relay pins a session to one account for prompt-cache affinity, and with
+/// no session identity it derives one from the request body. Reusing one fixed
+/// fixture therefore pins every request to the same account, which is correct
+/// production behaviour but hides the distribution these routing tests measure.
+/// Give each request its own session so the pool spread is what is asserted.
+pub fn session_request(session: &str) -> String {
+    format!(
+        r#"{{"model":"codex","stream":true,"messages":[{{"role":"user","content":"hi"}}],"session_id":"{session}"}}"#
+    )
+}
+
 pub fn codex_sse(text: &str) -> String {
     format!(
         concat!(

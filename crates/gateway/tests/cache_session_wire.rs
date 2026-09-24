@@ -8,12 +8,14 @@ use mahoquot_gateway::{config::GatewayConfig, routes::create_app, state::AppStat
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
+type SeenLog = Arc<Mutex<Vec<(axum::http::HeaderMap, Value)>>>;
+
 #[tokio::test]
 async fn gemini_session_survives_history_changes_without_forwarding_ingress_headers() {
     // Given: an isolated provider endpoint and a real gateway route.
-    let seen = Arc::new(Mutex::new(Vec::<(axum::http::HeaderMap, Value)>::new()));
+    let seen: SeenLog = Arc::new(Mutex::new(Vec::new()));
     async fn capture(
-        State(seen): State<Arc<Mutex<Vec<(axum::http::HeaderMap, Value)>>>>,
+        State(seen): State<SeenLog>,
         headers: axum::http::HeaderMap,
         body: Bytes,
     ) -> impl axum::response::IntoResponse {
@@ -213,19 +215,30 @@ async fn antigravity_replays_the_thought_signature_its_own_upstream_emitted() {
     std::fs::remove_dir_all(auth).unwrap();
 
     // Then: the replayed call carries the signature the gateway captured.
-    let seen = seen.lock().unwrap();
-    assert_eq!(seen.len(), 2);
-    let parts = seen[1]["request"]["contents"][1]["parts"]
-        .as_array()
-        .expect("replayed assistant turn")
-        .clone();
-    let replayed = parts
-        .iter()
-        .find(|part| part.get("functionCall").is_some())
-        .expect("replayed functionCall part");
-    assert_eq!(replayed["functionCall"]["id"], "call_todo_1");
-    assert_eq!(replayed["thoughtSignature"], SIGNATURE, "parts: {parts:?}");
-    drop(seen);
+    let (captured_len, replayed_id, replayed_signature, parts_debug) = {
+        let seen = seen.lock().unwrap();
+        let parts = seen[1]["request"]["contents"][1]["parts"]
+            .as_array()
+            .expect("replayed assistant turn")
+            .clone();
+        let replayed = parts
+            .iter()
+            .find(|part| part.get("functionCall").is_some())
+            .expect("replayed functionCall part")
+            .clone();
+        (
+            seen.len(),
+            replayed["functionCall"]["id"].clone(),
+            replayed["thoughtSignature"].clone(),
+            parts.clone(),
+        )
+    };
+    assert_eq!(captured_len, 2);
+    assert_eq!(replayed_id, "call_todo_1");
+    assert_eq!(
+        replayed_signature, SIGNATURE,
+        "parts: {parts_debug:?}"
+    );
 
     // And: the counters behind /admin/stats saw the replayed call as a ledger
     // hit and never needed the unsigned-sentinel fallback.

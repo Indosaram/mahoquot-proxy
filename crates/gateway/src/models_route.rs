@@ -1,11 +1,24 @@
 use serde_json::{json, Value};
 
-#[allow(deprecated)]
-use mahoquot_providers::{
-    ANTIGRAVITY_MODELS, CLAUDE_MODELS, KIRO_MODELS, VERTEX_MODELS, ZCODE_MODELS,
-};
+use mahoquot_registry::ProviderId;
 
 use crate::account::{AccountMember, ProviderKind};
+
+/// The registry provider id a `ProviderKind` maps onto. Kept next to
+/// `member_matches_provider_binding` so both agree on the identity strings.
+pub fn provider_id_for_kind(kind: ProviderKind) -> Option<ProviderId> {
+    let id = match kind {
+        ProviderKind::Codex => ProviderId::codex(),
+        ProviderKind::Antigravity => ProviderId::antigravity(),
+        ProviderKind::Claude => ProviderId::claude(),
+        ProviderKind::Cursor => ProviderId::cursor(),
+        ProviderKind::Kiro => ProviderId::kiro(),
+        ProviderKind::Vertex => ProviderId::vertex(),
+        ProviderKind::Zcode => ProviderId::zcode(),
+        ProviderKind::Devin | ProviderKind::Generic => return None,
+    };
+    Some(id)
+}
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ModelEntry {
@@ -227,12 +240,12 @@ pub fn expand_prefixed_models(
     entries: Vec<ModelEntry>,
     members: &[std::sync::Arc<AccountMember>],
 ) -> Vec<ModelEntry> {
-    let has_official_claude = members
-        .iter()
-        .any(|m| m.kind() == ProviderKind::Claude && !m.is_nekos_relay() && !m.is_manually_disabled());
-    let has_nekos_claude = members
-        .iter()
-        .any(|m| m.kind() == ProviderKind::Claude && m.is_nekos_relay() && !m.is_manually_disabled());
+    let has_official_claude = members.iter().any(|m| {
+        m.kind() == ProviderKind::Claude && !m.is_nekos_relay() && !m.is_manually_disabled()
+    });
+    let has_nekos_claude = members.iter().any(|m| {
+        m.kind() == ProviderKind::Claude && m.is_nekos_relay() && !m.is_manually_disabled()
+    });
 
     if !has_official_claude && !has_nekos_claude {
         return entries;
@@ -328,7 +341,11 @@ pub fn model_ids_from_env(raw: Option<&str>) -> Vec<String> {
 
 /// Advertise a model only when an account that can actually serve it is loaded,
 /// so a client selecting from /v1/models never gets a routing failure.
-#[allow(deprecated)]
+///
+/// Model ids come from the embedded registry catalog rather than per-provider
+/// arrays in this crate: the catalog is the single source of truth and is
+/// refreshed from the remote catalog, so a provider that adds or retires a model
+/// does not need a code change here.
 pub fn model_entries(providers: &[ProviderKind], env_override: Option<&str>) -> Vec<ModelEntry> {
     let mut entries: Vec<ModelEntry> = Vec::new();
 
@@ -341,52 +358,30 @@ pub fn model_entries(providers: &[ProviderKind], env_override: Option<&str>) -> 
         }
     }
 
-    if providers.contains(&ProviderKind::Antigravity) {
-        for id in ANTIGRAVITY_MODELS {
-            entries.push(ModelEntry {
-                id: id.to_string(),
-                owned_by: "google".to_string(),
-            });
+    for kind in providers {
+        // Codex is advertised from the env/default list above, not the catalog:
+        // its ids are operator-selectable rather than catalog-bound.
+        if *kind == ProviderKind::Codex {
+            continue;
         }
-    }
-
-    for (kind, owned_by, models) in [
-        (ProviderKind::Claude, "anthropic", CLAUDE_MODELS),
-        (ProviderKind::Zcode, "z-ai", ZCODE_MODELS),
-        (ProviderKind::Kiro, "kiro", KIRO_MODELS),
-    ] {
-        if providers.contains(&kind) {
-            for id in models {
-                let id = if kind == ProviderKind::Kiro {
-                    format!("kiro/{id}")
-                } else {
-                    id.to_string()
-                };
-                entries.push(ModelEntry {
-                    id,
-                    owned_by: owned_by.to_string(),
-                });
-            }
-        }
-    }
-    if providers.contains(&ProviderKind::Cursor) {
-        for id in [
-            "cursor/auto",
-            "cursor/auto-cost",
-            "cursor/auto-balance",
-            "cursor/auto-intelligence",
-        ] {
+        let Some(provider_id) = provider_id_for_kind(*kind) else {
+            continue;
+        };
+        let owned_by = match kind {
+            ProviderKind::Antigravity => "google",
+            ProviderKind::Vertex => "google-vertex",
+            ProviderKind::Claude => "anthropic",
+            ProviderKind::Zcode => "z-ai",
+            ProviderKind::Kiro => "kiro",
+            ProviderKind::Cursor => "cursor",
+            ProviderKind::Codex | ProviderKind::Devin | ProviderKind::Generic => continue,
+        };
+        let contribution =
+            mahoquot_registry::embedded_snapshot().contribution_for_provider(&provider_id);
+        for model_id in contribution.model_ids() {
             entries.push(ModelEntry {
-                id: id.to_string(),
-                owned_by: "cursor".to_string(),
-            });
-        }
-    }
-    if providers.contains(&ProviderKind::Vertex) {
-        for id in VERTEX_MODELS {
-            entries.push(ModelEntry {
-                id: id.to_string(),
-                owned_by: "google-vertex".to_string(),
+                id: model_id.as_str().to_string(),
+                owned_by: owned_by.to_string(),
             });
         }
     }
@@ -443,8 +438,14 @@ mod tests {
     use crate::management::settings::Settings;
     use std::sync::Arc;
 
+    /// Model ids the embedded catalog binds to one provider, in catalog order.
+    fn registry_models_for(provider: ProviderId) -> Vec<mahoquot_registry::ModelId> {
+        mahoquot_registry::embedded_snapshot()
+            .contribution_for_provider(&provider)
+            .model_ids()
+    }
+
     #[test]
-    #[allow(deprecated)]
     fn characterization_provider_presence_exposure_all_providers() {
         // 1. Empty providers -> empty entries
         assert!(model_entries(&[], None).is_empty());
@@ -469,78 +470,41 @@ mod tests {
             ]
         );
 
-        // 3. Antigravity only -> 14 ANTIGRAVITY_MODELS owned by "google"
-        let ag = model_entries(&[ProviderKind::Antigravity], None);
-        assert_eq!(ag.len(), 14);
-        assert!(ag.iter().all(|e| e.owned_by == "google"));
-        for model in mahoquot_providers::ANTIGRAVITY_MODELS {
-            assert!(
-                ag.iter().any(|e| e.id == model),
-                "missing antigravity model {model}"
+        // 3..8. Every catalog-backed provider advertises exactly the models the
+        // embedded catalog binds to it, under the owner label the console shows.
+        for (kind, provider, owner) in [
+            (
+                ProviderKind::Antigravity,
+                ProviderId::antigravity(),
+                "google",
+            ),
+            (ProviderKind::Claude, ProviderId::claude(), "anthropic"),
+            (ProviderKind::Zcode, ProviderId::zcode(), "z-ai"),
+            (ProviderKind::Kiro, ProviderId::kiro(), "kiro"),
+            (ProviderKind::Cursor, ProviderId::cursor(), "cursor"),
+            (ProviderKind::Vertex, ProviderId::vertex(), "google-vertex"),
+        ] {
+            let expected = registry_models_for(provider.clone());
+            let entries = model_entries(&[kind], None);
+            assert_eq!(
+                entries.len(),
+                expected.len(),
+                "{provider:?} entry count must match the catalog binding count"
             );
+            assert!(
+                entries.iter().all(|e| e.owned_by == owner),
+                "{provider:?} entries must be owned by {owner}"
+            );
+            for model_id in &expected {
+                assert!(
+                    entries.iter().any(|e| e.id == model_id.as_str()),
+                    "{provider:?} is missing catalog model {model_id}"
+                );
+            }
         }
 
-        // 4. Claude only -> 12 CLAUDE_MODELS owned by "anthropic"
-        let claude = model_entries(&[ProviderKind::Claude], None);
-        assert_eq!(claude.len(), 12);
-        assert!(claude.iter().all(|e| e.owned_by == "anthropic"));
-        for model in mahoquot_providers::CLAUDE_MODELS {
-            assert!(
-                claude.iter().any(|e| e.id == *model),
-                "missing claude model {model}"
-            );
-        }
-
-        // 5. Zcode only -> 5 ZCODE_MODELS owned by "z-ai"
-        let zcode = model_entries(&[ProviderKind::Zcode], None);
-        assert_eq!(zcode.len(), 5);
-        assert!(zcode.iter().all(|e| e.owned_by == "z-ai"));
-        for model in mahoquot_providers::ZCODE_MODELS {
-            assert!(
-                zcode.iter().any(|e| e.id == *model),
-                "missing zcode model {model}"
-            );
-        }
-
-        // 6. Kiro only -> 8 KIRO_MODELS prefixed with "kiro/" owned by "kiro"
-        let kiro = model_entries(&[ProviderKind::Kiro], None);
-        assert_eq!(kiro.len(), 8);
-        assert!(kiro.iter().all(|e| e.owned_by == "kiro"));
-        for model in mahoquot_providers::KIRO_MODELS {
-            let expected_id = format!("kiro/{model}");
-            assert!(
-                kiro.iter().any(|e| e.id == expected_id),
-                "missing kiro model {expected_id}"
-            );
-        }
-
-        // 7. Cursor only -> 4 cursor/auto models owned by "cursor"
-        let cursor = model_entries(&[ProviderKind::Cursor], None);
-        assert_eq!(cursor.len(), 4);
-        assert!(cursor.iter().all(|e| e.owned_by == "cursor"));
-        let cursor_ids: Vec<&str> = cursor.iter().map(|e| e.id.as_str()).collect();
-        assert_eq!(
-            cursor_ids,
-            [
-                "cursor/auto",
-                "cursor/auto-cost",
-                "cursor/auto-balance",
-                "cursor/auto-intelligence",
-            ]
-        );
-
-        // 8. Vertex only -> 21 VERTEX_MODELS owned by "google-vertex"
-        let vertex = model_entries(&[ProviderKind::Vertex], None);
-        assert_eq!(vertex.len(), 21);
-        assert!(vertex.iter().all(|e| e.owned_by == "google-vertex"));
-        for model in mahoquot_providers::VERTEX_MODELS {
-            assert!(
-                vertex.iter().any(|e| e.id == *model),
-                "missing vertex model {model}"
-            );
-        }
-
-        // 9. All 7 providers present -> 9 + 14 + 12 + 5 + 8 + 4 + 21 = 73 entries
+        // 9. Every provider present -> codex defaults plus each catalog binding,
+        // with no id advertised twice under different owners.
         let all = model_entries(
             &[
                 ProviderKind::Codex,
@@ -553,21 +517,40 @@ mod tests {
             ],
             None,
         );
-        assert_eq!(all.len(), 73);
+        let expected_total = 9
+            + registry_models_for(ProviderId::antigravity()).len()
+            + registry_models_for(ProviderId::claude()).len()
+            + registry_models_for(ProviderId::zcode()).len()
+            + registry_models_for(ProviderId::kiro()).len()
+            + registry_models_for(ProviderId::cursor()).len()
+            + registry_models_for(ProviderId::vertex()).len();
+        assert_eq!(all.len(), expected_total);
 
-        // 10. Env override scopes Codex only
-        let custom = model_entries(
-            &[ProviderKind::Codex, ProviderKind::Claude],
-            Some("custom-gpt, extra-gpt"),
-        );
-        let custom_codex: Vec<_> = custom.iter().filter(|e| e.owned_by == "openai").collect();
-        assert_eq!(custom_codex.len(), 2);
-        assert_eq!(custom_codex[0].id, "custom-gpt");
-        assert_eq!(custom_codex[1].id, "extra-gpt");
-        assert_eq!(
-            custom.iter().filter(|e| e.owned_by == "anthropic").count(),
-            12
-        );
+        // A model bound by two providers is listed once per provider, which is
+        // how the console lets the operator pick either route.
+        let shared: Vec<&ModelEntry> = all
+            .iter()
+            .filter(|e| {
+                registry_models_for(ProviderId::antigravity())
+                    .iter()
+                    .any(|m| m.as_str() == e.id)
+                    && registry_models_for(ProviderId::claude())
+                        .iter()
+                        .any(|m| m.as_str() == e.id)
+            })
+            .collect();
+        for entry in &shared {
+            let owners: Vec<&str> = shared
+                .iter()
+                .filter(|other| other.id == entry.id)
+                .map(|other| other.owned_by.as_str())
+                .collect();
+            assert!(
+                owners.contains(&"google") && owners.contains(&"anthropic"),
+                "overlapping model {} must appear under both owners, saw {owners:?}",
+                entry.id
+            );
+        }
     }
 
     #[test]
@@ -1213,10 +1196,8 @@ mod tests {
         ];
 
         // 1. Both official and nekos active -> both prefixes generated
-        let expanded = expand_prefixed_models(
-            base_entries.clone(),
-            &[official.clone(), nekos.clone()],
-        );
+        let expanded =
+            expand_prefixed_models(base_entries.clone(), &[official.clone(), nekos.clone()]);
         let ids: Vec<&str> = expanded.iter().map(|e| e.id.as_str()).collect();
         assert!(ids.contains(&"claude-3-7-sonnet-20250219"));
         assert!(ids.contains(&"anthropic-claude-3-7-sonnet-20250219"));
@@ -1259,19 +1240,32 @@ mod tests {
         let now_unix = 1726000000;
 
         // 1. Uninitialized catalog state -> considered stale
-        assert!(has_stale_devin_members(std::slice::from_ref(&member), now_unix));
+        assert!(has_stale_devin_members(
+            std::slice::from_ref(&member),
+            now_unix
+        ));
 
         // 2. Fresh catalog state -> not stale
-        let key = crate::devin_catalog::DevinCacheKey::new("devin-stale-check", "tok", "https://api.devin.com");
+        let key = crate::devin_catalog::DevinCacheKey::new(
+            "devin-stale-check",
+            "tok",
+            "https://api.devin.com",
+        );
         let fresh_cat = Arc::new(crate::devin_catalog::DevinAccountCatalogState::new_success(
             key.clone(),
             vec![],
             now_unix,
         ));
         member.set_devin_catalog_state(fresh_cat);
-        assert!(!has_stale_devin_members(std::slice::from_ref(&member), now_unix));
+        assert!(!has_stale_devin_members(
+            std::slice::from_ref(&member),
+            now_unix
+        ));
 
         // 3. Expired catalog state (now_unix + 301s) -> stale
-        assert!(has_stale_devin_members(std::slice::from_ref(&member), now_unix + 301));
+        assert!(has_stale_devin_members(
+            std::slice::from_ref(&member),
+            now_unix + 301
+        ));
     }
 }

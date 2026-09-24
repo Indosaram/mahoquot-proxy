@@ -9,7 +9,7 @@ use std::sync::{
 
 #[tokio::test]
 async fn warmup_actual_http_validation_and_zero_hit_eligibility() {
-    let listener = loop {
+    let listener = {
         let mut bound = None;
         for port in 18840..=18899 {
             if let Ok(l) =
@@ -19,7 +19,7 @@ async fn warmup_actual_http_validation_and_zero_hit_eligibility() {
                 break;
             }
         }
-        break bound.expect("mock port");
+        bound.expect("mock port")
     };
     let base = format!("http://{}", listener.local_addr().unwrap());
     let mode = Arc::new(AtomicUsize::new(0));

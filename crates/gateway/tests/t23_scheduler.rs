@@ -8,7 +8,7 @@ use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use axum::routing::post;
 use axum::Router;
-use common::{codex_sse, create_auth_file_json, unique_temp_dir, CODEX_PATH, OPENAI_REQUEST};
+use common::{codex_sse, create_auth_file_json, session_request, unique_temp_dir, CODEX_PATH};
 use http_body_util::BodyExt;
 use mahoquot_gateway::config::GatewayConfig;
 use mahoquot_gateway::inbound::ApiKeys;
@@ -41,12 +41,16 @@ fn expired_cooldown_rejoins_available_peer_without_bypassing_scheduler_policies(
             priorities: [("a".to_string(), 0), ("b".to_string(), 1)].into(),
         };
         for health in [
-            Health::Cooldown { until_unix_ms: i64::MAX },
+            Health::Cooldown {
+                until_unix_ms: i64::MAX,
+            },
             Health::Disabled,
             Health::AuthFailed,
         ] {
             a.set_health(health);
-            let snapshot = scheduler.update_settings(settings.clone(), &members).unwrap();
+            let snapshot = scheduler
+                .update_settings(settings.clone(), &members)
+                .unwrap();
             assert_eq!(snapshot.selected.as_deref(), Some("b"), "{health:?}");
             assert_eq!(snapshot.order, ["b"]);
             assert!(!snapshot.fail_open);
@@ -56,7 +60,11 @@ fn expired_cooldown_rejoins_available_peer_without_bypassing_scheduler_policies(
         a.set_health(Health::Cooldown { until_unix_ms: 0 });
         scheduler.reconcile(&members);
         let snapshot = scheduler.snapshot();
-        assert_eq!(snapshot.selected.as_deref(), Some("a"), "expired cooldown must rejoin");
+        assert_eq!(
+            snapshot.selected.as_deref(),
+            Some("a"),
+            "expired cooldown must rejoin"
+        );
         assert_eq!(snapshot.order, ["a", "b"]);
         assert!(!snapshot.fail_open);
         assert!(scheduler.permits("a"));
@@ -81,7 +89,8 @@ fn expired_cooldown_rejoins_available_peer_without_bypassing_scheduler_policies(
         std::fs::write(
             auth_dir.join("scheduler-state.json"),
             serde_json::json!({"exhausted_since_unix": {"a": i64::MAX}}).to_string(),
-        ).unwrap();
+        )
+        .unwrap();
         let held = SchedulerRegistry::load(&auth_dir.join("config.yaml"), &members);
         assert_eq!(held.snapshot().selected.as_deref(), Some("b"));
         assert_eq!(held.snapshot().order, ["b"]);
@@ -192,7 +201,7 @@ async fn management(
         .unwrap()
 }
 
-async fn relay(app: &axum::Router) -> String {
+async fn relay(app: &axum::Router, session: &str) -> String {
     let response = app
         .clone()
         .oneshot(
@@ -201,7 +210,7 @@ async fn relay(app: &axum::Router) -> String {
                 .uri("/v1/chat/completions")
                 .header(header::AUTHORIZATION, format!("Bearer {KEY}"))
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(OPENAI_REQUEST))
+                .body(Body::from(session_request(session)))
                 .unwrap(),
         )
         .await
@@ -254,7 +263,7 @@ async fn scheduler_rotates_two_account_pool_by_reset_time() {
     let order = response_json(management(&app, "GET", "/scheduler/order", None).await).await;
     assert_eq!(status["selected"], "a");
     assert_eq!(order["order"], serde_json::json!(["a", "b"]));
-    assert!(relay(&app).await.contains("from-a"));
+    assert!(relay(&app, "rotate-1").await.contains("from-a"));
 
     state
         .find_member("a")
@@ -277,7 +286,7 @@ async fn scheduler_rotates_two_account_pool_by_reset_time() {
     );
     let status = response_json(management(&app, "GET", "/scheduler/status", None).await).await;
     assert_eq!(status["selected"], "b");
-    assert!(relay(&app).await.contains("from-b"));
+    assert!(relay(&app, "rotate-2").await.contains("from-b"));
 
     task_a.abort();
     task_b.abort();
@@ -303,8 +312,8 @@ async fn corrupt_scheduler_state_fails_open_without_auth_mutation() {
     let state =
         Arc::new(AppState::new(&config(auth_dir.clone(), Strategy::StrictRoundRobin)).unwrap());
     let app = create_app(state);
-    let first = relay(&app).await;
-    let second = relay(&app).await;
+    let first = relay(&app, "corrupt-1").await;
+    let second = relay(&app, "corrupt-2").await;
     assert!(first.contains("from-a") || first.contains("from-b"));
     assert!(second.contains("from-a") || second.contains("from-b"));
     assert_ne!(first.contains("from-a"), second.contains("from-a"));
@@ -354,8 +363,8 @@ async fn all_exhausted_restores_base_strategy() {
     let status = response_json(management(&app, "GET", "/scheduler/status", None).await).await;
     assert_eq!(status["selected"], serde_json::Value::Null);
     assert_eq!(status["fail_open"], true);
-    let first = relay(&app).await;
-    let second = relay(&app).await;
+    let first = relay(&app, "exhausted-1").await;
+    let second = relay(&app, "exhausted-2").await;
     assert_ne!(first.contains("from-a"), second.contains("from-a"));
 
     task_a.abort();
@@ -418,7 +427,7 @@ async fn scheduler_parking_only_filters_future_selections_and_in_flight_arc_comp
     .await;
 
     let in_flight_app = app.clone();
-    let in_flight = tokio::spawn(async move { relay(&in_flight_app).await });
+    let in_flight = tokio::spawn(async move { relay(&in_flight_app, "parking-inflight").await });
     tokio::time::timeout(std::time::Duration::from_secs(2), started.notified())
         .await
         .expect("account a request started");
@@ -438,7 +447,7 @@ async fn scheduler_parking_only_filters_future_selections_and_in_flight_arc_comp
         Some(serde_json::json!({"enabled": true})),
     )
     .await;
-    assert!(relay(&app).await.contains("future-b"));
+    assert!(relay(&app, "parking-after").await.contains("future-b"));
 
     release_tx.send(()).unwrap();
     let completed = tokio::time::timeout(std::time::Duration::from_secs(2), in_flight)

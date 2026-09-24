@@ -174,7 +174,11 @@ pub fn parse_cli_poll(body: &Value) -> ZcodeCliPoll {
         .unwrap_or_default()
     {
         "ready" => {
-            let token = non_empty("token").expect("ready poll without token");
+            // A ready poll without a token is an upstream protocol violation.
+            // Report it as a failure instead of panicking on remote JSON.
+            let Some(token) = non_empty("token") else {
+                return ZcodeCliPoll::Failed("ready poll without token".to_string());
+            };
             ZcodeCliPoll::Ready {
                 token,
                 email: data
@@ -409,9 +413,6 @@ pub fn is_zcode_model_in_snapshot(snapshot: &RegistrySnapshot, model: &str) -> b
 pub fn is_zcode_model(model: &str) -> bool {
     is_zcode_model_in_snapshot(embedded_snapshot(), model)
 }
-
-#[deprecated(note = "query catalog/registry for models instead")]
-pub const ZCODE_MODELS: &[&str] = &["glm-5.3", "glm-5.3-flash", "glm-5.2", "glm-5.1", "glm-4.6"];
 
 pub fn zcode_messages_url(upstream_base: &str) -> String {
     format!(
@@ -1079,6 +1080,23 @@ mod tests {
             parse_cli_poll(&serde_json::json!({"data": {"status": "failed"}, "msg": "denied"})),
             ZcodeCliPoll::Failed("denied".to_string())
         );
+    }
+
+    #[test]
+    fn ready_poll_without_a_token_is_a_failure_not_a_panic() {
+        // given an upstream that reports ready but omits or blanks the token
+        for body in [
+            serde_json::json!({"data": {"status": "ready"}}),
+            serde_json::json!({"data": {"status": "ready", "token": "   "}}),
+        ] {
+            // when the poll is parsed
+            let parsed = parse_cli_poll(&body);
+            // then it surfaces as a failure the caller can report
+            assert_eq!(
+                parsed,
+                ZcodeCliPoll::Failed("ready poll without token".to_string())
+            );
+        }
     }
 
     #[test]

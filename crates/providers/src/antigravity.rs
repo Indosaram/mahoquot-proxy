@@ -106,24 +106,6 @@ pub fn is_antigravity_model(model: &str) -> bool {
     is_antigravity_model_in_snapshot(embedded_snapshot(), model)
 }
 
-#[deprecated(note = "query catalog/registry for models instead")]
-pub const ANTIGRAVITY_MODELS: [&str; 14] = [
-    "gemini-3.8-flash-high",
-    "gemini-3.7-flash-high",
-    "gemini-3.6-flash-high",
-    "gemini-3.5-flash-low",
-    "gemini-3.5-flash-extra-low",
-    "gemini-3.1-flash-lite",
-    "gemini-3.1-flash-image",
-    "gemini-3.1-pro-low",
-    "gemini-3-flash",
-    "gemini-3-flash-agent",
-    "gemini-pro-agent",
-    "claude-sonnet-4-6",
-    "claude-opus-4-6-thinking",
-    "gpt-oss-120b-medium",
-];
-
 #[derive(Clone, Default, serde::Deserialize, serde::Serialize)]
 pub struct AntigravityAccount {
     #[serde(default)]

@@ -37,20 +37,12 @@ pub fn supported_models(snapshot: &RegistrySnapshot) -> Vec<String> {
 
 #[allow(deprecated)]
 pub fn is_cursor_model_in_snapshot(snapshot: &RegistrySnapshot, model: &str) -> bool {
-    contribution(snapshot).supports_model(model) || CURSOR_MODELS.contains(&model)
+    contribution(snapshot).supports_model(model)
 }
 
 pub fn is_cursor_model(model: &str) -> bool {
     is_cursor_model_in_snapshot(embedded_snapshot(), model)
 }
-
-#[deprecated(note = "query catalog/registry for models instead")]
-pub const CURSOR_MODELS: &[&str] = &[
-    "cursor-small",
-    "cursor-fast",
-    "gpt-5.6-sol",
-    "claude-sonnet-4-5-20250929",
-];
 
 pub fn cursor_chat_url(upstream_base: &str) -> String {
     format!(
