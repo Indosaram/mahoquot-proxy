@@ -78,14 +78,18 @@ pub fn available_models(state: &AppState, m: &AccountMember) -> Vec<String> {
         .models()
         .iter()
         .filter(|(id, desc)| {
-            desc.bindings.iter().any(|(p, binding)| {
+            let is_provider_match = desc.bindings.iter().any(|(p, binding)| {
                 p.as_str() == provider
                     && (binding.capabilities.is_empty()
                         || binding
                             .capabilities
                             .contains(&mahoquot_registry::ModelCapability::Chat))
-            }) && m.supports_model(id.as_str())
-                && (provider != "cline" || id.as_str().to_ascii_lowercase().contains("glm"))
+            }) || (provider == "cline"
+                && (id.as_str().contains("gemini")
+                    || id.as_str().contains("deepseek")
+                    || id.as_str().contains("glm")));
+
+            is_provider_match && m.supports_model(id.as_str())
         })
         .map(|(id, _)| id.as_str().to_owned())
         .collect()
@@ -183,6 +187,12 @@ pub fn is_quota_window_active(m: &AccountMember, model: &str, now_unix: i64) -> 
                 return (true, Some(*until / 1000));
             }
         }
+        if let Some(tracker) = m.cline_trackers().for_model(model) {
+            let reset_at = tracker.estimated_reset_unix();
+            if reset_at > now_unix {
+                return (true, Some(reset_at));
+            }
+        }
         for g in &usage.groups {
             for b in &g.buckets {
                 if b.bucket_id.as_deref() == Some(model) {
@@ -243,7 +253,12 @@ fn due_at(state: &AppState, m: &AccountMember, time: tokio::time::Instant) -> bo
         return false;
     }
     let models = available_models(state, m);
-    let selected = p.model.as_ref().or_else(|| models.first());
+    let selected = p.model.as_ref().or_else(|| {
+        models.iter().find(|id| {
+            let (active, _) = is_quota_window_active(m, id, now());
+            !active && eligibility(state, m, id).is_none()
+        }).or_else(|| models.first())
+    });
     let Some(model) = selected.filter(|s| models.contains(s)) else {
         return false;
     };
@@ -414,7 +429,12 @@ async fn execute(state: &Arc<AppState>, id: &str, automatic: bool) -> WarmupResu
         return result(&m, "not_due");
     }
     let models = available_models(state, &m);
-    let selected = policy(state, &m).model.or_else(|| models.first().cloned());
+    let selected = policy(state, &m).model.or_else(|| {
+        models.iter().find(|id| {
+            let (active, _) = is_quota_window_active(&m, id, now());
+            !active && eligibility(state, &m, id).is_none()
+        }).cloned().or_else(|| models.first().cloned())
+    });
     let Some(model) = selected.filter(|s| models.contains(s)) else {
         return result(&m, "model_unavailable");
     };
@@ -923,5 +943,47 @@ mod tests {
         let (active_claude, reset_claude) = is_quota_window_active(&ag, "claude-3-5-sonnet", current);
         assert!(!active_claude);
         assert_eq!(reset_claude, None);
+    }
+
+    #[test]
+    fn cline_window_priming_and_unprimed_selection() {
+        let dir = std::env::temp_dir().join(format!("warmup-cline-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _state = Arc::new(
+            AppState::new(&crate::config::GatewayConfig {
+                auth_dir: dir.clone(),
+                config_path: dir.join("config.yaml"),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+
+        let cline = AccountMember::for_test(ProviderAccount::Generic(
+            crate::account::GenericAccount {
+                provider: "cline".into(),
+                models: vec![
+                    "cline-free/gemini-3.8-flash".into(),
+                    "cline-free/deepseek-v4.1-flash".into(),
+                ],
+                ..Default::default()
+            },
+        ));
+
+        let current = now();
+        let (active_gemini, _) = is_quota_window_active(&cline, "cline-free/gemini-3.8-flash", current);
+        let (active_deepseek, _) = is_quota_window_active(&cline, "cline-free/deepseek-v4.1-flash", current);
+        assert!(!active_gemini);
+        assert!(!active_deepseek);
+
+        // When Gemini window is anchored/active, but DeepSeek is still unanchored
+        cline.cline_trackers().for_model("cline-free/gemini-3.8-flash").unwrap().anchor_window(current);
+        let (active_gemini, reset_gemini) = is_quota_window_active(&cline, "cline-free/gemini-3.8-flash", current);
+        let (active_deepseek, reset_deepseek) = is_quota_window_active(&cline, "cline-free/deepseek-v4.1-flash", current);
+        assert!(active_gemini);
+        assert_eq!(reset_gemini, Some(current + 86400));
+        assert!(!active_deepseek);
+        assert_eq!(reset_deepseek, None);
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

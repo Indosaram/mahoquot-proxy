@@ -151,7 +151,7 @@ pub enum ProviderAccount {
     Generic(GenericAccount),
 }
 
-#[derive(Clone, Debug, serde::Deserialize)]
+#[derive(Clone, Debug, Default, serde::Deserialize)]
 pub struct GenericAccount {
     #[serde(default)]
     pub identity_slug: String,
