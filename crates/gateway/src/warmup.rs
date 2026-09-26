@@ -483,15 +483,27 @@ async fn execute(state: &Arc<AppState>, id: &str, automatic: bool) -> WarmupResu
         if status == 429 {
             if m.provider_name() == "cline" {
                 if let Some((cap_model, secs)) = crate::relay::parse_cline_cap_error(&bytes) {
-                    crate::relay::record_cline_quota_bucket(&m, &cap_model, secs, now(), 100.0);
-                    if let Some(tracker) = m.cline_trackers().for_model(&cap_model) {
-                        tracker.on_cap_429(now() + secs);
+                    let tracker = m.cline_trackers().for_model(&cap_model);
+                    let reset_at = crate::relay::resolve_cline_deadline(tracker, now(), secs);
+                    crate::relay::record_cline_quota_bucket(
+                        &m,
+                        &cap_model,
+                        reset_at - now(),
+                        now(),
+                        100.0,
+                    );
+                    if let Some(tracker) = tracker {
+                        tracker.on_cap_429(reset_at);
                     }
                 }
             }
             let (quota_model, deadline) = crate::relay::parse_cline_cap_error(&bytes)
                 .filter(|_| m.provider_name() == "cline")
-                .map(|(id, secs)| (id, now() * 1000 + secs * 1000))
+                .map(|(id, secs)| {
+                    let tracker = m.cline_trackers().for_model(&id);
+                    let reset_at = crate::relay::resolve_cline_deadline(tracker, now(), secs);
+                    (id, reset_at * 1000)
+                })
                 .unwrap_or((model.clone(), header_deadline));
             if !m.set_group_cooldown(&quota_model, deadline) {
                 let mut health = m.health.write().unwrap_or_else(|p| p.into_inner());
@@ -508,6 +520,14 @@ async fn execute(state: &Arc<AppState>, id: &str, automatic: bool) -> WarmupResu
                     }
                     Health::AuthFailed | Health::Disabled => {}
                 }
+            }
+            // Routability is checked with the model warmup *asked for*, not
+            // the name upstream echoed back. Cline's fallback group key is the
+            // raw model string, so an upstream date suffix benched a key
+            // `group_available` never reads and the probe kept re-selecting the
+            // same exhausted account. Bench the requested key as well.
+            if quota_model != *model {
+                let _ = m.set_group_cooldown(&model, deadline);
             }
         }
         if status == 401 {

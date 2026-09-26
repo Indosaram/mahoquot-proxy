@@ -321,6 +321,10 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&state),
         std::time::Duration::from_secs(config.usage_poll_secs),
     );
+    mahoquot_gateway::egress_supervisor::spawn_egress_supervisor(
+        state.clone(),
+        std::time::Duration::from_secs(10),
+    );
     let app = create_app(state.clone());
 
     let listener = TcpListener::bind((bind_addr.as_str(), config.port)).await?;

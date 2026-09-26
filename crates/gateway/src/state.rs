@@ -695,15 +695,37 @@ impl AppState {
             .map(|m| {
                 let health = m.health();
                 let (input_tokens, output_tokens) = self.telemetry.account_tokens(&m.id);
+                // Per-model quota blocks live only in `group_cooldowns`; account-wide
+                // health never sees them. Fold the earliest active one in so a benched
+                // account stops reporting itself `available`.
+                let group_deadline = m.earliest_group_cooldown_ms(now_ms);
                 let (effective_health, reset_at_unix_ms) = match health {
                     Health::Cooldown { until_unix_ms } if until_unix_ms <= now_ms => {
-                        (crate::metrics::HealthStats::Available, None)
+                        match group_deadline {
+                            Some(until_unix_ms) => (
+                                crate::metrics::HealthStats::Cooldown { until_unix_ms },
+                                Some(until_unix_ms),
+                            ),
+                            None => (crate::metrics::HealthStats::Available, None),
+                        }
                     }
-                    Health::Cooldown { until_unix_ms } => (
-                        crate::metrics::HealthStats::Cooldown { until_unix_ms },
-                        Some(until_unix_ms),
-                    ),
-                    Health::Available => (crate::metrics::HealthStats::Available, None),
+                    Health::Cooldown { until_unix_ms } => {
+                        // Whichever block releases first is the one the operator awaits.
+                        let until_unix_ms = group_deadline
+                            .filter(|group| *group < until_unix_ms)
+                            .unwrap_or(until_unix_ms);
+                        (
+                            crate::metrics::HealthStats::Cooldown { until_unix_ms },
+                            Some(until_unix_ms),
+                        )
+                    }
+                    Health::Available => match group_deadline {
+                        Some(until_unix_ms) => (
+                            crate::metrics::HealthStats::Cooldown { until_unix_ms },
+                            Some(until_unix_ms),
+                        ),
+                        None => (crate::metrics::HealthStats::Available, None),
+                    },
                     Health::AuthFailed => (crate::metrics::HealthStats::AuthFailed, None),
                     Health::Disabled => (crate::metrics::HealthStats::Disabled, None),
                 };
@@ -789,5 +811,92 @@ impl AppState {
             history: self.telemetry.snapshot(),
             signature_ledger: self.signature_ledger.stats(),
         }
+    }
+}
+
+#[cfg(test)]
+mod stats_tests {
+    use super::*;
+
+    fn state_with_cline_account() -> (Arc<AppState>, Arc<crate::account::AccountMember>) {
+        let auth_dir = std::env::temp_dir().join(format!(
+            "mahoquot-stats-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&auth_dir).expect("create auth dir");
+        let credential = serde_json::json!({
+            "type": "generic",
+            "identity_slug": "cline-account",
+            "provider": "cline",
+            "label": "Cline",
+            "adapter": "openai-chat",
+            "base_url": "http://127.0.0.1:9",
+            "api_key": "fixture-cline",
+        })
+        .to_string();
+        std::fs::write(auth_dir.join("generic-cline.json"), credential).expect("write cline");
+        let config = crate::config::GatewayConfig {
+            auth_dir: auth_dir.clone(),
+            config_path: auth_dir.join("config.yaml"),
+            auth_refresh_enabled: false,
+            ..crate::config::GatewayConfig::default()
+        };
+        let state = Arc::new(AppState::new(&config).expect("state"));
+        let member = state.pool.load_full().members[0].clone();
+        (state, member)
+    }
+
+    fn account_json(state: &AppState, id: &str) -> serde_json::Value {
+        let stats = state.get_stats();
+        let account = stats
+            .accounts
+            .iter()
+            .find(|account| account.id == id)
+            .expect("account present in stats");
+        serde_json::to_value(account).expect("serialize account stats")
+    }
+
+    fn now_ms() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn an_account_benched_for_one_quota_group_reports_cooldown() {
+        let (state, member) = state_with_cline_account();
+        let deadline = (now_ms() / 1000 + 600) * 1000;
+        assert!(
+            member.set_group_cooldown("z-ai/glm-5.3-flash", deadline),
+            "test premise: cline must split quota groups"
+        );
+
+        let value = account_json(&state, &member.id);
+        assert_eq!(
+            value["health"]["status"], "cooldown",
+            "an account blocked for one model must not report itself available while \
+             requests for it are being rejected"
+        );
+        assert_eq!(
+            value["reset_at_unix_ms"],
+            serde_json::json!(deadline),
+            "the earliest per-model deadline is the reset the operator waits on"
+        );
+    }
+
+    #[test]
+    fn an_account_with_no_active_quota_block_stays_available() {
+        let (state, member) = state_with_cline_account();
+        let expired = (now_ms() / 1000 - 60) * 1000;
+        assert!(member.set_group_cooldown("z-ai/glm-5.3-flash", expired));
+
+        let value = account_json(&state, &member.id);
+        assert_eq!(
+            value["health"]["status"], "available",
+            "an expired per-model deadline must not pin the cooldown badge"
+        );
+        assert_eq!(value["reset_at_unix_ms"], serde_json::json!(null));
     }
 }

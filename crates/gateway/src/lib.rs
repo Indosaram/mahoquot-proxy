@@ -5,6 +5,7 @@ pub mod compat;
 pub mod config;
 pub mod cp_routes;
 pub mod devin_catalog;
+pub mod egress_supervisor;
 pub mod inbound;
 pub mod management;
 pub mod metrics;

@@ -3543,6 +3543,18 @@
       "metadata": {
         "context_limit": "256000"
       }
+    },
+    "cline-free/gemini-3.8-flash": {
+      "id": "cline-free/gemini-3.8-flash",
+      "owned_by": "google",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1048576"
+      }
     }
   },
   "providers": {

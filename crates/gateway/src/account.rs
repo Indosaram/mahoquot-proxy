@@ -990,11 +990,31 @@ pub fn model_quota_group<'a>(provider: &str, model: &'a str) -> Option<&'a str> 
     } else if provider == "cline" {
         if model.contains("deepseek-v4.1-flash") {
             Some("deepseek-v4.1-flash")
-        } else if model.contains("glm-5.3-flash") {
-            Some("z-ai/glm-5.3-flash")
+        } else if model.contains("gemini-3.8-flash") {
+            Some("cline-free/gemini-3.8-flash")
         } else {
-            Some(model)
+            // Cline echoes a dated upstream id back in the 429 body
+            // (`deepseek/deepseek-v4-flash-0731`) while the client asked for
+            // `deepseek/deepseek-v4-flash`. Those resolved to two group keys, so
+            // the bench landed where routing never looked and the account was
+            // re-selected on the next request — each repeat stamping a fresh
+            // reset. Strip the date suffix so both spellings share one key.
+            match split_date_suffix(model) {
+                Some(base) => Some(base),
+                None => Some(model),
+            }
         }
+    } else {
+        None
+    }
+}
+
+/// Split a trailing `-${4-digit month/day}` off a model id, returning the id
+/// without it. Anything that does not look like that suffix is left alone.
+pub(crate) fn split_date_suffix(model: &str) -> Option<&str> {
+    let (base, suffix) = model.rsplit_once('-')?;
+    if suffix.len() == 4 && suffix.bytes().all(|b| b.is_ascii_digit()) {
+        Some(base)
     } else {
         None
     }
@@ -1009,6 +1029,12 @@ pub struct AccountMember {
     /// model families separately. Empty for single-pool providers, whose
     /// cooldown lives in `health`.
     pub group_cooldowns: Arc<RwLock<BTreeMap<String, i64>>>,
+    /// Quota groups benched because the upstream credit balance ran out rather
+    /// than a timed quota (unix ms). Kept beside `group_cooldowns` so the two
+    /// answer different questions: that map records when we retry, this one
+    /// records why, which is what lets the exhaustion 503 tell an operator to
+    /// top up instead of naming a reset that will never arrive.
+    pub credit_benched: Arc<RwLock<BTreeMap<String, i64>>>,
     pub active_requests: Arc<AtomicU64>,
     pub last_activity: Arc<std::sync::Mutex<tokio::time::Instant>>,
     pub upstream_override: Option<String>,
@@ -1062,6 +1088,7 @@ impl AccountMember {
             inner: RwLock::new(inner),
             health: Arc::new(RwLock::new(Health::Available)),
             group_cooldowns: Arc::new(RwLock::new(BTreeMap::new())),
+            credit_benched: Arc::new(RwLock::new(BTreeMap::new())),
             active_requests: Arc::new(AtomicU64::new(0)),
             last_activity: Arc::new(std::sync::Mutex::new(tokio::time::Instant::now())),
             upstream_override: None,
@@ -1274,6 +1301,7 @@ impl AccountMember {
             inner: RwLock::new(self.inner.read().unwrap_or_else(|p| p.into_inner()).clone()),
             health: Arc::clone(&self.health),
             group_cooldowns: Arc::clone(&self.group_cooldowns),
+            credit_benched: Arc::clone(&self.credit_benched),
             active_requests: Arc::clone(&self.active_requests),
             last_activity: Arc::clone(&self.last_activity),
             upstream_override: self.upstream_override.clone(),
@@ -1574,6 +1602,22 @@ impl AccountMember {
         model_quota_group(&self.provider_name(), model)
     }
 
+    /// Earliest still-active per-model quota deadline (unix ms), or `None`
+    /// when every quota group on this account is routable.
+    ///
+    /// Display-only: routing already decides availability per model, but
+    /// `/admin/stats` only read account-wide health, so an account benched for
+    /// one lane still reported itself `available` while requests were 503ing.
+    pub fn earliest_group_cooldown_ms(&self, now_ms: i64) -> Option<i64> {
+        self.group_cooldowns
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .filter(|deadline| **deadline > now_ms)
+            .min()
+            .copied()
+    }
+
     /// Bench only the quota group `model` belongs to, leaving the rest of the
     /// account routable. Returns false when the provider has no group split, so
     /// the caller falls back to an account-wide cooldown.
@@ -1616,6 +1660,36 @@ impl AccountMember {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.get(group).map(|until_ms| until_ms / 1000)
+    }
+
+    /// Record that `model`'s quota group is benched because the account's
+    /// upstream credit balance ran out. Mirrors [`Self::set_group_cooldown`]
+    /// in both group resolution and its later-deadline-wins rule, so the two
+    /// maps never disagree about which group or until when.
+    pub fn set_group_credit_bench(&self, model: &str, until_unix_ms: i64) {
+        let Some(group) = self.quota_group_for(model) else {
+            return;
+        };
+        let mut guard = self
+            .credit_benched
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let slot = guard.entry(group.to_string()).or_insert(until_unix_ms);
+        *slot = (*slot).max(until_unix_ms);
+    }
+
+    /// Whether `model`'s quota group is benched for a credit balance right
+    /// now. An expired mark is read as false rather than removed: the deadline
+    /// already governs routability, this only labels it.
+    pub fn group_credit_benched(&self, model: &str, now_unix_ms: i64) -> bool {
+        let Some(group) = self.quota_group_for(model) else {
+            return false;
+        };
+        let guard = self
+            .credit_benched
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.get(group).is_some_and(|until| *until > now_unix_ms)
     }
 
     pub fn is_expired(&self, now_unix: i64) -> bool {
@@ -2286,6 +2360,7 @@ pub fn load_account_members(auth_dir: &Path) -> anyhow::Result<Vec<Arc<AccountMe
                 Health::Available
             })),
             group_cooldowns: Arc::new(RwLock::new(BTreeMap::new())),
+            credit_benched: Arc::new(RwLock::new(BTreeMap::new())),
             active_requests: Arc::new(AtomicU64::new(0)),
             last_activity: Arc::new(std::sync::Mutex::new(tokio::time::Instant::now())),
             upstream_override,

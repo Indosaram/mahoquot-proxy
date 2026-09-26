@@ -254,7 +254,10 @@ fn test_cline_stale_usage_expires_and_drops_non_display_models() {
     let cline_member = create_cline_account(
         "cline-usage-test",
         "http://127.0.0.1:18899",
-        vec!["z-ai/glm-5.3-flash".to_string(), "z-ai/glm-5.3".to_string()],
+        vec![
+            "cline-free/gemini-3.8-flash".to_string(),
+            "z-ai/glm-5.3".to_string(),
+        ],
     );
 
     let now_unix = 1_700_000_000;
@@ -267,8 +270,8 @@ fn test_cline_stale_usage_expires_and_drops_non_display_models() {
             models: Some("Cline Free Models".to_string()),
             buckets: vec![
                 QuotaBucket {
-                    bucket_id: Some("z-ai/glm-5.3-flash".to_string()),
-                    display_name: Some("z-ai/glm-5.3-flash (Daily limit)".to_string()),
+                    bucket_id: Some("cline-free/gemini-3.8-flash".to_string()),
+                    display_name: Some("cline-free/gemini-3.8-flash (Daily limit)".to_string()),
                     window: Some("Daily".to_string()),
                     used_percent: Some(100.0),
                     reset_at_unix: Some(past_reset),
@@ -294,14 +297,17 @@ fn test_cline_stale_usage_expires_and_drops_non_display_models() {
     let group = &usage.groups[0];
     // Non-display models are dropped entirely, even while unexpired
     assert_eq!(
-        group.buckets.iter().find(|b| b.bucket_id.as_deref() == Some("z-ai/glm-5.3")),
+        group
+            .buckets
+            .iter()
+            .find(|b| b.bucket_id.as_deref() == Some("z-ai/glm-5.3")),
         None,
         "non-display model buckets must never render"
     );
     let b_display = group
         .buckets
         .iter()
-        .find(|b| b.bucket_id.as_deref() == Some("z-ai/glm-5.3-flash"))
+        .find(|b| b.bucket_id.as_deref() == Some("cline-free/gemini-3.8-flash"))
         .expect("display model bucket is kept");
 
     // Expired bucket must become unknown (used_percent: None), NOT fabricated zero
@@ -385,8 +391,8 @@ fn test_cline_persisted_old_quota_expires_on_restore() {
                 display_name: Some("Cline Free Limits".to_string()),
                 models: Some("Cline Free Models".to_string()),
                 buckets: vec![QuotaBucket {
-                    bucket_id: Some("z-ai/glm-5.3-flash".to_string()),
-                    display_name: Some("z-ai/glm-5.3-flash (Daily limit)".to_string()),
+                    bucket_id: Some("cline-free/gemini-3.8-flash".to_string()),
+                    display_name: Some("cline-free/gemini-3.8-flash (Daily limit)".to_string()),
                     window: Some("Daily".to_string()),
                     used_percent: Some(100.0),
                     // Reset was in the past (e.g. 1 hour ago)
@@ -414,7 +420,7 @@ fn test_cline_persisted_old_quota_expires_on_restore() {
     let cline_member = create_cline_account(
         "cline-saved",
         "http://127.0.0.1:18899",
-        vec!["z-ai/glm-5.3-flash".to_string()],
+        vec!["cline-free/gemini-3.8-flash".to_string()],
     );
     cline_member.set_usage(restored_usage.clone());
     let snapshot = cline_member.usage_snapshot();

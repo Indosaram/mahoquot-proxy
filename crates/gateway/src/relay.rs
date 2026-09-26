@@ -1429,6 +1429,24 @@ async fn extract_failure(resp: reqwest::Response, status_code: u16) -> FinalFail
 /// `Retry-After` cannot bench an account effectively forever.
 const MAX_COOLDOWN_SECS: i64 = 86_400;
 
+/// Cooldown for a Cline 402 `insufficient_credits`, in seconds.
+///
+/// A 402 reports a credit balance, not a timer: the body carries no reset and
+/// the balance does not refill on any schedule. Bench until a daily reset and
+/// two things break at once — a topped-up account stays blocked for the rest
+/// of the day, and [`exhaustion_failure_response`] advertises a reset instant
+/// that never arrives. A short backoff keeps the pool from being hammered on a
+/// balance that cannot recover by waiting, while letting a manual top-up take
+/// effect on the next attempt.
+const CLINE_CREDIT_BACKOFF_SECS: i64 = 300;
+
+/// Deadline a Cline 402 benches until: the upstream-reported reset when the
+/// body carries one, otherwise the credit backoff.
+pub(crate) fn cline_402_fallback(body: &[u8], requested_model: String) -> (String, i64) {
+    parse_cline_cap_error(body)
+        .unwrap_or_else(|| (requested_model, CLINE_CREDIT_BACKOFF_SECS))
+}
+
 /// Cooldown deadline for an upstream-supplied `Retry-After`, in unix ms.
 ///
 /// The header is fully upstream-controlled, so the value is clamped in BOTH
@@ -1509,6 +1527,29 @@ pub(crate) fn parse_cline_cap_error(body: &[u8]) -> Option<(String, i64)> {
     Some((model, if total_secs > 0 { total_secs } else { 300 }))
 }
 
+/// Resolve the absolute deadline for a cline cap 429.
+///
+/// [`parse_cline_cap_error`] clamps at [`MAX_COOLDOWN_SECS`], so a full-day
+/// reading is a ceiling, not a measurement: upstream said "24h or more".
+/// Re-deriving `now + 86400` from such a reading on every repeat 429 walks the
+/// deadline forward forever and lands every account's reset on the moment its
+/// latest probe fired — which is exactly how the whole pool ended up showing
+/// one batched reset time. A deadline already in force outranks that guess:
+/// only a reading strictly below the ceiling, or a window with nothing recorded
+/// yet, re-anchors it.
+pub(crate) fn resolve_cline_deadline(
+    tracker: Option<&crate::cline_usage::ClineDailyTracker>,
+    now_secs: i64,
+    reported_secs: i64,
+) -> i64 {
+    let candidate = now_secs.saturating_add(reported_secs);
+    if reported_secs < MAX_COOLDOWN_SECS {
+        return candidate;
+    }
+    let known = tracker.map(|tracker| tracker.estimated_reset_unix()).unwrap_or(0);
+    if known > now_secs { known } else { candidate }
+}
+
 /// A 429 whose body says the account ran out of usage budget rather than
 /// misbehaving — cline's daily free limit (`INFERENCE_CAP_ERROR`) or the
 /// zcode plan's quota biz error (1005). Exhaustion is an expected state the
@@ -1564,7 +1605,7 @@ pub(crate) fn canonical_cline_quota_model(model: &str) -> &'static str {
     if model.contains("deepseek-v4.1-flash") {
         "cline-free/deepseek-v4.1-flash"
     } else {
-        "z-ai/glm-5.3-flash"
+        "cline-free/gemini-3.8-flash"
     }
 }
 
@@ -1652,19 +1693,26 @@ async fn record_cooldown(
 
     let (effective_model, until_unix_ms) = if member.provider_name() == "cline" {
         if let Some((cap_model, reset_secs)) = parse_cline_cap_error(&failure.body) {
-            let deadline_ms = cooldown_deadline_ms(now_ms, reset_secs);
-            record_cline_quota_bucket(member, &cap_model, reset_secs, now_ms / 1000, 100.0);
+            let now_secs = now_ms / 1000;
+            // A clamped full-day reading carries no precision, so it must not
+            // re-anchor a deadline we already know: that is the drift that
+            // slid every reset forward on each repeat 429.
+            let tracker = member.cline_trackers().for_model(&cap_model);
+            let reset_at = resolve_cline_deadline(tracker, now_secs, reset_secs);
+            let deadline_ms = reset_at.saturating_mul(1000);
+            record_cline_quota_bucket(member, &cap_model, reset_at - now_secs, now_secs, 100.0);
             // Upstream named the exact reset: reconcile the 24h tracker so the
             // estimate is exact and the budget counts as consumed.
-            if let Some(tracker) = member.cline_trackers().for_model(&cap_model) {
-                tracker.on_cap_429(now_ms / 1000 + reset_secs);
+            if let Some(tracker) = tracker {
+                tracker.on_cap_429(reset_at);
             }
             persist_cline_cap_event(
                 state,
                 member,
                 &cap_model,
                 now_ms,
-                now_ms / 1000 + reset_secs,
+                reset_at,
+                false,
             );
             (Some(cap_model), deadline_ms)
         } else {
@@ -1674,7 +1722,18 @@ async fn record_cooldown(
         (model.map(ToString::to_string), header_until_unix_ms)
     };
 
-    bench_exhausted_quota(member, effective_model.as_deref().or(model), until_unix_ms);
+    // A cline cap must bench under both names it can be routed by: routing
+    // checks the requested model, the 429 body names what upstream billed.
+    // Every other path benches exactly the model it was called with.
+    if member.provider_name() == "cline"
+        && effective_model.as_deref().is_some_and(|cap| Some(cap) != model)
+    {
+        if let Some(cap_model) = effective_model.as_deref() {
+            bench_cline_cap(member, cap_model, model, until_unix_ms);
+        }
+    } else {
+        bench_exhausted_quota(member, effective_model.as_deref().or(model), until_unix_ms);
+    }
     member.record_fail();
     state.metrics.failed_over.fetch_add(1, Ordering::Relaxed);
     // Rate limiting — exhaustion or not — is an expected operating state: the
@@ -1699,21 +1758,75 @@ fn bench_exhausted_quota(member: &AccountMember, model: Option<&str>, until_unix
     member.set_health(Health::Cooldown { until_unix_ms });
 }
 
+/// Bench a cline cap under **both** model names it can be routed by.
+///
+/// Routability is checked with the model the client asked for
+/// ([`AccountMember::group_available`]), while the 429 body names the model
+/// upstream actually billed. Cline's fallback group key is the raw model
+/// string (`model_quota_group` only normalizes `glm-5.3-flash` and
+/// `deepseek-v4.1-flash`), so a vendor date suffix such as
+/// `deepseek-v4-flash-0731` benches a key routing never reads — the account
+/// stays selectable and immediately earns another 429, which is what walked
+/// every reset forward and batched the pool onto one timestamp.
+fn bench_cline_cap(
+    member: &AccountMember,
+    cap_model: &str,
+    requested_model: Option<&str>,
+    until_unix_ms: i64,
+) {
+    bench_exhausted_quota(member, Some(cap_model), until_unix_ms);
+    if let Some(requested) = requested_model {
+        if requested != cap_model {
+            bench_exhausted_quota(member, Some(requested), until_unix_ms);
+        }
+    }
+}
+
+/// Also label a cline bench as credit-driven, under both model names it can
+/// be routed by.
+///
+/// [`bench_cline_cap`] decides when the account becomes selectable again;
+/// this decides what the exhaustion response may claim about why. They stay
+/// separate so a provider with no quota-group split simply skips the label
+/// instead of needing a second bench.
+fn label_credit_bench(
+    member: &AccountMember,
+    cap_model: &str,
+    requested_model: Option<&str>,
+    until_unix_ms: i64,
+) {
+    member.set_group_credit_bench(cap_model, until_unix_ms);
+    if let Some(requested) = requested_model {
+        if requested != cap_model {
+            member.set_group_credit_bench(requested, until_unix_ms);
+        }
+    }
+}
+
 /// Persist an upstream-confirmed cap's exact reset so a restart can restore
 /// the exhausted bucket without waiting for the next 429. Display-only: a
 /// history failure must never affect routing.
+/// Persist an upstream-confirmed cap's exact reset so a restart can restore
+/// the exhausted bucket without waiting for the next 429. Display-only: a
+/// history failure must never affect routing.
+///
+/// `credit_driven` records *why* the account was benched. Without it a
+/// restart could only see the deadline, and the exhaustion response would
+/// call an emptied credit balance "daily-exhausted".
 fn persist_cline_cap_event(
     state: &AppState,
     member: &AccountMember,
     model: &str,
     now_ms: i64,
     reset_at_unix: i64,
+    credit_driven: bool,
 ) {
     let event = crate::request_history::ClineCapEvent {
         account_identifier: member.id.clone(),
         model: model.to_string(),
         cap_at_ms: now_ms,
         reset_at_unix,
+        credit_driven,
     };
     let Ok(store) = state.history.store() else {
         return;
@@ -1794,6 +1907,36 @@ fn earliest_exhaustion_reset_unix_secs(
     earliest
 }
 
+/// Whether every account benched for `canonical_model` is blocked by an empty
+/// credit balance rather than a timed quota.
+///
+/// One account benched some other way returns false, so the response keeps
+/// its daily wording instead of replacing one unverified claim with the
+/// opposite one.
+fn benched_pool_is_out_of_credit(
+    pool: &crate::state::PoolSnapshot,
+    canonical_model: Option<&str>,
+) -> bool {
+    let Some(model) = canonical_model else {
+        return false;
+    };
+    let now = now_unix_secs();
+    let mut saw_benched = false;
+    for member in &pool.members {
+        if !member
+            .group_reset_at_unix(model)
+            .is_some_and(|reset| reset > now)
+        {
+            continue;
+        }
+        saw_benched = true;
+        if !member.group_credit_benched(model, now * 1000) {
+            return false;
+        }
+    }
+    saw_benched
+}
+
 /// The 503 a client receives when every account that can serve the model is
 /// benched on the same hard cap: carries Retry-After and the earliest reset
 /// so agents can fall back immediately and retry on schedule.
@@ -1810,11 +1953,18 @@ fn exhaustion_failure_response(
     let positive_retry_after = retry_after_secs.filter(|secs| *secs > 0);
     let eta = positive_retry_after.map(format_reset_eta);
     let model_text = canonical_model.unwrap_or("the requested model");
-    let message = match eta {
-        Some(eta) => format!(
+    let out_of_credit = benched_pool_is_out_of_credit(pool, canonical_model);
+    let message = match (out_of_credit, eta) {
+        (true, Some(eta)) => format!(
+            "all pool accounts are out of credit for model '{model_text}'; add credits to resume, earliest retry in {eta}"
+        ),
+        (true, None) => format!(
+            "all pool accounts are out of credit for model '{model_text}'; add credits to resume"
+        ),
+        (false, Some(eta)) => format!(
             "all pool accounts are daily-exhausted for model '{model_text}'; earliest known quota reset in {eta}"
         ),
-        None => format!(
+        (false, None) => format!(
             "all pool accounts are daily-exhausted for model '{model_text}'"
         ),
     };
@@ -1843,7 +1993,7 @@ fn exhaustion_failure_response(
         .unwrap_or_else(|_| {
             (
                 StatusCode::SERVICE_UNAVAILABLE,
-                "all pool accounts are daily-exhausted",
+                "all pool accounts are unavailable for the requested model",
             )
                 .into_response()
         })
@@ -2397,6 +2547,184 @@ fn capture_usage(member: &AccountMember, headers: &HeaderMap) {
     };
     if usage.observed_at_unix.is_some() {
         member.set_usage(usage);
+    }
+}
+
+#[cfg(test)]
+mod cline_deadline_tests {
+    use super::{
+        bench_cline_cap, cline_402_fallback, resolve_cline_deadline,
+        CLINE_CREDIT_BACKOFF_SECS, MAX_COOLDOWN_SECS,
+    };
+    use crate::cline_usage::{ClineDailyTracker, DAY_SECS};
+
+    /// Upstream's billed name differs from what the client asked for: the
+    /// trailing date suffix used to resolve to a second group key, so the bench
+    /// landed where routing never looked and the account was re-selected on the
+    /// very next request. Both spellings must now share one key.
+    #[test]
+    fn a_cap_benches_the_requested_model_not_just_upstreams_name() {
+        let requested = "deepseek/deepseek-v4-flash";
+        let billed = "deepseek/deepseek-v4-flash-0731";
+        // The dated id upstream echoes back must not create a second key.
+        assert_eq!(
+            crate::account::model_quota_group("cline", requested),
+            crate::account::model_quota_group("cline", billed),
+            "a dated upstream id must share the requested model's group"
+        );
+        // The dated id does not resolve a display lane (it is not a tracked
+        // budget), which is exactly why the *bench* cannot be gated behind it.
+        assert!(
+            crate::cline_usage::cline_quota_lane(billed).is_none(),
+            "test premise: an unlaned model must still be restorable"
+        );
+        assert!(
+            crate::cline_usage::cline_quota_lane("deepseek/deepseek-v4.1-flash").is_some(),
+            "the tracked lane still resolves"
+        );
+
+        let state = cline_state("cap-key-mismatch");
+        let pool = state.pool.load_full();
+        let member = pool.members[0].clone();
+        assert_eq!(member.provider_name(), "cline");
+
+        let now_ms = 1_900_000_000_000_i64;
+        let deadline_ms = now_ms + 3_600_000; // an hour out: still in force
+        bench_cline_cap(&member, billed, Some(requested), deadline_ms);
+
+        // Routing asks about the requested name: it must be benched.
+        assert!(
+            !member.group_available(requested, now_ms),
+            "routing must not select a cap-benched account"
+        );
+        // ...and upstream's own name stays benched too.
+        assert!(!member.group_available(billed, now_ms));
+        // The sibling lane is untouched: only the exhausted family benches.
+        assert!(member.group_available("cline-free/deepseek-v4.1-flash", now_ms));
+    }
+
+    fn cline_state(tag: &str) -> crate::state::AppState {
+        let auth_dir = std::env::temp_dir().join(format!(
+            "mahoquot-cline-cap-{tag}-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&auth_dir).expect("create auth dir");
+        let cred = serde_json::json!({
+            "type": "generic",
+            "identity_slug": "cline-account",
+            "provider": "cline",
+            "label": "Cline",
+            "adapter": "openai-chat",
+            "base_url": "http://127.0.0.1:9",
+            "api_key": "fixture-cline",
+        })
+        .to_string();
+        std::fs::write(auth_dir.join("generic-cline.json"), cred).expect("write cline");
+        let config = crate::config::GatewayConfig {
+            auth_dir: auth_dir.clone(),
+            config_path: auth_dir.join("config.yaml"),
+            auth_refresh_enabled: false,
+            ..crate::config::GatewayConfig::default()
+        };
+        crate::state::AppState::new(&config).expect("state")
+    }
+
+    // Far enough ahead that every deadline below is still in the future when
+    // the suite runs, so `estimated_reset_unix` reports the override.
+    const NOW: i64 = 1_900_000_000;
+
+    #[test]
+    fn clamped_reading_never_walks_a_known_deadline_forward() {
+        let now = NOW;
+        let tracker = ClineDailyTracker::with_config(1);
+        // First observation anchors the window: nothing is known yet.
+        let anchor = resolve_cline_deadline(Some(&tracker), now, MAX_COOLDOWN_SECS);
+        assert_eq!(anchor, now + MAX_COOLDOWN_SECS);
+        tracker.on_cap_429(anchor);
+
+        // Repeats must hold the anchored deadline instead of re-deriving
+        // `now + 24h` from the ceiling, which is what slid every account's
+        // reset forward and batched the whole pool onto one timestamp.
+        for offset in [60_i64, 300, 900, 3_600] {
+            assert_eq!(
+                resolve_cline_deadline(Some(&tracker), now + offset, MAX_COOLDOWN_SECS),
+                anchor,
+                "repeat at +{offset}s must not move the deadline"
+            );
+        }
+    }
+
+    #[test]
+    fn precise_reading_still_reanchors() {
+        let now = NOW;
+        let tracker = ClineDailyTracker::with_config(1);
+        tracker.on_cap_429(now + DAY_SECS);
+
+        // A real measurement below the ceiling is information, not a guess:
+        // it must win over the stale anchor (upstream shortened the window).
+        assert_eq!(
+            resolve_cline_deadline(Some(&tracker), now, MAX_COOLDOWN_SECS - 1),
+            now + MAX_COOLDOWN_SECS - 1
+        );
+    }
+
+    #[test]
+    fn expired_deadline_reanchors_from_now() {
+        let now = NOW;
+        let tracker = ClineDailyTracker::with_config(1);
+        // Anchor a window that has already lapsed: its reset is in the past,
+        // so there is no live deadline to preserve.
+        tracker.anchor_window(now - DAY_SECS - 100);
+        assert!(tracker.estimated_reset_unix() < now);
+
+        assert_eq!(
+            resolve_cline_deadline(Some(&tracker), now, MAX_COOLDOWN_SECS),
+            now + MAX_COOLDOWN_SECS
+        );
+        // No tracker at all behaves the same way.
+        assert_eq!(
+            resolve_cline_deadline(None, now, MAX_COOLDOWN_SECS),
+            now + MAX_COOLDOWN_SECS
+        );
+    }
+
+    #[test]
+    fn a_402_without_a_reset_benches_for_the_credit_backoff() {
+        let body = br#"{"error":{"code":"insufficient_credits","message":"Insufficient balance. Your Cline Credits balance is $-0.01","current_balance":-0.006066,"total_spent":0,"total_promotions":0}}"#;
+        let (model, secs) = cline_402_fallback(body, "z-ai/glm-5.3-flash".to_string());
+
+        assert_eq!(model, "z-ai/glm-5.3-flash");
+        assert_eq!(secs, CLINE_CREDIT_BACKOFF_SECS);
+        assert!(
+            secs < DAY_SECS,
+            "a credit balance does not refill daily, so it must not be benched for a day"
+        );
+    }
+
+    #[test]
+    fn a_stale_daily_reset_does_not_extend_a_402_backoff() {
+        let now = NOW;
+        let body = br#"{"error":{"code":"insufficient_credits","message":"Insufficient balance"}}"#;
+        let (model, secs) = cline_402_fallback(body, "z-ai/glm-5.3-flash".to_string());
+
+        let tracker = ClineDailyTracker::with_config(1);
+        tracker.on_cap_429(now + DAY_SECS);
+
+        assert_eq!(
+            resolve_cline_deadline(Some(&tracker), now, secs),
+            now + CLINE_CREDIT_BACKOFF_SECS,
+            "a leftover daily override must not stretch the backoff back out to a day"
+        );
+        assert_eq!(model, "z-ai/glm-5.3-flash");
+    }
+
+    #[test]
+    fn an_upstream_daily_limit_still_reports_its_own_reset() {
+        let body = br#"{"error":{"message":"Daily free limit reached on model z-ai/glm-5.3-flash. Try again in 6h 30m"}}"#;
+        let (_, secs) = cline_402_fallback(body, "z-ai/glm-5.3-flash".to_string());
+
+        assert_eq!(secs, 6 * 3600 + 30 * 60);
     }
 }
 
@@ -3200,7 +3528,7 @@ pub async fn handle_relay(
             );
         }
     };
-    let eligible = eligible_indices(
+    let mut eligible = eligible_indices(
         &pool,
         route.as_ref(),
         plan.model.as_deref(),
@@ -3265,6 +3593,10 @@ pub async fn handle_relay(
     // attempt onto a distinct account even when session affinity binds the
     // router to the failing one.
     let mut attempted: Vec<usize> = Vec::new();
+    let select_model = route
+        .as_ref()
+        .map(|r| r.canonical_model.as_str())
+        .or(plan.model.as_deref());
 
     // Limit-exhaustion 429s (daily model caps) bench the account for hours,
     // so the same account can never repeat: walking the remaining pool is
@@ -3276,6 +3608,17 @@ pub async fn handle_relay(
         if failover_budget >= max_attempts {
             break;
         }
+        // `eligible` was computed once, before this request attempted
+        // anything. An account benched by an attempt earlier in this same walk,
+        // or by a concurrent request, must not be chosen again: each repeat 429
+        // stamps a brand-new 24h deadline over the one already recorded, which
+        // is what pushed reset times forward and batched them.
+        eligible.retain(|&idx| {
+            let Some(member) = pool.members.get(idx) else {
+                return false;
+            };
+            select_model.is_none_or(|model| member.group_available(model, now_ms))
+        });
         let chosen_idx = match select_index(&state, &pool, &hint, &eligible, &attempted) {
             Some(idx) => idx,
             None => break,
@@ -3636,9 +3979,9 @@ pub async fn handle_relay(
             let failure = extract_failure(resp, status_code).await;
             // Cline bills a free-tier account's overflow to paid Credits; a
             // $0 balance answers 402 insufficient_credits on a model the
-            // account has otherwise exhausted. That is account-scoped, like
-            // the daily cap: bench the model lane until the daily reset and
-            // keep walking the pool without spending the failover budget.
+            // account has otherwise exhausted. That is account-scoped, but it
+            // is a balance rather than a timer: bench briefly and keep walking
+            // the pool without spending the failover budget.
             if failure_is_insufficient_credits(&failure.body)
                 && plan
                     .model
@@ -3650,31 +3993,29 @@ pub async fn handle_relay(
                     .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
                     .unwrap_or(0);
                 let now_unix = now_ms / 1000;
-                if let Some((cap_model, reset_secs)) =
-                    crate::relay::parse_cline_cap_error(&failure.body).or_else(|| {
-                        Some((
-                            plan.model.clone().unwrap_or_default(),
-                            crate::cline_usage::DAY_SECS,
-                        ))
-                    })
-                {
-                    record_cline_quota_bucket(&member, &cap_model, reset_secs, now_unix, 100.0);
-                    if let Some(tracker) = member.cline_trackers().for_model(&cap_model) {
-                        tracker.on_cap_429(now_unix + reset_secs);
-                    }
-                    persist_cline_cap_event(
-                        &state,
-                        &member,
-                        &cap_model,
-                        now_ms,
-                        now_unix + reset_secs,
-                    );
-                    bench_exhausted_quota(
-                        &member,
-                        Some(&cap_model),
-                        (now_unix + reset_secs) * 1000,
-                    );
+                let (cap_model, reset_secs) = crate::relay::cline_402_fallback(
+                    &failure.body,
+                    plan.model.clone().unwrap_or_default(),
+                );
+                let tracker = member.cline_trackers().for_model(&cap_model);
+                let reset_at = crate::relay::resolve_cline_deadline(tracker, now_unix, reset_secs);
+                record_cline_quota_bucket(&member, &cap_model, reset_at - now_unix, now_unix, 100.0);
+                if let Some(tracker) = tracker {
+                    tracker.on_cap_429(reset_at);
                 }
+                persist_cline_cap_event(&state, &member, &cap_model, now_ms, reset_at, true);
+                bench_cline_cap(
+                    &member,
+                    &cap_model,
+                    plan.model.as_deref(),
+                    reset_at * 1000,
+                );
+                label_credit_bench(
+                    &member,
+                    &cap_model,
+                    plan.model.as_deref(),
+                    reset_at * 1000,
+                );
                 last_failure = Some(failure);
                 continue;
             }
@@ -4093,6 +4434,98 @@ mod routing_tests {
             ..GatewayConfig::default()
         };
         (AppState::new(&config).expect("state"), auth_dir)
+    }
+
+    #[tokio::test]
+    async fn a_credit_blocked_pool_reports_a_credit_block_not_a_daily_reset() {
+        let (state, auth_dir) = state_with_credentials(
+            "credit-block",
+            &[("generic-cline.json", cline_credential("cline-a"))],
+        );
+        let pool = state.pool.load_full();
+        assert_eq!(pool.members.len(), 1, "the cline fixture is the only account");
+
+        let model = "z-ai/glm-5.3-flash";
+        let until = (now_unix_secs() + 300) * 1000;
+        let member = pool.members[0].clone();
+        bench_cline_cap(&member, model, Some(model), until);
+        label_credit_bench(&member, model, Some(model), until);
+
+        let text = read_body(exhaustion_failure_response(&pool, Some(model))).await;
+        assert!(text.contains("out of credit"), "{text}");
+        assert!(text.contains("add credits to resume"), "{text}");
+        assert!(!text.contains("daily-exhausted"), "{text}");
+
+        let _ = std::fs::remove_dir_all(auth_dir);
+    }
+
+    #[tokio::test]
+    async fn a_timed_quota_bench_keeps_the_daily_wording() {
+        let (state, auth_dir) = state_with_credentials(
+            "timed-quota",
+            &[("generic-cline.json", cline_credential("cline-b"))],
+        );
+        let pool = state.pool.load_full();
+
+        let model = "z-ai/glm-5.3-flash";
+        let until = (now_unix_secs() + 300) * 1000;
+        let member = pool.members[0].clone();
+        bench_cline_cap(&member, model, Some(model), until);
+
+        let text = read_body(exhaustion_failure_response(&pool, Some(model))).await;
+        assert!(text.contains("daily-exhausted"), "{text}");
+        assert!(!text.contains("out of credit"), "{text}");
+
+        let _ = std::fs::remove_dir_all(auth_dir);
+    }
+
+    #[tokio::test]
+    async fn one_account_on_a_timed_quota_stops_the_pool_claiming_credit() {
+        let (state, auth_dir) = state_with_credentials(
+            "mixed-block",
+            &[
+                ("generic-cline-a.json", cline_credential("cline-x")),
+                ("generic-cline-b.json", cline_credential("cline-y")),
+            ],
+        );
+        let pool = state.pool.load_full();
+        assert_eq!(pool.members.len(), 2);
+
+        let model = "z-ai/glm-5.3-flash";
+        let until = (now_unix_secs() + 300) * 1000;
+        let credit_blocked = &pool.members[0];
+        let timed_quota = &pool.members[1];
+        bench_cline_cap(credit_blocked, model, Some(model), until);
+        label_credit_bench(credit_blocked, model, Some(model), until);
+        bench_cline_cap(timed_quota, model, Some(model), until);
+
+        // Claiming "out of credit" here would swap one false blanket statement
+        // for the opposite one: only half the pool is short of credit.
+        let text = read_body(exhaustion_failure_response(&pool, Some(model))).await;
+        assert!(text.contains("daily-exhausted"), "{text}");
+        assert!(!text.contains("out of credit"), "{text}");
+
+        let _ = std::fs::remove_dir_all(auth_dir);
+    }
+
+    fn cline_credential(slug: &str) -> String {
+        serde_json::json!({
+            "type": "generic",
+            "identity_slug": slug,
+            "provider": "cline",
+            "label": "Cline",
+            "adapter": "openai-chat",
+            "base_url": "http://127.0.0.1:9",
+            "api_key": "fixture-cline",
+        })
+        .to_string()
+    }
+
+    async fn read_body(response: axum::response::Response) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        String::from_utf8_lossy(&bytes).into_owned()
     }
 
     #[test]

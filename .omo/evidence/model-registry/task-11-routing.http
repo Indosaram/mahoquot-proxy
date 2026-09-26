@@ -18,9 +18,9 @@ access-control-allow-origin: *
 access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
 access-control-allow-headers: Authorization, Content-Type
 content-length: 332
-date: Thu, 24 Sep 2026 15:06:03 GMT
+date: Sat, 26 Sep 2026 07:38:43 GMT
 
-{"choices":[{"finish_reason":"stop","index":0,"message":{"content":"antigravity fixture","role":"assistant"}}],"created":1790262363,"id":"chatcmpl-ag_fixture","model":"claude-sonnet-4-6","object":"chat.completion","usage":{"completion_tokens":1,"completion_tokens_details":{"reasoning_tokens":0},"prompt_tokens":1,"total_tokens":2}}
+{"choices":[{"finish_reason":"stop","index":0,"message":{"content":"antigravity fixture","role":"assistant"}}],"created":1790408323,"id":"chatcmpl-ag_fixture","model":"claude-sonnet-4-6","object":"chat.completion","usage":{"completion_tokens":1,"completion_tokens_details":{"reasoning_tokens":0},"prompt_tokens":1,"total_tokens":2}}
 
 ---
 
@@ -44,6 +44,6 @@ access-control-allow-origin: *
 access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
 access-control-allow-headers: Authorization, Content-Type
 content-length: 144
-date: Thu, 24 Sep 2026 15:06:03 GMT
+date: Sat, 26 Sep 2026 07:38:43 GMT
 
 {"error":{"code":"model_not_found","message":"unknown provider for model unknown-fixture-model","param":"model","type":"invalid_request_error"}}

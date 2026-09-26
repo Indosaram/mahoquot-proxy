@@ -198,7 +198,7 @@ pub enum ClineQuotaLane {
 pub fn cline_quota_lane(model: &str) -> Option<ClineQuotaLane> {
     let bare = model.rsplit('/').next().unwrap_or(model);
     match bare {
-        "glm-5.3-flash" => Some(ClineQuotaLane::Glm),
+        "gemini-3.8-flash" => Some(ClineQuotaLane::Glm),
         "deepseek-v4.1-flash" => Some(ClineQuotaLane::Deepseek),
         _ => None,
     }
@@ -274,7 +274,7 @@ fn emit_seed_buckets(
     now: i64,
 ) {
     for (model, tracker) in [
-        ("z-ai/glm-5.3-flash", &trackers.glm),
+        ("cline-free/gemini-3.8-flash", &trackers.glm),
         ("cline-free/deepseek-v4.1-flash", &trackers.deepseek),
     ] {
         let reset_unix = tracker.estimated_reset_unix();
@@ -316,6 +316,18 @@ async fn restore_cap_buckets(
         if cap.reset_at_unix <= now {
             continue;
         }
+        // Bench first, and unconditionally. The tracker/bucket below only
+        // exist for display lanes, but routability must be restored for every
+        // persisted cap — gating the cooldown behind `for_model` let a cline
+        // cap on an unlaned model come back from a restart with no bench at
+        // all, and the account was re-selected seconds later.
+        member.set_group_cooldown(&cap.model, cap.reset_at_unix * 1000);
+        // Restore the *reason* alongside the deadline. A restart otherwise
+        // sees only when the account is blocked, and the exhaustion response
+        // would keep calling an emptied credit balance "daily-exhausted".
+        if cap.credit_driven {
+            member.set_group_credit_bench(&cap.model, cap.reset_at_unix * 1000);
+        }
         let Some(tracker) = member.cline_trackers().for_model(&cap.model) else {
             continue;
         };
@@ -327,7 +339,6 @@ async fn restore_cap_buckets(
             now,
             100.0,
         );
-        member.set_group_cooldown(&cap.model, cap.reset_at_unix * 1000);
     }
 }
 
@@ -399,6 +410,125 @@ mod tests {
         assert_eq!(t.used_tokens(), 800, "second seed is ignored once seeded");
     }
 
+    #[tokio::test]
+    async fn a_cap_on_an_unlaned_model_still_benches_after_restore() {
+        // The bench must not sit behind the display lane: `deepseek-v4-flash`
+        // is not a tracked budget, but its cap still has to come back from a
+        // restart or the account is routable again seconds after boot.
+        use std::sync::Arc;
+        let now = now_unix();
+        let auth_dir = std::env::temp_dir().join(format!(
+            "mahoquot-restore-unlaned-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&auth_dir).expect("create auth dir");
+        let cred = serde_json::json!({
+            "type": "generic",
+            "identity_slug": "cline-account",
+            "provider": "cline",
+            "label": "Cline",
+            "adapter": "openai-chat",
+            "base_url": "http://127.0.0.1:9",
+            "api_key": "fixture-cline",
+        })
+        .to_string();
+        std::fs::write(auth_dir.join("generic-cline.json"), cred).expect("write cline");
+        let config = crate::config::GatewayConfig {
+            auth_dir: auth_dir.clone(),
+            config_path: auth_dir.join("config.yaml"),
+            auth_refresh_enabled: false,
+            ..crate::config::GatewayConfig::default()
+        };
+        let state = Arc::new(crate::state::AppState::new(&config).expect("state"));
+        let pool = state.pool.load_full();
+        let member = pool.members[0].clone();
+
+        // Seed the durable cap exactly as the live path records it.
+        let store = state.history.store().expect("history store");
+        store
+            .record_cline_cap(&crate::request_history::ClineCapEvent {
+                account_identifier: member.id.clone(),
+                model: "deepseek/deepseek-v4-flash".to_string(),
+                cap_at_ms: now * 1000,
+                reset_at_unix: now + 3_600,
+                credit_driven: false,
+            })
+            .expect("record cap");
+
+        assert!(
+            crate::cline_usage::cline_quota_lane("deepseek/deepseek-v4-flash").is_none(),
+            "test premise: this model is not a tracked display lane"
+        );
+
+        restore_cap_buckets(&state, &member, now).await;
+
+        assert!(
+            !member.group_available("deepseek/deepseek-v4-flash", now * 1000),
+            "an unlaned cap must still bench its group across a restart"
+        );
+        assert!(
+            !member.group_credit_benched("deepseek/deepseek-v4-flash", now * 1000),
+            "a timed-quota cap must not be relabelled as a credit block on restore"
+        );
+        // A tracked sibling lane is unaffected.
+        assert!(member.group_available("z-ai/glm-5.3-flash", now * 1000));
+    }
+
+    #[tokio::test]
+    async fn restore_relabels_a_cap_that_was_benched_for_credits() {
+        let now = now_unix();
+        let auth_dir = std::env::temp_dir().join(format!(
+            "mahoquot-restore-credit-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&auth_dir).expect("create auth dir");
+        let cred = serde_json::json!({
+            "type": "generic",
+            "identity_slug": "cline-account",
+            "provider": "cline",
+            "label": "Cline",
+            "adapter": "openai-chat",
+            "base_url": "http://127.0.0.1:9",
+            "api_key": "fixture-cline",
+        })
+        .to_string();
+        std::fs::write(auth_dir.join("generic-cline.json"), cred).expect("write cline");
+        let config = crate::config::GatewayConfig {
+            auth_dir: auth_dir.clone(),
+            config_path: auth_dir.join("config.yaml"),
+            auth_refresh_enabled: false,
+            ..crate::config::GatewayConfig::default()
+        };
+        let state = Arc::new(crate::state::AppState::new(&config).expect("state"));
+        let pool = state.pool.load_full();
+        let member = pool.members[0].clone();
+
+        let store = state.history.store().expect("history store");
+        store
+            .record_cline_cap(&crate::request_history::ClineCapEvent {
+                account_identifier: member.id.clone(),
+                model: "z-ai/glm-5.3-flash".to_string(),
+                cap_at_ms: now * 1000,
+                reset_at_unix: now + 300,
+                credit_driven: true,
+            })
+            .expect("record cap");
+
+        restore_cap_buckets(&state, &member, now).await;
+
+        assert!(
+            !member.group_available("z-ai/glm-5.3-flash", now * 1000),
+            "the deadline must survive the restart"
+        );
+        assert!(
+            member.group_credit_benched("z-ai/glm-5.3-flash", now * 1000),
+            "an emptied balance must come back labelled, so the 503 can ask for credits \
+             instead of claiming a daily reset that will never arrive"
+        );
+    }
+
     #[test]
     fn anchor_window_opens_closed_window_only() {
         let now = now_unix();
@@ -412,14 +542,23 @@ mod tests {
     #[test]
     fn lanes_track_tokens_independently() {
         let set = ClineTrackers::with_budgets(1_000, 1_000);
-        let glm = set.for_model("z-ai/glm-5.3-flash").expect("glm lane");
+        let gemini = set
+            .for_model("cline-free/gemini-3.8-flash")
+            .expect("gemini lane");
         let ds = set
             .for_model("cline-free/deepseek-v4.1-flash")
             .expect("deepseek lane");
-        glm.observe(900, now_unix());
-        assert_eq!(glm.used_percent(), Some(90.0), "glm lane absorbs only glm tokens");
+        gemini.observe(900, now_unix());
+        assert_eq!(
+            gemini.used_percent(),
+            Some(90.0),
+            "gemini lane absorbs only gemini tokens"
+        );
         assert_eq!(ds.used_percent(), Some(0.0), "deepseek lane stays untouched");
-        assert!(set.for_model("z-ai/glm-4.7").is_none(), "non-display models route nowhere");
+        assert!(
+            set.for_model("z-ai/glm-4.7").is_none(),
+            "non-display models route nowhere"
+        );
         let capped = set
             .for_model("deepseek/deepseek-v4.1-flash")
             .expect("vendor-prefixed cap id");
@@ -430,16 +569,20 @@ mod tests {
     fn seeded_windows_emit_display_buckets_until_reset() {
         let now = now_unix();
         let set = ClineTrackers::with_budgets(1_000, 1_000);
-        let glm = set.for_model("z-ai/glm-5.3-flash").expect("glm lane");
+        let gemini = set
+            .for_model("cline-free/gemini-3.8-flash")
+            .expect("gemini lane");
         let ds = set
             .for_model("cline-free/deepseek-v4.1-flash")
             .expect("deepseek lane");
-        glm.seed_from_history(500, now - 3_600);
-        assert_eq!(glm.used_percent(), Some(50.0));
-        assert_eq!(glm.estimated_reset_unix(), now - 3_600 + DAY_SECS);
+        gemini.seed_from_history(500, now - 3_600);
+        assert_eq!(gemini.used_percent(), Some(50.0));
+        assert_eq!(gemini.estimated_reset_unix(), now - 3_600 + DAY_SECS);
         assert_eq!(ds.used_percent(), Some(0.0), "untouched lane emits nothing");
         let expired = ClineTrackers::with_budgets(1_000, 1_000);
-        let old = expired.for_model("z-ai/glm-5.3-flash").expect("glm lane");
+        let old = expired
+            .for_model("cline-free/gemini-3.8-flash")
+            .expect("gemini lane");
         old.seed_from_history(500, now - DAY_SECS - 3_600);
         assert_eq!(
             old.estimated_reset_unix(),

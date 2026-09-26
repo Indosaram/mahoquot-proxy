@@ -292,6 +292,10 @@ pub struct ClineCapEvent {
     pub model: String,
     pub cap_at_ms: i64,
     pub reset_at_unix: i64,
+    /// Whether the cap came from an exhausted credit balance rather than a
+    /// timed daily quota. Restored on boot so the exhaustion response does not
+    /// call an empty balance "daily-exhausted" after a restart.
+    pub credit_driven: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -972,12 +976,28 @@ fn migrate(connection: &mut Connection) -> Result<(), HistoryError> {
         transaction.pragma_update(None, "user_version", 5)?;
         transaction.commit()?;
     }
+    init_deferred_schema(connection);
     Ok(())
 }
 
 pub fn init_schema(conn: &Connection) {
     conn.execute(
         "ALTER TABLE usage_events ADD COLUMN cache_write_tokens INTEGER NOT NULL DEFAULT 0;",
+        [],
+    )
+    .ok();
+}
+
+/// Add the columns added after their table's own migration ran.
+///
+/// [`init_schema`] fires before V5 creates `cline_cap_events`, so an ALTER of
+/// that table there would fail against a missing table and be swallowed by the
+/// tolerated result. Called once the table is guaranteed to exist.
+pub fn init_deferred_schema(conn: &Connection) {
+    // Additive column: the duplicate-column error on a database that already
+    // has it is expected, hence the tolerated result.
+    conn.execute(
+        "ALTER TABLE cline_cap_events ADD COLUMN credit_driven INTEGER NOT NULL DEFAULT 0;",
         [],
     )
     .ok();
@@ -1139,9 +1159,15 @@ fn worker_loop(
             Command::RecordClineCap(event, reply) => {
                 let result = connection
                     .execute(
-                        "INSERT INTO cline_cap_events(account_identifier, model, cap_at_ms, reset_at_unix) \
-                         VALUES (?1, ?2, ?3, ?4)",
-                        params![event.account_identifier, event.model, event.cap_at_ms, event.reset_at_unix],
+                        "INSERT INTO cline_cap_events(account_identifier, model, cap_at_ms, reset_at_unix, credit_driven) \
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![
+                            event.account_identifier,
+                            event.model,
+                            event.cap_at_ms,
+                            event.reset_at_unix,
+                            event.credit_driven
+                        ],
                     )
                     .map(|_| true)
                     .map_err(HistoryError::from);
@@ -1150,9 +1176,12 @@ fn worker_loop(
             Command::ListClineCaps(accounts, reply) => {
                 let result = (|| -> Result<Vec<ClineCapEvent>, HistoryError> {
                     // Latest cap per (account, model): a newer 429 always
-                    // supersedes an older reset for the same lane.
+                    // supersedes an older reset for the same lane. SQLite
+                    // reads the bare credit_driven from the row that supplied
+                    // MAX(reset_at_unix), so the flag belongs to the reset we
+                    // are actually restoring.
                     let mut statement = connection.prepare(
-                        "SELECT account_identifier, model, cap_at_ms, MAX(reset_at_unix) \
+                        "SELECT account_identifier, model, cap_at_ms, MAX(reset_at_unix), credit_driven \
                          FROM cline_cap_events WHERE reset_at_unix > ?1 GROUP BY account_identifier, model",
                     )?;
                     let rows = statement
@@ -1162,6 +1191,7 @@ fn worker_loop(
                                 model: row.get(1)?,
                                 cap_at_ms: row.get(2)?,
                                 reset_at_unix: row.get(3)?,
+                                credit_driven: row.get(4)?,
                             })
                         })?
                         .collect::<Result<Vec<_>, _>>()?;
@@ -2803,12 +2833,14 @@ mod extended_tests {
             model: "z-ai/glm-5.3-flash".to_string(),
             cap_at_ms: now_ms - 86_400_000,
             reset_at_unix: now_ms / 1000 - 3600,
+            credit_driven: false,
         };
         let live = ClineCapEvent {
             account_identifier: "cline-user-b@example".to_string(),
             model: "cline-free/deepseek-v4.1-flash".to_string(),
             cap_at_ms: now_ms - 1_000,
             reset_at_unix: now_ms / 1000 + 7_200,
+            credit_driven: true,
         };
         history.record_cline_cap(&expired).unwrap();
         history.record_cline_cap(&live).unwrap();
@@ -2839,6 +2871,7 @@ mod extended_tests {
             model: "z-ai/glm-5.3-flash".to_string(),
             cap_at_ms: unix_time_ms(),
             reset_at_unix: unix_time_ms() / 1000 + 60,
+            credit_driven: true,
         };
         history.record_cline_cap(&event).unwrap();
         assert_eq!(history.cline_caps(&[]).unwrap().len(), 1);
