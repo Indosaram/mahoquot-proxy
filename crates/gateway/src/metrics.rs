@@ -85,6 +85,8 @@ pub struct AccountStats {
     pub output_tokens: u64,
     pub total_tokens: u64,
     pub reset_at_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_routability: Option<std::collections::BTreeMap<String, bool>>,
     pub last_error: Option<LastError>,
     pub ttft: Option<TtftSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

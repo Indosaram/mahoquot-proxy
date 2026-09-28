@@ -79,14 +79,14 @@ async fn warmup_actual_http_validation_and_zero_hit_eligibility() {
                 let mode = mode.clone();
                 async move {
                     hits.fetch_add(1, Ordering::SeqCst);
-                    assert_eq!(body["model"], "z-ai/glm-5.3-flash");
+                    assert_eq!(body["model"], "cline-free/gemini-3.8-flash");
                     if mode.load(Ordering::SeqCst) == 6 {
                         return (axum::http::StatusCode::OK, [("content-type","text/event-stream")], "data: {\"choices\":[{\"delta\":{\"content\":\"x\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n");
                     }
                     (
                         axum::http::StatusCode::TOO_MANY_REQUESTS,
                         [("retry-after", "7200")],
-                        r#"{"error":{"code":"INFERENCE_CAP_ERROR","message":"Daily free limit reached on model z-ai/glm-5.3-flash. Try again in 2h 30m"}}"#,
+                        r#"{"error":{"code":"INFERENCE_CAP_ERROR","message":"Daily free limit reached on model cline-free/gemini-3.8-flash. Try again in 2h 30m"}}"#,
                     )
                 }
             }
@@ -225,7 +225,7 @@ async fn warmup_actual_http_validation_and_zero_hit_eligibility() {
             .effective_provider_policy("codex")
             .enabled
     );
-    std::fs::write(dir.join("generic-cline.json"),json!({"type":"generic","identity_slug":"cline-fixture","provider":"cline","adapter":"openai","base_url":base,"upstream_override":base,"api_key":"mock","models":["z-ai/glm-5.3-flash"]}).to_string()).unwrap();
+    std::fs::write(dir.join("generic-cline.json"),json!({"type":"generic","identity_slug":"cline-fixture","provider":"cline","adapter":"openai","base_url":base,"upstream_override":base,"api_key":"mock","models":["cline-free/gemini-3.8-flash"]}).to_string()).unwrap();
     state.rescan_pool().unwrap();
     let cline = state
         .pool
@@ -235,6 +235,19 @@ async fn warmup_actual_http_validation_and_zero_hit_eligibility() {
         .find(|m| m.provider_name() == "cline")
         .unwrap()
         .clone();
+    state
+        .settings
+        .mutate(|settings| {
+            settings.warmup.accounts.insert(
+                cline.id.clone(),
+                mahoquot_gateway::management::settings::WarmupAccountPolicy::Custom {
+                    model: Some("cline-free/gemini-3.8-flash".into()),
+                    idle_secs: 60,
+                    min_interval_secs: 60,
+                },
+            );
+        })
+        .unwrap();
     let first = warm_account(&state, &cline).await;
     println!("Cline429 {}", serde_json::to_string(&first).unwrap());
     assert_eq!(first.status, 429);
@@ -245,7 +258,7 @@ async fn warmup_actual_http_validation_and_zero_hit_eligibility() {
     assert_eq!(cline_hits.load(Ordering::SeqCst), 1);
     let usage = cline.usage_snapshot();
     let bucket = &usage.groups[0].buckets[0];
-    assert_eq!(bucket.bucket_id.as_deref(), Some("z-ai/glm-5.3-flash"));
+    assert_eq!(bucket.bucket_id.as_deref(), Some("cline-free/gemini-3.8-flash"));
     assert_eq!(bucket.used_percent, Some(100.0));
     assert_eq!(
         bucket.reset_at_unix.unwrap() - usage.observed_at_unix.unwrap(),

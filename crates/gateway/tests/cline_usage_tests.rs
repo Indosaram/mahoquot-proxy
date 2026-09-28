@@ -125,12 +125,12 @@ async fn cline_daily_budget_reports_usage_without_capping_the_account() {
     let temp_dir = unique_temp_dir("qgw-cline-usage-test");
     std::fs::write(
         temp_dir.join("generic-cline-a.json"),
-        cline_account(port_a, "[\"z-ai/glm-5.3-flash\"]"),
+        cline_account(port_a, "[\"cline-free/gemini-3.8-flash\"]"),
     )
     .unwrap();
     std::fs::write(
         temp_dir.join("generic-cline-b.json"),
-        cline_account(port_b, "[\"z-ai/glm-5.3-flash\"]"),
+        cline_account(port_b, "[\"cline-free/gemini-3.8-flash\"]"),
     )
     .unwrap();
 
@@ -167,7 +167,7 @@ async fn cline_daily_budget_reports_usage_without_capping_the_account() {
     let client = reqwest::Client::new();
     let gw_url = format!("http://127.0.0.1:{gw_port}/v1/chat/completions");
     let req = serde_json::json!({
-        "model": "z-ai/glm-5.3-flash",
+        "model": "cline-free/gemini-3.8-flash",
         "messages": [{"role": "user", "content": "hello"}],
         "stream": false
     });
@@ -203,7 +203,7 @@ async fn cline_daily_budget_reports_usage_without_capping_the_account() {
         .as_secs() as i64;
 
     let member_a = state.find_member("generic-cline-a").expect("member a");
-    let model = "z-ai/glm-5.3-flash";
+    let model = "cline-free/gemini-3.8-flash";
     assert!(
         member_a.group_available(model, now_unix),
         "an over-budget estimate must not bench the account: only upstream caps"
@@ -286,7 +286,7 @@ async fn cline_quota_bucket_surfaces_only_the_display_model() {
                 })
                 .unwrap_or_default();
             let tokens = match model.as_str() {
-                "z-ai/glm-5.3-flash" => 6_000_000,
+                "cline-free/gemini-3.8-flash" => 6_000_000,
                 "z-ai/glm-4.7" => 7_000_000,
                 _ => 2_000_000,
             };
@@ -313,7 +313,7 @@ async fn cline_quota_bucket_surfaces_only_the_display_model() {
         temp_dir.join("generic-cline-a.json"),
         cline_account(
             port,
-            "[\"z-ai/glm-5.3-flash\",\"z-ai/glm-4.7\",\"cline-free/deepseek-v4.1-flash\"]",
+            "[\"cline-free/gemini-3.8-flash\",\"z-ai/glm-4.7\",\"cline-free/deepseek-v4.1-flash\"]",
         ),
     )
     .unwrap();
@@ -351,7 +351,7 @@ async fn cline_quota_bucket_surfaces_only_the_display_model() {
     let client = reqwest::Client::new();
     let gw_url = format!("http://127.0.0.1:{gw_port}/v1/chat/completions");
     for model in [
-        "z-ai/glm-5.3-flash",
+        "cline-free/gemini-3.8-flash",
         "z-ai/glm-4.7",
         "cline-free/deepseek-v4.1-flash",
     ] {
@@ -389,11 +389,14 @@ async fn cline_quota_bucket_surfaces_only_the_display_model() {
         .collect();
     assert_eq!(
         ids,
-        vec!["z-ai/glm-5.3-flash", "cline-free/deepseek-v4.1-flash"],
-        "glm and deepseek render buckets; every other model stays hidden"
+        vec!["cline-free/gemini-3.8-flash", "cline-free/deepseek-v4.1-flash"],
+        "gemini and deepseek render buckets; every other model stays hidden"
     );
     let bucket = &group.buckets[0];
-    assert_eq!(bucket.display_name.as_deref(), Some("z-ai/glm-5.3-flash (Daily limit)"));
+    assert_eq!(
+        bucket.display_name.as_deref(),
+        Some("cline-free/gemini-3.8-flash (Daily limit)")
+    );
     let glm_used = bucket.used_percent.expect("live usage is reported");
     let deepseek = &group.buckets[1];
     assert_eq!(

@@ -687,6 +687,20 @@ impl AppState {
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
 
+        let cline_models = [
+            "cline-free/gemini-3.8-flash",
+            "cline-free/deepseek-v4.1-flash",
+        ];
+        let model_candidates: Vec<_> = cline_models
+            .iter()
+            .map(|model| {
+                (
+                    *model,
+                    crate::relay::eligible_account_ids_for_model(self, model, now_ms),
+                )
+            })
+            .collect();
+
         let accounts = self
             .pool
             .load()
@@ -740,6 +754,12 @@ impl AppState {
                     output_tokens,
                     total_tokens: input_tokens.saturating_add(output_tokens),
                     reset_at_unix_ms,
+                    model_routability: (m.provider_name() == "cline").then(|| {
+                        model_candidates
+                            .iter()
+                            .map(|(model, ids)| ((*model).to_string(), ids.contains(&m.id)))
+                            .collect()
+                    }),
                     last_error: self.monitor.last_error(&m.id),
                     ttft: self.monitor.account_ttft(&m.id),
                     usage: m.usage_snapshot(),
@@ -833,6 +853,7 @@ mod stats_tests {
             "adapter": "openai-chat",
             "base_url": "http://127.0.0.1:9",
             "api_key": "fixture-cline",
+            "models": ["cline-free/gemini-3.8-flash", "cline-free/deepseek-v4.1-flash"],
         })
         .to_string();
         std::fs::write(auth_dir.join("generic-cline.json"), credential).expect("write cline");
@@ -898,5 +919,52 @@ mod stats_tests {
             "an expired per-model deadline must not pin the cooldown badge"
         );
         assert_eq!(value["reset_at_unix_ms"], serde_json::json!(null));
+    }
+
+    #[test]
+    fn cline_stats_separate_estimated_usage_from_model_routing() {
+        let (state, member) = state_with_cline_account();
+        let now = now_ms();
+        crate::relay::record_cline_quota_bucket(
+            &member,
+            "cline-free/gemini-3.8-flash",
+            600,
+            now / 1000,
+            99.9,
+        );
+        let before = account_json(&state, &member.id);
+        assert_eq!(
+            before["model_routability"]["cline-free/gemini-3.8-flash"],
+            true
+        );
+        member.set_group_cooldown("cline-free/gemini-3.8-flash", now + 600_000);
+        let stats = account_json(&state, &member.id);
+        assert_eq!(
+            stats["model_routability"]["cline-free/gemini-3.8-flash"],
+            false
+        );
+        assert_eq!(
+            stats["model_routability"]["cline-free/deepseek-v4.1-flash"],
+            true
+        );
+
+        let (expired_state, expired_member) = state_with_cline_account();
+        expired_member.set_group_cooldown("cline-free/gemini-3.8-flash", now - 1_000);
+        let expired = account_json(&expired_state, &expired_member.id);
+        assert_eq!(
+            expired["model_routability"]["cline-free/gemini-3.8-flash"],
+            true
+        );
+
+        state.force_health(&member.id, Health::Disabled);
+        let disabled = account_json(&state, &member.id);
+        assert_eq!(
+            disabled["model_routability"]["cline-free/gemini-3.8-flash"],
+            false
+        );
+        assert_eq!(
+            disabled["model_routability"]["cline-free/deepseek-v4.1-flash"],
+            false
+        );
     }
 }

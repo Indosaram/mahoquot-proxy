@@ -2428,6 +2428,21 @@ fn eligible_indices(
     ranked.into_iter().map(|(index, _)| index).collect()
 }
 
+pub(crate) fn eligible_account_ids_for_model(
+    state: &AppState,
+    model: &str,
+    now_ms: i64,
+) -> Vec<String> {
+    let pool = state.pool.load_full();
+    let Ok(Some(route)) = resolve_route(&pool, Some(model), None) else {
+        return Vec::new();
+    };
+    eligible_indices(&pool, Some(&route), Some(model), now_ms, None, None, state)
+        .into_iter()
+        .filter_map(|index| pool.members.get(index).map(|member| member.id.clone()))
+        .collect()
+}
+
 fn select_index(
     state: &AppState,
     pool: &crate::state::PoolSnapshot,
