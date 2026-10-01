@@ -389,24 +389,6 @@ pub fn model_entries(providers: &[ProviderKind], env_override: Option<&str>) -> 
     entries
 }
 
-pub fn generic_model_entries(members: &[std::sync::Arc<AccountMember>]) -> Vec<ModelEntry> {
-    let mut entries = Vec::new();
-    for member in members {
-        let Some((provider, models)) = member.generic_models() else {
-            continue;
-        };
-        for id in models {
-            if !entries.iter().any(|entry: &ModelEntry| entry.id == id) {
-                entries.push(ModelEntry {
-                    id,
-                    owned_by: provider.clone(),
-                });
-            }
-        }
-    }
-    entries
-}
-
 pub fn models_payload(entries: &[ModelEntry], created_unix: i64) -> Value {
     // Static per-provider entries and per-account entries overlap by design
     // (several accounts may own the same model), and OpenAI clients treat a
@@ -434,7 +416,7 @@ pub fn models_payload(entries: &[ModelEntry], created_unix: i64) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::account::{AccountMember, GenericAccount, ProviderAccount};
+    use crate::account::{AccountMember, ProviderAccount};
     use crate::management::settings::Settings;
     use std::sync::Arc;
 
@@ -598,91 +580,6 @@ mod tests {
         assert_eq!(data[0]["owned_by"], "first-provider");
         assert_eq!(data[1]["id"], "other-model");
         assert_eq!(data[1]["owned_by"], "second-provider");
-    }
-
-    #[test]
-    fn characterization_generic_model_entries_empty_and_non_empty() {
-        // Generic account with empty models produces NO model entries
-        let empty_generic = Arc::new(AccountMember::for_test(ProviderAccount::Generic(
-            GenericAccount {
-                identity_slug: "slug-empty".to_string(),
-                provider: "custom-empty".to_string(),
-                label: "Custom Empty".to_string(),
-                email: String::new(),
-                adapter: "openai-chat".to_string(),
-                base_url: "https://api.empty.com/v1".to_string(),
-                api_key: "k1".to_string(),
-                auth_mode: "key".to_string(),
-                refresh_token: String::new(),
-                expired: String::new(),
-                token_url: String::new(),
-                client_id: String::new(),
-                project_id: String::new(),
-                models: vec![],
-                static_headers: Default::default(),
-                disabled: false,
-            },
-        )));
-        assert!(generic_model_entries(std::slice::from_ref(&empty_generic)).is_empty());
-
-        // Generic account with declared models exposes each model with account's provider
-        let populated_generic = Arc::new(AccountMember::for_test(ProviderAccount::Generic(
-            GenericAccount {
-                identity_slug: "slug-pop".to_string(),
-                provider: "custom-provider-a".to_string(),
-                label: "Custom A".to_string(),
-                email: String::new(),
-                adapter: "openai-chat".to_string(),
-                base_url: "https://api.a.com/v1".to_string(),
-                api_key: "k2".to_string(),
-                auth_mode: "key".to_string(),
-                refresh_token: String::new(),
-                expired: String::new(),
-                token_url: String::new(),
-                client_id: String::new(),
-                project_id: String::new(),
-                models: vec!["model-alpha".to_string(), "model-beta".to_string()],
-                static_headers: Default::default(),
-                disabled: false,
-            },
-        )));
-        let entries = generic_model_entries(std::slice::from_ref(&populated_generic));
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].id, "model-alpha");
-        assert_eq!(entries[0].owned_by, "custom-provider-a");
-        assert_eq!(entries[1].id, "model-beta");
-        assert_eq!(entries[1].owned_by, "custom-provider-a");
-
-        // Multiple generic accounts deduplicate across accounts (first account wins)
-        let overlapping_generic = Arc::new(AccountMember::for_test(ProviderAccount::Generic(
-            GenericAccount {
-                identity_slug: "slug-overlap".to_string(),
-                provider: "custom-provider-b".to_string(),
-                label: "Custom B".to_string(),
-                email: String::new(),
-                adapter: "openai-chat".to_string(),
-                base_url: "https://api.b.com/v1".to_string(),
-                api_key: "k3".to_string(),
-                auth_mode: "key".to_string(),
-                refresh_token: String::new(),
-                expired: String::new(),
-                token_url: String::new(),
-                client_id: String::new(),
-                project_id: String::new(),
-                models: vec!["model-alpha".to_string(), "model-gamma".to_string()],
-                static_headers: Default::default(),
-                disabled: false,
-            },
-        )));
-        let multi_entries =
-            generic_model_entries(&[empty_generic, populated_generic, overlapping_generic]);
-        assert_eq!(multi_entries.len(), 3);
-        assert_eq!(multi_entries[0].id, "model-alpha");
-        assert_eq!(multi_entries[0].owned_by, "custom-provider-a");
-        assert_eq!(multi_entries[1].id, "model-beta");
-        assert_eq!(multi_entries[1].owned_by, "custom-provider-a");
-        assert_eq!(multi_entries[2].id, "model-gamma");
-        assert_eq!(multi_entries[2].owned_by, "custom-provider-b");
     }
 
     #[test]

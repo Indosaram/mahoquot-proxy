@@ -220,7 +220,7 @@ impl StreamCapture {
             let record = OutcomeRecord {
                 event_id: &outcome.event_id,
                 occurred_at_ms: outcome.occurred_at_ms,
-                provider: &outcome.provider,
+                provider: outcome.provider.clone(),
                 account: Some(outcome.member.id()),
                 model: outcome.model.as_deref(),
                 key_identifier: outcome.key_identifier.as_deref(),
@@ -314,7 +314,7 @@ impl futures::Stream for CountedStream {
 struct OutcomeRecord<'a> {
     event_id: &'a str,
     occurred_at_ms: i64,
-    provider: &'a str,
+    provider: String,
     account: Option<&'a str>,
     model: Option<&'a str>,
     key_identifier: Option<&'a str>,
@@ -346,7 +346,7 @@ async fn record_request_outcome(state: &AppState, record: OutcomeRecord<'_>) {
         event_id: record.event_id.to_string(),
         occurred_at_ms: record.occurred_at_ms,
         account_identifier: record.account.unwrap_or("unknown").to_string(),
-        provider: record.provider.to_string(),
+        provider: record.provider.clone(),
         model: record.model.unwrap_or("unknown").to_string(),
         key_identifier: record.key_identifier.map(ToString::to_string),
         session_identifier: record.session.map(ToString::to_string),
@@ -364,11 +364,11 @@ async fn record_request_outcome(state: &AppState, record: OutcomeRecord<'_>) {
     });
     state
         .telemetry
-        .record_with_account(timestamp, record.provider, record.account, record.success);
+        .record_with_account(timestamp, &record.provider, record.account, record.success);
     if let (Some(account), Some(token_usage)) = (record.account, record.token_usage) {
         state.telemetry.record_tokens(
             timestamp,
-            record.provider,
+            &record.provider,
             account,
             token_usage.input_tokens,
             token_usage.output_tokens,
@@ -377,7 +377,7 @@ async fn record_request_outcome(state: &AppState, record: OutcomeRecord<'_>) {
     let line = serde_json::json!({
         "kind": "request",
         "timestamp": timestamp,
-        "provider": record.provider,
+        "provider": record.provider.as_str(),
         "account": record.account,
         "model": record.model.unwrap_or(""),
         "status": record.status,
@@ -3589,7 +3589,7 @@ pub async fn handle_relay(
     // Attribution follows the last account we ATTEMPTED, not the last one that
     // happened to answer with a buffered HTTP failure: transport and
     // proactive-refresh failures end an attempt without an HTTP response.
-    let mut last_attempted: Option<(&'static str, String)> = None;
+    let mut last_attempted: Option<(String, String)> = None;
     let affinity = affinity_key(headers)
         .or_else(|| body_affinity_key(plan.original_body.as_ref()))
         .or_else(|| body_prefix_affinity_key(plan.original_body.as_ref()));
@@ -3644,7 +3644,7 @@ pub async fn handle_relay(
         };
         let activity = member.begin_activity();
         attempted.push(chosen_idx);
-        last_attempted = Some((member.kind().as_str(), member.id().to_string()));
+        last_attempted = Some((member.provider_name(), member.id().to_string()));
 
         let mut refreshed_this_account = false;
         let now_unix = SystemTime::now()
@@ -3828,7 +3828,7 @@ pub async fn handle_relay(
                                     OutcomeRecord {
                                         event_id: &event_id,
                                         occurred_at_ms,
-                                        provider: member.kind().as_str(),
+                                        provider: member.provider_name(),
                                         account: Some(member.id()),
                                         model: plan.model.as_deref(),
                                         key_identifier: key_identifier.as_deref(),
@@ -3866,7 +3866,7 @@ pub async fn handle_relay(
                             OutcomeRecord {
                                 event_id: &event_id,
                                 occurred_at_ms,
-                                provider: member.kind().as_str(),
+                                provider: member.provider_name(),
                                 account: Some(member.id()),
                                 model: plan.model.as_deref(),
                                 key_identifier: key_identifier.as_deref(),
@@ -3892,7 +3892,7 @@ pub async fn handle_relay(
                         credential_token,
                         event_id: event_id.clone(),
                         occurred_at_ms,
-                        provider: member.kind().as_str().to_string(),
+                        provider: member.provider_name(),
                         model: plan.model.clone(),
                         key_identifier: key_identifier.clone(),
                         session: session.clone(),
@@ -4118,7 +4118,7 @@ pub async fn handle_relay(
             OutcomeRecord {
                 event_id: &event_id,
                 occurred_at_ms,
-                provider: member.kind().as_str(),
+                provider: member.provider_name(),
                 account: Some(member.id()),
                 model: plan.model.as_deref(),
                 key_identifier: key_identifier.as_deref(),
@@ -4179,7 +4179,9 @@ pub async fn handle_relay(
         OutcomeRecord {
             event_id: &event_id,
             occurred_at_ms,
-            provider: failure_provider.unwrap_or("unknown"),
+            provider: failure_provider
+                .map(|provider| provider.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
             account: failure_account.as_deref(),
             model: plan.model.as_deref(),
             key_identifier: key_identifier.as_deref(),

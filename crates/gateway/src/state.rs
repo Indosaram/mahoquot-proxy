@@ -687,15 +687,26 @@ impl AppState {
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
 
-        let cline_models = [
-            "cline-free/gemini-3.8-flash",
-            "cline-free/deepseek-v4.1-flash",
-        ];
-        let model_candidates: Vec<_> = cline_models
+        // Routability mirrors what the relay would do, per account, over the
+        // models that account can serve. Candidates are the models generic
+        // accounts declare (deduplicated) — data-driven, so a provider adding
+        // or retiring models needs no edit here. Non-generic providers (codex,
+        // antigravity, ...) keep their own discovery surfaces.
+        let mut candidate_models: Vec<String> = Vec::new();
+        for member in self.pool.load().members.iter() {
+            if let Some((_, declared)) = member.generic_models() {
+                for model in declared {
+                    if !candidate_models.contains(&model) {
+                        candidate_models.push(model);
+                    }
+                }
+            }
+        }
+        let model_candidates: Vec<_> = candidate_models
             .iter()
             .map(|model| {
                 (
-                    *model,
+                    model.as_str(),
                     crate::relay::eligible_account_ids_for_model(self, model, now_ms),
                 )
             })
@@ -754,9 +765,12 @@ impl AppState {
                     output_tokens,
                     total_tokens: input_tokens.saturating_add(output_tokens),
                     reset_at_unix_ms,
-                    model_routability: (m.provider_name() == "cline").then(|| {
+                    model_routability: m.generic_models().map(|(_, declared)| {
                         model_candidates
                             .iter()
+                            .filter(|(model, _)| {
+                                declared.is_empty() || declared.iter().any(|id| id.as_str() == *model)
+                            })
                             .map(|(model, ids)| ((*model).to_string(), ids.contains(&m.id)))
                             .collect()
                     }),
@@ -966,5 +980,63 @@ mod stats_tests {
             disabled["model_routability"]["cline-free/deepseek-v4.1-flash"],
             false
         );
+    }
+
+    #[test]
+    fn a_non_cline_generic_account_reports_routability_for_its_declared_models() {
+        let auth_dir = std::env::temp_dir().join(format!(
+            "mahoquot-stats-zhipu-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&auth_dir).expect("create auth dir");
+        let credential = serde_json::json!({
+            "type": "generic",
+            "identity_slug": "zhipu-coding",
+            "provider": "zhipu-bigmodel-coding",
+            "label": "Zhipu",
+            "adapter": "openai-chat",
+            "base_url": "http://127.0.0.1:9",
+            "api_key": "fixture-zhipu",
+            "models": ["glm-5.3", "glm-5.3-flash"],
+        })
+        .to_string();
+        std::fs::write(auth_dir.join("generic-zhipu.json"), credential).expect("write zhipu");
+        let config = crate::config::GatewayConfig {
+            auth_dir: auth_dir.clone(),
+            config_path: auth_dir.join("config.yaml"),
+            auth_refresh_enabled: false,
+            ..crate::config::GatewayConfig::default()
+        };
+        let state = Arc::new(AppState::new(&config).expect("state"));
+        let member = state.pool.load_full().members[0].clone();
+
+        let value = account_json(&state, &member.id);
+        assert_eq!(
+            value["model_routability"]["glm-5.3"], true,
+            "a healthy account must report its declared models routable"
+        );
+        assert_eq!(value["model_routability"]["glm-5.3-flash"], true);
+
+        // Providers without a quota-group split bench per model through the
+        // upstream unsupported-models feedback path, not group cooldowns.
+        member.mark_model_unsupported("glm-5.3-flash");
+        let value = account_json(&state, &member.id);
+        assert_eq!(
+            value["model_routability"]["glm-5.3-flash"], false,
+            "an upstream-unsupported model must show up as unroutable"
+        );
+        assert_eq!(
+            value["model_routability"]["glm-5.3"], true,
+            "the sibling model must stay routable — per-model, not account-wide"
+        );
+
+        state.force_health(&member.id, Health::Disabled);
+        let value = account_json(&state, &member.id);
+        assert_eq!(
+            value["model_routability"]["glm-5.3"], false,
+            "account-wide health must dominate every per-model entry"
+        );
+        assert_eq!(value["model_routability"]["glm-5.3-flash"], false);
     }
 }

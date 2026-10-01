@@ -283,18 +283,34 @@ fn registry_with_account_contributions(
         let provider_id = ProviderId::canonical(provider_name)?;
         match effective.providers.get(&provider_id) {
             Some(ProviderPolicy::Closed) => {
+                // A closed provider owns its catalog models: an account's model
+                // list cannot extend them. Skip unclaimed ids with a warning
+                // instead of failing the whole composition — one stale
+                // declaration must not unload every other provider from the
+                // pool. Authorized models are already bound in the catalog, so
+                // nothing needs to be added here.
                 for model in &models {
-                    let model_id = ModelId::new(model)?;
+                    let model_id = match ModelId::new(model) {
+                        Ok(model_id) => model_id,
+                        Err(err) => {
+                            tracing::warn!(
+                                provider = %provider_id,
+                                model = %model,
+                                "skipping unparseable generic model declaration: {err}"
+                            );
+                            continue;
+                        }
+                    };
                     let is_authorized = effective
                         .models
                         .get(&model_id)
                         .is_some_and(|desc| desc.bindings.contains_key(&provider_id));
                     if !is_authorized {
-                        return Err(RegistryError::UnauthorizedContribution {
-                            provider_id,
-                            policy: ProviderPolicy::Closed,
-                            model_id,
-                        });
+                        tracing::warn!(
+                            provider = %provider_id,
+                            model = %model_id,
+                            "generic declaration ignored: the model belongs to a closed provider"
+                        );
                     }
                 }
                 continue;
@@ -713,5 +729,70 @@ impl UnifiedRuntimeState {
                     )
                 }
             })
+    }
+}
+
+
+#[cfg(test)]
+mod closed_contribution_tests {
+    use super::*;
+    use crate::account::{AccountMember, GenericAccount, ProviderAccount};
+
+    fn generic_member(provider: &str, models: &[&str]) -> Arc<AccountMember> {
+        Arc::new(AccountMember::for_test(ProviderAccount::Generic(GenericAccount {
+            identity_slug: format!("slug-{provider}"),
+            provider: provider.to_string(),
+            label: provider.to_string(),
+            email: String::new(),
+            adapter: "openai-chat".to_string(),
+            base_url: "http://127.0.0.1:9".to_string(),
+            api_key: "fixture".to_string(),
+            auth_mode: "key".to_string(),
+            refresh_token: String::new(),
+            expired: String::new(),
+            token_url: String::new(),
+            client_id: String::new(),
+            project_id: String::new(),
+            models: models.iter().map(|m| m.to_string()).collect(),
+            static_headers: Default::default(),
+            disabled: false,
+        })))
+    }
+
+    #[test]
+    fn a_closed_provider_declaration_skips_unclaimed_models_instead_of_failing() {
+        let members = vec![generic_member("zcode", &["glm-5.3", "brand-new-glm"])];
+        let composition = compute_candidate_composition(
+            1,
+            members,
+            std::sync::Arc::new(mahoquot_registry::embedded_snapshot().clone()),
+            None,
+        )
+        .expect("an unauthorized declaration must not unload the pool");
+
+        // The catalog-authorized model keeps its closed binding untouched.
+        let glm = ModelId::new("glm-5.3").unwrap();
+        assert!(composition
+            .registry
+            .models()
+            .get(&glm)
+            .is_some_and(|desc| desc.bindings.contains_key(&ProviderId::zcode())));
+
+        // The unclaimed declaration is skipped, not fatal.
+        assert!(!composition
+            .registry
+            .models()
+            .contains_key(&ModelId::new("brand-new-glm").unwrap()));
+
+        // The member still advertises the authorized model for routing.
+        let entries = crate::models_route::project_model_entries(
+            &composition.registry,
+            &composition.members,
+        );
+        assert!(
+            entries.iter().any(|entry| entry.id == "glm-5.3"),
+            "the authorized model must stay routable after the skip"
+        );
+        assert!(!entries.iter().any(|entry| entry.id == "brand-new-glm"));
     }
 }
