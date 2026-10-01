@@ -3555,6 +3555,18 @@
       "metadata": {
         "context_limit": "1048576"
       }
+    },
+    "cline-free/mimo-v2.6-flash": {
+      "id": "cline-free/mimo-v2.6-flash",
+      "owned_by": "xiaomi",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1048576"
+      }
     }
   },
   "providers": {
