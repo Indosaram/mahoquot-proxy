@@ -54,6 +54,7 @@ fn runtime_maintenance_prunes_expired_records_at_exact_clock_trigger() {
             cached_input_tokens_known: false, cache_write_tokens: 0,
             cache_write_tokens_known: false,
             reasoning_tokens: 0, total_tokens: 2, latency_ms: 1,
+            fast: false,
         }).unwrap();
     }
     clock.store(now + 59_999, Ordering::SeqCst);
@@ -94,6 +95,7 @@ fn runtime_maintenance_enforces_configured_size_cap_without_retention() {
             cached_input_tokens: 0, cached_input_tokens_known: false,
             cache_write_tokens: 0, cache_write_tokens_known: false,
             reasoning_tokens: 0, total_tokens: 2, latency_ms: 1,
+            fast: false,
         }).unwrap();
     }
     assert_eq!(store.totals().unwrap().requests, 10);
@@ -339,6 +341,7 @@ async fn full_channel_is_nonblocking() {
             reasoning_tokens: 0,
             total_tokens: 2,
             latency_ms: 1,
+            fast: false,
         });
     }
     let elapsed = started.elapsed();
@@ -436,6 +439,7 @@ async fn cancelled_clear_preserves_rows() {
         reasoning_tokens: 0,
         total_tokens: 2,
         latency_ms: 1,
+        fast: false,
     });
     fixture.state.history.flush().expect("flush clear sentinel");
 
@@ -487,6 +491,7 @@ async fn confirmed_filtered_clear_deletes_only_the_selected_scope() {
             reasoning_tokens: 0,
             total_tokens: 2,
             latency_ms: 1,
+            fast: false,
         });
     }
     fixture.state.history.flush().expect("flush clear fixtures");
@@ -588,6 +593,7 @@ fn enqueue_event(
         reasoning_tokens: index % 7,
         total_tokens: 120 + index * 2,
         latency_ms: 50 + index,
+        fast: false,
     });
 }
 
@@ -1027,6 +1033,7 @@ async fn one_invalid_event_does_not_discard_the_valid_events_in_its_batch() {
         reasoning_tokens: 0,
         total_tokens: 2,
         latency_ms: 1,
+        fast: false,
     };
 
     fixture.state.history.enqueue(make("k1", "batch-good-1".to_string()));
@@ -1082,6 +1089,7 @@ async fn export_is_bounded_instead_of_returning_every_row() {
             reasoning_tokens: 0,
             total_tokens: 2,
             latency_ms: 1,
+            fast: false,
         });
         if index % 200 == 0 {
             fixture.state.history.flush().expect("flush ingest worker");
@@ -1139,6 +1147,7 @@ async fn session_identifier_round_trips_through_store_and_management_wire() {
         reasoning_tokens: 0,
         total_tokens: 2,
         latency_ms: 1,
+        fast: false,
     };
     assert!(fixture.state.history.enqueue(labeled.clone()));
     let mut unlabeled = labeled.clone();

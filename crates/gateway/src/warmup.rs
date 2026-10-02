@@ -213,6 +213,32 @@ pub fn is_quota_window_active(m: &AccountMember, model: &str, now_unix: i64) -> 
         }
     }
 }
+fn codex_display_window_active(
+    usage: &crate::usage::AccountUsage,
+    now_unix: i64,
+) -> (bool, Option<i64>) {
+    // Codex can return an untouched window with a fresh full-length reset on
+    // every poll. A future reset alone is not evidence that the window began.
+    let window = [&usage.primary, &usage.secondary]
+        .into_iter()
+        .find(|w| w.window_minutes.is_some_and(|minutes| minutes == 5 * 60));
+    let Some(window) = window else {
+        return (false, None);
+    };
+    let (Some(window_minutes), Some(reset_after_seconds), Some(reset_at)) = (
+        window.window_minutes,
+        window.reset_after_seconds,
+        window.reset_at_unix,
+    ) else {
+        return (false, None);
+    };
+    let full_window_seconds = window_minutes.saturating_mul(60);
+    if reset_at > now_unix && reset_after_seconds < full_window_seconds {
+        (true, Some(reset_at))
+    } else {
+        (false, None)
+    }
+}
 pub fn resolve_window_state(
     state: &AppState,
     m: &AccountMember,
@@ -674,7 +700,13 @@ pub fn status(state: &AppState) -> Value {
         let models = available_models(state, m);
         let model = p.model.as_ref().or_else(|| models.first());
         let (window_active, reset_at) = model
-            .map(|m_name| resolve_window_state(state, m, m_name, current_now))
+            .map(|m_name| {
+                if m.provider_name() == "codex" {
+                    codex_display_window_active(&m.usage_snapshot(), current_now)
+                } else {
+                    resolve_window_state(state, m, m_name, current_now)
+                }
+            })
             .unwrap_or((false, None));
         let skip = if !supported(m) {
             Some("unsupported")
@@ -730,6 +762,54 @@ pub fn status(state: &AppState) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn codex_display_requires_evidence_of_a_started_five_hour_window() {
+        let now = 1_800_000_000;
+        let moving_full_window = crate::usage::QuotaWindow {
+            used_percent: Some(0.0),
+            window_minutes: Some(300),
+            reset_after_seconds: Some(18_000),
+            reset_at_unix: Some(now + 18_000),
+            ..Default::default()
+        };
+        assert_eq!(
+            codex_display_window_active(
+                &crate::usage::AccountUsage {
+                    primary: moving_full_window,
+                    ..Default::default()
+                },
+                now,
+            ),
+            (false, None)
+        );
+
+        let weekly_only = crate::usage::AccountUsage {
+            primary: crate::usage::QuotaWindow {
+                used_percent: Some(25.0),
+                window_minutes: Some(10_080),
+                reset_after_seconds: Some(604_800),
+                reset_at_unix: Some(now + 604_800),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(codex_display_window_active(&weekly_only, now), (false, None));
+
+        let active_five_hour = crate::usage::AccountUsage {
+            primary: crate::usage::QuotaWindow {
+                used_percent: Some(0.0),
+                window_minutes: Some(300),
+                reset_after_seconds: Some(17_999),
+                reset_at_unix: Some(now + 17_999),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            codex_display_window_active(&active_five_hour, now),
+            (true, Some(now + 17_999))
+        );
+    }
     #[test]
     fn codex_warmup_omits_parameters_the_upstream_rejects() {
         let member =

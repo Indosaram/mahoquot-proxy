@@ -184,6 +184,7 @@ fn event_json(event: &crate::request_history::HistoryEventRow) -> Value {
         "key-label": event.key_identifier,
         "status": event.status_code,
         "succeeded": event.succeeded,
+        "fast": event.fast,
         "input-tokens": event.input_tokens,
         "output-tokens": event.output_tokens,
         "cached-input-tokens": event.cached_input_tokens,

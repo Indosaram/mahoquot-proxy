@@ -153,6 +153,10 @@ pub struct UsageEvent {
     pub cache_write_tokens_known: bool,
     #[serde(rename = "cache-write-tokens", default)]
     pub cache_write_tokens: u64,
+    /// Set when the request left for the upstream carrying the priority service
+    /// tier. Additive: rows written before the column existed read back false.
+    #[serde(default)]
+    pub fast: bool,
     pub reasoning_tokens: u64,
     pub total_tokens: u64,
     pub latency_ms: u64,
@@ -253,6 +257,10 @@ pub struct HistoryEventRow {
     pub cache_write_tokens_known: bool,
     #[serde(rename = "cache-write-tokens", default)]
     pub cache_write_tokens: u64,
+    /// Set when the request left for the upstream carrying the priority service
+    /// tier. Additive: rows written before the column existed read back false.
+    #[serde(default)]
+    pub fast: bool,
     pub reasoning_tokens: u64,
     pub total_tokens: u64,
     pub latency_ms: u64,
@@ -986,6 +994,11 @@ pub fn init_schema(conn: &Connection) {
         [],
     )
     .ok();
+    conn.execute(
+        "ALTER TABLE usage_events ADD COLUMN fast INTEGER NOT NULL DEFAULT 0;",
+        [],
+    )
+    .ok();
 }
 
 /// Add the columns added after their table's own migration ran.
@@ -1277,9 +1290,9 @@ fn insert_event(connection: &Connection, event: &UsageEvent) -> Result<bool, His
             status_code, succeeded, input_tokens, output_tokens, cached_input_tokens,
             reasoning_tokens, total_tokens, latency_ms, created_at_ms,
             estimated_cost_usd, price_version, cache_write_tokens,
-            cached_input_tokens_known, cache_write_tokens_known, session_identifier
+            cached_input_tokens_known, cache_write_tokens_known, session_identifier, fast
          ) VALUES (
-            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22
          )",
         params![
             event.event_id,
@@ -1303,6 +1316,7 @@ fn insert_event(connection: &Connection, event: &UsageEvent) -> Result<bool, His
             event.cached_input_tokens_known,
             event.cache_write_tokens_known,
             event.session_identifier,
+            i64::from(event.fast),
         ],
     )?;
     Ok(changed == 1)
@@ -1327,7 +1341,7 @@ const EVENT_SELECT: &str =
          e.key_identifier, e.status_code, e.succeeded, e.input_tokens, e.output_tokens, \
          e.cached_input_tokens, e.reasoning_tokens, e.total_tokens, e.latency_ms, \
          e.estimated_cost_usd, e.price_version, e.cache_write_tokens, \
-         e.cached_input_tokens_known, e.cache_write_tokens_known, e.session_identifier \
+         e.cached_input_tokens_known, e.cache_write_tokens_known, e.session_identifier, e.fast \
          FROM usage_events e";
 
 fn read_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryEventRow> {
@@ -1353,6 +1367,7 @@ fn read_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryEventRow> 
         cached_input_tokens_known: row.get(18)?,
         cache_write_tokens_known: row.get(19)?,
         session_identifier: row.get(20)?,
+        fast: row.get::<_, i64>(21)? != 0,
     })
 }
 
@@ -2104,6 +2119,7 @@ pub mod tests {
             reasoning_tokens: fixture.output_tokens / 2,
             total_tokens: fixture.input_tokens + fixture.output_tokens,
             latency_ms: 125,
+            fast: false,
         }
     }
 
@@ -2781,6 +2797,7 @@ mod extended_tests {
             reasoning_tokens: 0,
             total_tokens: 150,
             latency_ms: 200,
+            fast: false,
         };
         let event_json = serde_json::to_string(&event).unwrap();
         assert!(event_json.contains("\"cache-write-tokens\":30"));
@@ -2809,6 +2826,7 @@ mod extended_tests {
             latency_ms: 200,
             estimated_cost_usd: 0.001,
             price_version: None,
+            fast: false,
         };
         let row_json = serde_json::to_string(&row).unwrap();
         assert!(row_json.contains("\"cache-write-tokens\":30"));

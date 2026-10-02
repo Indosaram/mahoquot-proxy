@@ -178,7 +178,7 @@ pub fn retain_redeem_request_id(existing: &str, generated: &str) -> String {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum QuotaError {
     Unsupported,
     Unauthorized,
@@ -235,10 +235,16 @@ pub async fn refresh_account_usage(
                 &member.id,
                 now_unix() + USAGE_RATE_LIMIT_BACKOFF_SECS,
             );
+            member.record_quota_refresh_failure_with_status("Rate limited (429)", "rate_limited");
             tracing::debug!(account = %member.id, "usage poll rate limited; backing off");
             Ok(())
         }
-        Err(error) => Err(error),
+        Err(error) => {
+            if error != QuotaError::Unsupported {
+                member.record_quota_refresh_failure(&error.to_string());
+            }
+            Err(error)
+        }
     }
 }
 
@@ -858,8 +864,8 @@ async fn refresh_codex_usage(
         .await
         .map_err(|e| QuotaError::Upstream(e.to_string()))?;
     let status = resp.status();
-    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        return Err(QuotaError::Unauthorized);
+    if let Some(error) = codex_usage_status_error(status) {
+        return Err(error);
     }
     if !status.is_success() {
         return Err(QuotaError::Upstream(format!("usage http {status}")));
@@ -870,6 +876,9 @@ async fn refresh_codex_usage(
         .map_err(|e| QuotaError::Upstream(e.to_string()))?;
     let now = now_unix();
     let mut usage = parsed.into_account_usage(now);
+    usage.refreshed_at_unix = Some(now);
+    usage.refresh_status = Some("ok".to_string());
+    usage.last_refresh_error = None;
     if usage.reset_credits_available.unwrap_or(0) > 0 {
         // Enrichment only: an account with credits still has a valid quota
         // snapshot when the expiry endpoint is unreachable, so a failure here
@@ -880,6 +889,16 @@ async fn refresh_codex_usage(
     }
     member.set_usage(usage);
     Ok(())
+}
+
+fn codex_usage_status_error(status: reqwest::StatusCode) -> Option<QuotaError> {
+    match status {
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
+            Some(QuotaError::Unauthorized)
+        }
+        reqwest::StatusCode::TOO_MANY_REQUESTS => Some(QuotaError::RateLimited),
+        _ => None,
+    }
 }
 
 /// Read each banked reset credit's grant and expiry.
@@ -1134,6 +1153,14 @@ mod tests {
         assert_eq!(a.as_bytes()[14], b'4');
         assert!(matches!(a.as_bytes()[19], b'8' | b'9' | b'a' | b'b'));
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn codex_usage_429_is_rate_limited() {
+        assert!(matches!(
+            codex_usage_status_error(reqwest::StatusCode::TOO_MANY_REQUESTS),
+            Some(QuotaError::RateLimited)
+        ));
     }
 
     #[test]

@@ -81,6 +81,7 @@ struct StreamedOutcome {
     status: u16,
     started: std::time::Instant,
     bytes_in: usize,
+    fast: bool,
 }
 
 /// Shared state of a counting body: byte counter, bounded head/tail windows
@@ -232,6 +233,7 @@ impl StreamCapture {
                 bytes_in: outcome.bytes_in,
                 bytes_out,
                 tokens,
+                fast: outcome.fast,
                 token_usage,
             };
             record_request_outcome(&state, record).await;
@@ -326,11 +328,19 @@ struct OutcomeRecord<'a> {
     bytes_in: usize,
     bytes_out: u64,
     tokens: Option<u64>,
+    /// Whether this request left for the upstream carrying the priority service
+    /// tier, i.e. whether the caller's fast-mode switch applied to it.
+    fast: bool,
     token_usage: Option<crate::usage::ResponseTokenUsage>,
 }
 
 async fn record_request_outcome(state: &AppState, record: OutcomeRecord<'_>) {
     let timestamp = now_unix_secs();
+    // The tier is injected into the codex wire document, which only a codex
+    // member sends: the OpenAI-chat, Antigravity, Claude, and Devin adapters
+    // re-derive their own body from the caller's original, so a plan the
+    // injector rewrote is not by itself proof that the request left fast.
+    let fast = record.fast && record.provider == "codex";
     let token_usage = record.token_usage.unwrap_or_default();
     let total_tokens = token_usage.total_tokens();
     if total_tokens > 0 {
@@ -361,6 +371,7 @@ async fn record_request_outcome(state: &AppState, record: OutcomeRecord<'_>) {
         reasoning_tokens: token_usage.reasoning_tokens,
         total_tokens: token_usage.total_tokens(),
         latency_ms: record.elapsed_ms,
+        fast,
     });
     state
         .telemetry
@@ -374,7 +385,7 @@ async fn record_request_outcome(state: &AppState, record: OutcomeRecord<'_>) {
             token_usage.output_tokens,
         );
     }
-    let line = serde_json::json!({
+    let mut entry = serde_json::json!({
         "kind": "request",
         "timestamp": timestamp,
         "provider": record.provider.as_str(),
@@ -386,8 +397,14 @@ async fn record_request_outcome(state: &AppState, record: OutcomeRecord<'_>) {
         "bytes-in": record.bytes_in,
         "bytes-out": record.bytes_out,
         "tokens": record.tokens,
-    })
-    .to_string();
+    });
+    // In observed test samples the upstream echoed `auto`/`default`, so this marker
+    // records that the request left carrying the fast/priority tier (pre-response
+    // request configuration, not served-tier proof).
+    if fast {
+        entry["fast"] = serde_json::Value::Bool(true);
+    }
+    let line = entry.to_string();
     // The live tail is always fed; file persistence is the only gated part.
     state.log_tail.push(line.clone());
     track_cline_daily_usage(state, &record, timestamp);
@@ -2133,6 +2150,38 @@ fn build_plan(
     }
 }
 
+/// Proxy-wide ChatGPT fast mode.
+///
+/// Injected here rather than inside the compatibility translators: the native
+/// `/v1/responses` passthrough assembles no body of its own, and the translated
+/// chat-completions and Anthropic paths deliberately rebuild the upstream
+/// document from an allow list, which is why a client-sent tier never survives
+/// them. Both land on `CODEX_PATH`, so one post-build step covers every
+/// codex-bound request.
+///
+/// Only the Responses surface accepts this field — `/responses/compact` and
+/// `/alpha/search` are different upstream paths and stay untouched.
+fn apply_codex_fast_mode(plan: &mut RelayPlan) -> bool {
+    if plan.upstream_path != compat::CODEX_PATH {
+        return false;
+    }
+    let Ok(mut document) = serde_json::from_slice::<serde_json::Value>(&plan.body) else {
+        return false;
+    };
+    let Some(object) = document.as_object_mut() else {
+        return false;
+    };
+    object.insert(
+        "service_tier".to_string(),
+        serde_json::Value::String("priority".to_string()),
+    );
+    let Ok(encoded) = serde_json::to_vec(&document) else {
+        return false;
+    };
+    plan.body = Bytes::from(encoded);
+    true
+}
+
 fn reply_shape(mode: RelayMode) -> compat::ReplyShape {
     match mode {
         RelayMode::GeminiNative => compat::ReplyShape::Gemini,
@@ -2561,7 +2610,7 @@ fn capture_usage(member: &AccountMember, headers: &HeaderMap) {
         _ => parse_codex_headers(&map, now),
     };
     if usage.observed_at_unix.is_some() {
-        member.set_usage(usage);
+        member.update_usage_from_headers(usage);
     }
 }
 
@@ -3508,10 +3557,11 @@ pub async fn handle_relay(
     let created = now_ms / 1000;
 
     let prompt_cache_key = prompt_cache_key_for(headers, body_bytes.as_ref());
-    let plan = match build_plan(mode, req_path, body_bytes, prompt_cache_key.as_deref()) {
+    let mut plan = match build_plan(mode, req_path, body_bytes, prompt_cache_key.as_deref()) {
         Ok(plan) => plan,
         Err(message) => return json_error(StatusCode::BAD_REQUEST, &message),
     };
+    let fast = state.settings.current().codex_fast_mode && apply_codex_fast_mode(&mut plan);
 
     // 2. Model check: if scoped key restricts allowed_models, enforce whitelist.
     if let Some(ref scoped) = scoped_key {
@@ -3840,6 +3890,7 @@ pub async fn handle_relay(
                                         bytes_in,
                                         bytes_out: 0,
                                         tokens: None,
+                                        fast,
                                         token_usage: None,
                                     },
                                 )
@@ -3878,6 +3929,7 @@ pub async fn handle_relay(
                                 bytes_in,
                                 bytes_out: bytes.len() as u64,
                                 tokens,
+                                fast,
                                 token_usage,
                             },
                         )
@@ -3902,6 +3954,7 @@ pub async fn handle_relay(
                         status: status_code,
                         started: request_started,
                         bytes_in,
+                        fast,
                     };
                     let counted = CountedStream::new(body, outcome, _in_flight);
                     return Response::from_parts(parts, Body::from_stream(counted));
@@ -4130,6 +4183,7 @@ pub async fn handle_relay(
                 bytes_in: plan.original_body.len(),
                 bytes_out: failure.body.len() as u64,
                 tokens: None,
+                fast,
                 token_usage: None,
             },
         )
@@ -4193,6 +4247,7 @@ pub async fn handle_relay(
             bytes_in: plan.original_body.len(),
             bytes_out,
             tokens: None,
+            fast,
             token_usage: None,
         },
     )
@@ -5201,5 +5256,75 @@ mod routing_tests {
             prompt_cache_key_for(&headers, other).unwrap(),
             "distinct first user turns must not collide into one cache key"
         );
+    }
+}
+
+#[cfg(test)]
+mod codex_fast_mode_tests {
+    use super::*;
+
+    fn plan(upstream_path: &str, body: &str) -> RelayPlan {
+        RelayPlan {
+            upstream_path: upstream_path.to_string(),
+            body: Bytes::from(body.to_string()),
+            model: Some("gpt-6.1-sol".to_string()),
+            mode: RelayMode::OpenAiCompat,
+            client_stream: false,
+            include_usage: false,
+            openai_body: None,
+            original_body: Bytes::new(),
+        }
+    }
+
+    fn body_of(plan: &RelayPlan) -> serde_json::Value {
+        serde_json::from_slice(&plan.body).expect("rewritten body stays JSON")
+    }
+
+    #[test]
+    fn fast_mode_sets_priority_without_losing_the_translated_document() {
+        let mut target = plan(
+            compat::CODEX_PATH,
+            r#"{"model":"gpt-6.1-sol","instructions":"be brief","input":[{"type":"message"}],"store":false}"#,
+        );
+        apply_codex_fast_mode(&mut target);
+        let body = body_of(&target);
+        assert_eq!(body["service_tier"], "priority");
+        assert_eq!(body["instructions"], "be brief");
+        assert_eq!(body["store"], false);
+        assert!(body["input"].is_array());
+    }
+
+    #[test]
+    fn fast_mode_overwrites_a_client_supplied_tier() {
+        let mut target = plan(compat::CODEX_PATH, r#"{"model":"m","service_tier":"auto"}"#);
+        apply_codex_fast_mode(&mut target);
+        assert_eq!(body_of(&target)["service_tier"], "priority");
+    }
+
+    #[test]
+    fn fast_mode_leaves_other_codex_surfaces_byte_identical() {
+        for path in [
+            "/backend-api/codex/responses/compact",
+            "/backend-api/codex/alpha/search",
+            "/v1/responses",
+        ] {
+            let original = r#"{"model":"m"}"#;
+            let mut target = plan(path, original);
+            apply_codex_fast_mode(&mut target);
+            assert_eq!(
+                target.body,
+                Bytes::from(original.to_string()),
+                "{path} is a different upstream document shape"
+            );
+        }
+    }
+
+    #[test]
+    fn fast_mode_ignores_a_body_that_is_not_a_json_object() {
+        for original in ["[1,2,3]", "not json"] {
+            let mut target = plan(compat::CODEX_PATH, original);
+            apply_codex_fast_mode(&mut target);
+            assert_eq!(target.body, Bytes::from(original.to_string()));
+        }
     }
 }

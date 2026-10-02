@@ -1133,12 +1133,17 @@ impl AccountMember {
     }
 
     pub fn usage_snapshot(&self) -> crate::usage::AccountUsage {
-        let mut usage = self.usage.read().map(|u| u.clone()).unwrap_or_default();
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        self.usage_snapshot_at(now_unix)
+    }
+
+    pub fn usage_snapshot_at(&self, now_unix: i64) -> crate::usage::AccountUsage {
+        let usage = self.usage.read().map(|u| u.clone()).unwrap_or_default();
+        let mut usage = crate::usage::with_quota_freshness(usage, now_unix, 360);
         if self.provider_name() == "cline" {
-            let now_unix = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
             usage.expire_stale_cline_limits(now_unix);
         }
         usage
@@ -1180,9 +1185,55 @@ impl AccountMember {
             })
     }
 
-    pub fn set_usage(&self, usage: crate::usage::AccountUsage) {
+    pub fn set_usage(&self, mut usage: crate::usage::AccountUsage) {
         if let Ok(mut slot) = self.usage.write() {
+            if usage.refreshed_at_unix.is_none() {
+                if usage.reset_credits_available.is_none() {
+                    usage.reset_credits_available = slot.reset_credits_available;
+                }
+                if usage.reset_credits.is_empty() {
+                    usage.reset_credits = slot.reset_credits.clone();
+                }
+                usage.refreshed_at_unix = slot.refreshed_at_unix;
+                if usage.last_refresh_error.is_none() {
+                    usage.last_refresh_error = slot.last_refresh_error.clone();
+                }
+                if usage.refresh_status.is_none() {
+                    usage.refresh_status = slot.refresh_status.clone();
+                }
+                if usage.model_availability.is_none() {
+                    usage.model_availability = slot.model_availability.clone();
+                }
+                if usage.plan_type.is_none() {
+                    usage.plan_type = slot.plan_type.clone();
+                }
+                if usage.groups.is_empty() {
+                    usage.groups = slot.groups.clone();
+                }
+            }
             *slot = usage;
+        }
+    }
+
+    /// Merges partial updates from response headers into the current usage
+    /// without overwriting poll-only fields such as reset credits, or falsely
+    /// freshening `refreshed_at_unix`.
+    pub fn update_usage_from_headers(&self, header_usage: crate::usage::AccountUsage) {
+        if let Ok(mut slot) = self.usage.write() {
+            slot.apply_header_update(header_usage);
+        }
+    }
+
+    /// Records a failed usage refresh attempt, setting status and error without
+    /// discarding the last valid usage snapshot.
+    pub fn record_quota_refresh_failure(&self, error: &str) {
+        self.record_quota_refresh_failure_with_status(error, "error");
+    }
+
+    pub fn record_quota_refresh_failure_with_status(&self, error: &str, status: &str) {
+        if let Ok(mut slot) = self.usage.write() {
+            slot.last_refresh_error = Some(error.to_string());
+            slot.refresh_status = Some(status.to_string());
         }
     }
 

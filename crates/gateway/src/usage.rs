@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -66,6 +66,17 @@ pub struct ResetCredit {
     pub status: Option<String>,
 }
 
+/// Upstream model availability metadata (e.g. from `model_usage` in Codex wham).
+/// Note: this represents binary availability / gating metadata, NOT consumed quota percentages.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ModelAvailability {
+    pub available: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credits_would_enable: Option<bool>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct AccountUsage {
     pub plan_type: Option<String>,
@@ -93,9 +104,119 @@ pub struct AccountUsage {
     /// Rolling 3h/24h deltas derived from locally sampled counters.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub windows: Vec<crate::usage::UsageWindowDelta>,
+    /// Unix seconds when a full quota refresh was last successfully completed.
+    /// Deliberately distinct from `observed_at_unix` so request headers do not
+    /// falsely freshen poll-only fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refreshed_at_unix: Option<i64>,
+    /// Error string from the last failed quota refresh attempt, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_refresh_error: Option<String>,
+    /// Refresh status: "ok", "error", "rate_limited", or "stale".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_status: Option<String>,
+    /// Per-model availability metadata (NOT quota percentages).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_availability: Option<BTreeMap<String, ModelAvailability>>,
 }
 
 impl AccountUsage {
+    /// Merges partial updates from response headers while preserving poll-only
+    /// and pre-existing fields like reset credits, model availability, and refresh status.
+    /// Notice: `refreshed_at_unix` is deliberately NOT touched by request headers so
+    /// poll-only fields are not falsely represented as freshly polled.
+    pub fn apply_header_update(&mut self, header_usage: AccountUsage) {
+        if header_usage.observed_at_unix.is_some() {
+            self.observed_at_unix = header_usage.observed_at_unix;
+        }
+        if header_usage.plan_type.is_some() {
+            self.plan_type = header_usage.plan_type;
+        }
+        if header_usage.active_limit.is_some() {
+            self.active_limit = header_usage.active_limit;
+        }
+        for incoming in [header_usage.primary, header_usage.secondary] {
+            if incoming.is_empty() {
+                continue;
+            }
+            let target = match (incoming.window_minutes, incoming.limit_name.as_deref()) {
+                (Some(minutes), name)
+                    if self.primary.window_minutes == Some(minutes)
+                        && (name.is_none()
+                            || self.primary.limit_name.is_none()
+                            || self.primary.limit_name.as_deref() == name) =>
+                {
+                    Some(&mut self.primary)
+                }
+                (Some(minutes), name)
+                    if self.secondary.window_minutes == Some(minutes)
+                        && (name.is_none()
+                            || self.secondary.limit_name.is_none()
+                            || self.secondary.limit_name.as_deref() == name) =>
+                {
+                    Some(&mut self.secondary)
+                }
+                (_, Some(name)) if self.primary.limit_name.as_deref() == Some(name) => {
+                    Some(&mut self.primary)
+                }
+                (_, Some(name)) if self.secondary.limit_name.as_deref() == Some(name) => {
+                    Some(&mut self.secondary)
+                }
+                (Some(_), _) => {
+                    if self.primary.is_empty() {
+                        Some(&mut self.primary)
+                    } else if self.secondary.is_empty() {
+                        Some(&mut self.secondary)
+                    } else {
+                        None
+                    }
+                }
+                _ if incoming.window_minutes.is_none()
+                    && incoming.limit_name.is_none()
+                    && !self.primary.is_empty() => Some(&mut self.primary),
+                _ if incoming.window_minutes.is_none()
+                    && incoming.limit_name.is_none()
+                    && !self.secondary.is_empty() => Some(&mut self.secondary),
+                _ if self.primary.is_empty() => Some(&mut self.primary),
+                _ if self.secondary.is_empty() => Some(&mut self.secondary),
+                _ => None,
+            };
+            if let Some(target) = target {
+                merge_quota_window(target, incoming);
+            }
+        }
+        if header_usage.credits_balance.is_some() {
+            self.credits_balance = header_usage.credits_balance;
+        }
+        if header_usage.credits_unlimited.is_some() {
+            self.credits_unlimited = header_usage.credits_unlimited;
+        }
+        if header_usage.has_credits.is_some() {
+            self.has_credits = header_usage.has_credits;
+        }
+        if !header_usage.groups.is_empty() {
+            for hg in header_usage.groups {
+                if let Some(existing) = self.groups.iter_mut().find(|g| {
+                    g.models.is_some() && g.models == hg.models
+                }) {
+                    for bucket in hg.buckets {
+                        if let Some(existing_bucket) = existing.buckets.iter_mut().find(|b| {
+                            b.bucket_id.is_some() && b.bucket_id == bucket.bucket_id
+                        }) {
+                            merge_quota_bucket(existing_bucket, bucket);
+                        } else {
+                            existing.buckets.push(bucket);
+                        }
+                    }
+                    if hg.display_name.is_some() {
+                        existing.display_name = hg.display_name;
+                    }
+                } else {
+                    self.groups.push(hg);
+                }
+            }
+        }
+    }
     pub fn expire_stale_cline_limits(&mut self, now_unix: i64) {
         for group in &mut self.groups {
             if group.display_name.as_deref() == Some("Cline Free Limits") {
@@ -117,6 +238,65 @@ impl AccountUsage {
 
     pub fn is_known(&self) -> bool {
         self.observed_at_unix.is_some()
+    }
+}
+
+pub fn with_quota_freshness(
+    mut usage: AccountUsage,
+    now_unix: i64,
+    stale_after_secs: i64,
+) -> AccountUsage {
+    if usage.refresh_status.as_deref() == Some("ok")
+        && usage
+            .refreshed_at_unix
+            .is_some_and(|at| now_unix.saturating_sub(at) > stale_after_secs)
+    {
+        usage.refresh_status = Some("stale".to_string());
+    }
+    usage
+}
+
+fn merge_quota_window(existing: &mut QuotaWindow, incoming: QuotaWindow) {
+    let same_identity = match (existing.window_minutes, incoming.window_minutes) {
+        (Some(left), Some(right)) => left == right,
+        _ => match (&existing.limit_name, &incoming.limit_name) {
+            (Some(left), Some(right)) => left == right,
+            _ => true,
+        },
+    };
+    if !same_identity {
+        *existing = incoming;
+        return;
+    }
+    if incoming.used_percent.is_some() {
+        existing.used_percent = incoming.used_percent;
+    }
+    if incoming.window_minutes.is_some() {
+        existing.window_minutes = incoming.window_minutes;
+    }
+    if incoming.reset_after_seconds.is_some() {
+        existing.reset_after_seconds = incoming.reset_after_seconds;
+    }
+    if incoming.reset_at_unix.is_some() {
+        existing.reset_at_unix = incoming.reset_at_unix;
+    }
+    if incoming.limit_name.is_some() {
+        existing.limit_name = incoming.limit_name;
+    }
+}
+
+fn merge_quota_bucket(existing: &mut QuotaBucket, incoming: QuotaBucket) {
+    if incoming.display_name.is_some() {
+        existing.display_name = incoming.display_name;
+    }
+    if incoming.window.is_some() {
+        existing.window = incoming.window;
+    }
+    if incoming.used_percent.is_some() {
+        existing.used_percent = incoming.used_percent;
+    }
+    if incoming.reset_at_unix.is_some() {
+        existing.reset_at_unix = incoming.reset_at_unix;
     }
 }
 
@@ -288,15 +468,27 @@ pub fn parse_codex_headers(headers: &HashMap<String, String>, now_unix: i64) -> 
         .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
         .collect();
 
-    let named_prefix = lower.keys().find_map(|k| {
-        let rest = k.strip_prefix("x-codex-")?;
-        let name = rest.strip_suffix("-limit-name")?;
-        if name.is_empty() {
-            None
-        } else {
-            Some(format!("x-codex-{name}-"))
+    // Identify all named limit families (e.g. x-codex-bengalfox-*, x-codex-gpt-6-astra-*)
+    let mut named_families: BTreeSet<String> = BTreeSet::new();
+    for k in lower.keys() {
+        if let Some(rest) = k.strip_prefix("x-codex-") {
+            if let Some(name) = rest.strip_suffix("-limit-name") {
+                if !name.is_empty() {
+                    named_families.insert(name.to_string());
+                }
+            } else if let Some(idx) = rest.find("-primary-") {
+                let name = &rest[..idx];
+                if !name.is_empty() && name != "primary" {
+                    named_families.insert(name.to_string());
+                }
+            } else if let Some(idx) = rest.find("-secondary-") {
+                let name = &rest[..idx];
+                if !name.is_empty() && name != "secondary" {
+                    named_families.insert(name.to_string());
+                }
+            }
         }
-    });
+    }
 
     let win = |prefix: &str, which: &str| QuotaWindow {
         used_percent: num(&lower, &format!("{prefix}{which}-used-percent")),
@@ -306,22 +498,65 @@ pub fn parse_codex_headers(headers: &HashMap<String, String>, now_unix: i64) -> 
         limit_name: text(&lower, &format!("{prefix}limit-name")),
     };
 
-    // Collect every window both families report, then classify by duration
-    // rather than by header name: which family carries the 5h vs the weekly
-    // window varies per account, so trusting `primary`/`secondary` positionally
-    // mislabels them.
-    let mut candidates = vec![win("x-codex-", "primary"), win("x-codex-", "secondary")];
-    if let Some(p) = named_prefix.as_deref() {
-        candidates.push(win(p, "primary"));
-        candidates.push(win(p, "secondary"));
-    }
-    candidates.retain(|w| !w.is_empty() && w.window_minutes.unwrap_or(0) > 0);
-    candidates.sort_by_key(|w| w.window_minutes.unwrap_or(i64::MAX));
-    candidates.dedup_by_key(|w| w.window_minutes.unwrap_or(0));
+    // Standard / default windows
+    let default_primary = win("x-codex-", "primary");
+    let default_secondary = win("x-codex-", "secondary");
 
-    // Shortest window is the session (5h) window, longest is the weekly one.
-    let primary = candidates.first().cloned().unwrap_or_default();
-    let secondary = candidates
+    // Collect distinct groups for each named family so model-specific quotas
+    // are preserved with their own identity and NOT collapsed or lost.
+    let mut groups = Vec::new();
+
+    for name in &named_families {
+        let pfx = format!("x-codex-{name}-");
+        let group_limit_name = text(&lower, &format!("{pfx}limit-name"));
+        let p_win = win(&pfx, "primary");
+        let s_win = win(&pfx, "secondary");
+
+        let mut buckets = Vec::new();
+        if !p_win.is_empty() && p_win.window_minutes.unwrap_or(0) > 0 {
+            buckets.push(QuotaBucket {
+                bucket_id: Some(format!("{name}-primary")),
+                display_name: Some(format!(
+                    "{} (primary)",
+                    group_limit_name.as_deref().unwrap_or(name)
+                )),
+                window: p_win.window_minutes.map(|m| format!("{}m", m)),
+                used_percent: p_win.used_percent,
+                reset_at_unix: p_win.reset_at_unix,
+            });
+        }
+        if !s_win.is_empty() && s_win.window_minutes.unwrap_or(0) > 0 {
+            buckets.push(QuotaBucket {
+                bucket_id: Some(format!("{name}-secondary")),
+                display_name: Some(format!(
+                    "{} (secondary)",
+                    group_limit_name.as_deref().unwrap_or(name)
+                )),
+                window: s_win.window_minutes.map(|m| format!("{}m", m)),
+                used_percent: s_win.used_percent,
+                reset_at_unix: s_win.reset_at_unix,
+            });
+        }
+        if !buckets.is_empty() {
+            groups.push(QuotaGroup {
+                display_name: group_limit_name.or_else(|| Some(name.clone())),
+                models: Some(name.clone()),
+                buckets,
+            });
+        }
+    }
+
+    let mut general_candidates = Vec::new();
+    if !default_primary.is_empty() && default_primary.window_minutes.unwrap_or(0) > 0 {
+        general_candidates.push(default_primary);
+    }
+    if !default_secondary.is_empty() && default_secondary.window_minutes.unwrap_or(0) > 0 {
+        general_candidates.push(default_secondary);
+    }
+    general_candidates.sort_by_key(|w| w.window_minutes.unwrap_or(i64::MAX));
+
+    let primary = general_candidates.first().cloned().unwrap_or_default();
+    let secondary = general_candidates
         .into_iter()
         .rev()
         .find(|w| w.window_minutes != primary.window_minutes)
@@ -343,7 +578,7 @@ pub fn parse_codex_headers(headers: &HashMap<String, String>, now_unix: i64) -> 
         credits_unlimited: flag(&lower, "x-codex-credits-unlimited"),
         has_credits: flag(&lower, "x-codex-credits-has-credits"),
         reset_credits_available: None,
-        groups: Vec::new(),
+        groups,
         observed_at_unix: observed,
         ..Default::default()
     }
@@ -789,6 +1024,50 @@ pub struct WhamUsage {
     pub credits: Option<WhamCredits>,
     #[serde(default)]
     pub rate_limit_reset_credits: Option<WhamResetCredits>,
+    #[serde(default)]
+    pub code_review_rate_limit: Option<WhamRateLimit>,
+    #[serde(default)]
+    pub additional_rate_limits: Option<Vec<WhamAdditionalRateLimit>>,
+    #[serde(default)]
+    pub model_usage: Option<std::collections::BTreeMap<String, WhamModelUsageEntry>>,
+    #[serde(default)]
+    pub chatpass: Option<WhamChatpass>,
+    #[serde(default)]
+    pub spend_control: Option<WhamSpendControl>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WhamModelUsageEntry {
+    #[serde(default)]
+    pub available: Option<bool>,
+    #[serde(default)]
+    pub available_at: Option<String>,
+    #[serde(default)]
+    pub credits_would_enable: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WhamAdditionalRateLimit {
+    pub limit_name: String,
+    pub metered_feature: String,
+    #[serde(default)]
+    pub rate_limit: Option<Option<WhamRateLimit>>,
+    #[serde(default)]
+    pub normal_model_slug: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WhamChatpass {
+    #[serde(default)]
+    pub windows: Vec<WhamWindow>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WhamSpendControl {
+    #[serde(default)]
+    pub reached: Option<bool>,
+    #[serde(default)]
+    pub individual_limit: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -884,6 +1163,41 @@ impl WhamResetCreditList {
     }
 }
 
+fn parse_wham_additional_rate_limits(
+    items: Vec<WhamAdditionalRateLimit>,
+    to_window: impl Fn(WhamWindow) -> QuotaWindow,
+    groups: &mut Vec<QuotaGroup>,
+) {
+    for item in items {
+        let Some(Some(rate_limit)) = item.rate_limit else {
+            continue;
+        };
+        let mut buckets = Vec::new();
+        for (identity, window) in [
+            ("primary", rate_limit.primary_window),
+            ("secondary", rate_limit.secondary_window),
+        ] {
+            if let Some(window) = window {
+                let window = to_window(window);
+                buckets.push(QuotaBucket {
+                    bucket_id: Some(format!("{}-{identity}", item.metered_feature)),
+                    display_name: Some(format!("{} ({identity})", item.limit_name)),
+                    window: window.window_minutes.map(|m| format!("{m}m")),
+                    used_percent: window.used_percent,
+                    reset_at_unix: window.reset_at_unix,
+                });
+            }
+        }
+        if !buckets.is_empty() {
+            groups.push(QuotaGroup {
+                display_name: Some(item.limit_name),
+                models: item.normal_model_slug.or(Some(item.metered_feature)),
+                buckets,
+            });
+        }
+    }
+}
+
 impl WhamUsage {
     pub fn into_account_usage(self, now_unix: i64) -> AccountUsage {
         let to_window = |w: WhamWindow| QuotaWindow {
@@ -906,6 +1220,99 @@ impl WhamUsage {
         // Order by length so the short session window is always `primary`,
         // matching the header path regardless of upstream field order.
         windows.sort_by_key(|w| w.window_minutes.unwrap_or(i64::MAX));
+
+        let mut groups = Vec::new();
+
+        // 1. Chatpass distinct actual quota windows
+        if let Some(cp) = self.chatpass {
+            if !cp.windows.is_empty() {
+                let buckets: Vec<QuotaBucket> = cp
+                    .windows
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, w)| {
+                        let win_label = w.limit_window_seconds.map(|s| format!("{}m", s / 60));
+                        QuotaBucket {
+                            bucket_id: Some(format!(
+                                "chatpass-{}",
+                                w.limit_window_seconds.unwrap_or(i as i64)
+                            )),
+                            display_name: Some(format!(
+                                "Chatpass {}",
+                                win_label.as_deref().unwrap_or("window")
+                            )),
+                            window: win_label,
+                            used_percent: w.used_percent,
+                            reset_at_unix: w.reset_at,
+                        }
+                    })
+                    .collect();
+                groups.push(QuotaGroup {
+                    display_name: Some("Chatpass".to_string()),
+                    models: Some("chatpass".to_string()),
+                    buckets,
+                });
+            }
+        }
+
+        // 2. Code review rate limit
+        if let Some(cr) = self.code_review_rate_limit {
+            let mut buckets = Vec::new();
+            if let Some(pw) = cr.primary_window {
+                let w = to_window(pw);
+                buckets.push(QuotaBucket {
+                    bucket_id: Some("code-review-primary".to_string()),
+                    display_name: Some("Code Review (primary)".to_string()),
+                    window: w.window_minutes.map(|m| format!("{}m", m)),
+                    used_percent: w.used_percent,
+                    reset_at_unix: w.reset_at_unix,
+                });
+            }
+            if let Some(sw) = cr.secondary_window {
+                let w = to_window(sw);
+                buckets.push(QuotaBucket {
+                    bucket_id: Some("code-review-secondary".to_string()),
+                    display_name: Some("Code Review (secondary)".to_string()),
+                    window: w.window_minutes.map(|m| format!("{}m", m)),
+                    used_percent: w.used_percent,
+                    reset_at_unix: w.reset_at_unix,
+                });
+            }
+            if !buckets.is_empty() {
+                groups.push(QuotaGroup {
+                    display_name: Some("Code Review".to_string()),
+                    models: Some("code-review".to_string()),
+                    buckets,
+                });
+            }
+        }
+
+        // 3. Additional rate limits
+        if let Some(addl) = self.additional_rate_limits {
+            parse_wham_additional_rate_limits(addl, to_window, &mut groups);
+        }
+
+        // 4. Model availability metadata (NOT invented percentages from usage counters)
+        let model_availability = self.model_usage.map(|mu| {
+            mu.into_iter()
+                .map(|(k, v)| {
+                    (
+                        k,
+                        ModelAvailability {
+                            available: v.available,
+                            available_at: v.available_at,
+                            credits_would_enable: v.credits_would_enable,
+                        },
+                    )
+                })
+                .filter(|(_, model)| {
+                    model.available.is_some()
+                        || model.available_at.is_some()
+                        || model.credits_would_enable.is_some()
+                })
+                .collect()
+        });
+
         let credits = self.credits;
         AccountUsage {
             plan_type: self.plan_type,
@@ -921,8 +1328,12 @@ impl WhamUsage {
             reset_credits_available: self
                 .rate_limit_reset_credits
                 .and_then(|r| r.available_count),
-            groups: Vec::new(),
+            groups,
             observed_at_unix: Some(now_unix),
+            refreshed_at_unix: Some(now_unix),
+            last_refresh_error: None,
+            refresh_status: Some("ok".to_string()),
+            model_availability,
             ..Default::default()
         }
     }
@@ -2105,19 +2516,23 @@ mod tests {
     #[test]
     fn session_window_carries_its_own_reset_time() {
         let u = parse_codex_headers(&live_headers(), 1_787_900_000);
-        assert_eq!(u.primary.used_percent, Some(0.0));
-        assert_eq!(u.primary.reset_at_unix, Some(1_787_909_818));
+        let spark = u.groups.iter().find(|g| g.models.as_deref() == Some("bengalfox")).unwrap();
+        assert_eq!(spark.buckets[0].used_percent, Some(0.0));
+        assert_eq!(spark.buckets[0].reset_at_unix, Some(1_787_909_818));
     }
 
     #[test]
-    fn classifies_windows_by_duration_not_header_family() {
-        // This live account carries the 5h window only under the named family
-        // while the plain family holds the weekly one; primary must still be
-        // the 300-minute session window.
+    fn keeps_named_model_windows_separate_from_account_windows() {
+        // Spark's 5h quota is not the default account's session quota.
+        // Keep the default weekly limit and both Spark windows independently.
         let u = parse_codex_headers(&live_headers(), 1_787_900_000);
-        assert_eq!(u.primary.window_minutes, Some(300));
-        assert_eq!(u.secondary.window_minutes, Some(10080));
-        assert_eq!(u.secondary.used_percent, Some(16.0));
+        assert_eq!(u.primary.window_minutes, Some(10080));
+        assert_eq!(u.primary.used_percent, Some(16.0));
+        assert!(u.secondary.is_empty());
+        let spark = u.groups.iter().find(|g| g.models.as_deref() == Some("bengalfox")).unwrap();
+        assert_eq!(spark.buckets.len(), 2);
+        assert_eq!(spark.buckets[0].window.as_deref(), Some("300m"));
+        assert_eq!(spark.buckets[1].window.as_deref(), Some("10080m"));
     }
 
     #[test]
@@ -2589,5 +3004,249 @@ mod tests {
         // then the pre-restart sample survives inside the window
         assert_eq!(sample.first().map(|s| s.requests), Some(7005));
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn partial_headers_do_not_overwrite_poll_only_fields() {
+        let mut baseline = AccountUsage {
+            plan_type: Some("pro".to_string()),
+            active_limit: Some("default".to_string()),
+            primary: QuotaWindow {
+                used_percent: Some(20.0),
+                window_minutes: Some(300),
+                reset_after_seconds: Some(10000),
+                reset_at_unix: Some(1_800_010_000),
+                limit_name: None,
+            },
+            secondary: QuotaWindow {
+                used_percent: Some(40.0),
+                window_minutes: Some(10080),
+                reset_after_seconds: Some(200000),
+                reset_at_unix: Some(1_800_200_000),
+                limit_name: None,
+            },
+            reset_credits_available: Some(3),
+            reset_credits: vec![ResetCredit {
+                granted_at_unix: Some(1_790_000_000),
+                expires_at_unix: Some(1_792_000_000),
+                status: Some("active".to_string()),
+            }],
+            observed_at_unix: Some(1_800_000_000),
+            refreshed_at_unix: Some(1_800_000_000),
+            last_refresh_error: None,
+            refresh_status: Some("ok".to_string()),
+            groups: vec![QuotaGroup {
+                display_name: Some("Chatpass".to_string()),
+                models: Some("chatpass".to_string()),
+                buckets: vec![QuotaBucket {
+                    bucket_id: Some("chatpass-604800".to_string()),
+                    display_name: Some("Chatpass 10080m".to_string()),
+                    window: Some("10080m".to_string()),
+                    used_percent: Some(0.0),
+                    reset_at_unix: Some(1_800_604_800),
+                }],
+            }],
+            model_availability: Some({
+                let mut map = BTreeMap::new();
+                map.insert(
+                    "gpt-6-astra".to_string(),
+                    ModelAvailability {
+                        available: Some(true),
+                        available_at: None,
+                        credits_would_enable: Some(false),
+                    },
+                );
+                map
+            }),
+            ..Default::default()
+        };
+
+        // Partial header arrival: reports new primary window usage, but no reset credits or poll fields
+        let header_update = AccountUsage {
+            primary: QuotaWindow {
+                used_percent: Some(45.0),
+                window_minutes: Some(300),
+                reset_after_seconds: Some(9000),
+                reset_at_unix: Some(1_800_010_000),
+                limit_name: None,
+            },
+            observed_at_unix: Some(1_800_001_000),
+            ..Default::default()
+        };
+
+        baseline.apply_header_update(header_update);
+
+        // Header fields updated:
+        assert_eq!(baseline.primary.used_percent, Some(45.0));
+        assert_eq!(baseline.observed_at_unix, Some(1_800_001_000));
+
+        // Poll-only fields PRESERVED untouched:
+        assert_eq!(baseline.reset_credits_available, Some(3));
+        assert_eq!(baseline.reset_credits.len(), 1);
+        assert_eq!(baseline.refreshed_at_unix, Some(1_800_000_000));
+        assert_eq!(baseline.refresh_status.as_deref(), Some("ok"));
+        assert_eq!(baseline.last_refresh_error, None);
+        assert!(baseline.model_availability.is_some());
+        assert_eq!(baseline.groups.len(), 1);
+        assert_eq!(baseline.groups[0].display_name.as_deref(), Some("Chatpass"));
+    }
+
+    #[test]
+    fn header_parser_preserves_multiple_named_limits_without_flattening_identity() {
+        let headers: HashMap<String, String> = [
+            ("x-codex-plan-type", "pro"),
+            ("x-codex-primary-used-percent", "10"),
+            ("x-codex-primary-window-minutes", "10080"),
+            ("x-codex-secondary-used-percent", "0"),
+            ("x-codex-secondary-window-minutes", "0"),
+            // bengalfox (300m window)
+            ("x-codex-bengalfox-limit-name", "GPT-5.3-Codex-Spark"),
+            ("x-codex-bengalfox-primary-used-percent", "5"),
+            ("x-codex-bengalfox-primary-window-minutes", "300"),
+            ("x-codex-bengalfox-primary-reset-at", "1787909818"),
+            ("x-codex-bengalfox-secondary-used-percent", "12"),
+            ("x-codex-bengalfox-secondary-window-minutes", "10080"),
+            ("x-codex-bengalfox-secondary-reset-at", "1788496618"),
+            // gpt-6-astra (also 300m window, but distinct model identity!)
+            ("x-codex-gpt-6-astra-limit-name", "GPT-6-Astra"),
+            ("x-codex-gpt-6-astra-primary-used-percent", "33"),
+            ("x-codex-gpt-6-astra-primary-window-minutes", "300"),
+            ("x-codex-gpt-6-astra-primary-reset-at", "1787910000"),
+            ("x-codex-gpt-6-astra-secondary-used-percent", "50"),
+            ("x-codex-gpt-6-astra-secondary-window-minutes", "10080"),
+            ("x-codex-gpt-6-astra-secondary-reset-at", "1788500000"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+
+        let usage = parse_codex_headers(&headers, 1_787_900_000);
+
+        assert_eq!(usage.primary.window_minutes, Some(10080));
+        assert_eq!(usage.primary.used_percent, Some(10.0));
+        assert_eq!(usage.secondary.window_minutes, None);
+
+        // Crucial: BOTH named limits must survive in `groups` with their distinct identities!
+        // Duration dedup must NOT have collapsed or discarded either model group.
+        assert_eq!(usage.groups.len(), 2);
+        let names: Vec<&str> = usage.groups.iter().map(|g| g.display_name.as_deref().unwrap()).collect();
+        assert!(names.contains(&"GPT-5.3-Codex-Spark"));
+        assert!(names.contains(&"GPT-6-Astra"));
+
+        let astra_group = usage.groups.iter().find(|g| g.models.as_deref() == Some("gpt-6-astra")).unwrap();
+        assert_eq!(astra_group.buckets.len(), 2);
+        assert_eq!(astra_group.buckets[0].used_percent, Some(33.0));
+    }
+
+    #[test]
+    fn parses_live_pro_wham_payload_with_chatpass_and_model_availability() {
+        let raw = r#"{
+          "rate_limit": {
+            "allowed": true,
+            "limit_reached": false,
+            "primary_window": {
+              "used_percent": 33,
+              "limit_window_seconds": 604800,
+              "reset_after_seconds": 320334,
+              "reset_at": 1791274357
+            },
+            "secondary_window": null
+          },
+          "code_review_rate_limit": null,
+          "additional_rate_limits": null,
+          "model_usage": {
+            "gpt-6-astra": {
+              "available": true,
+              "available_at": null,
+              "credits_would_enable": false
+            }
+          },
+          "chatpass": {
+            "windows": [
+              {
+                "used_percent": 0,
+                "limit_window_seconds": 604800,
+                "reset_after_seconds": 604800,
+                "reset_at": 1791558823
+              }
+            ]
+          },
+          "spend_control": {
+            "reached": false,
+            "individual_limit": null
+          }
+        }"#;
+
+        let wham: WhamUsage = serde_json::from_str(raw).expect("deserializes raw live Pro wham");
+        let usage = wham.into_account_usage(1_790_954_000);
+
+        // Rate limit window populated:
+        assert_eq!(usage.primary.used_percent, Some(33.0));
+        assert_eq!(usage.primary.window_minutes, Some(10080));
+        assert!(usage.secondary.is_empty());
+
+        // Chatpass mapped into distinct QuotaGroup with actual quota window:
+        let chatpass = usage.groups.iter().find(|g| g.display_name.as_deref() == Some("Chatpass")).expect("chatpass group");
+        assert_eq!(chatpass.buckets.len(), 1);
+        assert_eq!(chatpass.buckets[0].used_percent, Some(0.0));
+        assert_eq!(chatpass.buckets[0].window.as_deref(), Some("10080m"));
+        assert_eq!(chatpass.buckets[0].reset_at_unix, Some(1791558823));
+
+        // Model usage preserved as metadata in model_availability, NOT converted into percentages:
+        let avail = usage.model_availability.expect("model availability");
+        assert_eq!(avail.get("gpt-6-astra").and_then(|m| m.available), Some(true));
+        assert_eq!(avail.get("gpt-6-astra").and_then(|m| m.credits_would_enable), Some(false));
+
+        // Freshness set on full poll:
+        assert_eq!(usage.refreshed_at_unix, Some(1_790_954_000));
+        assert_eq!(usage.refresh_status.as_deref(), Some("ok"));
+        assert_eq!(usage.last_refresh_error, None);
+    }
+
+    #[test]
+    fn parses_wham_code_review_and_additional_rate_limits() {
+        let raw = r#"{
+          "rate_limit": {
+            "primary_window": { "used_percent": 10, "limit_window_seconds": 18000 }
+          },
+          "code_review_rate_limit": {
+            "primary_window": { "used_percent": 50, "limit_window_seconds": 86400, "reset_at": 1792000000 }
+          },
+          "additional_rate_limits": [
+            {
+              "limit_name": "Experimental Preview",
+              "metered_feature": "experimental-preview",
+              "normal_model_slug": "gpt-6-astra",
+              "rate_limit": {
+                "primary_window": { "used_percent": 80, "limit_window_seconds": 3600, "reset_after_seconds": 75 }
+              }
+            }
+          ]
+        }"#;
+
+        let wham: WhamUsage = serde_json::from_str(raw).expect("parse");
+        let usage = wham.into_account_usage(1_790_000_000);
+
+        let cr = usage.groups.iter().find(|g| g.display_name.as_deref() == Some("Code Review")).expect("code review group");
+        assert_eq!(cr.buckets[0].used_percent, Some(50.0));
+        assert_eq!(cr.buckets[0].window.as_deref(), Some("1440m"));
+
+        let addl = usage.groups.iter().find(|g| g.display_name.as_deref() == Some("Experimental Preview")).expect("additional group");
+        assert_eq!(addl.buckets[0].used_percent, Some(80.0));
+        assert_eq!(addl.buckets[0].window.as_deref(), Some("60m"));
+        assert_eq!(addl.buckets[0].reset_at_unix, None);
+        assert_eq!(addl.models.as_deref(), Some("gpt-6-astra"));
+    }
+
+    #[test]
+    fn missing_model_availability_is_not_fabricated_as_unavailable() {
+        let wham: WhamUsage = serde_json::from_str(
+            r#"{"model_usage":{"model-with-partial-entry":{"credits_would_enable":true}}}"#,
+        )
+        .expect("partial availability entry deserializes");
+        let usage = wham.into_account_usage(123);
+        let model = &usage.model_availability.unwrap()["model-with-partial-entry"];
+        assert_eq!(model.available, None);
+        assert_eq!(model.credits_would_enable, Some(true));
     }
 }

@@ -206,6 +206,34 @@ mod tests {
     use crate::management::settings::Settings;
 
     #[test]
+    fn codex_fast_mode_scalar_round_trips() {
+        let scalar = find("/codex-fast-mode").expect("registered");
+        let mut settings = Settings::default();
+        (scalar.read)(&settings);
+        assert_eq!((scalar.read)(&settings), json!(false));
+        assert!((scalar.write)(&mut settings, &json!({"value": true})).is_ok());
+        assert!(settings.codex_fast_mode);
+        assert_eq!((scalar.read)(&settings), json!(true));
+    }
+
+    #[test]
+    fn codex_fast_mode_persists_under_its_config_key_and_defaults_off() {
+        let restored: Settings =
+            serde_yaml::from_str("port: 18801\n").expect("a config written before the switch existed");
+        assert!(!restored.codex_fast_mode);
+
+        let mut settings = Settings::default();
+        settings.codex_fast_mode = true;
+        let yaml = serde_yaml::to_string(&settings).expect("serialize");
+        assert!(yaml.contains("codex-fast-mode: true"), "{yaml}");
+        assert!(
+            serde_yaml::from_str::<Settings>(&yaml)
+                .expect("deserialize")
+                .codex_fast_mode
+        );
+    }
+
+    #[test]
     fn every_upstream_scalar_path_is_registered() {
         // given the route list captured from upstream
         let groups: Value =

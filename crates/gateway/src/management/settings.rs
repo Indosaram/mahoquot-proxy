@@ -454,6 +454,17 @@ pub struct Settings {
     pub claude_header_defaults: PassthroughSettings,
     #[serde(default, rename = "codex-header-defaults")]
     pub codex_header_defaults: PassthroughSettings,
+    /// Proxy-wide ChatGPT fast mode.
+    ///
+    /// When enabled, every codex-bound upstream request carries
+    /// `service_tier: "priority"`. The ChatGPT codex backend only accepts that
+    /// field on its Responses surface, and every codex-bound request — the
+    /// `/v1/responses` passthrough as well as the chat-completions and
+    /// Anthropic translations — is normalised onto that one upstream path, so a
+    /// single switch governs them all. An explicit client tier is overwritten:
+    /// the operator's switch outranks the caller's preference.
+    #[serde(default, rename = "codex-fast-mode")]
+    pub codex_fast_mode: bool,
     #[serde(default, rename = "credential-concurrency")]
     pub credential_concurrency: PassthroughSettings,
     #[serde(default, rename = "credential-in-flight")]
@@ -541,6 +552,7 @@ impl Default for Settings {
             pprof: PassthroughSettings::default(),
             claude_header_defaults: PassthroughSettings::default(),
             codex_header_defaults: PassthroughSettings::default(),
+            codex_fast_mode: false,
             credential_concurrency: PassthroughSettings::default(),
             credential_in_flight: PassthroughSettings::default(),
             quota_exceeded: QuotaExceededSettings::default(),

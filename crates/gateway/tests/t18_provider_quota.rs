@@ -243,3 +243,268 @@ fn reset_credit_other_failure_is_upstream_error() {
         ResetAttemptPolicy::Upstream
     );
 }
+
+#[test]
+fn partial_header_updates_preserve_reset_credits_and_poll_freshness() {
+    let auth_dir = unique_temp_dir("codex-partial-headers");
+    std::fs::write(
+        auth_dir.join("codex-plain.json"),
+        common::create_auth_file_json("quota-partial", "acc-123", "token", Some("http://127.0.0.1:18899")),
+    )
+    .unwrap();
+    let state = AppState::new(&GatewayConfig {
+        auth_dir: auth_dir.clone(),
+        config_path: auth_dir.join("config.yaml"),
+        auth_refresh_enabled: false,
+        ..GatewayConfig::default()
+    })
+    .unwrap();
+    let member = state
+        .pool
+        .load()
+        .members
+        .iter()
+        .find(|m| m.kind() == mahoquot_gateway::account::ProviderKind::Codex)
+        .unwrap()
+        .clone();
+
+    // 1. Establish full baseline usage (simulating a full poll)
+    member.set_usage(mahoquot_gateway::usage::AccountUsage {
+        plan_type: Some("pro".to_string()),
+        primary: mahoquot_gateway::usage::QuotaWindow {
+            used_percent: Some(25.0),
+            window_minutes: Some(300),
+            reset_after_seconds: Some(12000),
+            reset_at_unix: Some(1_800_012_000),
+            limit_name: None,
+        },
+        reset_credits_available: Some(2),
+        reset_credits: vec![mahoquot_gateway::usage::ResetCredit {
+            granted_at_unix: Some(1_790_000_000),
+            expires_at_unix: Some(1_792_000_000),
+            status: Some("active".to_string()),
+        }],
+        refreshed_at_unix: Some(1_800_000_000),
+        observed_at_unix: Some(1_800_000_000),
+        refresh_status: Some("ok".to_string()),
+        ..Default::default()
+    });
+
+    // 2. Partial header update arrives on a request
+    let partial_header_usage = mahoquot_gateway::usage::AccountUsage {
+        primary: mahoquot_gateway::usage::QuotaWindow {
+            used_percent: Some(40.0),
+            window_minutes: Some(300),
+            reset_after_seconds: Some(11000),
+            reset_at_unix: Some(1_800_012_000),
+            limit_name: None,
+        },
+        observed_at_unix: Some(1_800_001_000),
+        ..Default::default()
+    };
+    member.update_usage_from_headers(partial_header_usage);
+
+    let snapshot = member.usage_snapshot();
+    // Headers updated observed_at and primary used_percent:
+    assert_eq!(snapshot.primary.used_percent, Some(40.0));
+    assert_eq!(snapshot.observed_at_unix, Some(1_800_001_000));
+
+    // Crucial: poll-only fields are preserved intact!
+    assert_eq!(snapshot.reset_credits_available, Some(2));
+    assert_eq!(snapshot.reset_credits.len(), 1);
+    assert_eq!(snapshot.refreshed_at_unix, Some(1_800_000_000));
+    assert_eq!(snapshot.refresh_status.as_deref(), Some("ok"));
+
+    std::fs::remove_dir_all(auth_dir).ok();
+}
+
+#[test]
+fn successful_snapshot_clears_absent_fields_and_header_update_merges_by_window() {
+    use mahoquot_gateway::usage::{AccountUsage, QuotaWindow};
+
+    let member = mahoquot_gateway::account::AccountMember::for_test_with_id(
+        "quota-snapshot",
+        mahoquot_gateway::account::ProviderAccount::Generic(
+            mahoquot_gateway::account::GenericAccount {
+                identity_slug: "quota-snapshot".to_string(),
+                provider: "openai".to_string(),
+                label: "test".to_string(),
+                email: String::new(),
+                adapter: "openai-chat".to_string(),
+                base_url: "https://example.test".to_string(),
+                api_key: "key".to_string(),
+                auth_mode: "key".to_string(),
+                refresh_token: String::new(),
+                expired: String::new(),
+                token_url: String::new(),
+                client_id: String::new(),
+                project_id: String::new(),
+                models: Vec::new(),
+                static_headers: Default::default(),
+                disabled: false,
+            },
+        ),
+    );
+    member.record_quota_refresh_failure("old error");
+    member.set_usage(AccountUsage {
+        refreshed_at_unix: Some(1000),
+        last_refresh_error: Some("old error".into()),
+        refresh_status: Some("ok".into()),
+        groups: vec![mahoquot_gateway::usage::QuotaGroup {
+            models: Some("old-model".into()),
+            ..Default::default()
+        }],
+        model_availability: Some(Default::default()),
+        ..Default::default()
+    });
+    member.set_usage(AccountUsage {
+        refreshed_at_unix: Some(1100),
+        refresh_status: Some("ok".into()),
+        ..Default::default()
+    });
+    let snapshot = member.usage_snapshot_at(1100);
+    assert_eq!(snapshot.last_refresh_error, None);
+    assert!(snapshot.groups.is_empty());
+    assert_eq!(snapshot.model_availability, None);
+
+    let mut windows = AccountUsage {
+        primary: QuotaWindow {
+            used_percent: Some(10.0),
+            window_minutes: Some(300),
+            reset_at_unix: Some(2000),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    windows.apply_header_update(AccountUsage {
+        primary: QuotaWindow {
+            used_percent: Some(45.0),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    assert_eq!(windows.primary.used_percent, Some(45.0));
+    assert_eq!(windows.primary.window_minutes, Some(300));
+    assert_eq!(windows.primary.reset_at_unix, Some(2000));
+    windows.apply_header_update(AccountUsage {
+        secondary: QuotaWindow {
+            used_percent: Some(5.0),
+            window_minutes: Some(10080),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    assert_eq!(windows.primary.window_minutes, Some(300));
+    assert_eq!(windows.secondary.window_minutes, Some(10080));
+
+    let mut short_only = AccountUsage {
+        primary: QuotaWindow {
+            used_percent: Some(20.0),
+            window_minutes: Some(300),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    short_only.apply_header_update(AccountUsage {
+        primary: QuotaWindow {
+            used_percent: Some(60.0),
+            window_minutes: Some(10080),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    assert_eq!(short_only.primary.window_minutes, Some(300));
+    assert_eq!(short_only.primary.used_percent, Some(20.0));
+    assert_eq!(short_only.secondary.window_minutes, Some(10080));
+    assert_eq!(short_only.secondary.used_percent, Some(60.0));
+}
+
+#[test]
+fn quota_snapshot_age_marks_only_successful_snapshot_stale() {
+    let member = mahoquot_gateway::account::AccountMember::for_test_with_id(
+        "quota-age",
+        mahoquot_gateway::account::ProviderAccount::Generic(
+            mahoquot_gateway::account::GenericAccount {
+                identity_slug: "quota-age".to_string(),
+                provider: "openai".to_string(),
+                label: "test".to_string(),
+                email: String::new(),
+                adapter: "openai-chat".to_string(),
+                base_url: "https://example.test".to_string(),
+                api_key: "key".to_string(),
+                auth_mode: "key".to_string(),
+                refresh_token: String::new(),
+                expired: String::new(),
+                token_url: String::new(),
+                client_id: String::new(),
+                project_id: String::new(),
+                models: Vec::new(),
+                static_headers: Default::default(),
+                disabled: false,
+            },
+        ),
+    );
+    member.set_usage(mahoquot_gateway::usage::AccountUsage {
+        refreshed_at_unix: Some(1000),
+        refresh_status: Some("ok".into()),
+        ..Default::default()
+    });
+    assert_eq!(member.usage_snapshot_at(1360).refresh_status.as_deref(), Some("ok"));
+    assert_eq!(member.usage_snapshot_at(1361).refresh_status.as_deref(), Some("stale"));
+    member.record_quota_refresh_failure("429");
+    assert_eq!(member.usage_snapshot_at(2000).refresh_status.as_deref(), Some("error"));
+}
+
+#[test]
+fn quota_refresh_failure_records_error_without_discarding_last_valid_snapshot() {
+    let auth_dir = unique_temp_dir("codex-refresh-failure");
+    std::fs::write(
+        auth_dir.join("codex-plain.json"),
+        common::create_auth_file_json("quota-failure", "acc-123", "token", Some("http://127.0.0.1:18899")),
+    )
+    .unwrap();
+    let state = AppState::new(&GatewayConfig {
+        auth_dir: auth_dir.clone(),
+        config_path: auth_dir.join("config.yaml"),
+        auth_refresh_enabled: false,
+        ..GatewayConfig::default()
+    })
+    .unwrap();
+    let member = state
+        .pool
+        .load()
+        .members
+        .iter()
+        .find(|m| m.kind() == mahoquot_gateway::account::ProviderKind::Codex)
+        .unwrap()
+        .clone();
+
+    member.set_usage(mahoquot_gateway::usage::AccountUsage {
+        plan_type: Some("plus".to_string()),
+        primary: mahoquot_gateway::usage::QuotaWindow {
+            used_percent: Some(30.0),
+            window_minutes: Some(300),
+            ..Default::default()
+        },
+        reset_credits_available: Some(1),
+        refreshed_at_unix: Some(1_790_000_000),
+        refresh_status: Some("ok".to_string()),
+        ..Default::default()
+    });
+
+    // Simulate poll error
+    member.record_quota_refresh_failure("Rate limited (429)");
+
+    let snapshot = member.usage_snapshot();
+    // Error recorded:
+    assert_eq!(snapshot.last_refresh_error.as_deref(), Some("Rate limited (429)"));
+    assert_eq!(snapshot.refresh_status.as_deref(), Some("error"));
+
+    // Previous valid snapshot preserved:
+    assert_eq!(snapshot.primary.used_percent, Some(30.0));
+    assert_eq!(snapshot.reset_credits_available, Some(1));
+    assert_eq!(snapshot.refreshed_at_unix, Some(1_790_000_000));
+    assert_eq!(snapshot.plan_type.as_deref(), Some("plus"));
+
+    std::fs::remove_dir_all(auth_dir).ok();
+}

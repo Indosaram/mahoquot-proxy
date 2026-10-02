@@ -165,6 +165,13 @@ pub const SCALARS: &[Scalar] = &[
         clear: None,
     },
     Scalar {
+        path: "/codex-fast-mode",
+        key: "codex-fast-mode",
+        read: |s| json!(s.codex_fast_mode),
+        write: |s, b| set_bool(&mut s.codex_fast_mode, b),
+        clear: None,
+    },
+    Scalar {
         path: "/proxy-url",
         key: "proxy-url",
         read: |s| json!(s.proxy_url),
