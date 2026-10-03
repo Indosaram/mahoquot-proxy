@@ -136,6 +136,18 @@ fn eligibility(state: &AppState, m: &AccountMember, model: &str) -> Option<&'sta
     }) {
         return Some("cooldown_model_quota");
     }
+    if m.provider_name() == "codex" {
+        if usage.is_codex_hard_limit_reached() {
+            return Some("codex_hard_spend_limit_reached");
+        }
+        let credit_enabled = state
+            .settings
+            .current()
+            .is_codex_account_credit_enabled(&m.id);
+        if !credit_enabled && usage.is_codex_included_quota_exhausted(Some(model), now()) {
+            return Some("credits_off_quota_exhausted");
+        }
+    }
     if m.access_token().is_empty() {
         return Some("no_access_token");
     }
@@ -1063,6 +1075,107 @@ mod tests {
         assert_eq!(reset_gemini, Some(current + 86400));
         assert!(!active_deepseek);
         assert_eq!(reset_deepseek, None);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn codex_warmup_eligibility_credit_gating_and_hard_limit() {
+        let dir = std::env::temp_dir().join(format!("warmup-codex-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let dis_json = serde_json::json!({
+            "identity_slug": "codex-disabled",
+            "type": "plus",
+            "account_id": "codex-disabled-acc",
+            "access_token": "mock-token",
+            "email": "disabled@example.com",
+            "expired": "2099-01-01T00:00:00Z",
+            "id_token": "fake_idt",
+            "last_refresh": "2026-08-27T00:00:00Z",
+            "refresh_token": "fake_rt",
+            "disabled": true
+        });
+        std::fs::write(dir.join("codex-disabled.json"), dis_json.to_string()).unwrap();
+
+        let state = Arc::new(
+            AppState::new(&crate::config::GatewayConfig {
+                auth_dir: dir.clone(),
+                config_path: dir.join("config.yaml"),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+
+        let codex = AccountMember::for_test(ProviderAccount::Codex(
+            mahoquot_providers::CodexAccount {
+                access_token: "mock-token".into(),
+                account_id: "codex-test-acc".into(),
+                ..Default::default()
+            },
+        ));
+
+        let current = now();
+        let exhausted_usage = crate::usage::AccountUsage {
+            primary: crate::usage::QuotaWindow {
+                used_percent: Some(100.0),
+                reset_at_unix: Some(current + 3600),
+                window_minutes: Some(300),
+                ..Default::default()
+            },
+            credits_balance: Some(50.0),
+            has_credits: Some(true),
+            ..Default::default()
+        };
+        codex.set_usage(exhausted_usage);
+
+        assert!(!state.settings.current().is_codex_account_credit_enabled(&codex.id));
+        let reason = eligibility(&state, &codex, "codex");
+        assert_eq!(reason, Some("credits_off_quota_exhausted"));
+
+        state
+            .settings
+            .mutate(|settings| {
+                settings.set_codex_account_credit_use(codex.id.clone(), true);
+            })
+            .unwrap();
+        assert!(state.settings.current().is_codex_account_credit_enabled(&codex.id));
+        let reason = eligibility(&state, &codex, "codex");
+        assert_eq!(reason, None);
+
+        let mut hard_limit_usage = codex.usage_snapshot();
+        hard_limit_usage.overage_limit_reached = Some(true);
+        codex.set_usage(hard_limit_usage);
+        assert!(codex.usage_snapshot().is_codex_hard_limit_reached());
+        let reason = eligibility(&state, &codex, "codex");
+        assert_eq!(reason, Some("codex_hard_spend_limit_reached"));
+
+        let disabled_codex = state
+            .find_member("codex-disabled")
+            .expect("disabled member loaded");
+        assert!(disabled_codex.is_manually_disabled());
+        state
+            .settings
+            .mutate(|settings| {
+                settings.set_codex_account_credit_use(disabled_codex.id.clone(), true);
+            })
+            .unwrap();
+        let reason = eligibility(&state, &disabled_codex, "codex");
+        assert_eq!(
+            reason,
+            Some("disabled"),
+            "real auth field disabled: true outranks credit opt-in"
+        );
+
+        codex.set_health(Health::Cooldown {
+            until_unix_ms: (current + 1000) * 1000,
+        });
+        let reason = eligibility(&state, &codex, "codex");
+        assert_eq!(
+            reason,
+            Some("account_unavailable"),
+            "cooldown outranks credit opt-in"
+        );
 
         std::fs::remove_dir_all(dir).unwrap();
     }

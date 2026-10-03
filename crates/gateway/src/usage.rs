@@ -89,6 +89,8 @@ pub struct AccountUsage {
     pub credits_balance: Option<f64>,
     pub credits_unlimited: Option<bool>,
     pub has_credits: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overage_limit_reached: Option<bool>,
     /// Reset credits left; spending one force-resets the 5h window.
     pub reset_credits_available: Option<i64>,
     /// Per-credit grant/expiry detail, soonest expiry first. Empty whenever
@@ -120,7 +122,105 @@ pub struct AccountUsage {
     pub model_availability: Option<BTreeMap<String, ModelAvailability>>,
 }
 
+fn matches_codex_model(
+    group_models: Option<&str>,
+    bucket_id: Option<&str>,
+    requested_model: &str,
+) -> bool {
+    if let Some(models) = group_models {
+        if models == requested_model {
+            return true;
+        }
+        if (models == "bengalfox" && (requested_model == "gpt-5.3-codex-spark" || requested_model == "spark"))
+            || ((models == "gpt-5.3-codex-spark" || models == "spark") && requested_model == "bengalfox")
+        {
+            return true;
+        }
+        if models.split(|c| c == ',' || c == ' ').any(|m| m.trim() == requested_model) {
+            return true;
+        }
+    }
+    if let Some(id) = bucket_id {
+        if id == requested_model {
+            return true;
+        }
+        if let Some(base) = id.strip_suffix("-primary").or_else(|| id.strip_suffix("-secondary")) {
+            if base == requested_model
+                || (base == "bengalfox" && (requested_model == "gpt-5.3-codex-spark" || requested_model == "spark"))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 impl AccountUsage {
+    /// Authoritative spend-limit or overage limit denial.
+    ///
+    /// When this is true, upstream or spend control has explicitly determined
+    /// that spending is blocked (e.g. overage limit reached or individual limit hit).
+    /// This denial is AUTHORITATIVE and must NEVER be bypassed by the user's
+    /// `credits_after_limit` opt-in switch.
+    pub fn is_codex_hard_limit_reached(&self) -> bool {
+        self.overage_limit_reached == Some(true)
+    }
+
+    /// Whether this account's included plan quota (monthly, weekly, or short session window)
+    /// has reached 100% and is currently active.
+    ///
+    /// When this is true, an account with `credits_after_limit: false` (default) is gated
+    /// from selection, but an account with `credits_after_limit: true` (user opt-in) is
+    /// allowed to continue serving requests and draw down available credits.
+    pub fn is_codex_included_quota_exhausted(
+        &self,
+        requested_model: Option<&str>,
+        now_unix: i64,
+    ) -> bool {
+        for window in [&self.primary, &self.secondary] {
+            if window.is_empty() {
+                continue;
+            }
+            if let Some(percent) = window.used_percent {
+                if percent >= 100.0 {
+                    if let Some(reset_at) = window.reset_at_unix {
+                        if reset_at > now_unix {
+                            return true;
+                        }
+                    } else if let Some(obs) = self.observed_at_unix {
+                        if now_unix.saturating_sub(obs) <= 300 {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(model) = requested_model {
+            for group in &self.groups {
+                for bucket in &group.buckets {
+                    if matches_codex_model(group.models.as_deref(), bucket.bucket_id.as_deref(), model) {
+                        if let Some(percent) = bucket.used_percent {
+                            if percent >= 100.0 {
+                                if let Some(reset_at) = bucket.reset_at_unix {
+                                    if reset_at > now_unix {
+                                        return true;
+                                    }
+                                } else if let Some(obs) = self.observed_at_unix {
+                                    if now_unix.saturating_sub(obs) <= 300 {
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        false
+    }
+
     /// Merges partial updates from response headers while preserving poll-only
     /// and pre-existing fields like reset credits, model availability, and refresh status.
     /// Notice: `refreshed_at_unix` is deliberately NOT touched by request headers so
@@ -193,6 +293,9 @@ impl AccountUsage {
         }
         if header_usage.has_credits.is_some() {
             self.has_credits = header_usage.has_credits;
+        }
+        if header_usage.overage_limit_reached.is_some() {
+            self.overage_limit_reached = header_usage.overage_limit_reached;
         }
         if !header_usage.groups.is_empty() {
             for hg in header_usage.groups {
@@ -577,6 +680,8 @@ pub fn parse_codex_headers(headers: &HashMap<String, String>, now_unix: i64) -> 
         credits_balance: num(&lower, "x-codex-credits-balance"),
         credits_unlimited: flag(&lower, "x-codex-credits-unlimited"),
         has_credits: flag(&lower, "x-codex-credits-has-credits"),
+        overage_limit_reached: flag(&lower, "x-codex-credits-overage-limit-reached")
+            .or_else(|| flag(&lower, "x-codex-overage-limit-reached")),
         reset_credits_available: None,
         groups,
         observed_at_unix: observed,
@@ -1099,6 +1204,8 @@ pub struct WhamCredits {
     /// Sent as a JSON string (e.g. "0"), not a number.
     #[serde(default)]
     pub balance: Option<String>,
+    #[serde(default)]
+    pub overage_limit_reached: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1314,6 +1421,14 @@ impl WhamUsage {
         });
 
         let credits = self.credits;
+        let overage_flag = credits.as_ref().and_then(|c| c.overage_limit_reached);
+        let spend_flag = self.spend_control.as_ref().and_then(|s| s.reached);
+        let overage_limit_reached = match (overage_flag, spend_flag) {
+            (Some(true), _) | (_, Some(true)) => Some(true),
+            (Some(false), Some(false)) => Some(false),
+            (Some(f), None) | (None, Some(f)) => Some(f),
+            (None, None) => None,
+        };
         AccountUsage {
             plan_type: self.plan_type,
             active_limit: None,
@@ -1325,6 +1440,7 @@ impl WhamUsage {
                 .and_then(|b| b.trim().parse::<f64>().ok()),
             credits_unlimited: credits.as_ref().and_then(|c| c.unlimited),
             has_credits: credits.as_ref().and_then(|c| c.has_credits),
+            overage_limit_reached,
             reset_credits_available: self
                 .rate_limit_reset_credits
                 .and_then(|r| r.available_count),
@@ -3248,5 +3364,120 @@ mod tests {
         let model = &usage.model_availability.unwrap()["model-with-partial-entry"];
         assert_eq!(model.available, None);
         assert_eq!(model.credits_would_enable, Some(true));
+    }
+
+    #[test]
+    fn codex_exhaustion_detects_future_reset_over_100_percent() {
+        let now = 1_000_000;
+        let mut u = AccountUsage::default();
+        assert!(!u.is_codex_included_quota_exhausted(None, now), "empty/unknown is not exhausted");
+
+        u.primary = QuotaWindow {
+            used_percent: Some(100.0),
+            reset_at_unix: Some(now + 60),
+            ..Default::default()
+        };
+        assert!(u.is_codex_included_quota_exhausted(None, now), "100% with future reset is exhausted");
+
+        // Past reset means window reset has occurred
+        u.primary.reset_at_unix = Some(now - 10);
+        assert!(!u.is_codex_included_quota_exhausted(None, now), "100% with past reset is not exhausted");
+
+        // 99% is not exhausted
+        u.primary.used_percent = Some(99.0);
+        u.primary.reset_at_unix = Some(now + 60);
+        assert!(!u.is_codex_included_quota_exhausted(None, now), "99% is not exhausted");
+    }
+
+    #[test]
+    fn codex_exhaustion_handles_burst_and_overage() {
+        let now = 1_000_000;
+        let mut u = AccountUsage::default();
+
+        // Fresh burst window reading (<= 300s)
+        u.primary = QuotaWindow {
+            used_percent: Some(100.0),
+            reset_at_unix: None,
+            ..Default::default()
+        };
+        u.observed_at_unix = Some(now - 100);
+        assert!(u.is_codex_included_quota_exhausted(None, now), "fresh burst 100% is exhausted");
+
+        // Stale burst window reading (> 300s)
+        u.observed_at_unix = Some(now - 400);
+        assert!(!u.is_codex_included_quota_exhausted(None, now), "stale burst reading is not held forever");
+
+        // Explicit overage limit reached
+        let mut u_overage = AccountUsage::default();
+        u_overage.overage_limit_reached = Some(true);
+        assert!(u_overage.is_codex_hard_limit_reached(), "overage_limit_reached is hard limit");
+    }
+
+    #[test]
+    fn codex_exhaustion_checks_model_specific_bucket() {
+        let now = 1_000_000;
+        let u = AccountUsage {
+            groups: vec![QuotaGroup {
+                display_name: Some("Spark".to_string()),
+                models: Some("bengalfox".to_string()),
+                buckets: vec![QuotaBucket {
+                    bucket_id: Some("bengalfox-spark".to_string()),
+                    used_percent: Some(100.0),
+                    reset_at_unix: Some(now + 300),
+                    ..Default::default()
+                }],
+            }],
+            ..Default::default()
+        };
+
+        assert!(u.is_codex_included_quota_exhausted(Some("bengalfox"), now), "spark model is exhausted");
+        assert!(!u.is_codex_included_quota_exhausted(Some("gpt-5.6-sol"), now), "other models are unaffected");
+    }
+
+    #[test]
+    fn parses_overage_limit_from_wham_and_headers() {
+        let raw = r#"{
+          "plan_type": "plus",
+          "credits": {
+            "has_credits": true,
+            "unlimited": false,
+            "balance": "15.5",
+            "overage_limit_reached": true
+          }
+        }"#;
+        let wham: WhamUsage = serde_json::from_str(raw).expect("parse");
+        let usage = wham.into_account_usage(1_000);
+        assert_eq!(usage.credits_balance, Some(15.5));
+        assert_eq!(usage.has_credits, Some(true));
+        assert_eq!(usage.credits_unlimited, Some(false));
+        assert_eq!(usage.overage_limit_reached, Some(true));
+
+        let mut headers = HashMap::new();
+        headers.insert("x-codex-credits-overage-limit-reached".to_string(), "true".to_string());
+        headers.insert("x-codex-credits-balance".to_string(), "20.0".to_string());
+        let header_usage = parse_codex_headers(&headers, 1_000);
+        assert_eq!(header_usage.overage_limit_reached, Some(true));
+        assert_eq!(header_usage.credits_balance, Some(20.0));
+    }
+
+    #[test]
+    fn spend_control_reached_is_not_masked_by_credits_overage_false() {
+        let raw = r#"{
+          "plan_type": "plus",
+          "credits": {
+            "has_credits": true,
+            "unlimited": false,
+            "balance": "10.0",
+            "overage_limit_reached": false
+          },
+          "spend_control": {
+            "reached": true,
+            "individual_limit": 50.0
+          }
+        }"#;
+        let wham: WhamUsage = serde_json::from_str(raw).expect("parse");
+        let usage = wham.into_account_usage(1_000);
+        assert_eq!(usage.overage_limit_reached, Some(true));
+        assert!(usage.is_codex_hard_limit_reached());
     }
 }

@@ -52,6 +52,11 @@ pub fn create_app(state: Arc<AppState>) -> Router {
         )
         .route("/admin/usage/refresh", post(admin_usage_refresh_handler))
         .route("/admin/accounts/{id}/reset", post(admin_reset_handler))
+        .route(
+            "/api/codex-auth/accounts/credits",
+            get(crate::management::accounts::get_codex_credits_opt_in)
+                .put(crate::management::accounts::put_codex_credits_opt_in),
+        )
         .route("/v1/chat/completions", post(chat_completions_handler))
         .route("/chat/completions", post(chat_completions_handler))
         .route("/v1/completions", post(completions_handler))

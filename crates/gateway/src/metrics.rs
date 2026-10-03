@@ -93,6 +93,8 @@ pub struct AccountStats {
     pub models: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discovery: Option<AccountDiscoveryMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credits_after_limit: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

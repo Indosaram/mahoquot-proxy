@@ -507,6 +507,13 @@ pub struct Settings {
     pub model_catalog: Option<ModelCatalogSettings>,
     #[serde(default)]
     pub warmup: WarmupSettings,
+    #[serde(
+        rename = "credit-codex-account-ids",
+        alias = "creditCodexAccountIds",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub credit_codex_account_ids: Vec<String>,
 
     #[serde(flatten)]
     pub extra: serde_yaml::Mapping,
@@ -572,6 +579,7 @@ impl Default for Settings {
             oauth_request_scoped_errors: serde_json::Value::Null,
             model_catalog: None,
             warmup: WarmupSettings::default(),
+            credit_codex_account_ids: Vec::new(),
             extra: serde_yaml::Mapping::new(),
         }
     }
@@ -628,6 +636,36 @@ impl Settings {
 
     pub fn to_yaml(&self) -> Result<String, SettingsError> {
         Ok(serde_yaml::to_string(self)?)
+    }
+
+    pub fn is_codex_account_credit_enabled(&self, account_id: &str) -> bool {
+        self.credit_codex_account_ids.iter().any(|id| id == account_id)
+    }
+
+    pub fn set_codex_account_credit_use(&mut self, account_id: String, enabled: bool) {
+        if enabled {
+            if !self.is_codex_account_credit_enabled(&account_id) {
+                self.credit_codex_account_ids.push(account_id);
+                self.credit_codex_account_ids.sort();
+            }
+        } else {
+            self.credit_codex_account_ids.retain(|id| id != &account_id);
+        }
+    }
+
+    pub fn set_all_codex_accounts_credit_use(
+        &mut self,
+        current_account_ids: &[String],
+        enabled: bool,
+    ) {
+        if enabled {
+            let mut ids = current_account_ids.to_vec();
+            ids.sort();
+            ids.dedup();
+            self.credit_codex_account_ids = ids;
+        } else {
+            self.credit_codex_account_ids.clear();
+        }
     }
 
     /// Write the document so a reader never observes a partial file: render to
@@ -1007,5 +1045,46 @@ mod tests {
         // then only the final file remains
         assert!(leftovers.is_empty(), "leftovers: {leftovers:?}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn codex_credit_allowlist_persists_and_defaults_off() {
+        let default_settings = Settings::default();
+        assert!(default_settings.credit_codex_account_ids.is_empty());
+        assert!(!default_settings.is_codex_account_credit_enabled("codex-1"));
+
+        // Single account enable
+        let mut s = default_settings.clone();
+        s.set_codex_account_credit_use("codex-1".to_string(), true);
+        assert!(s.is_codex_account_credit_enabled("codex-1"));
+        assert!(!s.is_codex_account_credit_enabled("codex-2"));
+
+        // Global enable for existing accounts
+        let existing = vec!["codex-1".to_string(), "codex-2".to_string()];
+        s.set_all_codex_accounts_credit_use(&existing, true);
+        assert!(s.is_codex_account_credit_enabled("codex-1"));
+        assert!(s.is_codex_account_credit_enabled("codex-2"));
+        // New account added later is OFF by default
+        assert!(!s.is_codex_account_credit_enabled("codex-3"));
+
+        // Global disable clears list
+        s.set_all_codex_accounts_credit_use(&existing, false);
+        assert!(s.credit_codex_account_ids.is_empty());
+        assert!(!s.is_codex_account_credit_enabled("codex-1"));
+
+        // YAML serialization round-trips
+        s.set_codex_account_credit_use("codex-a".to_string(), true);
+        let yaml = s.to_yaml().expect("yaml");
+        assert!(yaml.contains("credit-codex-account-ids:"), "{yaml}");
+        assert!(yaml.contains("codex-a"), "{yaml}");
+
+        let reloaded = Settings::from_yaml(&yaml).expect("from_yaml");
+        assert!(reloaded.is_codex_account_credit_enabled("codex-a"));
+        assert!(!reloaded.is_codex_account_credit_enabled("codex-b"));
+
+        // Also accepts camelCase alias from OpenCodex
+        let camel = "creditCodexAccountIds:\n  - codex-camel\n";
+        let loaded_camel = Settings::from_yaml(camel).expect("from camelCase");
+        assert!(loaded_camel.is_codex_account_credit_enabled("codex-camel"));
     }
 }

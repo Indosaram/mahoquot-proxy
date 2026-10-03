@@ -828,6 +828,11 @@ impl AppState {
                     } else {
                         None
                     },
+                    credits_after_limit: if m.kind() == crate::account::ProviderKind::Codex {
+                        Some(self.settings.current().is_codex_account_credit_enabled(&m.id))
+                    } else {
+                        None
+                    },
                 }
             })
             .collect();

@@ -922,4 +922,220 @@ pub fn account_management_routes() -> Router<Arc<AppState>> {
         .route("/auth-files/export", post(export_auth_files))
         .route("/auth-files/bulk", post(bulk_auth_files))
         .route("/api-key-bindings", get(list_bindings).put(put_binding))
+        .route(
+            "/accounts/credits",
+            get(get_codex_credits_opt_in).put(put_codex_credits_opt_in),
+        )
+        .route(
+            "/codex/credits",
+            get(get_codex_credits_opt_in).put(put_codex_credits_opt_in),
+        )
+}
+
+pub async fn get_codex_credits_opt_in(State(state): State<Arc<AppState>>) -> Response {
+    let ids = state.settings.current().credit_codex_account_ids.clone();
+    json_status(
+        StatusCode::OK,
+        json!({
+            "ids": ids,
+            "credit_codex_account_ids": ids,
+        }),
+    )
+}
+
+pub async fn put_codex_credits_opt_in(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Response {
+    if !body.is_object() {
+        return typed_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_body",
+            "body must be an object",
+        );
+    }
+
+    if let Some(all_val) = body.get("all") {
+        let Some(all) = all_val.as_bool() else {
+            return typed_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_body",
+                "all must be a boolean",
+            );
+        };
+
+        let state_clone = Arc::clone(&state);
+        let result = tokio::task::spawn_blocking(move || {
+            let (ids_vec, ids_to_save) = if all {
+                let mut codex_ids = BTreeSet::new();
+                for member in &state_clone.pool.load().members {
+                    if member.kind() == crate::account::ProviderKind::Codex {
+                        codex_ids.insert(member.id.clone());
+                    }
+                }
+
+                let dir = auth_dir(&state_clone);
+                if let Ok(entries) = std::fs::read_dir(&dir) {
+                    for entry in entries.flatten() {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        if !valid_name(&name) || !name.to_ascii_lowercase().ends_with(".json") {
+                            continue;
+                        }
+                        let path = entry.path();
+                        if let Ok(raw) = std::fs::read_to_string(&path) {
+                            if let Ok(val) = serde_json::from_str::<Value>(&raw) {
+                                let is_codex = val.get("type").and_then(Value::as_str) == Some("codex")
+                                    || val.get("type").and_then(Value::as_str) == Some("plus")
+                                    || val.get("provider").and_then(Value::as_str) == Some("codex");
+                                if is_codex {
+                                    let id = name.trim_end_matches(".json").to_string();
+                                    codex_ids.insert(id);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let enabled_ids: Vec<String> = codex_ids.into_iter().collect();
+                (enabled_ids.clone(), enabled_ids)
+            } else {
+                (Vec::new(), Vec::new())
+            };
+
+            state_clone
+                .settings
+                .mutate(|settings| {
+                    settings.set_all_codex_accounts_credit_use(&ids_to_save, all);
+                })
+                .map_err(|e| e.to_string())?;
+
+            Ok::<Vec<String>, String>(ids_vec)
+        })
+        .await;
+
+        match result {
+            Ok(Ok(ids)) => json_status(
+                StatusCode::OK,
+                json!({ "ok": true, "all": all, "ids": ids }),
+            ),
+            Ok(Err(err)) => typed_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "settings_save_failed",
+                err,
+            ),
+            Err(err) => typed_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "settings_save_failed",
+                err,
+            ),
+        }
+    } else {
+        let Some(id) = body
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            return typed_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_body",
+                "id is required when all is not provided",
+            );
+        };
+
+        if !valid_name(id) {
+            return typed_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_id",
+                "invalid account id format",
+            );
+        }
+
+        let enabled = body
+            .get("credits_after_limit")
+            .or_else(|| body.get("creditsAfterLimit"))
+            .and_then(Value::as_bool);
+        let Some(enabled) = enabled else {
+            return typed_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_body",
+                "credits_after_limit boolean is required",
+            );
+        };
+
+        let state_clone = Arc::clone(&state);
+        let id_owned = id.to_string();
+        let result = tokio::task::spawn_blocking(move || {
+            let is_codex = if let Some(member) = state_clone.find_member(&id_owned) {
+                if member.kind() != crate::account::ProviderKind::Codex {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        "invalid_provider",
+                        "account is not a Codex credential".to_string(),
+                    ));
+                }
+                true
+            } else {
+                let dir = auth_dir(&state_clone);
+                let candidate_path = if id_owned.ends_with(".json") {
+                    dir.join(&id_owned)
+                } else {
+                    dir.join(format!("{id_owned}.json"))
+                };
+                if let Ok(raw) = std::fs::read_to_string(&candidate_path) {
+                    if let Ok(val) = serde_json::from_str::<Value>(&raw) {
+                        val.get("type").and_then(Value::as_str) == Some("codex")
+                            || val.get("type").and_then(Value::as_str) == Some("plus")
+                            || val.get("provider").and_then(Value::as_str) == Some("codex")
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            };
+
+            if !is_codex {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    "account_not_found",
+                    "Codex account not found".to_string(),
+                ));
+            }
+
+            state_clone
+                .settings
+                .mutate(|settings| {
+                    settings.set_codex_account_credit_use(id_owned.clone(), enabled);
+                })
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "settings_save_failed",
+                        e.to_string(),
+                    )
+                })?;
+
+            Ok(())
+        })
+        .await;
+
+        match result {
+            Ok(Ok(())) => json_status(
+                StatusCode::OK,
+                json!({
+                    "ok": true,
+                    "id": id,
+                    "credits_after_limit": enabled,
+                    "creditsAfterLimit": enabled,
+                }),
+            ),
+            Ok(Err((status, code, msg))) => typed_error(status, code, msg),
+            Err(err) => typed_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "task_join_failed",
+                err,
+            ),
+        }
+    }
 }

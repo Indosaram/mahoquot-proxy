@@ -156,9 +156,12 @@ fn responses_request() -> Value {
 async fn the_switch_puts_priority_on_every_codex_bound_request() {
     // Given: a gateway with the switch on
     let h = harness("t32-fast-mode-on").await;
-    h.state.settings.mutate(|settings| {
-        settings.codex_fast_mode = true;
-    });
+    h.state
+        .settings
+        .mutate(|settings| {
+            settings.codex_fast_mode = true;
+        })
+        .unwrap();
 
     // When: the caller arrives through both codex-bound entry points
     assert_eq!(post_json(&h.app, "/v1/chat/completions", chat_request(None)).await, 200);
@@ -217,9 +220,12 @@ async fn the_switch_is_off_by_default_and_never_invents_a_tier() {
 async fn the_switch_outranks_a_client_tier() {
     // Given: the switch on and a client insisting on a different tier
     let h = harness("t32-fast-mode-override").await;
-    h.state.settings.mutate(|settings| {
-        settings.codex_fast_mode = true;
-    });
+    h.state
+        .settings
+        .mutate(|settings| {
+            settings.codex_fast_mode = true;
+        })
+        .unwrap();
 
     // When: that client calls
     assert_eq!(

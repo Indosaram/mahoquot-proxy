@@ -2397,6 +2397,7 @@ fn eligible_indices(
     state: &AppState,
 ) -> Vec<usize> {
     let Some(route) = route else {
+        let now_unix = now_ms / 1000;
         return pool
             .members
             .iter()
@@ -2405,6 +2406,24 @@ fn eligible_indices(
             .filter(|(_, member)| state.scheduler.permits(member.id()))
             .filter(|(_, member)| member_matches_api_key_binding(member, api_key_binding))
             .filter(|(_, member)| crate::models_route::member_matches_scope(member, scoped_key))
+            .filter(|(_, member)| {
+                if member.kind() == crate::account::ProviderKind::Codex {
+                    let usage = member.usage_snapshot();
+                    if usage.is_codex_hard_limit_reached() {
+                        return false;
+                    }
+                    let credit_enabled = state
+                        .settings
+                        .current()
+                        .is_codex_account_credit_enabled(member.id());
+                    if !credit_enabled
+                        && usage.is_codex_included_quota_exhausted(None, now_unix)
+                    {
+                        return false;
+                    }
+                }
+                true
+            })
             .map(|(index, _)| index)
             .collect();
     };
@@ -2435,6 +2454,21 @@ fn eligible_indices(
         }
         if !crate::models_route::member_matches_scope(member, scoped_key) {
             continue;
+        }
+        if member.kind() == crate::account::ProviderKind::Codex {
+            let usage = member.usage_snapshot();
+            if usage.is_codex_hard_limit_reached() {
+                continue;
+            }
+            let credit_enabled = state
+                .settings
+                .current()
+                .is_codex_account_credit_enabled(member.id());
+            if !credit_enabled
+                && usage.is_codex_included_quota_exhausted(Some(canonical_model), now_ms / 1000)
+            {
+                continue;
+            }
         }
         match prefix {
             Some(ModelPrefix::Anthropic) => {
@@ -3682,6 +3716,21 @@ pub async fn handle_relay(
             let Some(member) = pool.members.get(idx) else {
                 return false;
             };
+            if member.kind() == crate::account::ProviderKind::Codex {
+                let usage = member.usage_snapshot();
+                if usage.is_codex_hard_limit_reached() {
+                    return false;
+                }
+                let credit_enabled = state
+                    .settings
+                    .current()
+                    .is_codex_account_credit_enabled(member.id());
+                if !credit_enabled
+                    && usage.is_codex_included_quota_exhausted(select_model, now_ms / 1000)
+                {
+                    return false;
+                }
+            }
             select_model.is_none_or(|model| member.group_available(model, now_ms))
         });
         let chosen_idx = match select_index(&state, &pool, &hint, &eligible, &attempted) {
