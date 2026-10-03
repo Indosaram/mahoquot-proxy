@@ -45,6 +45,7 @@ pub struct AccountSnapshotPermissions {
     pub effective_base_url: String,
     pub devin_models: Option<Vec<String>>,
     pub devin_discovered: Option<Vec<crate::devin_catalog::DiscoveredDevinModel>>,
+    pub antigravity_models: Option<std::collections::BTreeMap<String, crate::usage::ModelAvailability>>,
     pub unsupported_models: Vec<String>,
 }
 
@@ -58,6 +59,7 @@ impl std::fmt::Debug for AccountSnapshotPermissions {
             .field("effective_base_url", &self.effective_base_url)
             .field("devin_models", &self.devin_models)
             .field("devin_discovered", &self.devin_discovered)
+            .field("antigravity_models", &self.antigravity_models)
             .field("unsupported_models", &self.unsupported_models)
             .finish()
     }
@@ -83,6 +85,25 @@ impl AccountSnapshotPermissions {
                     || m.strip_prefix("devin/").unwrap_or(m) == upstream
             }),
             None => false,
+        }
+    }
+
+    pub fn supports_antigravity_model(&self, requested: &str, canonical: &str, upstream: &str) -> bool {
+        if self.provider_kind != ProviderKind::Antigravity || self.disabled {
+            return false;
+        }
+        if self
+            .unsupported_models
+            .iter()
+            .any(|m| m == requested || m == canonical || m == upstream)
+        {
+            return false;
+        }
+        match &self.antigravity_models {
+            Some(discovered) => {
+                discovered.get(upstream).and_then(|m| m.available) == Some(true)
+            }
+            None => mahoquot_providers::is_antigravity_model(upstream),
         }
     }
 
@@ -120,6 +141,7 @@ impl PoolSnapshot {
                 .clone();
             let devin_models = m.devin_models();
             let devin_discovered = m.devin_discovered_models();
+            let antigravity_models = m.antigravity_discovered_models();
             permissions.insert(
                 m.id.clone(),
                 AccountSnapshotPermissions {
@@ -130,6 +152,7 @@ impl PoolSnapshot {
                     effective_base_url,
                     devin_models,
                     devin_discovered,
+                    antigravity_models,
                     unsupported_models: unsupported,
                 },
             );
@@ -203,6 +226,13 @@ impl PoolSnapshot {
         self.permissions.get(id).map(|p| p.effective_base_url.as_str())
     }
 
+    pub fn is_antigravity_model_eligible(&self, id: &str, model: &str) -> bool {
+        let stripped = model.strip_prefix("antigravity/").unwrap_or(model);
+        self.permissions
+            .get(id)
+            .is_some_and(|p| p.supports_antigravity_model(model, stripped, stripped))
+    }
+
     pub fn find_member(&self, id: &str) -> Option<Arc<AccountMember>> {
         self.members.iter().find(|m| m.id == id).cloned()
     }
@@ -249,8 +279,18 @@ impl PoolSnapshot {
                         if perm.provider_kind == ProviderKind::Devin {
                             return perm.supports_devin_model(model, canonical, upstream);
                         }
+                        if perm.provider_kind == ProviderKind::Antigravity {
+                            if perm.antigravity_models.is_none() {
+                                return binding.source != CatalogSource::Discovered;
+                            }
+                            return perm.supports_antigravity_model(model, canonical, upstream);
+                        }
                     } else if m.kind() == ProviderKind::Devin {
                         return m.supports_devin_model(model, canonical, upstream);
+                    } else if m.kind() == ProviderKind::Antigravity {
+                        return m.supports_antigravity_model(model)
+                            || m.supports_antigravity_model(canonical)
+                            || m.supports_antigravity_model(upstream);
                     }
 
                     m.generic_models().is_none_or(|(_, models)| {
@@ -269,6 +309,14 @@ fn registry_with_account_contributions(
     registry: &RegistrySnapshot,
 ) -> Result<RegistrySnapshot, RegistryError> {
     let mut effective = registry.clone();
+    effective.models.retain(|_, descriptor| {
+        let discovered = descriptor.bindings.get(&ProviderId::antigravity())
+            .is_some_and(|binding| binding.source == CatalogSource::Discovered);
+        if discovered {
+            descriptor.bindings.remove(&ProviderId::antigravity());
+        }
+        !discovered || !descriptor.bindings.is_empty()
+    });
     for member in members {
         let Some((provider_name, models)) = member.generic_models() else {
             continue;
@@ -376,6 +424,57 @@ fn registry_with_account_contributions(
                                     mahoquot_registry::ModelCapability::Tools,
                                 ])
                             });
+                    }
+                }
+            }
+        }
+    }
+    for member in members {
+        if member.kind() == ProviderKind::Antigravity && !member.is_manually_disabled() {
+            if let Some(models_map) = member.antigravity_discovered_models() {
+                if !models_map.is_empty() {
+                    let provider_id = ProviderId::antigravity();
+                    if !effective.providers.contains_key(&provider_id) {
+                        effective
+                            .providers
+                            .insert(provider_id.clone(), ProviderPolicy::Discovered);
+                    }
+                    for (model_name, avail) in &models_map {
+                        if !avail.available.unwrap_or(true) {
+                            continue;
+                        }
+                        let model_id = match ModelId::new(model_name) {
+                            Ok(id) => id,
+                            Err(err) => {
+                                tracing::warn!(model = %model_name, "skipping unparseable antigravity model: {err}");
+                                continue;
+                            }
+                        };
+                        let descriptor = effective
+                            .models
+                            .entry(model_id.clone())
+                            .or_insert_with(|| {
+                                let mut desc = ModelDescriptor::new(model_id.clone(), "google");
+                                desc.capabilities.insert(mahoquot_registry::ModelCapability::Chat);
+                                desc.capabilities.insert(mahoquot_registry::ModelCapability::Tools);
+                                desc
+                            });
+                        descriptor
+                            .bindings
+                            .entry(provider_id.clone())
+                            .or_insert_with(|| {
+                                ProviderBinding::new(
+                                    provider_id.clone(),
+                                    ProviderPolicy::Discovered,
+                                    CatalogSource::Discovered,
+                                )
+                                .with_capabilities([
+                                    mahoquot_registry::ModelCapability::Chat,
+                                    mahoquot_registry::ModelCapability::Tools,
+                                ])
+                                .with_priority(100)
+                            });
+
                     }
                 }
             }
@@ -498,6 +597,7 @@ pub struct UnifiedRuntimeState {
     generation_seq: AtomicU64,
     coordinator: Arc<RefreshCoordinator>,
     models_env: Option<String>,
+    base_registry: Arc<arc_swap::ArcSwap<RegistrySnapshot>>,
 }
 
 pub type RuntimeState = UnifiedRuntimeState;
@@ -505,12 +605,14 @@ pub type RuntimeState = UnifiedRuntimeState;
 impl UnifiedRuntimeState {
     pub fn new(initial: RuntimeComposition, models_env: Option<String>) -> Self {
         let generation_seq = AtomicU64::new(initial.generation);
+        let base_registry = Arc::new(arc_swap::ArcSwap::from(Arc::clone(&initial.registry)));
         let pool = Arc::new(arc_swap::ArcSwap::from_pointee(initial));
         Self {
             pool,
             generation_seq,
             coordinator: Arc::new(RefreshCoordinator::default()),
             models_env,
+            base_registry,
         }
     }
 
@@ -540,6 +642,7 @@ impl UnifiedRuntimeState {
     ) -> Result<Arc<RuntimeComposition>, anyhow::Error> {
         self.coordinator.exclusive(|| {
             candidate.registry.validate()?;
+            self.base_registry.store(Arc::clone(&candidate.registry));
             let arc_candidate = Arc::new(candidate);
             self.generation_seq
                 .store(arc_candidate.generation, Ordering::SeqCst);
@@ -563,6 +666,7 @@ impl UnifiedRuntimeState {
         let models_env = self.models_env.clone();
         let pool = Arc::clone(&self.pool);
         let gen_seq = &self.generation_seq;
+        let base_reg = Arc::clone(&self.base_registry);
 
         self.coordinator.exclusive(|| {
             let next_gen = gen_seq.fetch_add(1, Ordering::SeqCst) + 1;
@@ -570,10 +674,11 @@ impl UnifiedRuntimeState {
             let candidate = compute_candidate_composition(
                 next_gen,
                 current_members,
-                next_registry,
+                Arc::clone(&next_registry),
                 models_env.as_deref(),
             )?;
             commit()?;
+            base_reg.store(next_registry);
             let arc_candidate = Arc::new(candidate);
             pool.store(Arc::clone(&arc_candidate));
             Ok(arc_candidate)
@@ -587,14 +692,15 @@ impl UnifiedRuntimeState {
         let models_env = self.models_env.clone();
         let pool = Arc::clone(&self.pool);
         let gen_seq = &self.generation_seq;
+        let base_reg = Arc::clone(&self.base_registry);
 
         self.coordinator.exclusive(|| {
             let next_gen = gen_seq.fetch_add(1, Ordering::SeqCst) + 1;
-            let current_registry = Arc::clone(&pool.load().registry);
+            let base = Arc::clone(&base_reg.load());
             let candidate = compute_candidate_composition(
                 next_gen,
                 new_members,
-                current_registry,
+                base,
                 models_env.as_deref(),
             )?;
             let arc_candidate = Arc::new(candidate);
@@ -607,15 +713,16 @@ impl UnifiedRuntimeState {
         let models_env = self.models_env.clone();
         let pool = Arc::clone(&self.pool);
         let gen_seq = &self.generation_seq;
+        let base_reg = Arc::clone(&self.base_registry);
 
         self.coordinator.coordinate(|| {
             let next_gen = gen_seq.fetch_add(1, Ordering::SeqCst) + 1;
             let current_members = pool.load().members.clone();
-            let current_registry = Arc::clone(&pool.load().registry);
+            let base = Arc::clone(&base_reg.load());
             let candidate = compute_candidate_composition(
                 next_gen,
                 current_members,
-                current_registry,
+                base,
                 models_env.as_deref(),
             )?;
             pool.store(Arc::new(candidate));

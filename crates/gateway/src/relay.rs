@@ -2249,6 +2249,13 @@ fn account_declares_binding_model(
             || pool.is_devin_model_eligible(member.id(), &provider.upstream_model);
     }
 
+    if member.kind() == crate::account::ProviderKind::Antigravity {
+        if pool.account_permissions(member.id()).is_some_and(|p| p.antigravity_models.is_none()) {
+            return provider.binding.source != mahoquot_registry::CatalogSource::Discovered;
+        }
+        return pool.is_antigravity_model_eligible(member.id(), &provider.upstream_model);
+    }
+
     let Some((_, models)) = member.generic_models() else {
         return true;
     };

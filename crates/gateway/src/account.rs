@@ -1342,6 +1342,43 @@ impl AccountMember {
         self.devin_catalog.store(Some(state));
     }
 
+    pub fn antigravity_discovered_models(
+        &self,
+    ) -> Option<std::collections::BTreeMap<String, crate::usage::ModelAvailability>> {
+        if self.kind() != ProviderKind::Antigravity {
+            return None;
+        }
+        if self.is_manually_disabled() {
+            return Some(std::collections::BTreeMap::new());
+        }
+        let usage = self.usage.read().unwrap_or_else(|p| p.into_inner());
+        usage.model_availability.clone()
+    }
+
+    pub fn supports_antigravity_model(&self, model: &str) -> bool {
+        if self.kind() != ProviderKind::Antigravity || self.is_manually_disabled() {
+            return false;
+        }
+        let unsupported = self
+            .unsupported_models
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        if unsupported.iter().any(|m| m == model) {
+            return false;
+        }
+        let stripped = model.strip_prefix("antigravity/").unwrap_or(model);
+        let usage = self.usage.read().unwrap_or_else(|p| p.into_inner());
+        match &usage.model_availability {
+            Some(discovered) => {
+                discovered.get(model).and_then(|m| m.available).unwrap_or(false)
+                    || discovered.get(stripped).and_then(|m| m.available).unwrap_or(false)
+            }
+            None => {
+                is_antigravity_model(model) || is_antigravity_model(stripped)
+            }
+        }
+    }
+
     pub fn clone_for_snapshot(
         &self,
         new_catalog: Option<Arc<crate::devin_catalog::DevinAccountCatalogState>>,
@@ -1615,6 +1652,9 @@ impl AccountMember {
                     } else {
                         mahoquot_providers::is_claude_model(model) || model.starts_with("claude-")
                     }
+                }
+                ProviderAccount::Antigravity(_) => {
+                    self.supports_antigravity_model(model)
                 }
                 account => account.kind().serves_model(model),
             }

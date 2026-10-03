@@ -85,6 +85,14 @@ fn member_matches_provider_binding(
         return member.supports_devin_model(model_id.as_str(), model_id.as_str(), upstream);
     }
 
+    if member.kind() == ProviderKind::Antigravity {
+        let upstream = binding.effective_upstream_id(model_id);
+        return match member.antigravity_discovered_models() {
+            Some(models) => models.get(upstream).and_then(|m| m.available) == Some(true),
+            None => binding.source != mahoquot_registry::CatalogSource::Discovered,
+        };
+    }
+
     true
 }
 
@@ -253,7 +261,9 @@ pub fn expand_prefixed_models(
 
     let mut result = entries.clone();
     for entry in &entries {
-        if mahoquot_providers::is_claude_model(&entry.id) || entry.id.starts_with("claude-") {
+        if mahoquot_providers::is_claude_model(&entry.id)
+            || (entry.id.starts_with("claude-") && entry.owned_by != "google")
+        {
             if has_official_claude {
                 result.push(ModelEntry {
                     id: format!("anthropic/{}", entry.id),

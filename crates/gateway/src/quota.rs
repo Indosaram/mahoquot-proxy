@@ -729,9 +729,19 @@ async fn try_antigravity_quota(
         }
     };
 
-    let url = mahoquot_providers::antigravity_quota_summary_url(
-        mahoquot_providers::ANTIGRAVITY_UPSTREAM_BASE,
-    );
+    let override_base = member
+        .usage_override
+        .as_deref()
+        .or(member.upstream_override.as_deref());
+    let quota_base = override_base.unwrap_or(mahoquot_providers::ANTIGRAVITY_UPSTREAM_BASE);
+    let url = mahoquot_providers::antigravity_quota_summary_url(quota_base);
+
+    let previous_availability = member
+        .usage
+        .read()
+        .ok()
+        .and_then(|u| u.model_availability.clone());
+
     let client = state.client_for_member(member);
     let resp = client
         .post(&url)
@@ -774,9 +784,10 @@ async fn try_antigravity_quota(
     let mut usage = crate::usage::parse_antigravity_quota_summary(&body, now_unix());
 
     // Fetch plan tier from loadCodeAssist using the same token
+    let load_base = override_base.unwrap_or(mahoquot_providers::ANTIGRAVITY_LOAD_BASE);
     let load_url = format!(
         "{}/v1internal:loadCodeAssist",
-        mahoquot_providers::ANTIGRAVITY_LOAD_BASE
+        load_base.trim_end_matches('/')
     );
     if let Ok(load_resp) = client
         .post(&load_url)
@@ -829,7 +840,60 @@ async fn try_antigravity_quota(
         }
     }
 
+    // Dynamic model discovery from fetchAvailableModels
+    let models_base = override_base.unwrap_or(mahoquot_providers::ANTIGRAVITY_UPSTREAM_BASE);
+    let models_url = format!(
+        "{}/v1internal:fetchAvailableModels",
+        models_base.trim_end_matches('/')
+    );
+    let models_resp = client
+        .post(&models_url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("User-Agent", mahoquot_providers::ANTIGRAVITY_USER_AGENT)
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({ "project": project }))
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await;
+
+    usage.model_availability = previous_availability.clone();
+    match models_resp {
+        Ok(resp) if resp.status().is_success() => {
+            if let Ok(models_data) = resp.json::<serde_json::Value>().await {
+                let mut models_map = std::collections::BTreeMap::new();
+                if let Some(models_obj) = models_data.get("models").and_then(|v| v.as_object()) {
+                    for model_id in models_obj.keys() {
+                        models_map.insert(
+                            model_id.clone(),
+                            crate::usage::ModelAvailability {
+                                available: Some(true),
+                                available_at: None,
+                                credits_would_enable: None,
+                            },
+                        );
+                    }
+                    usage.model_availability = Some(models_map);
+                }
+            } else {
+                usage.model_availability = previous_availability.clone();
+            }
+        }
+        _ => {
+            // Transient fetch failure: retain last good snapshot
+            usage.model_availability = previous_availability.clone();
+        }
+    }
+
+    let availability_changed = usage.model_availability != previous_availability;
+    usage.refreshed_at_unix = Some(now_unix());
+    usage.refresh_status = Some("ok".to_string());
+    usage.last_refresh_error = None;
     member.set_usage(usage);
+
+    if availability_changed {
+        state.runtime.trigger_coalesced_refresh()
+            .map_err(|error| QuotaError::Upstream(format!("model catalog publication failed: {error}")))?;
+    }
     Ok(())
 }
 
