@@ -44,6 +44,15 @@ async fn management_endpoints_mutate_and_persist_opt_in() {
     let json_2 = create_auth_file_json("codex-2", "acc_2", "tok_2", None);
     std::fs::write(temp_dir.join("codex-1.json"), json_1).unwrap();
     std::fs::write(temp_dir.join("codex-2.json"), json_2).unwrap();
+    std::fs::write(temp_dir.join("antigravity-duplicate.json"), json!({
+        "type": "antigravity",
+        "identity_slug": "codex-1",
+        "access_token": "other-token",
+        "refresh_token": "other-refresh",
+        "project_id": "test-project",
+        "email": "other@example.test",
+        "expired": "2099-01-01T00:00:00Z"
+    }).to_string()).unwrap();
 
     let claude_json = serde_json::json!({
         "type": "claude",
@@ -66,6 +75,7 @@ async fn management_endpoints_mutate_and_persist_opt_in() {
         .unwrap(),
     );
     let app = create_app(Arc::clone(&state));
+    assert_eq!(state.find_member("codex-1").unwrap().kind(), mahoquot_gateway::account::ProviderKind::Antigravity);
 
     let res = app
         .clone()

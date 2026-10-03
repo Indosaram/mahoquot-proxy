@@ -146,6 +146,61 @@ async fn reset_credit_refresh_retry_is_idempotent() {
     std::fs::remove_dir_all(auth_dir).ok();
 }
 
+#[tokio::test]
+async fn reset_credit_route_selects_codex_when_another_provider_shares_id() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use http_body_util::BodyExt;
+    use mahoquot_gateway::account::ProviderKind;
+    use mahoquot_gateway::inbound::ApiKeys;
+    use tower::ServiceExt;
+
+    // Given a non-Codex account appears first with the same runtime id.
+    let auth_dir = unique_temp_dir("reset-provider-collision");
+    for (name, provider) in [("a-other.json", "antigravity"), ("b-codex.json", "codex")] {
+        std::fs::write(auth_dir.join(name), serde_json::to_vec(&serde_json::json!({
+            "type": provider,
+            "identity_slug": "shared-reset",
+            "access_token": "token",
+            "refresh_token": "refresh",
+            "project_id": "reset-project",
+            "account_id": "account",
+            "email": "reset@example.test",
+            "expired": "2099-01-01T00:00:00Z",
+            "id_token": "id",
+            "last_refresh": "2026-01-01T00:00:00Z",
+            "upstream_override": "http://127.0.0.1:18899"
+        })).unwrap()).unwrap();
+    }
+    let state = Arc::new(AppState::new(&GatewayConfig {
+        auth_dir: auth_dir.clone(),
+        config_path: auth_dir.join("config.yaml"),
+        api_keys: ApiKeys::new(vec!["reset-test".to_string()]),
+        auth_refresh_enabled: false,
+        ..GatewayConfig::default()
+    }).unwrap());
+    assert_eq!(state.find_member("shared-reset").unwrap().kind(), ProviderKind::Antigravity);
+    let codex = state.pool.load().members.iter().find(|m| m.kind() == ProviderKind::Codex).unwrap().clone();
+    assert_eq!(codex.id, "shared-reset");
+    codex.set_usage(mahoquot_gateway::usage::AccountUsage {
+        reset_credits_available: Some(0),
+        credits_balance: Some(0.0),
+        ..Default::default()
+    });
+
+    // When the real reset route resolves the shared id (no upstream needed).
+    let response = mahoquot_gateway::routes::create_app(state).oneshot(
+        Request::builder().method("POST").uri("/admin/accounts/shared-reset/reset")
+            .header("Authorization", "Bearer reset-test").body(Body::empty()).unwrap()
+    ).await.unwrap();
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    std::fs::remove_dir_all(auth_dir).unwrap();
+
+    // Then Codex's empty banked-reset balance is reported, not unsupported provider.
+    assert_eq!(status, StatusCode::CONFLICT, "{}", String::from_utf8_lossy(&body));
+}
+
 #[test]
 fn reset_credit_policy_retains_redeem_id() {
     assert_eq!(

@@ -1066,7 +1066,18 @@ pub async fn put_codex_credits_opt_in(
         let state_clone = Arc::clone(&state);
         let id_owned = id.to_string();
         let result = tokio::task::spawn_blocking(move || {
-            let is_codex = if let Some(member) = state_clone.find_member(&id_owned) {
+            let member = {
+                let pool = state_clone.pool.load();
+                pool.members
+                    .iter()
+                    .find(|member| {
+                        member.id == id_owned
+                            && member.kind() == crate::account::ProviderKind::Codex
+                    })
+                    .or_else(|| pool.members.iter().find(|member| member.id == id_owned))
+                    .cloned()
+            };
+            let is_codex = if let Some(member) = member {
                 if member.kind() != crate::account::ProviderKind::Codex {
                     return Err((
                         StatusCode::BAD_REQUEST,

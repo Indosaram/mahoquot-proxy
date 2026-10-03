@@ -341,7 +341,17 @@ async fn admin_reset_handler(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
-    let Some(member) = state.find_member(&id) else {
+    let member = {
+        let pool = state.pool.load();
+        pool.members
+            .iter()
+            .find(|member| {
+                member.id == id && member.kind() == crate::account::ProviderKind::Codex
+            })
+            .or_else(|| pool.members.iter().find(|member| member.id == id))
+            .cloned()
+    };
+    let Some(member) = member else {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": "unknown account" })),
