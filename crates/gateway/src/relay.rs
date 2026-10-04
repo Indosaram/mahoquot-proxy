@@ -526,7 +526,7 @@ struct UpstreamTarget {
 
 struct UpstreamExchange {
     response: reqwest::Response,
-    cursor_reply: Option<tokio::sync::mpsc::UnboundedSender<Bytes>>,
+    cursor_reply: Option<tokio::sync::mpsc::Sender<Bytes>>,
 }
 
 #[derive(Clone, Debug)]
@@ -1061,6 +1061,7 @@ fn resolve_target(
 enum UpstreamSendError {
     Reqwest(reqwest::Error),
     DevinClient(crate::proxy_policy::DevinClientBuildError),
+    CursorReply(String),
 }
 
 impl std::fmt::Display for UpstreamSendError {
@@ -1068,6 +1069,7 @@ impl std::fmt::Display for UpstreamSendError {
         match self {
             Self::Reqwest(e) => write!(f, "{e}"),
             Self::DevinClient(e) => write!(f, "{e}"),
+            Self::CursorReply(message) => write!(f, "{message}"),
         }
     }
 }
@@ -1091,6 +1093,7 @@ impl UpstreamSendError {
         match self {
             Self::Reqwest(e) => e.is_timeout() || e.is_connect() || e.is_request(),
             Self::DevinClient(_) => false,
+            Self::CursorReply(_) => false,
         }
     }
 }
@@ -1200,16 +1203,31 @@ async fn send_upstream(
     }
     let req_start = std::time::Instant::now();
     let (resp, cursor_reply) = if protocol == compat::Protocol::Cursor {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
-        let _ = tx.send(body_bytes.clone());
+        let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(compat::cursor::CURSOR_REPLY_QUEUE_CAPACITY);
+        // The initial request body is mandatory: a full (or closed) queue here
+        // would mean the connection is already unusable, so surface it instead
+        // of silently dropping the body.
+        tx.try_send(body_bytes.clone()).map_err(|_| {
+            UpstreamSendError::CursorReply(
+                "cursor reply queue full before the request body".to_string(),
+            )
+        })?;
         let heartbeat_tx = tx.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
             interval.tick().await;
             loop {
+                if heartbeat_tx.is_closed() {
+                    break;
+                }
                 interval.tick().await;
+                if heartbeat_tx.is_closed() {
+                    break;
+                }
+                // Heartbeats stay droppable: a full queue means the upstream is
+                // not reading, so stop emitting rather than grow the channel.
                 if heartbeat_tx
-                    .send(Bytes::from(compat::cursor::client_heartbeat_frame()))
+                    .try_send(Bytes::from(compat::cursor::client_heartbeat_frame()))
                     .is_err()
                 {
                     break;
@@ -1218,7 +1236,7 @@ async fn send_upstream(
         });
         let stream = futures::stream::unfold(
             rx,
-            |mut rx: tokio::sync::mpsc::UnboundedReceiver<Bytes>| async move {
+            |mut rx: tokio::sync::mpsc::Receiver<Bytes>| async move {
                 rx.recv()
                     .await
                     .map(|chunk| (Ok::<Bytes, std::io::Error>(chunk), rx))

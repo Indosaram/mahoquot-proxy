@@ -247,6 +247,17 @@ fn sanitize_schema(value: &mut Value) {
     }
 }
 
+/// Upper bound on a single declared AWS event-stream frame. The four-byte
+/// length prefix is authoritative before any payload arrives, so an oversized
+/// declaration is refused as soon as it is read instead of buffering the
+/// payload it promises.
+pub const MAX_KIRO_FRAME_BYTES: usize = 64 * 1024 * 1024;
+
+/// Upper bound on the JSON retained between chunks. A payload that never
+/// closes its object would otherwise keep growing for the lifetime of the
+/// request.
+pub const MAX_KIRO_JSON_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+
 #[derive(Default)]
 pub struct KiroDecoder {
     wire: Vec<u8>,
@@ -269,10 +280,19 @@ impl KiroDecoder {
         }
         self.wire.extend_from_slice(bytes);
         if self.framed.is_none() {
-            let Some(first) = self.wire.iter().find(|byte| !byte.is_ascii_whitespace()) else {
+            let first = self
+                .wire
+                .iter()
+                .position(|byte| !byte.is_ascii_whitespace());
+            let Some(index) = first else {
+                // Whitespace alone never selects a framing, so cap what is
+                // otherwise an unbounded run of prefix padding.
+                if self.wire.len() > MAX_KIRO_FRAME_BYTES {
+                    self.fail("Kiro stream exceeds the frame limit".to_string(), out);
+                }
                 return;
             };
-            self.framed = Some(*first != b'{');
+            self.framed = Some(self.wire[index] != b'{');
         }
         if self.framed == Some(false) {
             let bytes = std::mem::take(&mut self.wire);
@@ -282,6 +302,10 @@ impl KiroDecoder {
         while self.wire.len() >= 12 && !self.completed {
             let total = u32::from_be_bytes(self.wire[..4].try_into().unwrap()) as usize;
             let headers = u32::from_be_bytes(self.wire[4..8].try_into().unwrap()) as usize;
+            if total > MAX_KIRO_FRAME_BYTES {
+                self.fail("Kiro frame exceeds the size limit".to_string(), out);
+                return;
+            }
             if total < 16 || headers > total - 16 {
                 self.fail("Invalid Kiro event-stream framing".to_string(), out);
                 return;
@@ -407,6 +431,12 @@ impl KiroDecoder {
                 return;
             }
         }
+        // Checked after draining every complete object so a large but valid
+        // payload is never mistaken for stuck accumulation; only the
+        // unterminated remainder is bounded.
+        if self.buffer.len() > MAX_KIRO_JSON_BUFFER_BYTES {
+            self.fail("Kiro JSON buffer exceeds the size limit".to_string(), out);
+        }
     }
 
     pub fn finish(&mut self, out: &mut Vec<CodexEvent>) {
@@ -488,6 +518,58 @@ mod tests {
         frame.extend_from_slice(payload);
         frame.extend_from_slice(&crc(&frame).to_be_bytes());
         frame
+    }
+
+    #[test]
+    fn kiro_decoder_fails_on_an_oversized_declared_frame() {
+        // Only the twelve-byte prelude is delivered: the decoder must refuse
+        // the declared length without waiting for (or buffering) the payload
+        // it promises.
+        let mut prelude = (MAX_KIRO_FRAME_BYTES as u32 + 1).to_be_bytes().to_vec();
+        prelude.extend_from_slice(&0u32.to_be_bytes());
+        prelude.extend_from_slice(&0u32.to_be_bytes());
+        assert_eq!(prelude.len(), 12);
+
+        let mut decoder = KiroDecoder::new();
+        let mut events = Vec::new();
+        decoder.decode(&prelude, &mut events);
+        decoder.finish(&mut events);
+        assert_failure_terminates(&events);
+    }
+
+    #[test]
+    fn kiro_decoder_fails_when_the_json_buffer_exceeds_the_cap() {
+        let mut payload = br#"{"content":""#.to_vec();
+        payload.extend(std::iter::repeat(b'a').take(MAX_KIRO_JSON_BUFFER_BYTES + 1));
+        assert!(payload.len() > MAX_KIRO_JSON_BUFFER_BYTES);
+
+        let mut decoder = KiroDecoder::new();
+        let mut events = Vec::new();
+        decoder.decode(&payload, &mut events);
+        decoder.finish(&mut events);
+        assert_failure_terminates(&events);
+    }
+
+    /// A limit breach must surface as an error frame and leave the renderer
+    /// terminated, so the stream ends instead of silently truncating (§9).
+    fn assert_failure_terminates(events: &[CodexEvent]) {
+        assert!(
+            matches!(events, [.., CodexEvent::Failed { .. }]),
+            "expected a terminal failure, got {events:?}"
+        );
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, CodexEvent::Completed { .. })));
+        let mut renderer =
+            super::super::render::ChunkRenderer::new("kiro/test".to_string(), 0, false);
+        let frames: Vec<_> = events
+            .iter()
+            .cloned()
+            .flat_map(|event| renderer.render(event))
+            .collect();
+        assert!(!frames.is_empty());
+        assert!(renderer.terminated());
+        assert!(renderer.close_unterminated().is_empty());
     }
 
     #[test]

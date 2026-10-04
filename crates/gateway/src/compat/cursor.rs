@@ -4,6 +4,20 @@ use serde_json::Value;
 use super::cursor_proto as proto;
 use super::events::CodexEvent;
 
+/// Upper bound on a single declared Connect frame. The four-byte length prefix
+/// is authoritative before any payload arrives, so an oversized declaration is
+/// refused as soon as it is read instead of buffering the payload it promises.
+pub const MAX_CURSOR_FRAME_BYTES: usize = 64 * 1024 * 1024;
+
+/// Capacity of the bounded channel carrying mandatory client replies (KV/exec)
+/// and heartbeats back into the upstream request body.
+pub const CURSOR_REPLY_QUEUE_CAPACITY: usize = 64;
+
+/// Reported when a mandatory reply cannot be enqueued because the bounded reply
+/// channel is full. The decoder converts this into an explicit failure event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplyQueueFull;
+
 pub fn openai_to_cursor_connect(body: &Value) -> Result<Vec<u8>, String> {
     let requested = body
         .get("model")
@@ -154,7 +168,7 @@ pub struct CursorDecoder {
     output_tokens: u64,
     open_tools: std::collections::HashMap<String, (String, u64)>,
     next_tool_index: u64,
-    reply_tx: Option<tokio::sync::mpsc::UnboundedSender<bytes::Bytes>>,
+    reply_tx: Option<tokio::sync::mpsc::Sender<bytes::Bytes>>,
 }
 
 impl CursorDecoder {
@@ -162,7 +176,7 @@ impl CursorDecoder {
         Self::default()
     }
 
-    pub fn with_reply_sender(reply_tx: tokio::sync::mpsc::UnboundedSender<bytes::Bytes>) -> Self {
+    pub fn with_reply_sender(reply_tx: tokio::sync::mpsc::Sender<bytes::Bytes>) -> Self {
         Self {
             reply_tx: Some(reply_tx),
             ..Self::default()
@@ -170,6 +184,9 @@ impl CursorDecoder {
     }
 
     pub fn decode(&mut self, bytes: &[u8], out: &mut Vec<CodexEvent>) {
+        if self.completed {
+            return;
+        }
         self.buffer.extend_from_slice(bytes);
         while self.buffer.len() >= 5 {
             let flags = self.buffer[0];
@@ -179,6 +196,13 @@ impl CursorDecoder {
                 self.buffer[3],
                 self.buffer[4],
             ]) as usize;
+            // The declared length is authoritative before the payload arrives,
+            // so an oversized declaration is refused instead of buffering for
+            // the frame it promises.
+            if length > MAX_CURSOR_FRAME_BYTES {
+                self.fail("Cursor frame exceeds the size limit", out);
+                return;
+            }
             if self.buffer.len() < length + 5 {
                 return;
             }
@@ -187,11 +211,8 @@ impl CursorDecoder {
             if flags & 0x02 != 0 {
                 if let Ok(value) = serde_json::from_slice::<Value>(&payload) {
                     if let Some(message) = value["error"]["message"].as_str() {
-                        self.completed = true;
-                        out.push(CodexEvent::Failed {
-                            message: message.to_string(),
-                        });
-                        continue;
+                        self.fail(message, out);
+                        return;
                     }
                 }
                 if !self.completed {
@@ -203,7 +224,20 @@ impl CursorDecoder {
                 continue;
             };
             self.decode_message(message, out);
+            // A terminal event (turn end or a reply-queue failure) ends the
+            // stream: stop decoding instead of consuming the rest forever.
+            if self.completed {
+                return;
+            }
         }
+    }
+
+    /// Marks the stream failed and emits exactly one terminal failure event.
+    fn fail(&mut self, message: impl Into<String>, out: &mut Vec<CodexEvent>) {
+        self.completed = true;
+        out.push(CodexEvent::Failed {
+            message: message.into(),
+        });
     }
 
     fn decode_message(&mut self, message: proto::AgentServerMessage, out: &mut Vec<CodexEvent>) {
@@ -213,11 +247,11 @@ impl CursorDecoder {
         let update = match message {
             proto::agent_server_message::Message::InteractionUpdate(update) => update,
             proto::agent_server_message::Message::KvServerMessage(message) => {
-                self.reply_to_kv(message);
+                self.reply_to_kv(message, out);
                 return;
             }
             proto::agent_server_message::Message::ExecServerMessage(message) => {
-                self.reply_to_exec(message);
+                self.reply_to_exec(message, out);
                 return;
             }
             proto::agent_server_message::Message::ConversationCheckpointUpdate(_) => return,
@@ -273,16 +307,30 @@ impl CursorDecoder {
         }
     }
 
-    fn send_reply(&self, message: proto::AgentClientMessage) {
-        if let Some(tx) = &self.reply_tx {
-            let _ = tx.send(bytes::Bytes::from(connect_frame(
-                &message.encode_to_vec(),
-                0,
-            )));
+    /// Enqueues a mandatory reply. A full (or closed) bounded queue is a
+    /// protocol failure: the decoder terminates and reports it explicitly
+    /// rather than silently dropping the reply.
+    fn send_reply(
+        &mut self,
+        message: proto::AgentClientMessage,
+        out: &mut Vec<CodexEvent>,
+    ) -> Result<(), ReplyQueueFull> {
+        let Some(tx) = self.reply_tx.clone() else {
+            return Ok(());
+        };
+        match tx.try_send(bytes::Bytes::from(connect_frame(
+            &message.encode_to_vec(),
+            0,
+        ))) {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                self.fail("cursor reply queue full", out);
+                Err(ReplyQueueFull)
+            }
         }
     }
 
-    fn reply_to_kv(&self, message: proto::KvServerMessage) {
+    fn reply_to_kv(&mut self, message: proto::KvServerMessage, out: &mut Vec<CodexEvent>) {
         let reply = match message.message {
             Some(proto::kv_server_message::Message::GetBlobArgs(_)) => {
                 proto::kv_client_message::Message::GetBlobResult(proto::GetBlobResult {
@@ -296,17 +344,20 @@ impl CursorDecoder {
             }
             None => return,
         };
-        self.send_reply(proto::AgentClientMessage {
-            message: Some(proto::agent_client_message::Message::KvClientMessage(
-                proto::KvClientMessage {
-                    id: message.id,
-                    message: Some(reply),
-                },
-            )),
-        });
+        let _ = self.send_reply(
+            proto::AgentClientMessage {
+                message: Some(proto::agent_client_message::Message::KvClientMessage(
+                    proto::KvClientMessage {
+                        id: message.id,
+                        message: Some(reply),
+                    },
+                )),
+            },
+            out,
+        );
     }
 
-    fn reply_to_exec(&self, message: proto::ExecServerMessage) {
+    fn reply_to_exec(&mut self, message: proto::ExecServerMessage, out: &mut Vec<CodexEvent>) {
         if !matches!(
             message.message,
             Some(proto::exec_server_message::Message::RequestContextArgs(_))
@@ -323,24 +374,27 @@ impl CursorDecoder {
             }),
             tools: Vec::new(),
         };
-        self.send_reply(proto::AgentClientMessage {
-            message: Some(proto::agent_client_message::Message::ExecClientMessage(
-                proto::ExecClientMessage {
-                    id: message.id,
-                    exec_id: message.exec_id,
-                    message: Some(proto::exec_client_message::Message::RequestContextResult(
-                        proto::RequestContextResult {
-                            result: Some(proto::request_context_result::Result::Success(
-                                proto::RequestContextSuccess {
-                                    request_context: Some(context),
-                                    served_from_disk_cache: Some(false),
-                                },
-                            )),
-                        },
-                    )),
-                },
-            )),
-        });
+        let _ = self.send_reply(
+            proto::AgentClientMessage {
+                message: Some(proto::agent_client_message::Message::ExecClientMessage(
+                    proto::ExecClientMessage {
+                        id: message.id,
+                        exec_id: message.exec_id,
+                        message: Some(proto::exec_client_message::Message::RequestContextResult(
+                            proto::RequestContextResult {
+                                result: Some(proto::request_context_result::Result::Success(
+                                    proto::RequestContextSuccess {
+                                        request_context: Some(context),
+                                        served_from_disk_cache: Some(false),
+                                    },
+                                )),
+                            },
+                        )),
+                    },
+                )),
+            },
+            out,
+        );
     }
 
     fn start_tool(
@@ -497,7 +551,7 @@ mod tests {
 
     #[test]
     fn server_kv_and_context_requests_receive_matching_client_replies() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(CURSOR_REPLY_QUEUE_CAPACITY);
         let mut decoder = CursorDecoder::with_reply_sender(tx);
         let mut events = Vec::new();
         for message in [
@@ -620,5 +674,60 @@ mod tests {
             if usage.prompt_tokens == 150 && usage.completion_tokens == 42
                 && usage.cached_tokens == 10 && usage.reasoning_tokens == 11)
         ));
+    }
+
+    #[test]
+    fn cursor_decoder_fails_on_an_oversized_declared_frame() {
+        // Only the five-byte prelude is delivered: the declared length must be
+        // refused without buffering for the payload it promises.
+        let mut prelude = vec![0u8];
+        prelude.extend_from_slice(&(MAX_CURSOR_FRAME_BYTES as u32 + 1).to_be_bytes());
+        assert_eq!(prelude.len(), 5);
+
+        let mut decoder = CursorDecoder::new();
+        let mut events = Vec::new();
+        decoder.decode(&prelude, &mut events);
+        // A later chunk must not resurrect the stream or add a second failure.
+        decoder.decode(b"data: more", &mut events);
+        decoder.finish(&mut events);
+        assert_eq!(events.len(), 1, "expected exactly one terminal failure: {events:?}");
+        assert!(matches!(events[0], CodexEvent::Failed { .. }));
+    }
+
+    #[test]
+    fn cursor_reply_queue_full_surfaces_failure_instead_of_dropping() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(CURSOR_REPLY_QUEUE_CAPACITY);
+        let mut decoder = CursorDecoder::with_reply_sender(tx);
+        let mut events = Vec::new();
+
+        // Each KV request demands exactly one reply; with nothing draining the
+        // bounded channel, the request that exceeds its capacity must surface an
+        // explicit failure rather than a silently dropped mandatory reply.
+        for id in 0..CURSOR_REPLY_QUEUE_CAPACITY as u32 + 1 {
+            let request = proto::AgentServerMessage {
+                message: Some(proto::agent_server_message::Message::KvServerMessage(
+                    proto::KvServerMessage {
+                        id,
+                        message: Some(proto::kv_server_message::Message::GetBlobArgs(
+                            proto::GetBlobArgs { blob_id: vec![1] },
+                        )),
+                    },
+                )),
+            };
+            decoder.decode(&connect_frame(&request.encode_to_vec(), 0), &mut events);
+        }
+
+        assert!(
+            matches!(events.last(), Some(CodexEvent::Failed { message }) if message.contains("reply queue full")),
+            "expected an explicit queue-full failure, got {events:?}"
+        );
+        let mut delivered = 0;
+        while rx.try_recv().is_ok() {
+            delivered += 1;
+        }
+        assert_eq!(
+            delivered, CURSOR_REPLY_QUEUE_CAPACITY,
+            "every enqueued reply must be delivered before the overflow"
+        );
     }
 }

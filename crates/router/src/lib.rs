@@ -35,6 +35,9 @@ fn u8_to_strategy(val: u8) -> Strategy {
 
 #[derive(Default, Debug)]
 struct RouterState {
+    /// Live pool member ids; `None` until `retain_members` activates the
+    /// allowlist, so a standalone router keeps recording every selection.
+    active: Option<std::collections::BTreeSet<String>>,
     /// member id -> last assigned sequence number
     last_served: HashMap<String, u64>,
     /// monotonically increasing global service counter
@@ -43,6 +46,14 @@ struct RouterState {
     /// instead of hopping every turn. Entries carry the sequence number at which
     /// they were last used so idle sessions can be evicted.
     affinity: HashMap<String, (String, u64)>,
+}
+
+impl RouterState {
+    fn admits(&self, id: &str) -> bool {
+        self.active
+            .as_ref()
+            .is_none_or(|active| active.contains(id))
+    }
 }
 
 /// Sessions idle for this many selections are dropped, bounding the map on a
@@ -84,14 +95,18 @@ impl Router {
         // never hops accounts unnecessarily regardless of strategy.
         if let Some(key) = hint.affinity_key.as_deref() {
             if let Some((bound_id, _)) = state.affinity.get(key).cloned() {
-                if let Some(idx) = members.iter().position(|m| {
-                    m.id() == bound_id && m.health().is_available(now_unix_ms)
-                }) {
-                    let seq = state.seq.wrapping_add(1);
-                    state.seq = seq;
-                    state.last_served.insert(bound_id.clone(), seq);
-                    state.affinity.insert(key.to_string(), (bound_id, seq));
-                    return Some(idx);
+                // A binding to a member outside the activated pool is stale and
+                // must not be refreshed, so fall through to normal selection.
+                if state.admits(&bound_id) {
+                    if let Some(idx) = members.iter().position(|m| {
+                        m.id() == bound_id && m.health().is_available(now_unix_ms)
+                    }) {
+                        let seq = state.seq.wrapping_add(1);
+                        state.seq = seq;
+                        state.last_served.insert(bound_id.clone(), seq);
+                        state.affinity.insert(key.to_string(), (bound_id, seq));
+                        return Some(idx);
+                    }
                 }
             }
         }
@@ -104,15 +119,18 @@ impl Router {
                 let seq = state.seq.wrapping_add(1);
                 state.seq = seq;
                 let chosen_id = members[chosen_idx].id().to_string();
-                state.last_served.insert(chosen_id.clone(), seq);
 
-                if let Some(key) = hint.affinity_key.as_deref() {
-                    state
-                        .affinity
-                        .insert(key.to_string(), (chosen_id, seq));
-                    if state.affinity.len() > 1024 {
-                        let cutoff = seq.saturating_sub(AFFINITY_MAX_IDLE);
-                        state.affinity.retain(|_, (_, s)| *s >= cutoff);
+                if state.admits(&chosen_id) {
+                    state.last_served.insert(chosen_id.clone(), seq);
+
+                    if let Some(key) = hint.affinity_key.as_deref() {
+                        state
+                            .affinity
+                            .insert(key.to_string(), (chosen_id, seq));
+                        if state.affinity.len() > 1024 {
+                            let cutoff = seq.saturating_sub(AFFINITY_MAX_IDLE);
+                            state.affinity.retain(|_, (_, s)| *s >= cutoff);
+                        }
                     }
                 }
 
@@ -143,15 +161,18 @@ impl Router {
                 state.seq = state.seq.wrapping_add(1);
                 let next_seq = state.seq;
                 let chosen_id = members[chosen_idx].id().to_string();
-                state.last_served.insert(chosen_id.clone(), next_seq);
 
-                if let Some(key) = hint.affinity_key.as_deref() {
-                    state
-                        .affinity
-                        .insert(key.to_string(), (chosen_id, next_seq));
-                    if state.affinity.len() > 1024 {
-                        let cutoff = next_seq.saturating_sub(AFFINITY_MAX_IDLE);
-                        state.affinity.retain(|_, (_, seq)| *seq >= cutoff);
+                if state.admits(&chosen_id) {
+                    state.last_served.insert(chosen_id.clone(), next_seq);
+
+                    if let Some(key) = hint.affinity_key.as_deref() {
+                        state
+                            .affinity
+                            .insert(key.to_string(), (chosen_id, next_seq));
+                        if state.affinity.len() > 1024 {
+                            let cutoff = next_seq.saturating_sub(AFFINITY_MAX_IDLE);
+                            state.affinity.retain(|_, (_, seq)| *seq >= cutoff);
+                        }
                     }
                 }
 
@@ -174,6 +195,30 @@ impl Router {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.affinity.get(key).map(|(id, _)| id.clone())
+    }
+
+    /// Prunes rotation/affinity bookkeeping for member ids no longer present and
+    /// activates the live-id allowlist, so a later `select` can never record a
+    /// member that has already left the pool.
+    pub fn retain_members(&self, active: &std::collections::BTreeSet<String>) -> usize {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.active = Some(active.clone());
+        let before = state.last_served.len();
+        state.last_served.retain(|id, _| active.contains(id));
+        state.affinity.retain(|_, (id, _)| active.contains(id));
+        before - state.last_served.len()
+    }
+
+    /// Member ids that currently hold rotation bookkeeping (diagnostic).
+    pub fn tracked_members(&self) -> Vec<String> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.last_served.keys().cloned().collect()
     }
 }
 
@@ -462,5 +507,97 @@ mod red_tests {
         let curr_seq = r.state.lock().unwrap().seq;
         assert!(curr_seq > last_seq, "sequence must remain monotonic when switching back to RoundRobin");
         assert_eq!(next, "b", "resumed RoundRobin must pick candidate b because candidate a was repeatedly served");
+    }
+
+    fn active_set(ids: &[&str]) -> std::collections::BTreeSet<String> {
+        ids.iter().map(|id| (*id).to_string()).collect()
+    }
+
+    #[test]
+    fn retain_members_drops_last_served_and_affinity_for_removed_ids() {
+        let p = avail3();
+        let r = Router::new(Strategy::StrictRoundRobin);
+        assert_eq!(p[r.select(&p, &keyed("conv-a")).expect("conv-a")].id(), "a");
+        assert_eq!(p[r.select(&p, &keyed("conv-b")).expect("conv-b")].id(), "b");
+        assert_eq!(p[r.select(&p, &keyed("conv-c")).expect("conv-c")].id(), "c");
+        assert_eq!(r.bound_affinity_member("conv-b").as_deref(), Some("b"));
+
+        let removed = r.retain_members(&active_set(&["a", "c"]));
+        assert_eq!(removed, 1, "only the removed member's bookkeeping is pruned");
+
+        let mut tracked = r.tracked_members();
+        tracked.sort();
+        assert_eq!(tracked, vec!["a".to_string(), "c".to_string()]);
+        assert_eq!(
+            r.bound_affinity_member("conv-b"),
+            None,
+            "affinity bound to a removed member must be dropped"
+        );
+        assert_eq!(r.bound_affinity_member("conv-a").as_deref(), Some("a"));
+        assert_eq!(r.bound_affinity_member("conv-c").as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn retain_members_preserves_seq_monotonicity_and_rotation() {
+        let p = avail3();
+        let r = Router::new(Strategy::StrictRoundRobin);
+        let hint = SessionHint::default();
+        for _ in 0..3 {
+            r.select(&p, &hint).expect("seed rotation");
+        }
+        let seq_before = r.state.lock().unwrap().seq;
+
+        let removed = r.retain_members(&active_set(&["b", "c"]));
+        assert_eq!(removed, 1);
+        assert_eq!(
+            r.state.lock().unwrap().seq,
+            seq_before,
+            "retain must not touch the fairness sequence"
+        );
+
+        let live = pool(&[("b", Health::Available), ("c", Health::Available)]);
+        let next = r.select(&live, &hint).expect("rotate after retain");
+        assert_eq!(live[next].id(), "b", "smallest last_served_seq is served first");
+        assert_eq!(r.state.lock().unwrap().seq, seq_before + 1);
+        let next2 = r.select(&live, &hint).expect("rotate after retain");
+        assert_eq!(live[next2].id(), "c");
+    }
+
+    #[test]
+    fn retain_members_keeps_live_ids() {
+        let p = avail3();
+        let r = Router::new(Strategy::StrictRoundRobin);
+        r.select(&p, &keyed("keep-1"));
+        r.select(&p, &keyed("keep-2"));
+        r.select(&p, &keyed("keep-3"));
+
+        let removed = r.retain_members(&active_set(&["a", "b", "c"]));
+        assert_eq!(removed, 0, "nothing is pruned when every id is live");
+
+        let mut tracked = r.tracked_members();
+        tracked.sort();
+        assert_eq!(
+            tracked,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+        assert_eq!(r.bound_affinity_member("keep-1").as_deref(), Some("a"));
+        assert_eq!(r.bound_affinity_member("keep-3").as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn router_after_retain_never_records_a_removed_member() {
+        let r = Router::new(Strategy::FillFirst);
+        r.retain_members(&active_set(&["b"]));
+
+        // A stale caller still holds the removed member's entry.
+        let stale = pool(&[("a", Health::Available)]);
+        let idx = r
+            .select(&stale, &SessionHint::default())
+            .expect("selection still returns the healthy stale member");
+        assert_eq!(stale[idx].id(), "a");
+        assert!(
+            r.tracked_members().is_empty(),
+            "a member outside the activated pool must never be recorded"
+        );
     }
 }

@@ -1,3 +1,4 @@
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -107,6 +108,61 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
+/// Usage-poll backoff deadlines plus the live-id allowlist, under one guard so a
+/// membership change and the write it guards can never be interleaved.
+///
+/// `active` is `None` until [`Self::retain_accounts`] activates membership, so a
+/// standalone state accepts every backoff write until the pool is explicit. Once
+/// activated, a poll that was already in flight when its account was deleted can
+/// no longer recreate the entry.
+#[derive(Debug, Default)]
+pub struct UsagePollBackoff {
+    active: Option<BTreeSet<String>>,
+    entries: HashMap<String, i64>,
+}
+
+impl UsagePollBackoff {
+    /// The recorded deadline, or `None` when the account holds no backoff.
+    pub fn get(&self, account: &str) -> Option<i64> {
+        self.entries.get(account).copied()
+    }
+
+    /// Records a backoff deadline. Returns `false`, dropping it, once the
+    /// allowlist is activated and the account has left the pool; the membership
+    /// check and the insert share this one guard.
+    pub fn set(&mut self, account: &str, until_unix: i64) -> bool {
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|active| !active.contains(account))
+        {
+            return false;
+        }
+        self.entries.insert(account.to_string(), until_unix);
+        true
+    }
+
+    /// Drops one account's deadline (a later poll succeeded again).
+    pub fn clear(&mut self, account: &str) {
+        self.entries.remove(account);
+    }
+
+    /// Publishes the live-id allowlist and drops the deadlines of accounts that
+    /// left the pool, all under one guard. This is the membership activation
+    /// point; returns the number of deadlines dropped.
+    pub fn retain_accounts(&mut self, active: &BTreeSet<String>) -> usize {
+        self.active = Some(active.clone());
+        let before = self.entries.len();
+        self.entries.retain(|account, _| active.contains(account));
+        before - self.entries.len()
+    }
+
+    /// Account ids that currently hold a deadline (diagnostic).
+    pub fn tracked_accounts(&self) -> Vec<String> {
+        self.entries.keys().cloned().collect()
+    }
+}
+
 fn poll_backoff_until(state: &AppState, account: &str) -> Option<i64> {
     state
         .usage_poll_backoff
@@ -116,12 +172,12 @@ fn poll_backoff_until(state: &AppState, account: &str) -> Option<i64> {
         .copied()
 }
 
-fn set_poll_backoff(state: &AppState, account: &str, until_unix: i64) {
+fn set_poll_backoff(state: &AppState, account: &str, until_unix: i64) -> bool {
     state
         .usage_poll_backoff
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(account.to_string(), until_unix);
+        .set(account, until_unix)
 }
 
 fn clear_poll_backoff(state: &AppState, account: &str) {
@@ -1197,15 +1253,52 @@ pub async fn refresh_all_usage(state: &Arc<AppState>) {
     state.usage_state.save(&snapshots, now_unix());
 }
 
-pub fn spawn_usage_poller(state: Arc<AppState>, every: Duration) {
-    tokio::spawn(async move {
+/// Owns the usage poller task so shutdown cancels it instead of detaching it.
+pub struct UsagePollerHandle {
+    stop: Arc<tokio::sync::Notify>,
+    join: tokio::task::JoinHandle<()>,
+}
+
+impl UsagePollerHandle {
+    /// Signals the loop to stop, then aborts the task and awaits the join under
+    /// a bounded wait. `abort` is what actually cancels an in-flight refresh;
+    /// the timeout only bounds the await, so a shutdown during a long upstream
+    /// poll never holds the process open.
+    pub async fn shutdown(self) {
+        self.stop.notify_one();
+        self.join.abort();
+        let _ = tokio::time::timeout(Duration::from_secs(5), self.join).await;
+    }
+}
+
+pub fn spawn_usage_poller(state: Arc<AppState>, every: Duration) -> UsagePollerHandle {
+    let stop = Arc::new(tokio::sync::Notify::new());
+    let stop_signal = Arc::clone(&stop);
+    let join = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(every);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            ticker.tick().await;
-            refresh_all_usage(&state).await;
+            tokio::select! {
+                _ = ticker.tick() => {}
+                _ = stop_signal.notified() => break,
+            }
+            // The refresh itself is cancellable: a shutdown during a long poll
+            // must not hold the process open for the whole upstream timeout.
+            tokio::select! {
+                _ = refresh_all_usage(&state) => {}
+                _ = stop_signal.notified() => break,
+            }
         }
     });
+    UsagePollerHandle { stop, join }
+}
+
+/// Publishes the live-id allowlist into the poll-backoff store and drops the
+/// deadlines of accounts that left the pool, both under the store's own guard.
+/// This is the backoff store's membership activation point: from here on a late
+/// poll for a deleted account is refused instead of recreating its entry.
+pub fn retain_poll_backoff(state: &AppState, active: &BTreeSet<String>) -> usize {
+    state.usage_poll_backoff.retain_accounts(active)
 }
 
 #[cfg(test)]
@@ -1320,5 +1413,101 @@ mod tests {
             relay_usage_bases(None, None),
             vec![RELAY_USAGE_FALLBACK_BASE.to_string()]
         );
+    }
+
+    fn temp_poller_state() -> (Arc<AppState>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("mahoquot-quota-poller-{}", uuid_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let config = crate::config::GatewayConfig {
+            auth_dir: dir.clone(),
+            config_path: dir.join("config.yaml"),
+            ..crate::config::GatewayConfig::default()
+        };
+        let state = Arc::new(AppState::new(&config).expect("state"));
+        (state, dir)
+    }
+
+    #[tokio::test]
+    async fn usage_poller_shutdown_stops_the_worker() {
+        let (state, dir) = temp_poller_state();
+        let handle = spawn_usage_poller(state, Duration::from_secs(3600));
+        tokio::time::timeout(Duration::from_secs(10), handle.shutdown())
+            .await
+            .expect("shutdown must complete");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn usage_poller_shutdown_aborts_a_worker_that_never_yields() {
+        // The worker is parked forever; abort (not a bare await) is what makes
+        // shutdown return, so a stuck upstream poll cannot block teardown.
+        let stop = Arc::new(tokio::sync::Notify::new());
+        let join = tokio::spawn(async { futures::future::pending::<()>().await });
+        let handle = UsagePollerHandle { stop, join };
+        tokio::time::timeout(Duration::from_secs(10), handle.shutdown())
+            .await
+            .expect("a pending worker must be aborted, not awaited forever");
+    }
+
+    #[test]
+    fn usage_poll_backoff_rejects_a_late_write_for_a_removed_account() {
+        let mut backoff = UsagePollBackoff::default();
+        // Before activation a standalone store accepts every write.
+        assert!(backoff.set("acc", 9_999));
+        assert_eq!(backoff.get("acc"), Some(9_999));
+
+        let active: BTreeSet<String> = ["other".to_string()].into_iter().collect();
+        assert_eq!(backoff.retain_accounts(&active), 1);
+        assert_eq!(backoff.get("acc"), None);
+
+        // A poll that was in flight when the account was deleted must not
+        // recreate its backoff entry.
+        assert!(!backoff.set("acc", 9_999));
+        assert_eq!(backoff.get("acc"), None);
+        assert!(backoff.tracked_accounts().is_empty());
+
+        // A live account is still accepted, and a success clears the entry.
+        assert!(backoff.set("other", 1_000));
+        assert_eq!(backoff.get("other"), Some(1_000));
+        backoff.clear("other");
+        assert_eq!(backoff.get("other"), None);
+        backoff.retain_accounts(&["acc".to_string()].into_iter().collect());
+        assert!(backoff.set("acc", 1));
+    }
+
+    #[test]
+    fn retain_poll_backoff_gates_later_writes_through_the_state_field() {
+        let (state, dir) = temp_poller_state();
+        let active: BTreeSet<String> = ["live".to_string()].into_iter().collect();
+        assert_eq!(retain_poll_backoff(&state, &active), 0);
+
+        assert!(set_poll_backoff(&state, "live", 5));
+        assert!(
+            !set_poll_backoff(&state, "gone", 5),
+            "a late poll for a removed account must be refused"
+        );
+        assert_eq!(poll_backoff_until(&state, "live"), Some(5));
+        assert_eq!(poll_backoff_until(&state, "gone"), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn retain_poll_backoff_drops_removed_accounts() {
+        let (state, dir) = temp_poller_state();
+        retain_poll_backoff(&state, &["gone".to_string(), "live".to_string()].into_iter().collect());
+        assert!(set_poll_backoff(&state, "gone", 9_999));
+        assert!(set_poll_backoff(&state, "live", 9_999));
+
+        let active: std::collections::BTreeSet<String> =
+            ["live".to_string()].into_iter().collect();
+        assert_eq!(retain_poll_backoff(&state, &active), 1);
+        assert_eq!(poll_backoff_until(&state, "gone"), None);
+        assert_eq!(poll_backoff_until(&state, "live"), Some(9_999));
+        assert!(
+            !set_poll_backoff(&state, "gone", 4_200),
+            "the pruned deadline must not be recreated by a late poll"
+        );
+        assert_eq!(poll_backoff_until(&state, "gone"), None);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

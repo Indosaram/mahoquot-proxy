@@ -76,6 +76,83 @@ mod reservation_tests {
             Some("codex-a")
         );
     }
+
+    #[test]
+    fn retain_accounts_releases_removed_accounts() {
+        let root = std::env::temp_dir().join(format!(
+            "mahoquot-reservation-reconcile-{}",
+            std::process::id()
+        ));
+        let registry = SchedulerRegistry::load(&root.join("config.yaml"), &[]);
+        registry.reserve("instance-a", "codex-a").unwrap();
+        registry.reserve("instance-b", "codex-b").unwrap();
+
+        // codex-a has been deleted from the pool; codex-b is still live.
+        let active: BTreeSet<String> = ["codex-b".to_string()].into_iter().collect();
+        let released = registry.retain_accounts(&active);
+
+        assert_eq!(released, vec!["instance-a".to_string()]);
+        let reservations = registry.reservations();
+        assert_eq!(reservations.len(), 1);
+        assert_eq!(
+            reservations.get("instance-b").map(String::as_str),
+            Some("codex-b")
+        );
+        // The released account is reservable again; the live one stays bound.
+        assert!(registry.permits("codex-a"));
+        assert!(!registry.permits("codex-b"));
+    }
+
+    #[test]
+    fn retain_accounts_keeps_live_accounts_and_other_instances() {
+        let root = std::env::temp_dir().join(format!(
+            "mahoquot-reservation-keep-{}",
+            std::process::id()
+        ));
+        let registry = SchedulerRegistry::load(&root.join("config.yaml"), &[]);
+        registry.reserve("instance-a", "codex-a").unwrap();
+        registry.reserve("instance-b", "codex-b").unwrap();
+
+        let active: BTreeSet<String> = ["codex-a", "codex-b", "codex-c"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let released = registry.retain_accounts(&active);
+
+        assert!(released.is_empty());
+        let reservations = registry.reservations();
+        assert_eq!(reservations.len(), 2);
+        assert_eq!(
+            reservations.get("instance-a").map(String::as_str),
+            Some("codex-a")
+        );
+        assert_eq!(
+            reservations.get("instance-b").map(String::as_str),
+            Some("codex-b")
+        );
+        assert!(!registry.permits("codex-a"));
+        assert!(!registry.permits("codex-b"));
+    }
+
+    #[test]
+    fn reserving_an_account_outside_the_activated_pool_is_rejected() {
+        let root = std::env::temp_dir().join(format!(
+            "mahoquot-reservation-inactive-{}",
+            std::process::id()
+        ));
+        let registry = SchedulerRegistry::load(&root.join("config.yaml"), &[]);
+        // Before activation a standalone registry still accepts reservations.
+        assert!(registry.reserve("instance-a", "codex-a").is_ok());
+        assert!(registry.release("instance-a"));
+
+        let active: BTreeSet<String> = ["codex-live".to_string()].into_iter().collect();
+        registry.retain_accounts(&active);
+
+        let error = registry.reserve("instance-b", "codex-gone").unwrap_err();
+        assert!(error.contains("not active"), "unexpected error: {error}");
+        // A live account is still reservable after the allowlist is published.
+        assert!(registry.reserve("instance-c", "codex-live").is_ok());
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -123,7 +200,18 @@ pub struct SchedulerRegistry {
     settings_path: PathBuf,
     state_path: PathBuf,
     state_parse_failed: AtomicBool,
-    reservations: std::sync::Mutex<BTreeMap<String, String>>,
+    reservations: std::sync::Mutex<ReservationState>,
+}
+
+/// Guarded reservation table. The live-id allowlist and the reservations share
+/// one mutex, so an input check and the insert it guards can never be
+/// interleaved with a reconcile.
+#[derive(Debug, Default)]
+struct ReservationState {
+    /// Live pool ids; `None` until `retain_accounts` activates the allowlist,
+    /// so a standalone registry accepts reservations until membership is explicit.
+    active: Option<BTreeSet<String>>,
+    reservations: BTreeMap<String, String>,
 }
 
 impl SchedulerRegistry {
@@ -139,7 +227,7 @@ impl SchedulerRegistry {
             settings_path,
             state_path,
             state_parse_failed: AtomicBool::new(settings_failed || state_failed),
-            reservations: std::sync::Mutex::new(BTreeMap::new()),
+            reservations: std::sync::Mutex::new(ReservationState::default()),
         };
         registry.reconcile(members);
         registry
@@ -158,6 +246,7 @@ impl SchedulerRegistry {
             .reservations
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .reservations
             .values()
             .any(|reserved| reserved == account)
         {
@@ -168,17 +257,30 @@ impl SchedulerRegistry {
     }
 
     pub fn reserve(&self, instance_id: &str, account_id: &str) -> Result<(), String> {
-        let mut reservations = self
+        let mut state = self
             .reservations
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if reservations
+        // Once the pool membership is explicit, a reservation for an account
+        // that is not live is rejected under the same lock that holds the
+        // table, so a concurrent reconcile cannot land between check and write.
+        if state
+            .active
+            .as_ref()
+            .is_some_and(|active| !active.contains(account_id))
+        {
+            return Err(format!("account {account_id} is not active"));
+        }
+        if state
+            .reservations
             .iter()
             .any(|(instance, account)| instance != instance_id && account == account_id)
         {
             return Err(format!("account {account_id} is already reserved"));
         }
-        reservations.insert(instance_id.to_string(), account_id.to_string());
+        state
+            .reservations
+            .insert(instance_id.to_string(), account_id.to_string());
         Ok(())
     }
 
@@ -186,6 +288,7 @@ impl SchedulerRegistry {
         self.reservations
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .reservations
             .remove(instance_id)
             .is_some()
     }
@@ -194,7 +297,28 @@ impl SchedulerRegistry {
         self.reservations
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .reservations
             .clone()
+    }
+
+    /// Sets the live-id allowlist and releases reservations whose account left
+    /// the pool, all under one guard. Returns the released instance ids.
+    pub fn retain_accounts(&self, active: &BTreeSet<String>) -> Vec<String> {
+        let mut state = self
+            .reservations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.active = Some(active.clone());
+        let mut released = Vec::new();
+        state.reservations.retain(|instance, account| {
+            if active.contains(account.as_str()) {
+                true
+            } else {
+                released.push(instance.clone());
+                false
+            }
+        });
+        released
     }
 
     pub fn update_settings(

@@ -42,6 +42,11 @@ fn history_error(error: HistoryError) -> Response {
             "history_unavailable",
             error,
         ),
+        HistoryError::TooManyGroups { .. } => error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "history_groups_too_many",
+            error,
+        ),
     }
 }
 

@@ -21,6 +21,13 @@ const DEFAULT_MAX_SIZE_BYTES: u64 = 512 * 1024 * 1024;
 const DEFAULT_PRUNE_CHUNK_SIZE: usize = 500;
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Hard ceiling on the number of groups a single history query may materialize.
+///
+/// The grouping query appends `LIMIT MAX_HISTORY_GROUPS + 1` so an over-cap
+/// request is detected rather than silently truncated; the console's bounded
+/// ranges stay far below this bound.
+pub const MAX_HISTORY_GROUPS: usize = 10_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimeBucket {
     Minute,
@@ -63,6 +70,8 @@ pub enum HistoryError {
     Database(String),
     #[error("request history worker is unavailable")]
     WorkerUnavailable,
+    #[error("history grouping exceeds {limit} groups; narrow the time range or drop a group-by dimension")]
+    TooManyGroups { limit: usize },
 }
 
 impl From<rusqlite::Error> for HistoryError {
@@ -1714,6 +1723,7 @@ fn query_groups(
         .map(|index| index.to_string())
         .collect::<Vec<_>>()
         .join(", ");
+    let limit = MAX_HISTORY_GROUPS + 1;
     let sql = format!(
         "SELECT {select_sql},
             COUNT(*),
@@ -1732,7 +1742,8 @@ fn query_groups(
             COALESCE(SUM(cache_write_tokens_known), 0)
          FROM usage_events e{where_sql}
          GROUP BY {group_sql}
-         ORDER BY {group_sql}"
+         ORDER BY {group_sql}
+         LIMIT {limit}"
     );
     let mut statement = connection.prepare(&sql)?;
     let rows = statement.query_map(params_from_iter(query_params.iter()), |row| {
@@ -1771,7 +1782,13 @@ fn query_groups(
             },
         })
     })?;
-    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    let groups = rows.collect::<Result<Vec<_>, _>>()?;
+    if groups.len() > MAX_HISTORY_GROUPS {
+        return Err(HistoryError::TooManyGroups {
+            limit: MAX_HISTORY_GROUPS,
+        });
+    }
+    Ok(groups)
 }
 
 fn build_where(query: &HistoryQuery) -> (String, Vec<Value>) {
@@ -2893,5 +2910,72 @@ mod extended_tests {
         };
         history.record_cline_cap(&event).unwrap();
         assert_eq!(history.cline_caps(&[]).unwrap().len(), 1);
+    }
+
+    fn seed_model_groups(connection: &mut Connection, count: usize) {
+        let transaction = connection.transaction().unwrap();
+        {
+            let mut statement = transaction
+                .prepare(
+                    "INSERT INTO usage_events(event_id, occurred_at_ms, account_identifier, provider,
+                     model, status_code, succeeded, created_at_ms)
+                     VALUES (?1, 1, 'account', 'provider', ?2, 200, 1, 1)",
+                )
+                .unwrap();
+            for index in 0..count {
+                statement
+                    .execute(params![format!("event-{index}"), format!("model-{index}")])
+                    .unwrap();
+            }
+        }
+        transaction.commit().unwrap();
+    }
+
+    #[test]
+    fn group_query_returns_all_groups_at_the_limit() {
+        // Given exactly MAX_HISTORY_GROUPS distinct model groups.
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate(&mut connection).unwrap();
+        seed_model_groups(&mut connection, MAX_HISTORY_GROUPS);
+
+        // When the grouping query runs at the cap.
+        let result = query_history(
+            &connection,
+            &HistoryQuery {
+                group_by: vec![GroupDimension::Model],
+                ..HistoryQuery::default()
+            },
+        )
+        .unwrap();
+
+        // Then every group is materialized and none is dropped.
+        assert_eq!(result.groups.len(), MAX_HISTORY_GROUPS);
+    }
+
+    #[test]
+    fn group_query_errors_instead_of_truncating_above_the_limit() {
+        // Given one more distinct group than the cap allows.
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate(&mut connection).unwrap();
+        seed_model_groups(&mut connection, MAX_HISTORY_GROUPS + 1);
+
+        // When the grouping query would exceed the cap.
+        let error = query_history(
+            &connection,
+            &HistoryQuery {
+                group_by: vec![GroupDimension::Model],
+                ..HistoryQuery::default()
+            },
+        )
+        .unwrap_err();
+
+        // Then it reports the actionable limit instead of returning a truncated group list.
+        assert_eq!(
+            error,
+            HistoryError::TooManyGroups {
+                limit: MAX_HISTORY_GROUPS
+            }
+        );
+        assert!(error.to_string().contains(&MAX_HISTORY_GROUPS.to_string()));
     }
 }

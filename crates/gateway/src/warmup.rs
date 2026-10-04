@@ -9,7 +9,7 @@ use futures::{
 use mahoquot_types::{Health, PoolMember};
 use serde_json::{json, Value};
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -28,18 +28,97 @@ pub struct WarmupResult {
 type Flight = Shared<BoxFuture<'static, WarmupResult>>;
 /// Last attempt time, the model that was probed, and its result.
 type WarmupHistoryEntry = (tokio::time::Instant, i64, Option<WarmupResult>);
+/// Pool account ids the runner last reconciled as live. Kept beside the probe
+/// history so the allowlist check and the insert share one lock acquisition and
+/// a delete can never be interleaved between them.
+type ActiveIds = BTreeSet<String>;
+/// Live-id allowlist, probe history and in-flight probes, guarded by a single
+/// mutex so a membership check, a flight insertion and a prune can never be
+/// interleaved. `active` is `None` until `retain_accounts` activates membership,
+/// so a standalone runner keeps recording probes until the pool is explicit.
+struct WarmupInner {
+    active: Option<ActiveIds>,
+    entries: HashMap<String, WarmupHistoryEntry>,
+    flights: HashMap<String, FlightEntry>,
+    /// Monotonic tag handed to each new flight so a stale completion can never
+    /// remove a flight registered after a prune (or a prune + re-add).
+    flight_generation: u64,
+}
+
+/// One in-flight probe plus the generation that registered it.
+struct FlightEntry {
+    generation: u64,
+    flight: Flight,
+}
+
+impl WarmupInner {
+    fn admits(&self, id: &str) -> bool {
+        self.active.as_ref().is_none_or(|active| active.contains(id))
+    }
+}
+
 pub struct WarmupRunner {
-    flights: Mutex<HashMap<String, Flight>>,
-    history: Mutex<HashMap<String, WarmupHistoryEntry>>,
+    inner: Mutex<WarmupInner>,
     limit: tokio::sync::Semaphore,
 }
 impl Default for WarmupRunner {
     fn default() -> Self {
         Self {
-            flights: Mutex::default(),
-            history: Mutex::default(),
+            inner: Mutex::new(WarmupInner {
+                active: None,
+                entries: HashMap::new(),
+                flights: HashMap::new(),
+                flight_generation: 0,
+            }),
             limit: tokio::sync::Semaphore::new(LIMIT),
         }
+    }
+}
+impl WarmupRunner {
+    /// Replaces the allowlist and prunes the probe history and the in-flight
+    /// probes of ids the pool no longer holds, all under one guard. Returns the
+    /// number of history and flight entries pruned.
+    pub fn retain_accounts(&self, active: &ActiveIds) -> usize {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner.active = Some(active.clone());
+        let before_history = inner.entries.len();
+        inner.entries.retain(|id, _| active.contains(id));
+        let before_flights = inner.flights.len();
+        inner.flights.retain(|id, _| active.contains(id));
+        (before_history - inner.entries.len()) + (before_flights - inner.flights.len())
+    }
+    /// Inserts a probe record. Once `retain_accounts` has activated the live-id
+    /// allowlist a record for a departed account is dropped; before activation a
+    /// standalone runner accepts every writer. The membership check and the
+    /// insert share one lock acquisition. Returns false when dropped.
+    pub fn record_probe(&self, id: &str, record: WarmupHistoryEntry) -> bool {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if !inner.admits(id) {
+            return false;
+        }
+        inner.entries.insert(id.to_string(), record);
+        true
+    }
+    /// Removes the flight registered under `id`, but only while it is still the
+    /// exact generation its creator published. A prune (or a prune followed by a
+    /// re-add) between the spawn and its completion leaves the newer flight in
+    /// place instead of deleting it from under its caller.
+    fn finish_flight(&self, id: &str, generation: u64) {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if inner
+            .flights
+            .get(id)
+            .is_some_and(|entry| entry.generation == generation)
+        {
+            inner.flights.remove(id);
+        }
+    }
+    /// Live ids that currently hold a probe record, sorted for determinism.
+    pub fn tracked_accounts(&self) -> Vec<String> {
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let mut ids: Vec<String> = inner.entries.keys().cloned().collect();
+        ids.sort();
+        ids
     }
 }
 fn now() -> i64 {
@@ -265,10 +344,10 @@ pub fn resolve_window_state(
     // but a warmup probe succeeded recently, recognize the account as primed for 5 hours (18,000s).
     let history = state
         .warmup
-        .history
+        .inner
         .lock()
         .unwrap_or_else(|p| p.into_inner());
-    if let Some((_, attempt_unix, Some(res))) = history.get(&m.id) {
+    if let Some((_, attempt_unix, Some(res))) = history.entries.get(&m.id) {
         if res.ok {
             let window_duration = 5 * 3600; // 5-hour sliding window
             let expiry = attempt_unix + window_duration;
@@ -305,9 +384,10 @@ fn due_at(state: &AppState, m: &AccountMember, time: tokio::time::Instant) -> bo
     }
     let recent = state
         .warmup
-        .history
+        .inner
         .lock()
         .unwrap_or_else(|p| p.into_inner())
+        .entries
         .get(&m.id)
         .is_some_and(|(at, _, _)| time.duration_since(*at) < Duration::from_secs(60));
     if recent {
@@ -480,13 +560,17 @@ async fn execute(state: &Arc<AppState>, id: &str, automatic: bool) -> WarmupResu
         return result(&m, reason);
     }
     {
-        let mut history = state
+        let previous = state
             .warmup
-            .history
+            .inner
             .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let previous = history.get(id).and_then(|(_, _, r)| r.clone());
-        history.insert(id.into(), (tokio::time::Instant::now(), now(), previous));
+            .unwrap_or_else(|p| p.into_inner())
+            .entries
+            .get(id)
+            .and_then(|(_, _, r)| r.clone());
+        state
+            .warmup
+            .record_probe(id, (tokio::time::Instant::now(), now(), previous));
     }
     let start = tokio::time::Instant::now();
     let mut out = result(&m, "timeout");
@@ -621,9 +705,10 @@ async fn execute(state: &Arc<AppState>, id: &str, automatic: bool) -> WarmupResu
     out.latency_ms = start.elapsed().as_millis() as u64;
     if let Some(record) = state
         .warmup
-        .history
+        .inner
         .lock()
         .unwrap_or_else(|p| p.into_inner())
+        .entries
         .get_mut(id)
     {
         record.2 = Some(out.clone());
@@ -639,32 +724,44 @@ async fn execute(state: &Arc<AppState>, id: &str, automatic: bool) -> WarmupResu
 }
 async fn run(state: &Arc<AppState>, m: &Arc<AccountMember>, automatic: bool) -> WarmupResult {
     let future = {
-        let mut flights = state
+        let mut inner = state
             .warmup
-            .flights
+            .inner
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        if let Some(f) = flights.get(&m.id) {
+        // Membership and the flight map share one guard: an account the pool has
+        // already dropped can never be handed a fresh flight by a caller that
+        // still holds the stale member.
+        if !inner.admits(&m.id) {
+            return result(m, "account_removed");
+        }
+        if let Some(entry) = inner.flights.get(&m.id) {
             if automatic {
                 return result(m, "in_flight");
             }
-            f.clone()
+            entry.flight.clone()
         } else {
             let state = state.clone();
             let id = m.id.clone();
             let (tx, rx) = tokio::sync::oneshot::channel();
             let fallback = result(m, "worker_failed");
             let f = async move { rx.await.unwrap_or(fallback) }.boxed().shared();
-            flights.insert(id.clone(), f.clone());
+            inner.flight_generation = inner.flight_generation.wrapping_add(1);
+            let generation = inner.flight_generation;
+            inner.flights.insert(
+                id.clone(),
+                FlightEntry {
+                    generation,
+                    flight: f.clone(),
+                },
+            );
             tokio::spawn(async move {
                 let out = execute(&state, &id, automatic).await;
-                let mut flights = state
-                    .warmup
-                    .flights
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner());
+                // Retire this flight before publishing the result, so the map is
+                // already clean when the caller wakes and a stale completion can
+                // never delete a newer same-id flight.
+                state.warmup.finish_flight(&id, generation);
                 let _ = tx.send(out);
-                flights.remove(&id);
             });
             f
         }
@@ -733,10 +830,10 @@ pub fn status(state: &AppState) -> Value {
         };
         let history = state
             .warmup
-            .history
+            .inner
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        let last = history.get(&m.id);
+        let last = history.entries.get(&m.id);
         let next_due = if p.enabled {
             if skip == Some("window_active") {
                 reset_at
@@ -931,7 +1028,7 @@ mod tests {
         assert!(due_at(&state, &member, start));
 
         // When a probe was attempted very recently (< 60s), due_at is false to avoid spam
-        state.warmup.history.lock().unwrap().insert(
+        state.warmup.inner.lock().unwrap().entries.insert(
             member.id.clone(),
             (start, now(), Some(result(&member, "failed"))),
         );
@@ -1178,5 +1275,157 @@ mod tests {
         );
 
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn warmup_record_probe_skips_a_removed_account() {
+        let runner = WarmupRunner::default();
+        let mut active = ActiveIds::new();
+        active.insert("live".to_string());
+        assert_eq!(runner.retain_accounts(&active), 0);
+
+        let start = tokio::time::Instant::now();
+        let record = |at: tokio::time::Instant| (at, now(), None::<WarmupResult>);
+        assert!(runner.record_probe("live", record(start)));
+        assert!(!runner.record_probe("gone", record(start)));
+        assert_eq!(runner.tracked_accounts(), vec!["live".to_string()]);
+
+        // Reconciling away the account drops its record, after which it can no
+        // longer be written: an in-flight probe cannot resurrect deleted state.
+        assert_eq!(runner.retain_accounts(&ActiveIds::new()), 1);
+        assert!(!runner.record_probe("live", record(start)));
+        assert!(runner.tracked_accounts().is_empty());
+    }
+
+    #[test]
+    fn warmup_standalone_runner_records_before_activation() {
+        // Before any `retain_accounts`, membership is not explicit: the warmup
+        // loop's own probe recording must keep working unchanged.
+        let runner = WarmupRunner::default();
+        let start = tokio::time::Instant::now();
+        runner.record_probe("acc", (start, now(), None));
+        assert_eq!(
+            runner.tracked_accounts(),
+            vec!["acc".to_string()],
+            "a runner whose allowlist has not been activated must accept probes"
+        );
+    }
+
+    fn warmup_state() -> (Arc<AppState>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("warmup-flights-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = Arc::new(
+            AppState::new(&crate::config::GatewayConfig {
+                auth_dir: dir.clone(),
+                config_path: dir.join("config.yaml"),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        (state, dir)
+    }
+
+    fn codex_member() -> Arc<AccountMember> {
+        Arc::new(AccountMember::for_test(ProviderAccount::Codex(
+            mahoquot_providers::CodexAccount {
+                access_token: "mock".into(),
+                ..Default::default()
+            },
+        )))
+    }
+
+    #[tokio::test]
+    async fn warmup_run_refuses_a_removed_account_instead_of_probing_it() {
+        let (state, dir) = warmup_state();
+        let member = codex_member();
+        // The pool no longer holds this account.
+        let active: ActiveIds = ["some-other-live-account".to_string()].into_iter().collect();
+        assert_eq!(state.warmup.retain_accounts(&active), 0);
+
+        let out = warm_account(&state, &member).await;
+
+        // Public surface only: pre-fix this created a flight and returned
+        // account_not_found, so the refusal is observable without touching the
+        // internal guard.
+        assert_eq!(
+            out.detail.as_deref(),
+            Some("account_removed"),
+            "a caller holding a removed member must be refused, not probed"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn warmup_run_does_not_register_a_flight_for_a_removed_account() {
+        let (state, dir) = warmup_state();
+        let member = codex_member();
+        let active: ActiveIds = ["some-other-live-account".to_string()].into_iter().collect();
+        assert_eq!(state.warmup.retain_accounts(&active), 0);
+
+        let _ = warm_account(&state, &member).await;
+
+        assert!(
+            state.warmup.inner.lock().unwrap().flights.is_empty(),
+            "an account the pool dropped must not be handed a fresh flight"
+        );
+        assert!(state.warmup.inner.lock().unwrap().entries.is_empty());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn warmup_run_registers_and_retires_a_flight_on_the_real_path() {
+        let (state, dir) = warmup_state();
+        let member = codex_member();
+        let active: ActiveIds = [member.id.clone()].into_iter().collect();
+        assert_eq!(state.warmup.retain_accounts(&active), 0);
+
+        // The member is not in this state's pool, so `execute` returns without
+        // any upstream call -- but the flight is registered and retired for real.
+        let out = warm_account(&state, &member).await;
+
+        assert_eq!(out.detail.as_deref(), Some("account_not_found"));
+        assert!(
+            state.warmup.inner.lock().unwrap().flights.is_empty(),
+            "a completed probe must retire its own flight before publishing"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn warmup_finish_flight_keeps_a_newer_generation() {
+        let runner = WarmupRunner::default();
+        let member = codex_member();
+        let fallback = result(&member, "unused");
+        let flight = || -> Flight {
+            let f = fallback.clone();
+            futures::FutureExt::shared(futures::FutureExt::boxed(async move { f }))
+        };
+
+        {
+            let mut inner = runner.inner.lock().unwrap();
+            inner
+                .flights
+                .insert(member.id.clone(), FlightEntry { generation: 1, flight: flight() });
+        }
+        // A completion of the registered generation retires its own flight.
+        runner.finish_flight(&member.id, 1);
+        assert!(runner.inner.lock().unwrap().flights.is_empty());
+
+        // A prune + re-add published generation 2; the stale generation-1
+        // completion must leave it in place.
+        {
+            let mut inner = runner.inner.lock().unwrap();
+            inner
+                .flights
+                .insert(member.id.clone(), FlightEntry { generation: 2, flight: flight() });
+        }
+        runner.finish_flight(&member.id, 1);
+        assert_eq!(
+            runner.inner.lock().unwrap().flights.len(),
+            1,
+            "a stale completion must not delete a newer same-id flight"
+        );
+        runner.finish_flight(&member.id, 2);
+        assert!(runner.inner.lock().unwrap().flights.is_empty());
     }
 }

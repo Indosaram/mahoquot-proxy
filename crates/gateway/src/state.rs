@@ -154,6 +154,212 @@ impl ScopedKeyTracker {
     }
 }
 
+/// Concurrent upstream inference requests the gateway admits at once. The
+/// permit is owned by the downstream response body, so it is released when the
+/// body finishes loading or the client disconnects — never at the headers.
+/// This is an intentional overload ceiling (immediate 503 past it), not a
+/// request-size limit: the 512 MiB body cap is untouched.
+pub const MAX_CONCURRENT_INFERENCE_REQUESTS: usize = 4;
+
+/// Guarded per-account usage-poll backoff.
+///
+/// The live-id allowlist and the backoff deadlines share one lock, so a
+/// `set_poll_backoff` for an account that already left the pool is dropped
+/// instead of resurrecting its entry after a reconcile. `lock()` exposes the
+/// small subset of `HashMap` operations the quota poller uses, so the existing
+/// `quota.rs` call sites keep compiling against the new field type.
+#[derive(Debug, Default)]
+pub struct PollBackoffStore {
+    inner: std::sync::Mutex<PollBackoffInner>,
+}
+
+#[derive(Debug, Default)]
+struct PollBackoffInner {
+    /// Live pool ids; `None` until `retain_accounts` activates the allowlist,
+    /// so a standalone store accepts every write until membership is explicit.
+    active: Option<std::collections::BTreeSet<String>>,
+    entries: std::collections::HashMap<String, i64>,
+}
+
+#[derive(Debug)]
+pub struct PollBackoffGuard<'a> {
+    inner: std::sync::MutexGuard<'a, PollBackoffInner>,
+}
+
+impl PollBackoffGuard<'_> {
+    pub fn set(&mut self, account: &str, until_unix: i64) -> bool {
+        if self.inner.active.as_ref().is_some_and(|active| !active.contains(account)) {
+            return false;
+        }
+        self.inner.entries.insert(account.to_string(), until_unix);
+        true
+    }
+
+    pub fn get(&self, account: &str) -> Option<&i64> {
+        self.inner.entries.get(account)
+    }
+
+    /// Inserts only while the account is live: the membership check and the
+    /// insert share this guard, so a reconcile cannot be interleaved.
+    pub fn insert(&mut self, account: String, until_unix: i64) -> Option<i64> {
+        if self
+            .inner
+            .active
+            .as_ref()
+            .is_some_and(|active| !active.contains(&account))
+        {
+            return None;
+        }
+        self.inner.entries.insert(account, until_unix)
+    }
+
+    pub fn remove(&mut self, account: &str) -> Option<i64> {
+        self.inner.entries.remove(account)
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.entries.len()
+    }
+
+    pub fn retain<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&String, &mut i64) -> bool,
+    {
+        self.inner.entries.retain(|account, until| f(account, until));
+    }
+}
+
+impl PollBackoffStore {
+    pub fn lock(&self) -> std::sync::LockResult<PollBackoffGuard<'_>> {
+        match self.inner.lock() {
+            Ok(inner) => Ok(PollBackoffGuard { inner }),
+            Err(poisoned) => Err(std::sync::PoisonError::new(PollBackoffGuard {
+                inner: poisoned.into_inner(),
+            })),
+        }
+    }
+
+    /// Publishes the live-id allowlist and drops the backoff of every account
+    /// that left the pool, all under one guard. Returns how many were pruned.
+    pub fn retain_accounts(&self, active: &std::collections::BTreeSet<String>) -> usize {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner.active = Some(active.clone());
+        let before = inner.entries.len();
+        inner.entries.retain(|id, _| active.contains(id));
+        before - inner.entries.len()
+    }
+
+    pub fn tracked_accounts(&self) -> Vec<String> {
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let mut ids: Vec<String> = inner.entries.keys().cloned().collect();
+        ids.sort();
+        ids
+    }
+}
+
+/// Guarded proxy-client cache.
+///
+/// A sticky TTL proxy mints a new upstream URL every rotation bucket, so the
+/// cached clients are keyed by that URL. The cache keeps only the newest URL
+/// per provider+member, and the live-id allowlist shares the same lock as the
+/// map, so a request that finishes after its account was removed cannot re-cache
+/// a client for the departed member.
+#[derive(Debug, Default)]
+pub struct ProxyClientCache {
+    inner: std::sync::Mutex<ProxyClientCacheInner>,
+}
+
+#[derive(Debug, Default)]
+struct ProxyClientCacheInner {
+    /// Live pool ids; `None` until `retain_members` activates the allowlist.
+    active: Option<std::collections::BTreeSet<String>>,
+    clients: std::collections::HashMap<String, reqwest::Client>,
+}
+
+impl ProxyClientCacheInner {
+    fn admits(&self, member_id: &str) -> bool {
+        self.active
+            .as_ref()
+            .is_none_or(|active| active.contains(member_id))
+    }
+}
+
+/// The member id segment of a `{provider}|{member_id}|{url}` cache key.
+fn proxy_client_owner(key: &str) -> Option<&str> {
+    key.split('|').nth(1)
+}
+
+impl ProxyClientCache {
+    pub fn get(&self, key: &str) -> Option<reqwest::Client> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clients
+            .get(key)
+            .cloned()
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clients
+            .len()
+    }
+
+    pub fn clear(&self) {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner.clients.clear();
+    }
+
+    /// Publishes the live-id allowlist and drops every cached client whose
+    /// member left the pool, all under one guard. Returns the number pruned.
+    pub fn retain_members(&self, active: &std::collections::BTreeSet<String>) -> usize {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner.active = Some(active.clone());
+        let before = inner.clients.len();
+        inner
+            .clients
+            .retain(|key, _| proxy_client_owner(key).is_some_and(|id| active.contains(id)));
+        before - inner.clients.len()
+    }
+
+    /// Replaces the member's previous URL client with `client`, unless the
+    /// member is no longer live (in which case the fresh client is used for the
+    /// request that built it but is never cached).
+    pub fn replace_scoped(
+        &self,
+        key: String,
+        scope: &str,
+        member_id: &str,
+        client: reqwest::Client,
+    ) {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if !inner.admits(member_id) {
+            return;
+        }
+        inner
+            .clients
+            .retain(|existing, _| existing == &key || !existing.starts_with(scope));
+        inner.clients.insert(key, client);
+    }
+}
+
+/// Single-flight claim for one account's Devin catalog discovery. Dropping the
+/// guard releases the claim, so a cancelled or failed refresh never wedges the
+/// account's discovery.
+pub struct DevinRefreshGuard {
+    gate: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    id: String,
+}
+
+impl Drop for DevinRefreshGuard {
+    fn drop(&mut self) {
+        let mut set = self.gate.lock().unwrap_or_else(|p| p.into_inner());
+        set.remove(&self.id);
+    }
+}
+
 pub struct AppState {
     pub warmup: crate::warmup::WarmupRunner,
     pub router: Router,
@@ -166,7 +372,7 @@ pub struct AppState {
     /// allowlist, so a per-provider proxy cannot capture everyone else's egress.
     pub direct_client: reqwest::Client,
     pub proxy_runtime: Arc<arc_swap::ArcSwap<crate::proxy_policy::ProxyRuntime>>,
-    pub proxy_clients: Arc<std::sync::Mutex<std::collections::HashMap<String, reqwest::Client>>>,
+    pub proxy_clients: Arc<ProxyClientCache>,
     pub metrics: Arc<GatewayMetrics>,
     pub monitor: Arc<MonitorState>,
     pub api_keys: Arc<ApiKeys>,
@@ -195,12 +401,21 @@ pub struct AppState {
     pub usage_samples: crate::usage::UsageSampleStore,
     pub usage_state: crate::usage::UsageStateStore,
     pub shutdown: Arc<tokio::sync::Notify>,
-    /// Per-account usage-poll backoff (unix secs). A 429 from a usage endpoint
-    /// parks the account here so the poller stops keeping the throttle hot.
     pub devin_http_client: reqwest::Client,
     pub devin_direct_client: reqwest::Client,
-    pub usage_poll_backoff: std::sync::Mutex<std::collections::HashMap<String, i64>>,
+    /// Per-account usage-poll backoff (unix secs). A 429 from a usage endpoint
+    /// parks the account here so the poller stops keeping the throttle hot.
+    /// The live-id allowlist shares this guard (see `PollBackoffStore`).
+    pub usage_poll_backoff: PollBackoffStore,
+    /// Devin discovery single-flight claims, taken before a refresh task is
+    /// spawned.
+    pub devin_refresh_in_flight: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     pub devin_cache: Arc<crate::devin_catalog::DevinDiscoveryCache>,
+    /// Admission ceiling for upstream inference; see
+    /// `MAX_CONCURRENT_INFERENCE_REQUESTS`.
+    pub inference_gate: Arc<tokio::sync::Semaphore>,
+    /// Serializes membership application for `rescan_pool`.
+    rescan_gate: std::sync::Mutex<()>,
     pub finalizer_notifiers: Arc<
         std::sync::Mutex<std::collections::HashMap<String, Vec<tokio::sync::mpsc::Sender<()>>>>,
     >,
@@ -303,7 +518,7 @@ impl AppState {
         let proxy_runtime = Arc::new(arc_swap::ArcSwap::from_pointee(
             crate::proxy_policy::ProxyRuntime::from_settings(&initial_settings),
         ));
-        let proxy_clients = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let proxy_clients = Arc::new(ProxyClientCache::default());
 
         let proxy_runtime_obs = Arc::clone(&proxy_runtime);
         let proxy_clients_obs = Arc::clone(&proxy_clients);
@@ -311,9 +526,7 @@ impl AppState {
             proxy_runtime_obs.store(Arc::new(crate::proxy_policy::ProxyRuntime::from_settings(
                 published,
             )));
-            if let Ok(mut clients) = proxy_clients_obs.lock() {
-                clients.clear();
-            }
+            proxy_clients_obs.clear();
         }));
         let scoped_keys = Arc::new(ScopedKeyTracker::new(&settings.current().scoped_api_keys));
         // Every published settings document rebuilds the index, so a key that
@@ -419,7 +632,7 @@ impl AppState {
             runtime_for_publisher.update_registry(registry).map(|_| ())
         }));
 
-        Ok(Self {
+        let state = Self {
             settings,
             scheduler,
             history,
@@ -431,7 +644,12 @@ impl AppState {
             ),
             usage_state,
             shutdown: Arc::new(tokio::sync::Notify::new()),
-            usage_poll_backoff: std::sync::Mutex::default(),
+            usage_poll_backoff: PollBackoffStore::default(),
+            devin_refresh_in_flight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            inference_gate: Arc::new(tokio::sync::Semaphore::new(
+                MAX_CONCURRENT_INFERENCE_REQUESTS,
+            )),
+            rescan_gate: std::sync::Mutex::new(()),
             router,
             runtime,
             catalog,
@@ -462,7 +680,12 @@ impl AppState {
             model_restrictions: AtomicBool::new(false),
             devin_cache: Arc::new(crate::devin_catalog::DevinDiscoveryCache::new()),
             finalizer_notifiers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-        })
+        };
+        // Bootstrap membership: every store that can outlive an account starts
+        // with the initial pool's allowlist, so no later writer can recreate an
+        // id the pool never had.
+        state.reconcile_account_state();
+        Ok(state)
     }
 
     pub fn set_routing_strategy(&self, strategy: mahoquot_types::Strategy) {
@@ -481,6 +704,13 @@ impl AppState {
     /// Rebuilds the pool from the auth directory so credentials written after
     /// startup (imports, OAuth onboarding) become live without a restart.
     pub fn rescan_pool(&self) -> anyhow::Result<usize> {
+        // Serialize the entire load+apply sequence. Two overlapping rescans
+        // must never let the older membership land after the newer one and
+        // resurrect accounts the pool has already dropped.
+        let _gate = self
+            .rescan_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let auth_dir = self.settings.current().auth_dir.clone();
         let members = load_account_members(std::path::Path::new(&auth_dir))?;
         // Surviving accounts keep their runtime state (health, counters, cached
@@ -512,7 +742,71 @@ impl AppState {
         let count = members.len();
         let new_snapshot = self.runtime.reload_accounts(members)?;
         self.scheduler.reconcile(&new_snapshot.members);
+        self.reconcile_account_state();
         Ok(count)
+    }
+
+    /// Publishes the live pool ids into every store that can be written by a
+    /// task outliving an account. This is a fan-out of `retain_accounts`; it
+    /// never performs a membership check on a writer's behalf — each store
+    /// keeps its allowlist inside the same guard as its data.
+    pub fn reconcile_account_state(&self) {
+        let ids: std::collections::BTreeSet<String> = self
+            .pool
+            .load()
+            .members
+            .iter()
+            .map(|member| member.id.clone())
+            .collect();
+        let _ = self.usage_samples.retain_accounts(&ids);
+        let _ = self.monitor.retain_accounts(&ids);
+        let _ = self.warmup.retain_accounts(&ids);
+        let _ = self.router.retain_members(&ids);
+        let _ = self.devin_cache.retain_accounts(&ids);
+        let _ = self.scheduler.retain_accounts(&ids);
+        let _ = self.usage_poll_backoff.retain_accounts(&ids);
+        let _ = self.proxy_clients.retain_members(&ids);
+    }
+
+    /// Authorization check for management input (scheduler reserve), not a
+    /// state-write gate.
+    pub fn is_active_account(&self, id: &str) -> bool {
+        self.pool.load().members.iter().any(|member| member.id == id)
+    }
+
+    /// Admittance gate for upstream inference requests.
+    pub fn inference_gate(&self) -> Arc<tokio::sync::Semaphore> {
+        Arc::clone(&self.inference_gate)
+    }
+
+    /// Number of cached per-target proxy clients (diagnostic; the retained set
+    /// is bounded to the latest URL per provider+member).
+    pub fn proxy_client_count(&self) -> usize {
+        self.proxy_clients.len()
+    }
+
+    /// Claims the single-flight slot for an account's Devin discovery. Returns
+    /// `None` when a refresh is already in flight, so a burst of stale requests
+    /// collapses onto the worker that is already running.
+    pub fn begin_devin_refresh(&self, id: &str) -> Option<DevinRefreshGuard> {
+        let mut in_flight = self
+            .devin_refresh_in_flight
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if !in_flight.insert(id.to_string()) {
+            return None;
+        }
+        Some(DevinRefreshGuard {
+            gate: Arc::clone(&self.devin_refresh_in_flight),
+            id: id.to_string(),
+        })
+    }
+
+    pub fn devin_refresh_in_flight_count(&self) -> usize {
+        self.devin_refresh_in_flight
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len()
     }
 
     pub fn runtime_state(&self) -> Arc<UnifiedRuntimeState> {
@@ -549,11 +843,27 @@ impl AppState {
     }
 
     pub fn client_for_target(&self, provider_name: &str, member_id: &str) -> reqwest::Client {
-        let runtime = self.proxy_runtime.load();
         let now_unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        self.client_for_target_at(provider_name, member_id, now_unix)
+    }
+
+    /// Time-injected core of `client_for_target`.
+    ///
+    /// A sticky TTL proxy mints a new upstream URL every rotation bucket. The
+    /// cached client is keyed by that URL, so without eviction the map would
+    /// keep one reqwest client (and its connection pool) per bucket forever.
+    /// On insert we keep only the newest URL per provider+member: the replaced
+    /// client is dropped, while a task that already cloned it finishes normally.
+    pub(crate) fn client_for_target_at(
+        &self,
+        provider_name: &str,
+        member_id: &str,
+        now_unix: u64,
+    ) -> reqwest::Client {
+        let runtime = self.proxy_runtime.load();
 
         let Some(proxy_url) = runtime.session_proxy_url(provider_name, member_id, now_unix) else {
             // Toggling a provider on at runtime must not retroactively proxy
@@ -566,17 +876,15 @@ impl AppState {
         };
 
         let cache_key = format!("{provider_name}|{member_id}|{proxy_url}");
-        {
-            let clients = self.proxy_clients.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(client) = clients.get(&cache_key) {
-                return client.clone();
-            }
+        if let Some(client) = self.proxy_clients.get(&cache_key) {
+            return client;
         }
 
         match crate::proxy_policy::build_http_client(Some(&proxy_url)) {
             Ok(client) => {
-                let mut clients = self.proxy_clients.lock().unwrap_or_else(|p| p.into_inner());
-                clients.insert(cache_key, client.clone());
+                let scope = format!("{provider_name}|{member_id}|");
+                self.proxy_clients
+                    .replace_scoped(cache_key, &scope, member_id, client.clone());
                 client
             }
             Err(err) => {
@@ -641,11 +949,21 @@ impl AppState {
         &self,
         member_id: &str,
     ) -> Result<reqwest::Client, crate::proxy_policy::DevinClientBuildError> {
-        let runtime = self.proxy_runtime.load();
         let now_unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        self.devin_client_for_target_at(member_id, now_unix)
+    }
+
+    /// Time-injected core of `devin_client_for_target`; see
+    /// `client_for_target_at` for the retention rule.
+    pub(crate) fn devin_client_for_target_at(
+        &self,
+        member_id: &str,
+        now_unix: u64,
+    ) -> Result<reqwest::Client, crate::proxy_policy::DevinClientBuildError> {
+        let runtime = self.proxy_runtime.load();
 
         let Some(proxy_url) = runtime.session_proxy_url("devin", member_id, now_unix) else {
             // session_proxy_url(None) must honor global proxy semantics consistently with existing client_for_target
@@ -657,17 +975,15 @@ impl AppState {
         };
 
         let cache_key = format!("devin|{member_id}|{proxy_url}");
-        {
-            let clients = self.proxy_clients.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(client) = clients.get(&cache_key) {
-                return Ok(client.clone());
-            }
+        if let Some(client) = self.proxy_clients.get(&cache_key) {
+            return Ok(client);
         }
 
         match crate::proxy_policy::build_devin_http_client(Some(&proxy_url)) {
             Ok(client) => {
-                let mut clients = self.proxy_clients.lock().unwrap_or_else(|p| p.into_inner());
-                clients.insert(cache_key, client.clone());
+                let scope = format!("devin|{member_id}|");
+                self.proxy_clients
+                    .replace_scoped(cache_key, &scope, member_id, client.clone());
                 Ok(client)
             }
             Err(err) => {
@@ -1043,5 +1359,164 @@ mod stats_tests {
             "account-wide health must dominate every per-model entry"
         );
         assert_eq!(value["model_routability"]["glm-5.3-flash"], false);
+    }
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use crate::management::settings::ProviderProxyPolicy;
+    use crate::proxy_policy::ProxyRuntime;
+
+    fn state_with_one_account() -> (Arc<AppState>, Arc<crate::account::AccountMember>) {
+        let auth_dir = std::env::temp_dir().join(format!(
+            "mahoquot-shared-integration-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&auth_dir).expect("create auth dir");
+        let credential = serde_json::json!({
+            "type": "generic",
+            "identity_slug": "cline-account",
+            "provider": "cline",
+            "label": "Cline",
+            "adapter": "openai-chat",
+            "base_url": "http://127.0.0.1:9",
+            "api_key": "fixture-cline",
+            "models": ["cline-free/gemini-3.8-flash"],
+        })
+        .to_string();
+        std::fs::write(auth_dir.join("generic-cline.json"), credential).expect("write cline");
+        let config = crate::config::GatewayConfig {
+            auth_dir: auth_dir.clone(),
+            config_path: auth_dir.join("config.yaml"),
+            auth_refresh_enabled: false,
+            ..crate::config::GatewayConfig::default()
+        };
+        let state = Arc::new(AppState::new(&config).expect("state"));
+        let member = state.pool.load_full().members[0].clone();
+        (state, member)
+    }
+
+    /// Sticky TTL policy: the session proxy URL changes once per bucket, which is
+    /// the rotation that used to grow the client map without bound.
+    fn install_sticky_policy(state: &AppState, provider: &str) {
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert(
+            provider.to_string(),
+            ProviderProxyPolicy {
+                enabled: true,
+                sticky: true,
+                ttl_secs: 600,
+                url: "http://127.0.0.1:18840".to_string(),
+            },
+        );
+        state.proxy_runtime.store(Arc::new(ProxyRuntime {
+            global_proxy_url: String::new(),
+            providers,
+        }));
+    }
+
+    #[test]
+    fn proxy_clients_keep_only_the_latest_url_per_member() {
+        let (state, member) = state_with_one_account();
+        install_sticky_policy(&state, "cline");
+
+        let first = state.client_for_target_at("cline", &member.id, 1_000_000);
+        assert_eq!(state.proxy_client_count(), 1);
+
+        let second = state.client_for_target_at("cline", &member.id, 1_000_600);
+        assert_eq!(
+            state.proxy_client_count(),
+            1,
+            "a rotation bucket must replace the member's previous client, not accumulate"
+        );
+        let again = state.client_for_target_at("cline", &member.id, 1_000_600);
+        assert_eq!(state.proxy_client_count(), 1, "the newest bucket stays cached");
+
+        drop((first, second, again));
+        assert_eq!(state.proxy_client_count(), 1);
+    }
+
+    #[test]
+    fn proxy_clients_keep_only_the_latest_url_per_devin_member() {
+        let (state, member) = state_with_one_account();
+        install_sticky_policy(&state, "devin");
+
+        state
+            .devin_client_for_target_at(&member.id, 2_000_000)
+            .expect("devin client");
+        assert_eq!(state.proxy_client_count(), 1);
+        state
+            .devin_client_for_target_at(&member.id, 2_000_600)
+            .expect("devin client");
+        assert_eq!(
+            state.proxy_client_count(),
+            1,
+            "Devin rotation must replace, not accumulate"
+        );
+    }
+
+    #[test]
+    fn proxy_clients_keep_distinct_members_separate() {
+        let (state, _member) = state_with_one_account();
+        install_sticky_policy(&state, "cline");
+        state.proxy_clients.retain_members(
+            &["member-a".to_string(), "member-b".to_string()].into_iter().collect(),
+        );
+
+        state.client_for_target_at("cline", "member-a", 3_000_000);
+        state.client_for_target_at("cline", "member-b", 3_000_000);
+        assert_eq!(state.proxy_client_count(), 2);
+
+        state.client_for_target_at("cline", "member-a", 3_000_600);
+        assert_eq!(
+            state.proxy_client_count(),
+            2,
+            "rotating one member must not evict another member's client"
+        );
+    }
+
+    #[test]
+    fn inference_gate_is_exhausted_after_four_permits_and_recovers_on_drop() {
+        let (state, _member) = state_with_one_account();
+        let gate = state.inference_gate();
+
+        let mut held = Vec::new();
+        for _ in 0..MAX_CONCURRENT_INFERENCE_REQUESTS {
+            held.push(
+                gate.clone()
+                    .try_acquire_owned()
+                    .expect("permit within the ceiling"),
+            );
+        }
+        assert!(
+            gate.clone().try_acquire_owned().is_err(),
+            "the request past the ceiling must be rejected immediately"
+        );
+
+        held.pop();
+        assert!(
+            gate.clone().try_acquire_owned().is_ok(),
+            "releasing a permit must admit the next request"
+        );
+    }
+
+    #[test]
+    fn devin_refresh_claim_is_single_flight_and_released_on_drop() {
+        let (state, _member) = state_with_one_account();
+
+        let guard = state.begin_devin_refresh("acct").expect("first claim");
+        assert!(
+            state.begin_devin_refresh("acct").is_none(),
+            "a repeated request while a refresh is in flight must coalesce"
+        );
+        assert_eq!(state.devin_refresh_in_flight_count(), 1);
+
+        drop(guard);
+        assert!(
+            state.begin_devin_refresh("acct").is_some(),
+            "dropping the guard must release the claim"
+        );
     }
 }

@@ -157,11 +157,30 @@ pub async fn open_stream(
 }
 
 pub async fn collect_stream(first: Bytes, mut stream: UpstreamStream) -> Result<Vec<u8>, String> {
-    let mut raw = first.to_vec();
+    let mut raw = Vec::new();
+    extend_nonstream_bounded(&mut raw, &first)?;
     while let Some(chunk) = stream.next().await {
-        raw.extend_from_slice(&chunk.map_err(|e| e.to_string())?);
+        extend_nonstream_bounded(&mut raw, &chunk.map_err(|e| e.to_string())?)?;
     }
     Ok(raw)
+}
+
+/// Upper bound on a total non-streaming upstream body buffered in memory. The
+/// streaming path never buffers; only the collect path can, so it is bounded
+/// here. Request-body support (512 MiB) is unrelated and unchanged.
+pub const MAX_NONSTREAM_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Appends `chunk` to the buffered non-streaming `raw` body, refusing a total
+/// beyond [`MAX_NONSTREAM_RESPONSE_BYTES`]. Every parsed event is derived from
+/// `raw`, so bounding `raw` bounds the accumulated event list too.
+pub(crate) fn extend_nonstream_bounded(raw: &mut Vec<u8>, chunk: &[u8]) -> Result<(), String> {
+    if raw.len().saturating_add(chunk.len()) > MAX_NONSTREAM_RESPONSE_BYTES {
+        return Err(format!(
+            "upstream non-streaming response exceeds the {MAX_NONSTREAM_RESPONSE_BYTES}-byte limit"
+        ));
+    }
+    raw.extend_from_slice(chunk);
+    Ok(())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -176,7 +195,7 @@ pub enum Protocol {
 
 pub struct ProtocolSession {
     pub protocol: Protocol,
-    pub cursor_reply: Option<tokio::sync::mpsc::UnboundedSender<Bytes>>,
+    pub cursor_reply: Option<tokio::sync::mpsc::Sender<Bytes>>,
     pub replay: Option<signature_ledger::ReplayScope>,
 }
 
@@ -208,14 +227,14 @@ impl ProtocolParser {
 
     fn with_cursor_reply(
         protocol: Protocol,
-        cursor_reply: Option<tokio::sync::mpsc::UnboundedSender<Bytes>>,
+        cursor_reply: Option<tokio::sync::mpsc::Sender<Bytes>>,
     ) -> Self {
         Self::with_parts(protocol, cursor_reply, None)
     }
 
     fn with_parts(
         protocol: Protocol,
-        cursor_reply: Option<tokio::sync::mpsc::UnboundedSender<Bytes>>,
+        cursor_reply: Option<tokio::sync::mpsc::Sender<Bytes>>,
         replay: Option<signature_ledger::ReplayScope>,
     ) -> Self {
         Self {
@@ -256,20 +275,22 @@ impl ProtocolParser {
         }
         if let Some(decoder) = self.anthropic.as_mut() {
             let mut frames = Vec::new();
-            self.sse.push_raw_data(chunk, &mut frames);
+            let result = self.sse.push_raw_data(chunk, &mut frames);
             for frame in frames {
                 decoder.decode(&frame, events);
             }
+            push_limit_failure(result, events);
             return;
         }
         match self.gemini.as_mut() {
             None => self.sse.push(chunk, events),
             Some(decoder) => {
                 let mut frames = Vec::new();
-                self.sse.push_raw_data(chunk, &mut frames);
+                let result = self.sse.push_raw_data(chunk, &mut frames);
                 for frame in frames {
                     decoder.decode(&frame, events);
                 }
+                push_limit_failure(result, events);
             }
         }
     }
@@ -289,10 +310,11 @@ impl ProtocolParser {
         }
         if let Some(decoder) = self.anthropic.as_mut() {
             let mut frames = Vec::new();
-            self.sse.finish_raw_data(&mut frames);
+            let result = self.sse.finish_raw_data(&mut frames);
             for frame in frames {
                 decoder.decode(&frame, events);
             }
+            push_limit_failure(result, events);
             decoder.finish(events);
             return;
         }
@@ -300,13 +322,25 @@ impl ProtocolParser {
             None => self.sse.finish(events),
             Some(decoder) => {
                 let mut frames = Vec::new();
-                self.sse.finish_raw_data(&mut frames);
+                let result = self.sse.finish_raw_data(&mut frames);
                 for frame in frames {
                     decoder.decode(&frame, events);
                 }
+                push_limit_failure(result, events);
                 decoder.finish(events);
             }
         }
+    }
+}
+
+/// Surfaces a raw SSE accumulation breach as a terminal failure event. The
+/// parser never reports the same breach twice, so at most one `Failed` is
+/// emitted per stream.
+fn push_limit_failure(result: Result<(), events::SseLimitError>, events: &mut Vec<CodexEvent>) {
+    if let Err(error) = result {
+        events.push(CodexEvent::Failed {
+            message: error.message().to_string(),
+        });
     }
 }
 
@@ -506,31 +540,63 @@ pub async fn collect_stream_with_replies(
     String,
 > {
     let mut parser = ProtocolParser::with_session(&session);
-    let mut raw = first.to_vec();
+    let mut raw = Vec::new();
+    let mut usage: Option<crate::usage::ResponseTokenUsage> = None;
+    // Only the events of the chunk under hand are retained. `raw` is the
+    // bounded source of truth, so keeping a second, whole-stream copy of the
+    // parsed events would double the retained memory for no benefit.
     let mut events = Vec::new();
+    extend_nonstream_bounded(&mut raw, &first)?;
     parser.push(&first, &mut events);
-    while let Some(chunk) = stream.next().await {
+    let mut failed = record_collected_events(&mut events, &mut usage);
+    while !failed {
+        let Some(chunk) = stream.next().await else {
+            break;
+        };
         let chunk = chunk.map_err(|e| e.to_string())?;
+        extend_nonstream_bounded(&mut raw, &chunk)?;
         parser.push(&chunk, &mut events);
-        raw.extend_from_slice(&chunk);
+        failed = record_collected_events(&mut events, &mut usage);
     }
-    parser.finish(&mut events);
-    let usage = events.iter().rev().find_map(|event| match event {
-        CodexEvent::Completed {
-            usage: Some(completed),
-        } => Some(crate::usage::ResponseTokenUsage {
-            input_tokens: completed.prompt_tokens,
-            output_tokens: completed.completion_tokens,
-            cached_input_tokens: completed.cached_tokens,
-            cached_input_tokens_known: completed.cached_tokens_known,
-            cache_write_tokens: completed.cache_write_tokens,
-            cache_write_tokens_known: completed.cache_write_tokens_known,
-            reasoning_tokens: completed.reasoning_tokens,
-        }),
-        _ => None,
-    });
+    // A terminal failure stops the read and drops the upstream instead of
+    // consuming the remaining body forever; `finish` is skipped so no
+    // `Completed` is published after the failure.
+    if !failed {
+        parser.finish(&mut events);
+        record_collected_events(&mut events, &mut usage);
+    }
     let devin_outcome = parser.devin.as_ref().map(|d| d.outcome().clone());
     Ok((raw, usage, devin_outcome))
+}
+
+/// Records the latest completion usage and reports whether a terminal failure
+/// was observed. Draining the per-chunk events each call keeps the collector
+/// from retaining a whole-stream copy of the parsed data.
+fn record_collected_events(
+    events: &mut Vec<CodexEvent>,
+    usage: &mut Option<crate::usage::ResponseTokenUsage>,
+) -> bool {
+    let mut failed = false;
+    for event in events.drain(..) {
+        match event {
+            CodexEvent::Completed {
+                usage: Some(completed),
+            } => {
+                *usage = Some(crate::usage::ResponseTokenUsage {
+                    input_tokens: completed.prompt_tokens,
+                    output_tokens: completed.completion_tokens,
+                    cached_input_tokens: completed.cached_tokens,
+                    cached_input_tokens_known: completed.cached_tokens_known,
+                    cache_write_tokens: completed.cache_write_tokens,
+                    cache_write_tokens_known: completed.cache_write_tokens_known,
+                    reasoning_tokens: completed.reasoning_tokens,
+                });
+            }
+            CodexEvent::Failed { .. } => failed = true,
+            _ => {}
+        }
+    }
+    failed
 }
 
 fn error_frames(renderer: &mut StreamRenderer, message: &str) -> Vec<Bytes> {
@@ -706,4 +772,132 @@ pub fn error_stream_body(message: &str) -> Body {
         buf.extend_from_slice(DONE_FRAME);
     }
     Body::from(buf)
+}
+
+#[cfg(test)]
+mod bounded_stream_tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
+
+    /// A source that counts its polls and records its own drop, so a body that
+    /// keeps consuming after a terminal failure is directly observable.
+    struct CountingSource {
+        chunks: VecDeque<Bytes>,
+        polls: Arc<AtomicUsize>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Stream for CountingSource {
+        type Item = reqwest::Result<Bytes>;
+
+        fn poll_next(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Self::Item>> {
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            match self.chunks.pop_front() {
+                Some(chunk) => Poll::Ready(Some(Ok(chunk))),
+                None => Poll::Ready(None),
+            }
+        }
+    }
+
+    impl Drop for CountingSource {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Drives a `streaming_body` that must terminate on its very first chunk,
+    /// returning the rendered body text plus the source's poll and drop counts.
+    async fn drain_after_terminal_first(first: Bytes, protocol: Protocol) -> (String, usize, usize) {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let source = CountingSource {
+            chunks: VecDeque::from(vec![Bytes::from_static(
+                b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"late\"}\n\n",
+            )]),
+            polls: Arc::clone(&polls),
+            drops: Arc::clone(&drops),
+        };
+        let body = streaming_body(StreamingBodyParams {
+            first,
+            upstream: Box::pin(source),
+            model: "fixture".into(),
+            created: 0,
+            include_usage: false,
+            shape: ReplyShape::Chat,
+            session: ProtocolSession {
+                protocol,
+                cursor_reply: None,
+                replay: None,
+            },
+            upstream_capture: None,
+            devin_outcome: None,
+        });
+        let collected = http_body_util::BodyExt::collect(body).await.unwrap();
+        (
+            String::from_utf8_lossy(&collected.to_bytes()).to_string(),
+            polls.load(Ordering::SeqCst),
+            drops.load(Ordering::SeqCst),
+        )
+    }
+
+    #[tokio::test]
+    async fn an_sse_limit_failure_stops_polling_and_drops_the_upstream() {
+        let (text, polls, drops) = drain_after_terminal_first(
+            Bytes::from(vec![b'a'; events::MAX_SSE_LINE_BYTES + 1]),
+            Protocol::Codex,
+        )
+        .await;
+        assert!(
+            text.contains("size limit"),
+            "expected a terminal failure frame: {text}"
+        );
+        assert_eq!(
+            polls, 0,
+            "the upstream must not be polled after the limit failure"
+        );
+        assert_eq!(drops, 1, "the upstream must be dropped when the stream ends");
+    }
+
+    #[tokio::test]
+    async fn a_kiro_frame_limit_failure_stops_polling_and_drops_the_upstream() {
+        let mut prelude = (kiro::MAX_KIRO_FRAME_BYTES as u32 + 1).to_be_bytes().to_vec();
+        prelude.extend_from_slice(&0u32.to_be_bytes());
+        prelude.extend_from_slice(&0u32.to_be_bytes());
+        let (text, polls, drops) =
+            drain_after_terminal_first(Bytes::from(prelude), Protocol::Kiro).await;
+        assert!(text.contains("error"), "expected a terminal error frame: {text}");
+        assert_eq!(polls, 0, "the upstream must not be polled after the frame limit");
+        assert_eq!(drops, 1, "the upstream must be dropped when the stream ends");
+    }
+
+    #[tokio::test]
+    async fn a_cursor_frame_limit_failure_stops_polling_and_drops_the_upstream() {
+        let mut prelude = vec![0u8];
+        prelude.extend_from_slice(&(cursor::MAX_CURSOR_FRAME_BYTES as u32 + 1).to_be_bytes());
+        let (text, polls, drops) =
+            drain_after_terminal_first(Bytes::from(prelude), Protocol::Cursor).await;
+        assert!(text.contains("error"), "expected a terminal error frame: {text}");
+        assert_eq!(polls, 0, "the upstream must not be polled after the frame limit");
+        assert_eq!(drops, 1, "the upstream must be dropped when the stream ends");
+    }
+
+    #[test]
+    fn bounded_nonstream_append_allows_exactly_the_cap() {
+        let mut raw = vec![0u8; MAX_NONSTREAM_RESPONSE_BYTES - 3];
+        assert!(extend_nonstream_bounded(&mut raw, &[1, 2, 3]).is_ok());
+        assert_eq!(raw.len(), MAX_NONSTREAM_RESPONSE_BYTES);
+    }
+
+    #[test]
+    fn bounded_nonstream_append_enforces_the_cap() {
+        let mut raw = vec![0u8; MAX_NONSTREAM_RESPONSE_BYTES];
+        let error = extend_nonstream_bounded(&mut raw, &[1]).unwrap_err();
+        assert!(error.contains("limit"), "{error}");
+        assert_eq!(raw.len(), MAX_NONSTREAM_RESPONSE_BYTES);
+    }
 }

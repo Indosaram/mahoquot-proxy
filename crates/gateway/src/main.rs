@@ -311,13 +311,16 @@ async fn main() -> anyhow::Result<()> {
             "SECURITY WARNING: gateway is listening on a non-loopback address without any API keys configured"
         );
     }
-    state
+    let flush_worker = state
         .telemetry
         .spawn_flush_worker(std::time::Duration::from_secs(10));
     // Keeps the Gemini replay ledger on disk across restarts without ever
     // writing from a request task.
     let signature_ledger_worker = state.signature_ledger.spawn_persistence_worker();
-    mahoquot_gateway::quota::spawn_usage_poller(
+    // The server owns these workers so shutdown joins them instead of leaving
+    // tasks (and their `Arc<AppState>`) detached after the process stops
+    // serving.
+    let usage_poller = mahoquot_gateway::quota::spawn_usage_poller(
         Arc::clone(&state),
         std::time::Duration::from_secs(config.usage_poll_secs),
     );
@@ -332,6 +335,11 @@ async fn main() -> anyhow::Result<()> {
 
     let shutdown = state.shutdown.clone();
     let result = run_server(listener, app, async move { shutdown.notified().await }).await;
+    // Cancel the poller before the final snapshot: a refresh that is still in
+    // flight must not write behind the flush, and neither task may outlive the
+    // server.
+    usage_poller.shutdown().await;
+    flush_worker.shutdown().await;
     // Final snapshot before the process exits, so a replay that arrived inside
     // the coalescing window is not lost.
     state.signature_ledger.shutdown();

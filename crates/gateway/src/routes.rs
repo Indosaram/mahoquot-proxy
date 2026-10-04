@@ -169,6 +169,10 @@ pub fn create_app(state: Arc<AppState>) -> Router {
         .route("/v1beta/interactions", post(cp_routes::v1beta_interactions))
         .route("/interactions", post(cp_routes::v1beta_interactions))
         .layer(from_fn_with_state(
+            Arc::clone(&state),
+            inference_admission,
+        ))
+        .layer(from_fn_with_state(
             Arc::new(crate::inbound::ApiKeys::with_live_settings(
                 Arc::clone(&state.settings),
                 crate::inbound::ApiKeys::new(state.api_keys.values().to_vec()),
@@ -231,6 +235,192 @@ async fn cors(method: Method, req: axum::extract::Request, next: Next) -> Respon
         HeaderValue::from_static("Authorization, Content-Type"),
     );
     response
+}
+
+/// Wraps a response body so it owns one inference permit until the body is
+/// fully consumed or dropped by the client.
+struct PermitBody<B> {
+    inner: B,
+    permit: std::cell::RefCell<Option<tokio::sync::OwnedSemaphorePermit>>,
+}
+
+impl<B> http_body::Body for PermitBody<B>
+where
+    B: http_body::Body + Unpin,
+{
+    type Data = B::Data;
+    type Error = B::Error;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        let polled = std::pin::Pin::new(&mut this.inner).poll_frame(cx);
+        if matches!(
+            &polled,
+            std::task::Poll::Ready(None) | std::task::Poll::Ready(Some(Err(_)))
+        ) {
+            this.permit.get_mut().take();
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// Requests behind the authenticated surface that reach an upstream model:
+/// inference, media and realtime relays. Model listing, informational roots,
+/// the admin control plane and the local token counter are excluded so the
+/// gateway stays administrable while the inference gate is saturated.
+fn is_inference_surface(method: &Method, path: &str) -> bool {
+    if method == Method::OPTIONS || path.starts_with("/admin/") {
+        return false;
+    }
+    !matches!(
+        path,
+        "/api/codex-auth/accounts/credits"
+            | "/v1/models"
+            | "/models"
+            | "/v1"
+            | "/v1/"
+            | "/v1beta/models"
+            | "/v1/messages/count_tokens"
+            | "/messages/count_tokens"
+    )
+}
+
+/// Admission control for the inference surface.
+///
+/// The permit is taken before the handler extracts the request body, so a
+/// chunked or length-less upload is rejected identically to a sized one, and it
+/// is moved into the response body wrapper, so it lives for as long as the
+/// downstream read does. Exhaustion answers immediately with a retryable 503:
+/// there is no queue and no timeout. The 512 MiB body ceiling is unchanged —
+/// this bounds concurrency, never request size.
+async fn inference_admission(
+    State(state): State<Arc<AppState>>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    if !is_inference_surface(request.method(), request.uri().path()) {
+        return next.run(request).await;
+    }
+
+    if request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|length| length > MAX_REQUEST_BODY_BYTES as u64)
+    {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    }
+
+    let permit = match state.inference_gate().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": {
+                        "code": "gateway_busy",
+                        "message": "too many concurrent inference requests",
+                        "retryable": true
+                    }
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let response = next.run(request).await;
+    response.map(|body| {
+        axum::body::Body::new(PermitBody {
+            inner: body,
+            permit: std::cell::RefCell::new(Some(permit)),
+        })
+    })
+}
+
+#[cfg(test)]
+mod permit_body_tests {
+    use super::*;
+    use http_body::Body as _;
+    use http_body::{Frame, SizeHint};
+    use std::convert::Infallible;
+    use std::task::{Context, Poll};
+
+    struct OneFrameThenEnd(bool);
+
+    impl http_body::Body for OneFrameThenEnd {
+        type Data = bytes::Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            if self.0 {
+                Poll::Ready(None)
+            } else {
+                self.0 = true;
+                Poll::Ready(Some(Ok(Frame::data(bytes::Bytes::from_static(b"body")))))
+            }
+        }
+
+        fn is_end_stream(&self) -> bool {
+            self.0
+        }
+
+        fn size_hint(&self) -> SizeHint {
+            SizeHint::default()
+        }
+    }
+
+    #[test]
+    fn permit_is_released_at_eof_while_body_remains_alive() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = gate.clone().try_acquire_owned().unwrap();
+        let mut body = PermitBody {
+            inner: OneFrameThenEnd(false),
+            permit: std::cell::RefCell::new(Some(permit)),
+        };
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(matches!(std::pin::Pin::new(&mut body).poll_frame(&mut cx), Poll::Ready(Some(Ok(_)))));
+        assert_eq!(gate.available_permits(), 0);
+        assert!(matches!(std::pin::Pin::new(&mut body).poll_frame(&mut cx), Poll::Ready(None)));
+        assert_eq!(gate.available_permits(), 1);
+        drop(body);
+        assert_eq!(gate.available_permits(), 1);
+    }
+
+    #[test]
+    fn permit_is_released_when_body_reports_end_stream() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = gate.clone().try_acquire_owned().unwrap();
+        let mut body = PermitBody {
+            inner: OneFrameThenEnd(true),
+            permit: std::cell::RefCell::new(Some(permit)),
+        };
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(body.is_end_stream());
+        assert!(matches!(std::pin::Pin::new(&mut body).poll_frame(&mut cx), Poll::Ready(None)));
+        assert_eq!(gate.available_permits(), 1);
+        drop(body);
+        assert_eq!(gate.available_permits(), 1);
+    }
+
 }
 
 async fn healthz_handler() -> impl IntoResponse {

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, LazyLock, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Query, State};
@@ -343,8 +343,7 @@ async fn exchange_antigravity_code(
     let filename = format!("antigravity-{}.json", sanitize_filename(&email));
     let auth_dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
     let rendered = serde_json::to_string_pretty(&credential).map_err(|error| error.to_string())?;
-    write_credential_atomically(&auth_dir.join(filename), rendered.as_bytes())
-        .map_err(|error| error.to_string())?;
+    write_session_credential(session, &auth_dir.join(filename), rendered.as_bytes())?;
 
     session.saved_account_email = Some(email);
     session.status = SessionStatus::Completed;
@@ -476,7 +475,8 @@ async fn exchange_xai_code(
     });
     let auth_dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
     let rendered = serde_json::to_string_pretty(&credential).map_err(|error| error.to_string())?;
-    write_credential_atomically(
+    write_session_credential(
+        session,
         &auth_dir.join(format!("generic-xai-{}.json", sanitize_filename(email))),
         rendered.as_bytes(),
     )
@@ -595,6 +595,154 @@ pub struct OAuthSession {
 
 static SESSIONS: LazyLock<RwLock<HashMap<String, OAuthSession>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Maximum number of concurrent OAuth sessions retained in memory.
+pub const MAX_OAUTH_SESSIONS: usize = 32;
+
+/// Idle lifetime of an OAuth session and of its callback listener task.
+pub const OAUTH_SESSION_TTL: Duration = Duration::from_secs(1800);
+
+/// Handle to a spawned OAuth callback listener.
+///
+/// `OAuthSession` is `Clone` (handlers clone it out of the registry and write it
+/// back), so the non-cloneable task handles live in this parallel registry
+/// keyed by session state instead of inside the session value.
+struct ListenerHandle {
+    abort: tokio::task::AbortHandle,
+    join: tokio::task::JoinHandle<()>,
+    ready: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl ListenerHandle {
+    /// Stops the listener immediately; the callback port is released as soon as
+    /// the task is cancelled.
+    fn abort_now(&self) {
+        self.abort.abort();
+    }
+
+    /// Aborts the listener and awaits its task so callers observe completion.
+    async fn shutdown(self) {
+        self.abort.abort();
+        let _ = self.join.await;
+    }
+}
+
+static LISTENERS: LazyLock<Mutex<HashMap<String, ListenerHandle>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Loopback callback ports for the browser-redirect providers. Kept fixed to
+/// the production values; tests inject an already-bound listener through
+/// `spawn_callback_listener` instead of overriding ports.
+fn callback_port(provider: &str) -> u16 {
+    match provider {
+        "anthropic" => 54545,
+        "antigravity" => 51121,
+        "codex" => 1455,
+        "command-code" => 5959,
+        _ => 0,
+    }
+}
+
+/// Binds the provider's callback port on loopback.
+async fn bind_callback_listener(provider: &str) -> std::io::Result<tokio::net::TcpListener> {
+    tokio::net::TcpListener::bind(("127.0.0.1", callback_port(provider))).await
+}
+
+/// Spawns a callback listener task that exits on the first of the OAuth
+/// callback signal or its own TTL `deadline`.
+///
+/// Takes an already-bound listener and an explicit deadline so tests can drive
+/// the task deterministically without touching production ports.
+fn spawn_callback_listener(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    finished: Arc<Notify>,
+    deadline: tokio::time::Instant,
+) -> ListenerHandle {
+    let (ready, wait_until_published) = tokio::sync::oneshot::channel();
+    let join = tokio::spawn(async move {
+        if wait_until_published.await.is_err() {
+            return;
+        }
+        let server = axum::serve(listener, app)
+            .with_graceful_shutdown(async move { finished.notified().await });
+        // `with_graceful_shutdown` alone still waits for every in-flight
+        // connection, so a hung callback would keep the port forever. Racing
+        // the whole server future against the TTL deadline hard-bounds the
+        // task: when the deadline fires the future is dropped, closing the
+        // listener and every accepted connection.
+        tokio::select! {
+            _ = server => {}
+            _ = tokio::time::sleep_until(deadline) => {}
+        }
+    });
+    ListenerHandle {
+        abort: join.abort_handle(),
+        join,
+        ready: Some(ready),
+    }
+}
+
+/// Updates a session already in the registry in place.
+///
+/// Late writes from a callback or status poll must never resurrect a session
+/// that was cancelled or evicted while the write was in flight, so an absent
+/// state is a no-op. The caller holds the `SESSIONS` write guard.
+fn update_session_in(sessions: &mut HashMap<String, OAuthSession>, session: OAuthSession) {
+    if let Some(slot) = sessions.get_mut(&session.state) {
+        *slot = session;
+    }
+}
+
+/// Removes sessions idle for at least `ttl`, returning their listener handles
+/// for the caller to stop. `now` is supplied so callers and tests stay
+/// deterministic instead of reading the wall clock internally.
+fn sweep_expired(
+    sessions: &mut HashMap<String, OAuthSession>,
+    listeners: &mut HashMap<String, ListenerHandle>,
+    now: Instant,
+    ttl: Duration,
+) -> Vec<ListenerHandle> {
+    let expired: Vec<String> = sessions
+        .iter()
+        .filter(|(_, session)| now.saturating_duration_since(session.created_at) >= ttl)
+        .map(|(state, _)| state.clone())
+        .collect();
+    let mut handles = Vec::with_capacity(expired.len());
+    for state in expired {
+        sessions.remove(&state);
+        if let Some(handle) = listeners.remove(&state) {
+            handles.push(handle);
+        }
+    }
+    handles
+}
+
+/// Evicts the oldest sessions until at most `cap` remain, returning their
+/// listener handles.
+fn enforce_cap(
+    sessions: &mut HashMap<String, OAuthSession>,
+    listeners: &mut HashMap<String, ListenerHandle>,
+    cap: usize,
+) -> Vec<ListenerHandle> {
+    if sessions.len() <= cap {
+        return Vec::new();
+    }
+    let mut ordered: Vec<(Instant, String)> = sessions
+        .iter()
+        .map(|(state, session)| (session.created_at, state.clone()))
+        .collect();
+    ordered.sort_by_key(|(created_at, _)| *created_at);
+    let excess = sessions.len() - cap;
+    let mut handles = Vec::new();
+    for (_, state) in ordered.into_iter().take(excess) {
+        sessions.remove(&state);
+        if let Some(handle) = listeners.remove(&state) {
+            handles.push(handle);
+        }
+    }
+    handles
+}
 
 fn sha256(data: &[u8]) -> [u8; 32] {
     let mut h: [u32; 8] = [
@@ -870,10 +1018,62 @@ pub fn create_cursor_auth_url(params: &HashMap<String, String>) -> (String, Stri
     (url, state, session)
 }
 
-fn register_session(session: OAuthSession) {
+/// Publishes a freshly created session, together with the callback listener
+/// handle when the flow opened one, in a single critical section.
+///
+/// Session and listener enter their registries under one lock acquisition
+/// (`SESSIONS` then `LISTENERS`), so a listener can never be recorded for a
+/// session that a concurrent `cancel_session` or cap/sweep eviction already
+/// removed. Sweep runs before the insert and the cap after it, so the just
+/// created session is never the eviction victim.
+fn publish_session(session: OAuthSession, listener: Option<ListenerHandle>) {
+    let now = Instant::now();
     let mut sessions = SESSIONS.write().unwrap();
-    sessions.retain(|_, s| s.created_at.elapsed() < Duration::from_secs(1800));
-    sessions.insert(session.state.clone(), session);
+    let mut listeners = LISTENERS.lock().unwrap();
+    for handle in sweep_expired(&mut sessions, &mut listeners, now, OAUTH_SESSION_TTL) {
+        handle.abort_now();
+    }
+    let state = session.state.clone();
+    sessions.insert(state.clone(), session);
+    if let Some(handle) = listener {
+        listeners.insert(state.clone(), handle);
+    }
+    for handle in enforce_cap(&mut sessions, &mut listeners, MAX_OAUTH_SESSIONS) {
+        handle.abort_now();
+    }
+    if sessions.contains_key(&state) {
+        if let Some(handle) = listeners.get_mut(&state) {
+            if let Some(ready) = handle.ready.take() {
+                let _ = ready.send(());
+            }
+        }
+    } else if let Some(handle) = listeners.remove(&state) {
+        handle.abort_now();
+    }
+}
+
+fn session_is_active(state: &str) -> bool {
+    SESSIONS
+        .read()
+        .unwrap()
+        .get(state)
+        .is_some_and(|session| {
+            Instant::now().saturating_duration_since(session.created_at) < OAUTH_SESSION_TTL
+        })
+}
+
+fn write_session_credential(
+    session: &OAuthSession,
+    path: &std::path::Path,
+    contents: &[u8],
+) -> Result<(), String> {
+    let sessions = SESSIONS.read().unwrap();
+    if !sessions.get(&session.state).is_some_and(|active| {
+        Instant::now().saturating_duration_since(active.created_at) < OAUTH_SESSION_TTL
+    }) {
+        return Err("OAuth session expired or cancelled".to_string());
+    }
+    write_credential_atomically(path, contents).map_err(|error| error.to_string())
 }
 
 async fn start_device_session(
@@ -926,7 +1126,7 @@ async fn start_device_session(
         .and_then(Value::as_str)
         .ok_or_else(|| "device authorization missing verification URI".to_string())?;
     let state_token = format!("{}-{}", &provider[..3.min(provider.len())], new_state());
-    register_session(OAuthSession {
+    publish_session(OAuthSession {
         state: state_token.clone(),
         provider: provider.to_string(),
         verifier: device_code.to_string(),
@@ -967,7 +1167,7 @@ async fn start_device_session(
         status: SessionStatus::Pending,
         created_at: Instant::now(),
         saved_account_email: None,
-    });
+    }, None);
     Ok(json!({
         "url": url,
         "state": state_token,
@@ -1087,7 +1287,7 @@ async fn poll_device_session(
         sanitize_filename(email)
     );
     let rendered = serde_json::to_string_pretty(&credential).map_err(|error| error.to_string())?;
-    write_credential_atomically(&auth_dir.join(filename), rendered.as_bytes())
+    write_session_credential(session, &auth_dir.join(filename), rendered.as_bytes())
         .map_err(|error| error.to_string())?;
     session.saved_account_email = Some(email.to_string());
     session.status = SessionStatus::Completed;
@@ -1199,7 +1399,7 @@ pub async fn exchange_anthropic_code(
     let file_path = auth_dir.join(&filename);
     let rendered = serde_json::to_string_pretty(&cred_json)
         .map_err(|e| format!("failed to format json: {e}"))?;
-    write_credential_atomically(&file_path, rendered.as_bytes())
+    write_session_credential(session, &file_path, rendered.as_bytes())
         .map_err(|e| format!("failed writing credential file: {e}"))?;
 
     session.saved_account_email = Some(email.to_string());
@@ -1298,7 +1498,7 @@ async fn exchange_codex_code(
     let filename = format!("codex-{}{}.json", sanitize_filename(email), suffix);
     let rendered = serde_json::to_string_pretty(&credential).map_err(|error| error.to_string())?;
     let auth_dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
-    write_credential_atomically(&auth_dir.join(filename), rendered.as_bytes())
+    write_session_credential(session, &auth_dir.join(filename), rendered.as_bytes())
         .map_err(|error| error.to_string())?;
     session.saved_account_email = Some(email.to_string());
     session.status = SessionStatus::Completed;
@@ -1411,7 +1611,7 @@ pub async fn poll_cursor_session(
     let file_path = auth_dir.join(&filename);
     let rendered = serde_json::to_string_pretty(&cred_json)
         .map_err(|e| format!("failed formatting json: {e}"))?;
-    write_credential_atomically(&file_path, rendered.as_bytes())
+    write_session_credential(session, &file_path, rendered.as_bytes())
         .map_err(|e| format!("failed writing credential file: {e}"))?;
 
     session.saved_account_email = Some(email.to_string());
@@ -1432,8 +1632,14 @@ pub async fn cancel_session(Query(params): Query<HashMap<String, String>>) -> Re
         );
     };
 
-    let mut sessions = SESSIONS.write().unwrap();
-    sessions.remove(state);
+    let handle = {
+        let mut sessions = SESSIONS.write().unwrap();
+        sessions.remove(state);
+        LISTENERS.lock().unwrap().remove(state)
+    };
+    if let Some(handle) = handle {
+        handle.shutdown().await;
+    }
     json_status(StatusCode::OK, json!({ "status": "ok" }))
 }
 
@@ -1451,16 +1657,36 @@ async fn auth_status(
             sessions.get(session_state).cloned()
         };
 
-        if let Some(mut session) = session_opt {
+            if let Some(mut session) = session_opt {
+            if Instant::now().saturating_duration_since(session.created_at) >= OAUTH_SESSION_TTL {
+                let handle = {
+                    let mut sessions = SESSIONS.write().unwrap();
+                    sessions.remove(session_state);
+                    LISTENERS.lock().unwrap().remove(session_state)
+                };
+                if let Some(handle) = handle {
+                    handle.shutdown().await;
+                }
+                return json_status(
+                    StatusCode::NOT_FOUND,
+                    json!({ "status": "error", "error": "OAuth session expired" }),
+                );
+            }
             if session.provider == "zcode" && session.status == SessionStatus::Pending {
                 let auth_dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
-                match poll_zcode_session(&state.http_client, &auth_dir, &mut session).await {
+                let poll_result = poll_zcode_session(&state.http_client, &auth_dir, &mut session).await;
+                if !session_is_active(session_state) {
+                    return json_status(StatusCode::NOT_FOUND, json!({ "status": "error", "error": "OAuth session expired or cancelled" }));
+                }
+                match poll_result {
                     Ok(Some(_cred)) => {
+                        if !session_is_active(session_state) {
+                            return json_status(StatusCode::NOT_FOUND, json!({ "status": "error", "error": "OAuth session expired or cancelled" }));
+                        }
                         if let Err(error) = state.rescan_pool() {
                             eprintln!("pool rescan failed after zcode onboarding: {error}");
                         }
-                        let mut sessions = SESSIONS.write().unwrap();
-                        sessions.insert(session.state.clone(), session);
+                        update_session_in(&mut SESSIONS.write().unwrap(), session);
                         return json_status(
                             StatusCode::OK,
                             json!({ "status": "ok", "provider": "zcode" }),
@@ -1470,9 +1696,11 @@ async fn auth_status(
                         return json_status(StatusCode::OK, json!({ "status": "pending" }));
                     }
                     Err(err) => {
+                        if !session_is_active(session_state) {
+                            return json_status(StatusCode::NOT_FOUND, json!({ "status": "error", "error": "OAuth session expired or cancelled" }));
+                        }
                         session.status = SessionStatus::Failed(err.clone());
-                        let mut sessions = SESSIONS.write().unwrap();
-                        sessions.insert(session.state.clone(), session);
+                        update_session_in(&mut SESSIONS.write().unwrap(), session);
                         return json_status(
                             StatusCode::BAD_REQUEST,
                             json!({ "status": "error", "error": err }),
@@ -1482,13 +1710,19 @@ async fn auth_status(
             }
             if session.provider == "cursor" && session.status == SessionStatus::Pending {
                 let auth_dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
-                match poll_cursor_session(&state.http_client, &auth_dir, &mut session).await {
+                let poll_result = poll_cursor_session(&state.http_client, &auth_dir, &mut session).await;
+                if !session_is_active(session_state) {
+                    return json_status(StatusCode::NOT_FOUND, json!({ "status": "error", "error": "OAuth session expired or cancelled" }));
+                }
+                match poll_result {
                     Ok(Some(_cred)) => {
+                        if !session_is_active(session_state) {
+                            return json_status(StatusCode::NOT_FOUND, json!({ "status": "error", "error": "OAuth session expired or cancelled" }));
+                        }
                         if let Err(error) = state.rescan_pool() {
                             eprintln!("pool rescan failed after cursor onboarding: {error}");
                         }
-                        let mut sessions = SESSIONS.write().unwrap();
-                        sessions.insert(session.state.clone(), session);
+                        update_session_in(&mut SESSIONS.write().unwrap(), session);
                         return json_status(
                             StatusCode::OK,
                             json!({ "status": "ok", "provider": "cursor" }),
@@ -1498,9 +1732,11 @@ async fn auth_status(
                         return json_status(StatusCode::OK, json!({ "status": "pending" }));
                     }
                     Err(err) => {
+                        if !session_is_active(session_state) {
+                            return json_status(StatusCode::NOT_FOUND, json!({ "status": "error", "error": "OAuth session expired or cancelled" }));
+                        }
                         session.status = SessionStatus::Failed(err.clone());
-                        let mut sessions = SESSIONS.write().unwrap();
-                        sessions.insert(session.state.clone(), session);
+                        update_session_in(&mut SESSIONS.write().unwrap(), session);
                         return json_status(
                             StatusCode::BAD_REQUEST,
                             json!({ "status": "error", "error": err }),
@@ -1511,15 +1747,19 @@ async fn auth_status(
             if device_provider(&session.provider).is_some()
                 && session.status == SessionStatus::Pending
             {
-                match poll_device_session(&state, &mut session).await {
+                let poll_result = poll_device_session(&state, &mut session).await;
+                if !session_is_active(session_state) {
+                    return json_status(StatusCode::NOT_FOUND, json!({ "status": "error", "error": "OAuth session expired or cancelled" }));
+                }
+                match poll_result {
                     Ok(Some(_)) => {
+                        if !session_is_active(session_state) {
+                            return json_status(StatusCode::NOT_FOUND, json!({ "status": "error", "error": "OAuth session expired or cancelled" }));
+                        }
                         if let Err(error) = state.rescan_pool() {
                             eprintln!("pool rescan failed after device onboarding: {error}");
                         }
-                        SESSIONS
-                            .write()
-                            .unwrap()
-                            .insert(session.state.clone(), session.clone());
+                        update_session_in(&mut SESSIONS.write().unwrap(), session.clone());
                         return json_status(
                             StatusCode::OK,
                             json!({ "status": "ok", "provider": session.provider }),
@@ -1527,11 +1767,11 @@ async fn auth_status(
                     }
                     Ok(None) => return json_status(StatusCode::OK, json!({ "status": "pending" })),
                     Err(error) => {
+                        if !session_is_active(session_state) {
+                            return json_status(StatusCode::NOT_FOUND, json!({ "status": "error", "error": "OAuth session expired or cancelled" }));
+                        }
                         session.status = SessionStatus::Failed(error.clone());
-                        SESSIONS
-                            .write()
-                            .unwrap()
-                            .insert(session.state.clone(), session);
+                        update_session_in(&mut SESSIONS.write().unwrap(), session);
                         return json_status(
                             StatusCode::BAD_REQUEST,
                             json!({ "status": "error", "error": error }),
@@ -1704,14 +1944,10 @@ async fn exchange_command_code_callback(
     );
     let auth_dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
     let rendered = serde_json::to_string_pretty(&credential).map_err(|e| e.to_string())?;
-    write_credential_atomically(&auth_dir.join(filename), rendered.as_bytes())
-        .map_err(|e| e.to_string())?;
-
-    if let Err(error) = state.rescan_pool() {
-        eprintln!("pool rescan failed after Command Code onboarding: {error}");
-    }
+    write_session_credential(session, &auth_dir.join(filename), rendered.as_bytes())?;
 
     session.saved_account_email = Some(final_label.to_string());
+    state.rescan_pool().map_err(|error| error.to_string())?;
     session.status = SessionStatus::Completed;
     Ok(())
 }
@@ -1791,22 +2027,20 @@ pub async fn oauth_callback(
         {
             session.status =
                 SessionStatus::Failed("Command Code callback missing required fields".to_string());
-            SESSIONS
-                .write()
-                .unwrap()
-                .insert(session.state.clone(), session);
+            update_session_in(&mut SESSIONS.write().unwrap(), session);
             return json_status(
                 StatusCode::BAD_REQUEST,
                 json!({ "error": "Command Code callback missing required fields", "status": "error" }),
             );
         }
 
-        match exchange_command_code_callback(&state, &mut session, api_key, user_name).await {
+                let exchange_result = exchange_command_code_callback(&state, &mut session, api_key, user_name).await;
+                if !session_is_active(state_val) {
+                    return json_status(StatusCode::NOT_FOUND, json!({ "status": "error", "error": "OAuth session expired or cancelled" }));
+                }
+                match exchange_result {
             Ok(()) => {
-                SESSIONS
-                    .write()
-                    .unwrap()
-                    .insert(session.state.clone(), session);
+                update_session_in(&mut SESSIONS.write().unwrap(), session);
                 return json_status(
                     StatusCode::OK,
                     json!({ "status": "ok", "success": true, "provider": "command-code" }),
@@ -1814,10 +2048,7 @@ pub async fn oauth_callback(
             }
             Err(err) => {
                 session.status = SessionStatus::Failed(err.clone());
-                SESSIONS
-                    .write()
-                    .unwrap()
-                    .insert(session.state.clone(), session);
+                update_session_in(&mut SESSIONS.write().unwrap(), session);
                 return json_status(
                     StatusCode::BAD_REQUEST,
                     json!({ "error": err, "status": "error" }),
@@ -1833,7 +2064,11 @@ pub async fn oauth_callback(
 
         if let Some(mut session) = session_opt {
             if session.provider == "codex" && session.status == SessionStatus::Pending {
-                match exchange_codex_code(&state, &mut session, code).await {
+                let exchange_result = exchange_codex_code(&state, &mut session, code).await;
+                if !session_is_active(state_param) {
+                    return json_status(StatusCode::NOT_FOUND, json!({ "status": "error", "error": "OAuth session expired or cancelled" }));
+                }
+                match exchange_result {
                     Ok(()) => {
                         if let Err(error) = state.rescan_pool() {
                             eprintln!("pool rescan failed after Codex onboarding: {error}");
@@ -1841,10 +2076,7 @@ pub async fn oauth_callback(
                     }
                     Err(error) => session.status = SessionStatus::Failed(error),
                 }
-                SESSIONS
-                    .write()
-                    .unwrap()
-                    .insert(session.state.clone(), session);
+                update_session_in(&mut SESSIONS.write().unwrap(), session);
             } else if session.provider == "anthropic"
                 && matches!(
                     session.status,
@@ -1860,6 +2092,9 @@ pub async fn oauth_callback(
                     state_param,
                 )
                 .await;
+                if !session_is_active(state_param) {
+                    return json_status(StatusCode::NOT_FOUND, json!({ "status": "error", "error": "OAuth session expired or cancelled" }));
+                }
 
                 match exchange_res {
                     Ok(_) => {
@@ -1869,10 +2104,7 @@ pub async fn oauth_callback(
                     }
                     Err(err) => {
                         session.status = SessionStatus::Failed(err.clone());
-                        SESSIONS
-                            .write()
-                            .unwrap()
-                            .insert(session.state.clone(), session);
+                        update_session_in(&mut SESSIONS.write().unwrap(), session);
                         return json_status(
                             StatusCode::BAD_REQUEST,
                             json!({"status":"error","error":err}),
@@ -1880,10 +2112,13 @@ pub async fn oauth_callback(
                     }
                 }
 
-                let mut sessions = SESSIONS.write().unwrap();
-                sessions.insert(session.state.clone(), session);
+                update_session_in(&mut SESSIONS.write().unwrap(), session);
             } else if session.provider == "xai" && session.status == SessionStatus::Pending {
-                match exchange_xai_code(&state, &mut session, code).await {
+                let exchange_result = exchange_xai_code(&state, &mut session, code).await;
+                if !session_is_active(state_param) {
+                    return json_status(StatusCode::NOT_FOUND, json!({ "status": "error", "error": "OAuth session expired or cancelled" }));
+                }
+                match exchange_result {
                     Ok(()) => {
                         if let Err(error) = state.rescan_pool() {
                             eprintln!("pool rescan failed after xAI onboarding: {error}");
@@ -1891,13 +2126,14 @@ pub async fn oauth_callback(
                     }
                     Err(error) => session.status = SessionStatus::Failed(error),
                 }
-                SESSIONS
-                    .write()
-                    .unwrap()
-                    .insert(session.state.clone(), session);
+                update_session_in(&mut SESSIONS.write().unwrap(), session);
             } else if session.provider == "antigravity" && session.status == SessionStatus::Pending
             {
-                match exchange_antigravity_code(&state, &mut session, code).await {
+                let exchange_result = exchange_antigravity_code(&state, &mut session, code).await;
+                if !session_is_active(state_param) {
+                    return json_status(StatusCode::NOT_FOUND, json!({ "status": "error", "error": "OAuth session expired or cancelled" }));
+                }
+                match exchange_result {
                     Ok(()) => {
                         if let Err(error) = state.rescan_pool() {
                             eprintln!("pool rescan failed after Antigravity onboarding: {error}");
@@ -1905,10 +2141,7 @@ pub async fn oauth_callback(
                     }
                     Err(error) => session.status = SessionStatus::Failed(error),
                 }
-                SESSIONS
-                    .write()
-                    .unwrap()
-                    .insert(session.state.clone(), session);
+                update_session_in(&mut SESSIONS.write().unwrap(), session);
             }
         }
     }
@@ -1926,15 +2159,15 @@ async fn anthropic_auth_url_handler(
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
     let (url, state, session) = create_anthropic_auth_url(&params);
-    if !params.contains_key("redirect_uri") {
-        let listener = match tokio::net::TcpListener::bind("127.0.0.1:54545").await {
+    let listener = if !params.contains_key("redirect_uri") {
+        let listener = match bind_callback_listener("anthropic").await {
             Ok(listener) => listener,
             Err(error) => {
                 return json_status(
                     StatusCode::CONFLICT,
                     json!({
                         "status": "error",
-                        "error": format!("Anthropic callback port 54545 is unavailable: {error}")
+                        "error": format!("Anthropic callback port {} is unavailable: {error}", callback_port("anthropic"))
                     }),
                 );
             }
@@ -2000,19 +2233,17 @@ async fn anthropic_auth_url_handler(
                         }
                     }),
                 );
-            tokio::spawn(async move {
-                let _ = axum::serve(listener, callback_app)
-                    .with_graceful_shutdown(async move {
-                        tokio::select! {
-                            _ = finished.notified() => {}
-                            _ = tokio::time::sleep(tokio::time::Duration::from_secs(300)) => {}
-                        }
-                    })
-                    .await;
-            });
+            Some(spawn_callback_listener(
+                listener,
+                callback_app,
+                finished,
+                tokio::time::Instant::now() + OAUTH_SESSION_TTL,
+            ))
         }
-    }
-    register_session(session);
+    } else {
+        None
+    };
+    publish_session(session, listener);
     json_status(
         StatusCode::OK,
         json!({ "url": url, "state": state, "provider": "anthropic", "status": "ok" }),
@@ -2027,7 +2258,7 @@ fn auth_url_for(
 ) -> Response {
     if provider == "anthropic" {
         let (url, state, session) = create_anthropic_auth_url(params);
-        register_session(session);
+        publish_session(session, None);
         return json_status(
             StatusCode::OK,
             json!({
@@ -2063,16 +2294,15 @@ async fn antigravity_auth_url_handler(
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
     let (url, state, session) = create_antigravity_auth_url(&params);
-    register_session(session);
-    if !params.contains_key("redirect_uri") {
-        let listener = match tokio::net::TcpListener::bind("127.0.0.1:51121").await {
+    let listener = if !params.contains_key("redirect_uri") {
+        let listener = match bind_callback_listener("antigravity").await {
             Ok(listener) => listener,
             Err(error) => {
                 return json_status(
                     StatusCode::CONFLICT,
                     json!({
                         "status": "error",
-                        "error": format!("Antigravity callback port 51121 is unavailable: {error}")
+                        "error": format!("Antigravity callback port {} is unavailable: {error}", callback_port("antigravity"))
                     }),
                 );
             }
@@ -2097,12 +2327,16 @@ async fn antigravity_auth_url_handler(
                 }
             }),
         );
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, callback_app)
-                .with_graceful_shutdown(async move { finished.notified().await })
-                .await;
-        });
-    }
+        Some(spawn_callback_listener(
+            listener,
+            callback_app,
+            finished,
+            tokio::time::Instant::now() + OAUTH_SESSION_TTL,
+        ))
+    } else {
+        None
+    };
+    publish_session(session, listener);
     json_status(
         StatusCode::OK,
         json!({
@@ -2116,7 +2350,7 @@ async fn antigravity_auth_url_handler(
 
 async fn cursor_auth_url_handler(Query(params): Query<HashMap<String, String>>) -> Response {
     let (url, state, session) = create_cursor_auth_url(&params);
-    register_session(session);
+    publish_session(session, None);
     json_status(
         StatusCode::OK,
         json!({
@@ -2133,16 +2367,15 @@ async fn codex_auth_url_handler(
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
     let (url, state, session) = create_codex_auth_url(&params);
-    register_session(session);
-    if !params.contains_key("redirect_uri") {
-        let listener = match tokio::net::TcpListener::bind("127.0.0.1:1455").await {
+    let listener = if !params.contains_key("redirect_uri") {
+        let listener = match bind_callback_listener("codex").await {
             Ok(listener) => listener,
             Err(error) => {
                 return json_status(
                     StatusCode::CONFLICT,
                     json!({
                         "status": "error",
-                        "error": format!("Codex callback port 1455 is unavailable: {error}")
+                        "error": format!("Codex callback port {} is unavailable: {error}", callback_port("codex"))
                     }),
                 );
             }
@@ -2167,12 +2400,16 @@ async fn codex_auth_url_handler(
                 }
             }),
         );
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, callback_app)
-                .with_graceful_shutdown(async move { finished.notified().await })
-                .await;
-        });
-    }
+        Some(spawn_callback_listener(
+            listener,
+            callback_app,
+            finished,
+            tokio::time::Instant::now() + OAUTH_SESSION_TTL,
+        ))
+    } else {
+        None
+    };
+    publish_session(session, listener);
     json_status(
         StatusCode::OK,
         json!({ "url": url, "state": state, "provider": "codex", "status": "ok" }),
@@ -2184,15 +2421,15 @@ async fn command_code_auth_url_handler(
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
     let (url, state, session) = create_command_code_auth_url(&params);
-    if !params.contains_key("redirect_uri") && !params.contains_key("callback") {
-        let listener = match tokio::net::TcpListener::bind("127.0.0.1:5959").await {
+    let listener = if !params.contains_key("redirect_uri") && !params.contains_key("callback") {
+        let listener = match bind_callback_listener("command-code").await {
             Ok(listener) => listener,
             Err(error) => {
                 return json_status(
                     StatusCode::CONFLICT,
                     json!({
                         "status": "error",
-                        "error": format!("Command Code callback port 5959 is unavailable: {error}")
+                        "error": format!("Command Code callback port {} is unavailable: {error}", callback_port("command-code"))
                     }),
                 )
             }
@@ -2226,13 +2463,16 @@ async fn command_code_auth_url_handler(
                 )
             }),
         );
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, callback_app)
-                .with_graceful_shutdown(async move { finished.notified().await })
-                .await;
-        });
-    }
-    register_session(session);
+        Some(spawn_callback_listener(
+            listener,
+            callback_app,
+            finished,
+            tokio::time::Instant::now() + OAUTH_SESSION_TTL,
+        ))
+    } else {
+        None
+    };
+    publish_session(session, listener);
     json_status(
         StatusCode::OK,
         json!({ "url": url, "state": state, "provider": "command-code", "status": "ok" }),
@@ -2345,8 +2585,7 @@ pub(crate) async fn poll_zcode_session(
                 "disabled": false,
             });
             let rendered = serde_json::to_string_pretty(&credential).map_err(|e| e.to_string())?;
-            write_credential_atomically(&auth_dir.join(filename), rendered.as_bytes())
-                .map_err(|e| e.to_string())?;
+            write_session_credential(session, &auth_dir.join(filename), rendered.as_bytes())?;
             session.saved_account_email = Some(identity.clone());
             session.status = SessionStatus::Completed;
             Ok(Some(identity))
@@ -2364,7 +2603,7 @@ async fn zcode_auth_url_handler(
     match start_zcode_plan_session(&app_state, &params).await {
         Ok((url, session)) => {
             let state = session.state.clone();
-            register_session(session);
+            publish_session(session, None);
             json_status(
                 StatusCode::OK,
                 json!({ "url": url, "state": state, "provider": "zcode", "status": "ok" }),
@@ -2379,7 +2618,7 @@ async fn zcode_auth_url_handler(
 
 async fn xai_auth_url_handler(Query(params): Query<HashMap<String, String>>) -> Response {
     let (url, state, session) = create_xai_auth_url(&params);
-    register_session(session);
+    publish_session(session, None);
     json_status(
         StatusCode::OK,
         json!({ "url":url, "state":state, "provider":"xai", "status":"ok" }),
@@ -2586,5 +2825,184 @@ mod tests {
         assert!(url.contains(&format!("state={state}")));
         assert_eq!(session.provider, "command-code");
         assert_eq!(session.status, SessionStatus::Pending);
+    }
+
+    fn test_session(state: &str, created_at: Instant) -> OAuthSession {
+        OAuthSession {
+            state: state.to_string(),
+            provider: "anthropic".to_string(),
+            verifier: String::new(),
+            challenge: String::new(),
+            redirect_uri: String::new(),
+            token_url: String::new(),
+            poll_url: String::new(),
+            uuid: String::new(),
+            status: SessionStatus::Pending,
+            created_at,
+            saved_account_email: None,
+        }
+    }
+
+    #[test]
+    fn removed_session_cannot_commit_a_credential() {
+        let state = format!("removed-{}", new_state());
+        let session = test_session(&state, Instant::now());
+        let path = std::env::temp_dir().join(format!("oauth-{state}.json"));
+        SESSIONS.write().unwrap().insert(state.clone(), session.clone());
+        assert!(session_is_active(&state));
+
+        SESSIONS.write().unwrap().remove(&state);
+        let result = write_session_credential(&session, &path, b"{}" );
+
+        assert_eq!(result.unwrap_err(), "OAuth session expired or cancelled");
+        assert!(!path.exists());
+    }
+
+    fn dummy_listener() -> ListenerHandle {
+        let join = tokio::spawn(std::future::pending::<()>());
+        ListenerHandle {
+            abort: join.abort_handle(),
+            join,
+            ready: None,
+        }
+    }
+
+    /// Deterministic test-port fixture: hands out distinct ports from the
+    /// project's reserved test range 18840-18899 and returns an already-bound
+    /// listener, so no test ever touches a production callback port.
+    static TEST_PORT_CURSOR: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
+    async fn allocate_test_listener() -> (tokio::net::TcpListener, u16) {
+        for _ in 0..60 {
+            let offset = TEST_PORT_CURSOR.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 60;
+            let port = 18840 + offset;
+            if let Ok(listener) = tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+                return (listener, port);
+            }
+        }
+        panic!("no free test port available in 18840-18899");
+    }
+
+    /// Proves a listener task actually released its callback port instead of
+    /// leaving the socket owned by a detached task.
+    async fn assert_port_released(port: u16) {
+        tokio::net::TcpListener::bind(("127.0.0.1", port))
+            .await
+            .expect("listener task must release its callback port");
+    }
+
+    #[tokio::test]
+    async fn sweep_expired_returns_the_listeners_of_expired_sessions() {
+        let now = Instant::now();
+        let mut sessions = HashMap::new();
+        let mut listeners = HashMap::new();
+        sessions.insert(
+            "expired".to_string(),
+            test_session(
+                "expired",
+                now - Duration::from_secs(OAUTH_SESSION_TTL.as_secs() + 1),
+            ),
+        );
+        listeners.insert("expired".to_string(), dummy_listener());
+        sessions.insert("fresh".to_string(), test_session("fresh", now));
+        listeners.insert("fresh".to_string(), dummy_listener());
+
+        let swept = sweep_expired(&mut sessions, &mut listeners, now, OAUTH_SESSION_TTL);
+
+        assert_eq!(swept.len(), 1);
+        assert!(!sessions.contains_key("expired"));
+        assert!(sessions.contains_key("fresh"));
+        assert!(!listeners.contains_key("expired"));
+        assert!(listeners.contains_key("fresh"));
+        for handle in swept {
+            handle.shutdown().await;
+        }
+        // The surviving listener is stopped explicitly; dropping its
+        // JoinHandle would only detach the task.
+        for (_, handle) in listeners.drain() {
+            handle.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn enforce_session_cap_evicts_oldest_by_created_at() {
+        let now = Instant::now();
+        let mut sessions = HashMap::new();
+        let mut listeners = HashMap::new();
+        for index in 0..3u64 {
+            let state = format!("cap-{index}");
+            sessions.insert(
+                state.clone(),
+                test_session(&state, now + Duration::from_secs(index)),
+            );
+            listeners.insert(state, dummy_listener());
+        }
+
+        let evicted = enforce_cap(&mut sessions, &mut listeners, 2);
+
+        assert_eq!(evicted.len(), 1);
+        assert!(!sessions.contains_key("cap-0"));
+        assert!(sessions.contains_key("cap-1"));
+        assert!(sessions.contains_key("cap-2"));
+        assert!(!listeners.contains_key("cap-0"));
+        for handle in evicted {
+            handle.shutdown().await;
+        }
+        // The survivors are stopped explicitly; dropping their JoinHandles
+        // would only detach the tasks.
+        for (_, handle) in listeners.drain() {
+            handle.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn listener_task_exits_on_its_own_ttl_deadline() {
+        let (listener, port) = allocate_test_listener().await;
+        let app = Router::new().route("/callback", get(|| async { "ok" }));
+        let finished = Arc::new(Notify::new());
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+        let mut handle = spawn_callback_listener(listener, app, finished, deadline);
+        handle.ready.take().unwrap().send(()).unwrap();
+
+        // A client that opened a connection but never finishes its request is
+        // still in flight; the TTL deadline must drop it and the listener.
+        use tokio::io::AsyncWriteExt;
+        let mut hung = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        hung.write_all(b"GET /callback HTTP/1.1\r\nHost: localhost\r\n")
+            .await
+            .unwrap();
+
+        let ListenerHandle { join, .. } = handle;
+        tokio::time::timeout(Duration::from_secs(5), join)
+            .await
+            .expect("listener must self-terminate on its TTL deadline")
+            .expect("listener task must not panic");
+
+        assert_port_released(port).await;
+        drop(hung);
+    }
+
+    #[tokio::test]
+    async fn cancel_session_aborts_and_awaits_the_listener() {
+        let (listener, port) = allocate_test_listener().await;
+        let app = Router::new().route("/callback", get(|| async { "ok" }));
+        let finished = Arc::new(Notify::new());
+        let state_key = format!("cancel-{}", new_state());
+        let deadline = tokio::time::Instant::now() + OAUTH_SESSION_TTL;
+        let handle = spawn_callback_listener(listener, app, finished, deadline);
+        {
+            let mut sessions = SESSIONS.write().unwrap();
+            sessions.insert(state_key.clone(), test_session(&state_key, Instant::now()));
+            LISTENERS.lock().unwrap().insert(state_key.clone(), handle);
+        }
+
+        let mut params = HashMap::new();
+        params.insert("state".to_string(), state_key.clone());
+        let response = cancel_session(Query(params)).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!SESSIONS.read().unwrap().contains_key(&state_key));
+        assert!(!LISTENERS.lock().unwrap().contains_key(&state_key));
+        assert_port_released(port).await;
     }
 }

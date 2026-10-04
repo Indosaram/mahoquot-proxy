@@ -1924,10 +1924,21 @@ fn prune_window(window: &mut Vec<UsageSample>) {
 /// long-running gateway paid an ever-larger O(n) write under the store mutex on
 /// every quota poll. Appending is O(1) per sample, and the file is rewritten
 /// only when the log has grown well past the retained window.
+/// Guarded contents of `UsageSampleStore`: the live-id allowlist and the sample
+/// windows share one mutex, so a membership check and the append it guards can
+/// never be interleaved with a prune.
+#[derive(Debug, Default)]
+struct UsageSampleInner {
+    /// Live pool ids. `None` until `retain_accounts` activates the allowlist,
+    /// so a standalone store accepts every push until membership is explicit.
+    active: Option<std::collections::BTreeSet<String>>,
+    entries: std::collections::BTreeMap<String, Vec<UsageSample>>,
+}
+
 #[derive(Debug, Default)]
 pub struct UsageSampleStore {
     path: std::path::PathBuf,
-    entries: std::sync::Mutex<std::collections::BTreeMap<String, Vec<UsageSample>>>,
+    inner: std::sync::Mutex<UsageSampleInner>,
     /// Lines appended since the last full rewrite, used to bound compaction.
     appended: std::sync::atomic::AtomicUsize,
 }
@@ -1998,7 +2009,10 @@ impl UsageSampleStore {
         let appended = raw.lines().filter(|line| !line.trim().is_empty()).count();
         Self {
             path,
-            entries: std::sync::Mutex::new(entries),
+            inner: std::sync::Mutex::new(UsageSampleInner {
+                active: None,
+                entries,
+            }),
             appended: std::sync::atomic::AtomicUsize::new(appended),
         }
     }
@@ -2040,8 +2054,17 @@ impl UsageSampleStore {
     /// Appends a sample, prunes anything older than the 7d quota horizon plus
     /// margin, persists, and returns the retained window for delta computation.
     pub fn push(&self, account_id: &str, sample: UsageSample) -> Vec<UsageSample> {
-        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
-        let window = entries.entry(account_id.to_string()).or_default();
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        // Once membership is explicit, a sample for a departed account is
+        // dropped instead of recreating its window.
+        if inner
+            .active
+            .as_ref()
+            .is_some_and(|active| !active.contains(account_id))
+        {
+            return Vec::new();
+        }
+        let window = inner.entries.entry(account_id.to_string()).or_default();
         window.push(sample);
         let before = window.len();
         prune_window(window);
@@ -2057,13 +2080,36 @@ impl UsageSampleStore {
                 .appended
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 + 1;
-            let retained_lines: usize = entries.values().map(Vec::len).sum();
+            let retained_lines: usize = inner.entries.values().map(Vec::len).sum();
             if pruned && appended > retained_lines * COMPACT_GROWTH_FACTOR {
-                self.rewrite_log(&entries);
+                self.rewrite_log(&inner.entries);
                 self.appended.store(0, std::sync::atomic::Ordering::Relaxed);
             }
         }
         retained
+    }
+
+    /// Publishes the live-id allowlist and drops every account id not in it,
+    /// rewriting the log so the orphaned lines do not survive a restart. This is
+    /// the membership activation point: `push` is gated from here on. Returns
+    /// the number of accounts dropped.
+    pub fn retain_accounts(&self, active: &std::collections::BTreeSet<String>) -> usize {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner.active = Some(active.clone());
+        let before = inner.entries.len();
+        inner.entries.retain(|id, _| active.contains(id));
+        let dropped = before - inner.entries.len();
+        if dropped > 0 {
+            self.rewrite_log(&inner.entries);
+            self.appended.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+        dropped
+    }
+
+    /// Account ids that currently hold a sample window (diagnostic).
+    pub fn tracked_accounts(&self) -> Vec<String> {
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner.entries.keys().cloned().collect()
     }
 
     /// Rewrites the log from memory, dropping the lines pruning has orphaned.
@@ -3120,6 +3166,142 @@ mod tests {
         // then the pre-restart sample survives inside the window
         assert_eq!(sample.first().map(|s| s.requests), Some(7005));
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn usage_sample_store_retain_accounts_drops_removed_ids_and_rewrites_log() {
+        let dir = std::env::temp_dir().join(format!("quotio-retain-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("usage-retain.json");
+        let store = UsageSampleStore::load(path.clone());
+        store.push(
+            "live-account",
+            UsageSample {
+                unix: 1_800_000,
+                requests: 1,
+                tokens: 10,
+                cost_usd: None,
+            },
+        );
+        store.push(
+            "dead-account",
+            UsageSample {
+                unix: 1_800_000,
+                requests: 2,
+                tokens: 20,
+                cost_usd: None,
+            },
+        );
+        assert_eq!(store.tracked_accounts().len(), 2);
+
+        let active: std::collections::BTreeSet<String> =
+            ["live-account".to_string()].into_iter().collect();
+        let dropped = store.retain_accounts(&active);
+
+        assert_eq!(dropped, 1);
+        assert_eq!(store.tracked_accounts(), vec!["live-account".to_string()]);
+        let on_disk = std::fs::read_to_string(&path).expect("log file");
+        assert!(on_disk.contains("live-account"));
+        assert!(
+            !on_disk.contains("dead-account"),
+            "the orphaned line survived the reconcile rewrite"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn usage_sample_store_retain_accounts_keeps_live_ids() {
+        let dir = std::env::temp_dir().join(format!("quotio-retain-keep-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("usage-retain-keep.json");
+        let store = UsageSampleStore::load(path.clone());
+        for id in ["kept-a", "kept-b"] {
+            store.push(
+                id,
+                UsageSample {
+                    unix: 1_800_000,
+                    requests: 1,
+                    tokens: 10,
+                    cost_usd: None,
+                },
+            );
+        }
+        let appended_before = store
+            .appended
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        let active: std::collections::BTreeSet<String> =
+            ["kept-a".to_string(), "kept-b".to_string()]
+                .into_iter()
+                .collect();
+        let dropped = store.retain_accounts(&active);
+
+        assert_eq!(dropped, 0);
+        assert_eq!(
+            store.appended.load(std::sync::atomic::Ordering::Relaxed),
+            appended_before,
+            "a full-set retain must not rewrite the log"
+        );
+        assert_eq!(
+            store.tracked_accounts(),
+            vec!["kept-a".to_string(), "kept-b".to_string()]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn usage_sample_store_retain_accounts_on_empty_store_is_noop() {
+        let dir = std::env::temp_dir().join(format!("quotio-retain-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("usage-retain-empty.json");
+        let store = UsageSampleStore::load(path.clone());
+
+        let active: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let dropped = store.retain_accounts(&active);
+
+        assert_eq!(dropped, 0);
+        assert!(store.tracked_accounts().is_empty());
+        assert!(
+            !path.exists(),
+            "an empty store must not trigger a log rewrite"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn usage_push_accepts_before_activation_and_drops_a_removed_account() {
+        let dir = std::env::temp_dir().join(format!("quotio-push-gate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("usage-push-gate.json");
+        let store = UsageSampleStore::load(path.clone());
+        let sample = |unix| UsageSample {
+            unix,
+            requests: 1,
+            tokens: 1,
+            cost_usd: None,
+        };
+
+        // No reconcile has run: a standalone store keeps accepting pushes.
+        assert_eq!(
+            store.push("acc", sample(1_800_000)).len(),
+            1,
+            "a store with no activated allowlist must accept a push"
+        );
+        assert_eq!(store.tracked_accounts(), vec!["acc".to_string()]);
+
+        let active: std::collections::BTreeSet<String> =
+            ["other".to_string()].into_iter().collect();
+        assert_eq!(store.retain_accounts(&active), 1);
+
+        assert!(
+            store.push("acc", sample(1_800_060)).is_empty(),
+            "a push for a removed account must be dropped"
+        );
+        assert!(
+            store.tracked_accounts().is_empty(),
+            "the dropped push must not recreate the removed account's window"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

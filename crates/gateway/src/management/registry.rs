@@ -411,10 +411,17 @@ async fn get_devin_models_status(
         }
     }
 
-    if !stale_members_to_refresh.is_empty() {
+    // Coalesce before spawning. A refresh task is created only for the members
+    // this request is the first to claim, so a burst of stale GETs collapses
+    // onto one worker per account instead of spawning a task per request.
+    let (claimed, guards) = claim_stale_devin_refreshes(&state, stale_members_to_refresh);
+    if !claimed.is_empty() {
         let state_clone = Arc::clone(&state);
         tokio::spawn(async move {
-            for member in stale_members_to_refresh {
+            // Each guard is released only after its member's refresh finishes,
+            // and a cancelled task releases them on drop.
+            let _guards = guards;
+            for member in claimed {
                 if let Ok(client) = state_clone.devin_client_for_member(&member) {
                     if let Ok(cat) = crate::devin_catalog::refresh_account_models(&member, &client, Some(&state_clone.devin_cache)).await {
                         let rev = cat.key.credential_revision.clone();
@@ -442,10 +449,92 @@ async fn get_devin_models_status(
     )
 }
 
+/// Claims the single-flight slot for each stale member **before** any task is
+/// spawned. Members already being refreshed are dropped from the list, so the
+/// caller spawns only when the claim set is non-empty.
+fn claim_stale_devin_refreshes(
+    state: &AppState,
+    stale: Vec<Arc<AccountMember>>,
+) -> (Vec<Arc<AccountMember>>, Vec<crate::state::DevinRefreshGuard>) {
+    let mut claimed = Vec::new();
+    let mut guards = Vec::new();
+    for member in stale {
+        if let Some(guard) = state.begin_devin_refresh(&member.id) {
+            claimed.push(member);
+            guards.push(guard);
+        }
+    }
+    (claimed, guards)
+}
+
 pub fn registry_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/model-registry", get(get_registry).post(refresh_registry))
         .route("/devin/models/refresh", post(refresh_devin_models))
         .route("/devin/models/status", get(get_devin_models_status))
         .route("/devin/models", get(get_devin_models_status))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::GatewayConfig;
+    use crate::inbound::ApiKeys;
+
+    fn state_with_one_account() -> Arc<AppState> {
+        let auth_dir = std::env::temp_dir().join(format!(
+            "mahoquot-devin-coalesce-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&auth_dir).expect("create auth dir");
+        let credential = serde_json::json!({
+            "type": "generic",
+            "identity_slug": "cline-account",
+            "provider": "cline",
+            "label": "Cline",
+            "adapter": "openai-chat",
+            "base_url": "http://127.0.0.1:9",
+            "upstream_override": "http://127.0.0.1:18849",
+            "api_key": "fixture-cline",
+            "models": ["cline-free/gemini-3.8-flash"],
+        })
+        .to_string();
+        std::fs::write(auth_dir.join("generic-cline.json"), credential).expect("write cline");
+        let config = GatewayConfig {
+            auth_dir: auth_dir.clone(),
+            config_path: auth_dir.join("config.yaml"),
+            api_keys: ApiKeys::default(),
+            auth_refresh_enabled: false,
+            ..GatewayConfig::default()
+        };
+        Arc::new(AppState::new(&config).expect("state"))
+    }
+
+    #[test]
+    fn repeated_stale_discovery_requests_do_not_spawn_a_task_per_request() {
+        let state = state_with_one_account();
+        let member = state.pool.load_full().members[0].clone();
+
+        let (first, first_guards) = claim_stale_devin_refreshes(&state, vec![Arc::clone(&member)]);
+        assert_eq!(first.len(), 1, "the first request claims the member");
+        assert_eq!(state.devin_refresh_in_flight_count(), 1);
+
+        let (second, _second_guards) =
+            claim_stale_devin_refreshes(&state, vec![Arc::clone(&member)]);
+        assert!(
+            second.is_empty(),
+            "a repeated stale request must not queue a second worker for the same account"
+        );
+        assert_eq!(state.devin_refresh_in_flight_count(), 1);
+
+        drop(first_guards);
+        let (third, _third_guards) =
+            claim_stale_devin_refreshes(&state, vec![Arc::clone(&member)]);
+        assert_eq!(
+            third.len(),
+            1,
+            "the claim is released once the refresh finishes"
+        );
+    }
 }

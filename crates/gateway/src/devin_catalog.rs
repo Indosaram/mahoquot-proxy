@@ -388,9 +388,25 @@ async fn fetch_devin_model_catalog_inner(
     Ok(models)
 }
 
+/// The set of account ids currently present in the pool. The cache keeps this
+/// allowlist inside the same swapped value as its entries, so a prune can never
+/// be undone by an insert that raced the pool deletion.
+pub type ActiveIds = std::collections::BTreeSet<String>;
+
+/// One `ArcSwap` payload: the live-id allowlist plus the cached catalogs. The
+/// allowlist lives inside the swapped value so a prune can never be undone by an
+/// insert that raced the pool deletion. `active` is `None` until
+/// `retain_accounts` activates membership, so a standalone cache keeps accepting
+/// inserts until the pool is explicit.
+#[derive(Default)]
+struct DevinCacheState {
+    active: Option<ActiveIds>,
+    entries: HashMap<DevinCacheKey, Arc<DevinAccountCatalogState>>,
+}
+
 /// State-owned discovery cache backed by `ArcSwap` for lock-free reads on the management hot-path.
 pub struct DevinDiscoveryCache {
-    entries: ArcSwap<HashMap<DevinCacheKey, Arc<DevinAccountCatalogState>>>,
+    state: ArcSwap<DevinCacheState>,
 }
 
 impl Default for DevinDiscoveryCache {
@@ -402,20 +418,74 @@ impl Default for DevinDiscoveryCache {
 impl DevinDiscoveryCache {
     pub fn new() -> Self {
         Self {
-            entries: ArcSwap::from_pointee(HashMap::new()),
+            state: ArcSwap::from_pointee(DevinCacheState::default()),
         }
     }
 
     pub fn get(&self, key: &DevinCacheKey) -> Option<Arc<DevinAccountCatalogState>> {
-        self.entries.load().get(key).cloned()
+        self.state.load().entries.get(key).cloned()
     }
 
+    /// Publishes `state` under `key` in one `rcu` swap: the membership check and
+    /// the write share a single closure, so a concurrent `retain_accounts` can
+    /// never be interleaved between them.
+    ///
+    /// The swap keeps only the newest revision per identity slug (an older
+    /// revision of the same slug is dropped) and skips keys whose slug is not in
+    /// the active allowlist. Before `retain_accounts` has activated membership
+    /// the allowlist is `None`, so the entry is accepted instead of silently
+    /// disabling discovery until the first reconcile.
+    ///
+    /// Out-of-order publication is rejected before it reaches here, by the
+    /// request-sequence guard in `RuntimeState::publish_devin_member_catalog`.
     pub fn insert(&self, key: DevinCacheKey, state: Arc<DevinAccountCatalogState>) {
-        self.entries.rcu(|current| {
-            let mut map = (**current).clone();
-            map.insert(key.clone(), Arc::clone(&state));
-            map
+        self.state.rcu(|current| {
+            let mut next = DevinCacheState {
+                active: current.active.clone(),
+                entries: current.entries.clone(),
+            };
+            let slug = key.identity_slug.clone();
+            if next
+                .active
+                .as_ref()
+                .is_some_and(|active| !active.contains(&slug))
+            {
+                return Arc::new(next);
+            }
+            next.entries.retain(|k, _| k.identity_slug != slug);
+            next.entries.insert(key.clone(), Arc::clone(&state));
+            Arc::new(next)
         });
+    }
+
+    /// Publishes the live-id allowlist and prunes every catalog whose identity
+    /// slug is no longer live, all in one `rcu` swap. This is the membership
+    /// activation point. Returns the number of accounts pruned.
+    pub fn retain_accounts(&self, active: &ActiveIds) -> usize {
+        let pruned = std::cell::Cell::new(0usize);
+        self.state.rcu(|current| {
+            let mut entries = current.entries.clone();
+            entries.retain(|k, _| active.contains(&k.identity_slug));
+            pruned.set(current.entries.len() - entries.len());
+            Arc::new(DevinCacheState {
+                active: Some(active.clone()),
+                entries,
+            })
+        });
+        pruned.get()
+    }
+
+    /// Identity slugs that currently hold a cached catalog (sorted, deduped).
+    pub fn tracked_accounts(&self) -> Vec<String> {
+        let state = self.state.load();
+        let mut slugs: Vec<String> = state
+            .entries
+            .keys()
+            .map(|k| k.identity_slug.clone())
+            .collect();
+        slugs.sort();
+        slugs.dedup();
+        slugs
     }
 }
 
@@ -514,5 +584,135 @@ pub async fn refresh_account_models(
             }
             Err(err)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::account::ProviderAccount;
+
+    fn cache_key(slug: &str, token: &str) -> DevinCacheKey {
+        DevinCacheKey::new(slug, token, "http://127.0.0.1:18899")
+    }
+
+    /// Deterministic fixture port: the project reserves 18840-18899 for tests, so
+    /// the stub never binds an arbitrary ephemeral port (and never a production one).
+    async fn bind_test_listener() -> tokio::net::TcpListener {
+        for port in 18840..=18899 {
+            match tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await {
+                Ok(listener) => return listener,
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
+                Err(error) => panic!("fixture bind failed on {port}: {error}"),
+            }
+        }
+        panic!("no available fixture port in 18840-18899");
+    }
+
+    fn catalog(key: &DevinCacheKey, now_unix: u64) -> Arc<DevinAccountCatalogState> {
+        Arc::new(DevinAccountCatalogState::new_success(
+            key.clone(),
+            vec![DiscoveredDevinModel::new("glm-5-2", "GLM 5.2")],
+            now_unix,
+        ))
+    }
+
+    #[test]
+    fn devin_cache_insert_replaces_older_revisions_and_skips_inactive_slugs() {
+        let cache = DevinDiscoveryCache::new();
+        let live: ActiveIds = ["devin-live".to_string()].into_iter().collect();
+        assert_eq!(cache.retain_accounts(&live), 0);
+
+        let older = cache_key("devin-live", "token-1");
+        cache.insert(older.clone(), catalog(&older, 1_726_000_000));
+        assert!(cache.get(&older).is_some());
+
+        // Credential rotation: the newer revision replaces the older revision of
+        // the same identity slug instead of accumulating a second entry.
+        let newer = cache_key("devin-live", "token-2");
+        cache.insert(newer.clone(), catalog(&newer, 1_726_000_100));
+        assert!(cache.get(&older).is_none(), "older revision must be dropped");
+        assert!(cache.get(&newer).is_some());
+        assert_eq!(cache.tracked_accounts(), vec!["devin-live".to_string()]);
+
+        // A slug that is not in the allowlist is refused outright.
+        let gone = cache_key("devin-gone", "token-3");
+        cache.insert(gone.clone(), catalog(&gone, 1_726_000_200));
+        assert!(cache.get(&gone).is_none(), "inactive slug must be skipped");
+        assert_eq!(cache.tracked_accounts(), vec!["devin-live".to_string()]);
+
+        // Once the account leaves the pool, its catalog is pruned under the
+        // same swap that publishes the new allowlist.
+        assert_eq!(cache.retain_accounts(&ActiveIds::new()), 1);
+        assert!(cache.get(&newer).is_none());
+        assert!(cache.tracked_accounts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn devin_cache_keys_are_pool_account_ids() {
+        // Local stub only: this test never contacts a real upstream.
+        let app = axum::Router::new().route(
+            "/exa.api_server_pb.ApiServerService/GetCascadeModelConfigs",
+            axum::routing::post(|| async {
+                let resp = GetCascadeModelConfigsResponse {
+                    client_model_configs: Vec::new(),
+                };
+                let mut body = Vec::new();
+                resp.encode(&mut body).expect("encode proto response");
+                axum::http::Response::builder()
+                    .status(axum::http::StatusCode::OK)
+                    .header("Content-Type", "application/proto")
+                    .body(axum::body::Body::from(body))
+                    .expect("build stub response")
+            }),
+        );
+        let listener = bind_test_listener().await;
+        let addr = listener.local_addr().expect("stub listener addr");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let account = mahoquot_providers::DevinAccount {
+            provider_type: "devin".to_string(),
+            identity_slug: "devin-pool-42".to_string(),
+            label: Some("devin-pool-42".to_string()),
+            email: None,
+            access_token: "token-42".to_string(),
+            api_server_url: format!("http://{addr}"),
+            disabled: false,
+        };
+        let member = Arc::new(AccountMember::for_test_with_id(
+            "devin-pool-42",
+            ProviderAccount::Devin(account),
+        ));
+        let client = reqwest::Client::builder()
+            .http1_only()
+            .no_proxy()
+            .build()
+            .expect("build stub client");
+
+        let cache = DevinDiscoveryCache::new();
+        let state = refresh_account_models(&member, &client, Some(&cache))
+            .await
+            .expect("refresh against the local stub");
+
+        // §9 identity evidence: the slug the refresh path produces is the pool
+        // account id, never a user-supplied identity or display label.
+        assert_eq!(state.key.identity_slug, member.id);
+        assert_eq!(state.key.identity_slug, "devin-pool-42");
+
+        cache.insert(state.key.clone(), Arc::clone(&state));
+        let live: ActiveIds = [member.id.clone()].into_iter().collect();
+        assert_eq!(cache.retain_accounts(&live), 0);
+        assert_eq!(cache.tracked_accounts(), vec![member.id.clone()]);
+        assert!(cache.get(&state.key).is_some());
+
+        // The allowlist is keyed by pool account id, so any other slug is refused.
+        let other = cache_key("user-supplied-slug", "token-9");
+        cache.insert(other.clone(), catalog(&other, 1_726_000_000));
+        assert!(cache.get(&other).is_none());
+
+        server.abort();
+        let _ = server.await;
     }
 }

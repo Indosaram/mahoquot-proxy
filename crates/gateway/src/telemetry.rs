@@ -54,6 +54,8 @@ pub struct TelemetryStore {
     path: PathBuf,
     buckets: Mutex<Vec<TelemetryBucket>>,
     flush_requested: tokio::sync::Notify,
+    #[cfg(test)]
+    flush_started: Mutex<Option<std::sync::Arc<tokio::sync::Notify>>>,
 }
 
 /// Index of the bucket for `minute_unix`, inserted (keeping the vector
@@ -76,6 +78,28 @@ fn bucket_index_for(buckets: &mut Vec<TelemetryBucket>, minute_unix: i64) -> usi
     }
 }
 
+/// Owns the dedicated stop signal for the telemetry flush task, so shutting
+/// the worker down can never contend with the store's shared
+/// `flush_requested` notification (no stolen or lost wakeups).
+pub struct FlushWorkerHandle {
+    stop: std::sync::Arc<tokio::sync::Notify>,
+    join: tokio::task::JoinHandle<()>,
+}
+
+impl FlushWorkerHandle {
+    /// Signals the worker to stop and awaits it to completion.
+    ///
+    /// A `spawn_blocking` flush cannot be cancelled, so this deliberately applies
+    /// no timeout: a dropped `JoinHandle` would detach the worker while it still
+    /// owns a `TelemetryStore` reference, abandoning the very flush shutdown
+    /// exists to finish. Callers that need a bound wrap this future in their own
+    /// timeout; the implementation never gives up on the worker.
+    pub async fn shutdown(self) {
+        self.stop.notify_one();
+        let _ = self.join.await;
+    }
+}
+
 impl TelemetryStore {
     pub fn load(path: PathBuf) -> Self {
         let buckets = load_buckets(&path);
@@ -83,6 +107,8 @@ impl TelemetryStore {
             path,
             buckets: Mutex::new(buckets),
             flush_requested: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            flush_started: Mutex::new(None),
         }
     }
 
@@ -352,23 +378,43 @@ impl TelemetryStore {
         std::fs::rename(temporary, &self.path)
     }
 
-    pub fn spawn_flush_worker(self: &std::sync::Arc<Self>, interval: std::time::Duration) {
+    pub fn spawn_flush_worker(
+        self: &std::sync::Arc<Self>,
+        interval: std::time::Duration,
+    ) -> FlushWorkerHandle {
         let store = std::sync::Arc::clone(self);
-        tokio::spawn(async move {
+        let stop = std::sync::Arc::new(tokio::sync::Notify::new());
+        let stop_signal = std::sync::Arc::clone(&stop);
+        let join = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
+                let mut stopping = false;
                 tokio::select! {
                     _ = ticker.tick() => {}
                     _ = store.flush_requested.notified() => {}
+                    _ = stop_signal.notified() => { stopping = true; }
                 }
                 let flush_store = std::sync::Arc::clone(&store);
+                #[cfg(test)]
+                if let Some(started) = store
+                    .flush_started
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone()
+                {
+                    started.notify_one();
+                }
                 let result = tokio::task::spawn_blocking(move || flush_store.flush()).await;
                 if let Ok(Err(error)) = result {
                     tracing::warn!(%error, "failed to flush telemetry history");
                 }
+                if stopping {
+                    break;
+                }
             }
         });
+        FlushWorkerHandle { stop, join }
     }
 }
 
@@ -426,5 +472,85 @@ mod tests {
 
         assert_eq!(store.snapshot().len(), 1);
         assert_eq!(store.snapshot()[0].providers[0].provider, "claude");
+    }
+
+    #[tokio::test]
+    async fn flush_worker_shutdown_waits_for_a_blocked_flush_to_finish() {
+        let dir = std::env::temp_dir().join(format!(
+            "mahoquot-telemetry-blocked-flush-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("telemetry.json");
+        let store = std::sync::Arc::new(TelemetryStore::load(path.clone()));
+        store.record_with_account(1_800, "codex", Some("codex-1"), true);
+        let flush_started = std::sync::Arc::new(tokio::sync::Notify::new());
+        *store.flush_started.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some(std::sync::Arc::clone(&flush_started));
+        let handle = store.spawn_flush_worker(std::time::Duration::from_secs(3600));
+
+        // Hold the store lock so the worker's final `spawn_blocking(flush)`
+        // blocks inside `snapshot()`. This is exactly the case a
+        // timeout-then-drop shutdown would silently abandon.
+        let guard = store.buckets.lock().unwrap_or_else(|p| p.into_inner());
+        let worker = tokio::spawn(async move { handle.shutdown().await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), flush_started.notified())
+            .await
+            .expect("worker must begin its final flush");
+
+        assert!(
+            !worker.is_finished(),
+            "shutdown must not return while the pending flush is still blocked"
+        );
+        assert!(
+            std::sync::Arc::strong_count(&store) >= 2,
+            "while the flush is blocked the worker still owns its store handle"
+        );
+
+        drop(guard);
+        tokio::time::timeout(std::time::Duration::from_secs(5), worker)
+            .await
+            .expect("shutdown must complete once the flush is released")
+            .expect("the shutdown task must not panic");
+
+        // A worker that was truly joined released every clone it held; a worker
+        // that was detached would still own one and keep the count above one.
+        assert_eq!(
+            std::sync::Arc::strong_count(&store),
+            1,
+            "shutdown must return only after the worker released its store handle"
+        );
+        assert!(path.exists(), "the released flush must have reached disk");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn flush_worker_survives_a_flush_error() {
+        let dir = std::env::temp_dir().join(format!(
+            "mahoquot-telemetry-flush-error-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        // `blocker` is a regular file, so every `create_dir_all(parent)` inside
+        // `flush` fails and the worker must keep looping instead of dying.
+        let blocker = dir.join("not-a-dir");
+        std::fs::write(&blocker, b"block").expect("write blocker");
+        let path = blocker.join("telemetry.json");
+        let store = std::sync::Arc::new(TelemetryStore::load(path.clone()));
+        let handle = store.spawn_flush_worker(std::time::Duration::from_secs(3600));
+        store.record_with_account(1_800, "codex", Some("codex-1"), true);
+
+        handle.stop.notify_one();
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(5), handle.join).await;
+
+        assert!(
+            matches!(joined, Ok(Ok(()))),
+            "flush worker must survive a flush error instead of panicking or hanging"
+        );
+        assert!(
+            !path.exists(),
+            "a failing flush must not create the store file"
+        );
+        std::fs::remove_dir_all(dir).ok();
     }
 }

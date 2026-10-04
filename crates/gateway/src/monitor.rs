@@ -130,13 +130,34 @@ impl Drop for InFlightGuard {
     }
 }
 
+/// The set of account ids currently present in the pool. A store keeps this
+/// allowlist inside the same guarded value as its data, so a prune can never be
+/// undone by an insert that raced the pool deletion.
+type ActiveIds = std::collections::BTreeSet<String>;
+
+#[derive(Debug, Default)]
+struct MonitorAccounts {
+    /// Live pool ids. `None` until `retain_accounts` activates the allowlist,
+    /// so a standalone store accepts every writer until membership is explicit.
+    active: Option<ActiveIds>,
+    ttft: HashMap<String, RingBuffer>,
+    last_errors: HashMap<String, LastError>,
+}
+
+impl MonitorAccounts {
+    fn admits(&self, account_id: &str) -> bool {
+        self.active
+            .as_ref()
+            .is_none_or(|active| active.contains(account_id))
+    }
+}
+
 #[derive(Debug)]
 pub struct MonitorState {
     started_at_unix_ms: i64,
     in_flight: AtomicU64,
     global_ttft: Mutex<RingBuffer>,
-    account_ttft: Mutex<HashMap<String, RingBuffer>>,
-    last_errors: Mutex<HashMap<String, LastError>>,
+    accounts: Mutex<MonitorAccounts>,
 }
 
 impl Default for MonitorState {
@@ -155,8 +176,7 @@ impl MonitorState {
             started_at_unix_ms: now_unix_ms,
             in_flight: AtomicU64::new(0),
             global_ttft: Mutex::new(RingBuffer::default()),
-            account_ttft: Mutex::new(HashMap::new()),
-            last_errors: Mutex::new(HashMap::new()),
+            accounts: Mutex::new(MonitorAccounts::default()),
         }
     }
 
@@ -179,16 +199,28 @@ impl MonitorState {
         }
     }
 
-    pub fn record_ttft(&self, account_id: &str, ttft_ms: f64) {
+    /// Records a TTFT sample. Once `retain_accounts` has activated the live-id
+    /// allowlist a sample for a departed account is dropped; before activation
+    /// a standalone store accepts every writer. The membership check and the
+    /// insert share one lock acquisition, so a concurrent `retain_accounts` can
+    /// never be interleaved between them. Returns `false` when dropped.
+    pub fn record_ttft(&self, account_id: &str, ttft_ms: f64) -> bool {
+        let Ok(mut accounts) = self.accounts.lock() else {
+            return false;
+        };
+        if !accounts.admits(account_id) {
+            return false;
+        }
+        accounts
+            .ttft
+            .entry(account_id.to_string())
+            .or_default()
+            .push(ttft_ms);
+        drop(accounts);
         if let Ok(mut global) = self.global_ttft.lock() {
             global.push(ttft_ms);
         }
-        if let Ok(mut accounts) = self.account_ttft.lock() {
-            accounts
-                .entry(account_id.to_string())
-                .or_default()
-                .push(ttft_ms);
-        }
+        true
     }
 
     pub fn ttft_percentiles(&self) -> TtftSnapshot {
@@ -204,13 +236,18 @@ impl MonitorState {
     }
 
     pub fn account_ttft(&self, account_id: &str) -> Option<TtftSnapshot> {
-        self.account_ttft
+        self.accounts
             .lock()
             .ok()
-            .and_then(|accounts| accounts.get(account_id).map(|buf| buf.snapshot()))
+            .and_then(|accounts| accounts.ttft.get(account_id).map(|buf| buf.snapshot()))
     }
 
-    pub fn record_error(&self, account_id: &str, status: u16, message: &str) {
+    /// Records the last error for an account. Once `retain_accounts` has
+    /// activated the live-id allowlist an error for a departed account is
+    /// dropped; before activation a standalone store accepts every writer. The
+    /// membership check and the insert share one lock acquisition. Returns
+    /// `false` when dropped.
+    pub fn record_error(&self, account_id: &str, status: u16, message: &str) -> bool {
         let unix_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
@@ -220,22 +257,68 @@ impl MonitorState {
             status,
             message: message.to_string(),
         };
-        if let Ok(mut errors) = self.last_errors.lock() {
-            errors.insert(account_id.to_string(), entry);
+        let Ok(mut accounts) = self.accounts.lock() else {
+            return false;
+        };
+        if !accounts.admits(account_id) {
+            return false;
         }
+        accounts.last_errors.insert(account_id.to_string(), entry);
+        true
+    }
+
+    /// Replaces the allowlist and prunes both the TTFT rings and the last
+    /// errors of ids that left the pool, all under one guard. Returns the
+    /// number of distinct accounts pruned.
+    pub fn retain_accounts(&self, active: &ActiveIds) -> usize {
+        let mut accounts = match self.accounts.lock() {
+            Ok(accounts) => accounts,
+            Err(_) => return 0,
+        };
+        accounts.active = Some(active.clone());
+        let mut pruned: std::collections::HashSet<String> = std::collections::HashSet::new();
+        accounts.ttft.retain(|id, _| {
+            if active.contains(id) {
+                true
+            } else {
+                pruned.insert(id.clone());
+                false
+            }
+        });
+        accounts.last_errors.retain(|id, _| {
+            if active.contains(id) {
+                true
+            } else {
+                pruned.insert(id.clone());
+                false
+            }
+        });
+        pruned.len()
+    }
+
+    /// Every account id that still owns state in this store, in a stable order.
+    pub fn tracked_accounts(&self) -> Vec<String> {
+        let accounts = match self.accounts.lock() {
+            Ok(accounts) => accounts,
+            Err(_) => return Vec::new(),
+        };
+        let mut ids: std::collections::BTreeSet<&String> = std::collections::BTreeSet::new();
+        ids.extend(accounts.ttft.keys());
+        ids.extend(accounts.last_errors.keys());
+        ids.into_iter().cloned().collect()
     }
 
     pub fn clear_error(&self, account_id: &str) {
-        if let Ok(mut errors) = self.last_errors.lock() {
-            errors.remove(account_id);
+        if let Ok(mut accounts) = self.accounts.lock() {
+            accounts.last_errors.remove(account_id);
         }
     }
 
     pub fn last_error(&self, account_id: &str) -> Option<LastError> {
-        self.last_errors
+        self.accounts
             .lock()
             .ok()
-            .and_then(|errors| errors.get(account_id).cloned())
+            .and_then(|accounts| accounts.last_errors.get(account_id).cloned())
     }
 
     pub fn render_prometheus(&self, now_unix_ms: i64, accounts: &[PromAccount]) -> String {
@@ -278,5 +361,91 @@ impl MonitorState {
             );
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn live(ids: &[&str]) -> ActiveIds {
+        ids.iter().map(|id| id.to_string()).collect()
+    }
+
+    #[test]
+    fn monitor_record_ttft_drops_a_removed_account() {
+        let monitor = MonitorState::new(0);
+        monitor.retain_accounts(&live(&["live", "gone"]));
+
+        assert!(
+            monitor.record_ttft("live", 10.0),
+            "a live account must accept a TTFT sample"
+        );
+        assert!(monitor.record_ttft("live", 20.0));
+        assert!(monitor.record_ttft("gone", 11.0));
+
+        assert_eq!(
+            monitor.retain_accounts(&live(&["live"])),
+            1,
+            "the removed account's TTFT ring is pruned"
+        );
+
+        assert!(
+            !monitor.record_ttft("gone", 12.0),
+            "a late sample for a removed account must be dropped"
+        );
+        assert!(
+            monitor.account_ttft("gone").is_none(),
+            "the dropped sample must not recreate the removed account's ring"
+        );
+        assert_eq!(
+            monitor.account_ttft("live").map(|s| s.samples),
+            Some(2),
+            "the surviving account keeps every sample it recorded"
+        );
+    }
+
+    #[test]
+    fn monitor_retain_accounts_prunes_ttft_and_last_errors_under_one_guard() {
+        let monitor = MonitorState::new(0);
+        monitor.retain_accounts(&live(&["keep", "ttft-only", "error-only"]));
+
+        assert!(monitor.record_ttft("keep", 1.0));
+        assert!(monitor.record_ttft("ttft-only", 2.0));
+        assert!(monitor.record_error("keep", 500, "transient"));
+        assert!(monitor.record_error("error-only", 503, "upstream"));
+
+        let pruned = monitor.retain_accounts(&live(&["keep"]));
+
+        assert_eq!(pruned, 2, "each distinct departed account is counted once");
+        assert!(monitor.account_ttft("ttft-only").is_none());
+        assert!(monitor.last_error("error-only").is_none());
+        assert_eq!(monitor.tracked_accounts(), vec!["keep".to_string()]);
+        assert!(monitor.account_ttft("keep").is_some());
+        assert!(monitor.last_error("keep").is_some());
+
+        // The rewritten allowlist stays in force: a pruned id cannot be
+        // resurrected by a writer that still holds its old id.
+        assert!(!monitor.record_ttft("ttft-only", 3.0));
+        assert!(!monitor.record_error("error-only", 503, "late"));
+    }
+
+    #[test]
+    fn monitor_standalone_default_records_before_activation() {
+        // Before any `retain_accounts`, membership is not explicit: existing
+        // callers (`relay.rs` TTFT/error recording) must keep working unchanged.
+        let monitor = MonitorState::new(0);
+        monitor.record_ttft("acc", 5.0);
+        monitor.record_error("acc", 500, "boom");
+
+        assert_eq!(
+            monitor.account_ttft("acc").map(|s| s.samples),
+            Some(1),
+            "a store whose allowlist has not been activated must accept samples"
+        );
+        assert!(
+            monitor.last_error("acc").is_some(),
+            "a store whose allowlist has not been activated must accept errors"
+        );
     }
 }
