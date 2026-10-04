@@ -105,6 +105,7 @@ fn gateway_config(auth_dir: &std::path::Path) -> GatewayConfig {
         captcha_config_url: None,
         captcha_solver_bin: None,
         catalog_cache_path: None,
+        max_concurrent_inference: mahoquot_gateway::state::MAX_CONCURRENT_INFERENCE_REQUESTS,
     }
 }
 
@@ -212,6 +213,7 @@ async fn management_uses_the_same_api_key_as_proxy_routes() {
         captcha_config_url: None,
         captcha_solver_bin: None,
         catalog_cache_path: None,
+        max_concurrent_inference: mahoquot_gateway::state::MAX_CONCURRENT_INFERENCE_REQUESTS,
     };
     let app = create_app(Arc::new(AppState::new(&config).expect("state")));
 

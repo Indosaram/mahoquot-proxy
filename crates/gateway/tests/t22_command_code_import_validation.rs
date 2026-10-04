@@ -41,6 +41,7 @@ fn gateway_config(auth_dir: &std::path::Path) -> GatewayConfig {
         history_batch_size: 64,
         captcha_config_url: None,
         captcha_solver_bin: None,
+        max_concurrent_inference: mahoquot_gateway::state::MAX_CONCURRENT_INFERENCE_REQUESTS,
     }
 }
 
