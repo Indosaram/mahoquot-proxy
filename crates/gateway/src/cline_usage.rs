@@ -13,8 +13,9 @@
 //! capacity thrown away. Only upstream decides exhaustion, via the cap 429 that
 //! benches the quota group it names.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Approximate daily free-token budget of one Cline account. A display
@@ -159,48 +160,89 @@ impl ClineDailyTracker {
     }
 }
 
+/// The display key of a Cline model: its bare slug after the vendor prefix.
+/// Bucket ids, tracker keys, and every display filter compare on this, so a
+/// routed alias (`z-ai/...`) and the upstream id (`cline-free/...`) name the
+/// same quota.
+pub fn cline_quota_slug(model: &str) -> &str {
+    model.rsplit('/').next().unwrap_or(model)
+}
+
+/// Which reference budget a slug's tracker starts from. The two historical
+/// env knobs keep their names (both already fall back to the account-wide
+/// budget); every model Cline ships tomorrow shares that default. Evaluated
+/// once, when the tracker is first created.
+fn budget_for_slug(slug: &str) -> u64 {
+    match slug {
+        "gemini-3.8-flash" => budget_env("CLINE_GLM_DAILY_TOKEN_BUDGET"),
+        "deepseek-v4.1-flash" => budget_env("CLINE_DEEPSEEK_DAILY_TOKEN_BUDGET"),
+        _ => budget_env("CLINE_DAILY_TOKEN_BUDGET"),
+    }
+}
+
+/// Rolling 24h budget trackers keyed by bare model slug, created on first
+/// touch: a free model Cline ships tomorrow needs no code change here. Which
+/// of these buckets a surface renders is a display setting on the frontend;
+/// the gateway tracks and records every Cline model it serves.
 #[derive(Clone)]
 pub struct ClineTrackers {
-    glm: Arc<ClineDailyTracker>,
-    deepseek: Arc<ClineDailyTracker>,
+    trackers: Arc<Mutex<HashMap<String, Arc<ClineDailyTracker>>>>,
 }
 
 impl ClineTrackers {
     pub fn from_env() -> Self {
         Self {
-            glm: ClineDailyTracker::with_config(budget_env("CLINE_GLM_DAILY_TOKEN_BUDGET")),
-            deepseek: ClineDailyTracker::with_config(budget_env(
-                "CLINE_DEEPSEEK_DAILY_TOKEN_BUDGET",
-            )),
+            trackers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
+    /// Pre-seeds the two historical budgets (tests and explicit tuning).
     pub fn with_budgets(glm_tokens: u64, deepseek_tokens: u64) -> Self {
-        Self {
-            glm: ClineDailyTracker::with_config(glm_tokens),
-            deepseek: ClineDailyTracker::with_config(deepseek_tokens),
-        }
+        let this = Self::from_env();
+        this.insert("gemini-3.8-flash", glm_tokens);
+        this.insert("deepseek-v4.1-flash", deepseek_tokens);
+        this
     }
 
-    pub fn for_model(&self, model: &str) -> Option<&ClineDailyTracker> {
-        match cline_quota_lane(model)? {
-            ClineQuotaLane::Glm => Some(&self.glm),
-            ClineQuotaLane::Deepseek => Some(&self.deepseek),
-        }
+    fn insert(&self, slug: &str, budget: u64) {
+        self.trackers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(slug.to_owned(), ClineDailyTracker::with_config(budget));
     }
-}
 
-pub enum ClineQuotaLane {
-    Glm,
-    Deepseek,
-}
+    /// The tracker for a model, minted on first touch. Callers sit behind the
+    /// Cline provider gate; pure routing reads use [`Self::existing`] instead
+    /// so they never mint state.
+    pub fn for_model(&self, model: &str) -> Arc<ClineDailyTracker> {
+        let slug = cline_quota_slug(model).to_owned();
+        let budget = budget_for_slug(&slug);
+        self.trackers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(slug)
+            .or_insert_with(|| ClineDailyTracker::with_config(budget))
+            .clone()
+    }
 
-pub fn cline_quota_lane(model: &str) -> Option<ClineQuotaLane> {
-    let bare = model.rsplit('/').next().unwrap_or(model);
-    match bare {
-        "gemini-3.8-flash" => Some(ClineQuotaLane::Glm),
-        "deepseek-v4.1-flash" => Some(ClineQuotaLane::Deepseek),
-        _ => None,
+    /// Read-only lookup for a tracker that already exists.
+    pub fn existing(&self, model: &str) -> Option<Arc<ClineDailyTracker>> {
+        self.trackers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(cline_quota_slug(model))
+            .cloned()
+    }
+
+    /// Snapshot for iteration, taken without holding the lock across the
+    /// recording calls that follow.
+    pub fn entries(&self) -> Vec<(String, Arc<ClineDailyTracker>)> {
+        self.trackers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|(slug, tracker)| (slug.clone(), tracker.clone()))
+            .collect()
     }
 }
 
@@ -242,23 +284,25 @@ pub fn seed_cline_trackers_from_history(state: &std::sync::Arc<crate::state::App
                 Ok(store) => store.export(&query).unwrap_or_default(),
                 Err(_) => continue,
             };
-            let mut sums = [0u64; 2];
-            let mut earliest = [0i64; 2];
+            let mut sums: HashMap<String, u64> = HashMap::new();
+            let mut earliest: HashMap<String, i64> = HashMap::new();
             for row in &rows {
-                let lane = match cline_quota_lane(&row.model) {
-                    Some(ClineQuotaLane::Glm) => 0,
-                    Some(ClineQuotaLane::Deepseek) => 1,
-                    None => continue,
-                };
-                sums[lane] = sums[lane].saturating_add(row.total_tokens);
+                let slug = cline_quota_slug(&row.model).to_owned();
+                *sums.entry(slug.clone()).or_default() += row.total_tokens;
                 let occurred = row.occurred_at_ms / 1000;
-                if occurred > 0 && (earliest[lane] == 0 || occurred < earliest[lane]) {
-                    earliest[lane] = occurred;
+                if occurred > 0 {
+                    let entry = earliest.entry(slug).or_insert(0);
+                    if *entry == 0 || occurred < *entry {
+                        *entry = occurred;
+                    }
                 }
             }
             let trackers = member.cline_trackers();
-            trackers.glm.seed_from_history(sums[0], earliest[0]);
-            trackers.deepseek.seed_from_history(sums[1], earliest[1]);
+            for (slug, sum) in &sums {
+                trackers
+                    .for_model(slug)
+                    .seed_from_history(*sum, earliest.get(slug).copied().unwrap_or(0));
+            }
             emit_seed_buckets(&state, &member, trackers, now);
             restore_cap_buckets(&state, &member, now).await;
         }
@@ -273,10 +317,7 @@ fn emit_seed_buckets(
     trackers: &ClineTrackers,
     now: i64,
 ) {
-    for (model, tracker) in [
-        ("cline-free/gemini-3.8-flash", &trackers.glm),
-        ("cline-free/deepseek-v4.1-flash", &trackers.deepseek),
-    ] {
+    for (slug, tracker) in trackers.entries() {
         let reset_unix = tracker.estimated_reset_unix();
         if reset_unix <= now {
             continue;
@@ -288,7 +329,7 @@ fn emit_seed_buckets(
         // the live request path.
         crate::relay::record_cline_quota_bucket(
             member,
-            model,
+            &format!("cline-free/{slug}"),
             reset_unix - now,
             now,
             percent.min(99.9),
@@ -316,11 +357,10 @@ async fn restore_cap_buckets(
         if cap.reset_at_unix <= now {
             continue;
         }
-        // Bench first, and unconditionally. The tracker/bucket below only
-        // exist for display lanes, but routability must be restored for every
-        // persisted cap — gating the cooldown behind `for_model` let a cline
-        // cap on an unlaned model come back from a restart with no bench at
-        // all, and the account was re-selected seconds later.
+        // Bench first, and unconditionally. Routability must be restored for
+        // every persisted cap — gating the cooldown behind tracker existence
+        // once let a cline cap come back from a restart with no bench at all,
+        // and the account was re-selected seconds later.
         member.set_group_cooldown(&cap.model, cap.reset_at_unix * 1000);
         // Restore the *reason* alongside the deadline. A restart otherwise
         // sees only when the account is blocked, and the exhaustion response
@@ -328,10 +368,9 @@ async fn restore_cap_buckets(
         if cap.credit_driven {
             member.set_group_credit_bench(&cap.model, cap.reset_at_unix * 1000);
         }
-        let Some(tracker) = member.cline_trackers().for_model(&cap.model) else {
-            continue;
-        };
-        tracker.on_cap_429(cap.reset_at_unix);
+        member.cline_trackers()
+            .for_model(&cap.model)
+            .on_cap_429(cap.reset_at_unix);
         crate::relay::record_cline_quota_bucket(
             member,
             &cap.model,
@@ -411,10 +450,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_cap_on_an_unlaned_model_still_benches_after_restore() {
-        // The bench must not sit behind the display lane: `deepseek-v4-flash`
-        // is not a tracked budget, but its cap still has to come back from a
-        // restart or the account is routable again seconds after boot.
+    async fn a_cap_on_any_model_still_benches_after_restore() {
+        // The bench must not sit behind tracker existence: `deepseek-v4-flash`
+        // has no traffic history at all, but its cap still has to come back
+        // from a restart or the account is routable again seconds after boot.
         use std::sync::Arc;
         let now = now_unix();
         let auth_dir = std::env::temp_dir().join(format!(
@@ -456,11 +495,6 @@ mod tests {
             })
             .expect("record cap");
 
-        assert!(
-            crate::cline_usage::cline_quota_lane("deepseek/deepseek-v4-flash").is_none(),
-            "test premise: this model is not a tracked display lane"
-        );
-
         restore_cap_buckets(&state, &member, now).await;
 
         assert!(
@@ -471,7 +505,7 @@ mod tests {
             !member.group_credit_benched("deepseek/deepseek-v4-flash", now * 1000),
             "a timed-quota cap must not be relabelled as a credit block on restore"
         );
-        // A tracked sibling lane is unaffected.
+        // An unrelated sibling model is unaffected.
         assert!(member.group_available("z-ai/glm-5.3-flash", now * 1000));
     }
 
@@ -540,49 +574,43 @@ mod tests {
     }
 
     #[test]
-    fn lanes_track_tokens_independently() {
+    fn per_model_trackers_stay_independently_budgeted() {
         let set = ClineTrackers::with_budgets(1_000, 1_000);
-        let gemini = set
-            .for_model("cline-free/gemini-3.8-flash")
-            .expect("gemini lane");
-        let ds = set
-            .for_model("cline-free/deepseek-v4.1-flash")
-            .expect("deepseek lane");
+        let gemini = set.for_model("cline-free/gemini-3.8-flash");
+        let ds = set.for_model("cline-free/deepseek-v4.1-flash");
         gemini.observe(900, now_unix());
         assert_eq!(
             gemini.used_percent(),
             Some(90.0),
-            "gemini lane absorbs only gemini tokens"
+            "gemini tracker absorbs only gemini tokens"
         );
-        assert_eq!(ds.used_percent(), Some(0.0), "deepseek lane stays untouched");
+        assert_eq!(ds.used_percent(), Some(0.0), "deepseek tracker stays untouched");
+        let capped = set.for_model("deepseek/deepseek-v4.1-flash");
         assert!(
-            set.for_model("z-ai/glm-4.7").is_none(),
-            "non-display models route nowhere"
+            Arc::ptr_eq(&capped, &ds),
+            "same tracker under a vendor prefix"
         );
-        let capped = set
-            .for_model("deepseek/deepseek-v4.1-flash")
-            .expect("vendor-prefixed cap id");
-        assert!(std::ptr::eq(capped, ds), "same lane under a vendor prefix");
+        let other = set.for_model("z-ai/glm-4.7");
+        assert!(
+            !Arc::ptr_eq(&other, &gemini),
+            "an unlisted model tracks on its own slug, never onto a display lane"
+        );
+        other.observe(DEFAULT_CLINE_DAILY_TOKEN_BUDGET / 10, now_unix());
+        assert_eq!(other.used_percent(), Some(10.0), "default budget applies");
     }
 
     #[test]
-    fn seeded_windows_emit_display_buckets_until_reset() {
+    fn seeded_windows_emit_buckets_until_reset() {
         let now = now_unix();
         let set = ClineTrackers::with_budgets(1_000, 1_000);
-        let gemini = set
-            .for_model("cline-free/gemini-3.8-flash")
-            .expect("gemini lane");
-        let ds = set
-            .for_model("cline-free/deepseek-v4.1-flash")
-            .expect("deepseek lane");
+        let gemini = set.for_model("cline-free/gemini-3.8-flash");
+        let ds = set.for_model("cline-free/deepseek-v4.1-flash");
         gemini.seed_from_history(500, now - 3_600);
         assert_eq!(gemini.used_percent(), Some(50.0));
         assert_eq!(gemini.estimated_reset_unix(), now - 3_600 + DAY_SECS);
         assert_eq!(ds.used_percent(), Some(0.0), "untouched lane emits nothing");
         let expired = ClineTrackers::with_budgets(1_000, 1_000);
-        let old = expired
-            .for_model("cline-free/gemini-3.8-flash")
-            .expect("gemini lane");
+        let old = expired.for_model("cline-free/gemini-3.8-flash");
         old.seed_from_history(500, now - DAY_SECS - 3_600);
         assert_eq!(
             old.estimated_reset_unix(),

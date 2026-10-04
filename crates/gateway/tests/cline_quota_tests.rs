@@ -250,7 +250,7 @@ fn test_cline_stats_normalizes_expired_health_and_preserves_future_and_disabled(
 }
 
 #[test]
-fn test_cline_stale_usage_expires_and_drops_non_display_models() {
+fn test_cline_stale_usage_expires_and_keeps_fresh_buckets() {
     let cline_member = create_cline_account(
         "cline-usage-test",
         "http://127.0.0.1:18899",
@@ -295,20 +295,20 @@ fn test_cline_stale_usage_expires_and_drops_non_display_models() {
     usage.expire_stale_cline_limits(now_unix);
 
     let group = &usage.groups[0];
-    // Non-display models are dropped entirely, even while unexpired
-    assert_eq!(
-        group
-            .buckets
-            .iter()
-            .find(|b| b.bucket_id.as_deref() == Some("z-ai/glm-5.3")),
-        None,
-        "non-display model buckets must never render"
-    );
+    // A fresh bucket of any model survives: display selection lives in the
+    // frontend, so the gateway keeps live data regardless of model.
+    let b_fresh = group
+        .buckets
+        .iter()
+        .find(|b| b.bucket_id.as_deref() == Some("z-ai/glm-5.3"))
+        .expect("fresh buckets of any model are kept");
+    assert_eq!(b_fresh.used_percent, Some(100.0));
+    assert_eq!(b_fresh.reset_at_unix, Some(future_reset));
     let b_display = group
         .buckets
         .iter()
         .find(|b| b.bucket_id.as_deref() == Some("cline-free/gemini-3.8-flash"))
-        .expect("display model bucket is kept");
+        .expect("expired bucket is kept but zeroed");
 
     // Expired bucket must become unknown (used_percent: None), NOT fabricated zero
     assert_eq!(

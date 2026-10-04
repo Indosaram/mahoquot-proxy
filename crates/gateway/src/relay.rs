@@ -448,9 +448,7 @@ fn track_cline_daily_usage(state: &AppState, record: &OutcomeRecord<'_>, timesta
     let Some(model) = record.model else {
         return;
     };
-    let Some(tracker) = member.cline_trackers().for_model(model) else {
-        return;
-    };
+    let tracker = member.cline_trackers().for_model(model);
     tracker.observe(usage.total_tokens(), timestamp);
     let reset_unix = tracker.estimated_reset_unix();
     if reset_unix <= timestamp {
@@ -1628,20 +1626,11 @@ fn failure_is_insufficient_credits(body: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
-/// The Cline free models whose daily caps are surfaced as UI quota buckets
-/// (glm and deepseek, per product tracking). Other pooled models keep their
-/// full health/cooldown and daily budget tracking, but their caps never
-/// render an "(Daily limit)" bucket.
-pub(crate) fn is_cline_quota_display_model(model: &str) -> bool {
-    crate::cline_usage::cline_quota_lane(model).is_some()
-}
-
-pub(crate) fn canonical_cline_quota_model(model: &str) -> &'static str {
-    if model.contains("deepseek-v4.1-flash") {
-        "cline-free/deepseek-v4.1-flash"
-    } else {
-        "cline-free/gemini-3.8-flash"
-    }
+/// The stable bucket id for any Cline model: its bare slug under the
+/// `cline-free/` namespace. Both historical ids came out of this shape, so
+/// buckets recorded before display selection existed keep their identity.
+pub(crate) fn canonical_cline_quota_model(model: &str) -> String {
+    format!("cline-free/{}", crate::cline_usage::cline_quota_slug(model))
 }
 
 /// Updates the member's `AccountUsage` with a QuotaGroup bucket representing the Cline model limit.
@@ -1652,9 +1641,6 @@ pub fn record_cline_quota_bucket(
     now_unix: i64,
     used_percent: f64,
 ) {
-    if !is_cline_quota_display_model(model) {
-        return;
-    }
     let canonical_model = canonical_cline_quota_model(model);
     let reset_at_unix = now_unix + reset_seconds;
     let mut usage = member.usage_snapshot();
@@ -1690,7 +1676,7 @@ pub fn record_cline_quota_bucket(
     if let Some(bucket) = group
         .buckets
         .iter_mut()
-        .find(|b| b.bucket_id.as_deref() == Some(canonical_model))
+        .find(|b| b.bucket_id.as_deref() == Some(canonical_model.as_str()))
     {
         bucket.used_percent = Some(used_percent);
         bucket.reset_at_unix = Some(reset_at_unix);
@@ -1733,14 +1719,12 @@ async fn record_cooldown(
             // re-anchor a deadline we already know: that is the drift that
             // slid every reset forward on each repeat 429.
             let tracker = member.cline_trackers().for_model(&cap_model);
-            let reset_at = resolve_cline_deadline(tracker, now_secs, reset_secs);
+            let reset_at = resolve_cline_deadline(Some(tracker.as_ref()), now_secs, reset_secs);
             let deadline_ms = reset_at.saturating_mul(1000);
             record_cline_quota_bucket(member, &cap_model, reset_at - now_secs, now_secs, 100.0);
             // Upstream named the exact reset: reconcile the 24h tracker so the
             // estimate is exact and the budget counts as consumed.
-            if let Some(tracker) = tracker {
-                tracker.on_cap_429(reset_at);
-            }
+            tracker.on_cap_429(reset_at);
             persist_cline_cap_event(
                 state,
                 member,
@@ -2695,16 +2679,8 @@ mod cline_deadline_tests {
             crate::account::model_quota_group("cline", billed),
             "a dated upstream id must share the requested model's group"
         );
-        // The dated id does not resolve a display lane (it is not a tracked
-        // budget), which is exactly why the *bench* cannot be gated behind it.
-        assert!(
-            crate::cline_usage::cline_quota_lane(billed).is_none(),
-            "test premise: an unlaned model must still be restorable"
-        );
-        assert!(
-            crate::cline_usage::cline_quota_lane("deepseek/deepseek-v4.1-flash").is_some(),
-            "the tracked lane still resolves"
-        );
+        // Display state never gates the *bench*: a persisted cap must be
+        // restorable for every model, tracked or not.
 
         let state = cline_state("cap-key-mismatch");
         let pool = state.pool.load_full();
@@ -4125,10 +4101,8 @@ pub async fn handle_relay(
             // is a balance rather than a timer: bench briefly and keep walking
             // the pool without spending the failover budget.
             if failure_is_insufficient_credits(&failure.body)
-                && plan
-                    .model
-                    .as_deref()
-                    .is_some_and(crate::relay::is_cline_quota_display_model)
+                && plan.model.is_some()
+                && member.provider_name() == "cline"
             {
                 let now_ms = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -4140,11 +4114,13 @@ pub async fn handle_relay(
                     plan.model.clone().unwrap_or_default(),
                 );
                 let tracker = member.cline_trackers().for_model(&cap_model);
-                let reset_at = crate::relay::resolve_cline_deadline(tracker, now_unix, reset_secs);
+                let reset_at = crate::relay::resolve_cline_deadline(
+                    Some(tracker.as_ref()),
+                    now_unix,
+                    reset_secs,
+                );
                 record_cline_quota_bucket(&member, &cap_model, reset_at - now_unix, now_unix, 100.0);
-                if let Some(tracker) = tracker {
-                    tracker.on_cap_429(reset_at);
-                }
+                tracker.on_cap_429(reset_at);
                 persist_cline_cap_event(&state, &member, &cap_model, now_ms, reset_at, true);
                 bench_cline_cap(
                     &member,
@@ -4182,6 +4158,38 @@ pub async fn handle_relay(
         }
 
         let failure = extract_failure(resp, status_code).await;
+
+        if status_code == 403 && member.kind() == crate::account::ProviderKind::Antigravity {
+            if let Ok(mut body) = serde_json::from_slice::<serde_json::Value>(&failure.body) {
+                let error = if body.get("error").is_some_and(serde_json::Value::is_object) {
+                    &mut body["error"]
+                } else {
+                    &mut body
+                };
+                let validation_required = error.get("details")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|details| details.iter().any(|detail| {
+                        detail.get("reason").and_then(serde_json::Value::as_str)
+                            == Some("VALIDATION_REQUIRED")
+                    }));
+                if validation_required {
+                    let email = member.email().unwrap_or_else(|| member.id().to_string());
+                    let message = format!("Google account verification required for {email} (VALIDATION_REQUIRED). Verify this Google account in your browser, then reauthenticate in the app.");
+                    error["message"] = serde_json::json!(message);
+                    error["account_id"] = serde_json::json!(member.id());
+                    member.set_health(Health::AuthFailed);
+                    member.record_fail();
+                    state.monitor.record_error(member.id(), status_code, &message);
+                    state.metrics.failed_over.fetch_add(1, Ordering::Relaxed);
+                    last_failure = Some(FinalFailure {
+                        body: Bytes::from(body.to_string()),
+                        ..failure
+                    });
+                    failover_budget += 1;
+                    continue;
+                }
+            }
+        }
 
         // A 403 is usually a workspace/entitlement or model denial, not a dead
         // credential (opencodex #1789 / 1fa0f6aad): model-rejection signatures

@@ -262,12 +262,12 @@ async fn cline_daily_budget_reports_usage_without_capping_the_account() {
     std::fs::remove_dir_all(&temp_dir).unwrap();
 }
 
-/// The display models (glm and deepseek) keep independent "(Daily limit)"
-/// quota buckets backed by separate token trackers. A served request on any
-/// other pooled Cline model never creates a bucket, and its tokens move
-/// neither display model's estimate.
+/// Every served Cline model gets its own "(Daily limit)" bucket backed by its
+/// own token tracker — which of them a surface renders is a frontend display
+/// setting, not a gateway gate — and no model's tokens move another's
+/// estimate.
 #[tokio::test]
-async fn cline_quota_bucket_surfaces_only_the_display_model() {
+async fn cline_quota_bucket_surfaces_every_served_model() {
     let mut servers = Vec::new();
     let mut shutdowns = Vec::new();
 
@@ -389,8 +389,12 @@ async fn cline_quota_bucket_surfaces_only_the_display_model() {
         .collect();
     assert_eq!(
         ids,
-        vec!["cline-free/gemini-3.8-flash", "cline-free/deepseek-v4.1-flash"],
-        "gemini and deepseek render buckets; every other model stays hidden"
+        vec![
+            "cline-free/gemini-3.8-flash",
+            "cline-free/glm-4.7",
+            "cline-free/deepseek-v4.1-flash",
+        ],
+        "every served cline model surfaces its own bucket"
     );
     let bucket = &group.buckets[0];
     assert_eq!(
@@ -398,25 +402,36 @@ async fn cline_quota_bucket_surfaces_only_the_display_model() {
         Some("cline-free/gemini-3.8-flash (Daily limit)")
     );
     let glm_used = bucket.used_percent.expect("live usage is reported");
-    let deepseek = &group.buckets[1];
+    let other = &group.buckets[1];
+    assert_eq!(
+        other.display_name.as_deref(),
+        Some("cline-free/glm-4.7 (Daily limit)")
+    );
+    let other_used = other.used_percent.expect("other model usage is reported");
+    let deepseek = &group.buckets[2];
     assert_eq!(
         deepseek.display_name.as_deref(),
         Some("cline-free/deepseek-v4.1-flash (Daily limit)")
     );
     let ds_used = deepseek.used_percent.expect("deepseek usage is reported");
     let glm_expect = 6_000_000.0 * 100.0 / 15_200_000.0;
+    let other_expect = 7_000_000.0 * 100.0 / 15_200_000.0;
     let ds_expect = 2_000_000.0 * 100.0 / 15_200_000.0;
     assert!(
         (glm_used - glm_expect).abs() < 1e-9,
-        "glm lane counts only glm-served tokens: got {glm_used}, want {glm_expect}"
+        "gemini tracker counts only gemini-served tokens: got {glm_used}, want {glm_expect}"
+    );
+    assert!(
+        (other_used - other_expect).abs() < 1e-9,
+        "glm-4.7 tracker counts only glm-4.7-served tokens: got {other_used}, want {other_expect}"
     );
     assert!(
         (ds_used - ds_expect).abs() < 1e-9,
-        "deepseek lane counts only deepseek-served tokens: got {ds_used}, want {ds_expect}"
+        "deepseek tracker counts only deepseek-served tokens: got {ds_used}, want {ds_expect}"
     );
     assert!(
         glm_used > ds_used,
-        "lanes are independent: {glm_used} must exceed {ds_used}"
+        "trackers are independent: {glm_used} must exceed {ds_used}"
     );
 
     for shutdown in shutdowns {

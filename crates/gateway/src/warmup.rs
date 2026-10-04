@@ -278,7 +278,7 @@ pub fn is_quota_window_active(m: &AccountMember, model: &str, now_unix: i64) -> 
                 return (true, Some(*until / 1000));
             }
         }
-        if let Some(tracker) = m.cline_trackers().for_model(model) {
+        if let Some(tracker) = m.cline_trackers().existing(model) {
             let reset_at = tracker.estimated_reset_unix();
             if reset_at > now_unix {
                 return (true, Some(reset_at));
@@ -626,7 +626,8 @@ async fn execute(state: &Arc<AppState>, id: &str, automatic: bool) -> WarmupResu
             if m.provider_name() == "cline" {
                 if let Some((cap_model, secs)) = crate::relay::parse_cline_cap_error(&bytes) {
                     let tracker = m.cline_trackers().for_model(&cap_model);
-                    let reset_at = crate::relay::resolve_cline_deadline(tracker, now(), secs);
+                    let reset_at =
+                        crate::relay::resolve_cline_deadline(Some(tracker.as_ref()), now(), secs);
                     crate::relay::record_cline_quota_bucket(
                         &m,
                         &cap_model,
@@ -634,16 +635,15 @@ async fn execute(state: &Arc<AppState>, id: &str, automatic: bool) -> WarmupResu
                         now(),
                         100.0,
                     );
-                    if let Some(tracker) = tracker {
-                        tracker.on_cap_429(reset_at);
-                    }
+                    tracker.on_cap_429(reset_at);
                 }
             }
             let (quota_model, deadline) = crate::relay::parse_cline_cap_error(&bytes)
                 .filter(|_| m.provider_name() == "cline")
                 .map(|(id, secs)| {
                     let tracker = m.cline_trackers().for_model(&id);
-                    let reset_at = crate::relay::resolve_cline_deadline(tracker, now(), secs);
+                    let reset_at =
+                        crate::relay::resolve_cline_deadline(Some(tracker.as_ref()), now(), secs);
                     (id, reset_at * 1000)
                 })
                 .unwrap_or((model.clone(), header_deadline));
@@ -694,9 +694,7 @@ async fn execute(state: &Arc<AppState>, id: &str, automatic: bool) -> WarmupResu
             // A successful probe is the account's first use of its 24h
             // daily-cap window: anchor the reset estimate at warmup time.
             if valid && m.provider_name() == "cline" {
-                if let Some(tracker) = m.cline_trackers().for_model(&model) {
-                    tracker.anchor_window(now());
-                }
+                m.cline_trackers().for_model(&model).anchor_window(now());
             }
         }
         Ok(Err(e)) => out.detail = Some(e),
@@ -1165,7 +1163,7 @@ mod tests {
         assert!(!active_deepseek);
 
         // When Gemini window is anchored/active, but DeepSeek is still unanchored
-        cline.cline_trackers().for_model("cline-free/gemini-3.8-flash").unwrap().anchor_window(current);
+        cline.cline_trackers().for_model("cline-free/gemini-3.8-flash").anchor_window(current);
         let (active_gemini, reset_gemini) = is_quota_window_active(&cline, "cline-free/gemini-3.8-flash", current);
         let (active_deepseek, reset_deepseek) = is_quota_window_active(&cline, "cline-free/deepseek-v4.1-flash", current);
         assert!(active_gemini);

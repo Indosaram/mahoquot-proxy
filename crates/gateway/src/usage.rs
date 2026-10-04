@@ -323,12 +323,6 @@ impl AccountUsage {
     pub fn expire_stale_cline_limits(&mut self, now_unix: i64) {
         for group in &mut self.groups {
             if group.display_name.as_deref() == Some("Cline Free Limits") {
-                group.buckets.retain(|bucket| {
-                    bucket
-                        .bucket_id
-                        .as_deref()
-                        .is_some_and(crate::relay::is_cline_quota_display_model)
-                });
                 for bucket in &mut group.buckets {
                     if bucket.reset_at_unix.is_some_and(|reset| reset <= now_unix) {
                         bucket.used_percent = None;
