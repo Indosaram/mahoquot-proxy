@@ -73,6 +73,8 @@ fn config_for(dir: &TestDir) -> GatewayConfig {
         api_keys: ApiKeys::new(vec![TEST_API_KEY.to_string()]),
         config_path: dir.path().join("config.yaml"),
         auth_refresh_enabled: false,
+        // A small ceiling keeps this fixture cheap; production defaults far higher.
+        max_concurrent_inference: 4,
         ..GatewayConfig::default()
     }
 }
@@ -230,14 +232,15 @@ async fn a_rescan_without_removal_keeps_every_store_intact() {
 }
 
 #[tokio::test]
-async fn router_admission_rejects_unpolled_fifth_body_and_releases_exactly_one_slot() {
+async fn router_admission_rejects_unpolled_body_past_ceiling_and_releases_exactly_one_slot() {
     let dir = TestDir::new("gate");
     let state = Arc::new(AppState::new(&config_for(&dir)).expect("state"));
     let app = create_app(Arc::clone(&state));
     let gate = state.inference_gate();
+    let ceiling = gate.available_permits();
     let polled = Arc::new(tokio::sync::Semaphore::new(0));
     let mut held = Vec::new();
-    for _ in 0..mahoquot_gateway::state::MAX_CONCURRENT_INFERENCE_REQUESTS {
+    for _ in 0..ceiling {
         let body = pending_body(Arc::clone(&polled));
         let request = Request::builder()
             .method(Method::POST)
@@ -248,7 +251,7 @@ async fn router_admission_rejects_unpolled_fifth_body_and_releases_exactly_one_s
             .unwrap();
         held.push(tokio::spawn(app.clone().oneshot(request)));
     }
-    for _ in 0..mahoquot_gateway::state::MAX_CONCURRENT_INFERENCE_REQUESTS {
+    for _ in 0..ceiling {
         tokio::time::timeout(Duration::from_secs(5), polled.acquire())
             .await
             .expect("each admitted request must reach body extraction")
@@ -256,21 +259,21 @@ async fn router_admission_rejects_unpolled_fifth_body_and_releases_exactly_one_s
             .forget();
     }
 
-    let fifth_signal = Arc::new(tokio::sync::Semaphore::new(0));
-    let fifth_body = pending_body(Arc::clone(&fifth_signal));
-    let fifth = Request::builder()
+    let overflow_signal = Arc::new(tokio::sync::Semaphore::new(0));
+    let overflow_body = pending_body(Arc::clone(&overflow_signal));
+    let overflow = Request::builder()
         .method(Method::POST)
         .uri("/v1/chat/completions")
         .header(header::AUTHORIZATION, format!("Bearer {TEST_API_KEY}"))
         .header(header::CONTENT_TYPE, "application/json")
-        .body(fifth_body)
+        .body(overflow_body)
         .unwrap();
-    let busy = app.clone().oneshot(fifth).await.expect("oneshot");
+    let busy = app.clone().oneshot(overflow).await.expect("oneshot");
     assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
     let busy_body = body_json(busy).await;
     assert_eq!(busy_body["error"]["code"], "gateway_busy");
     assert_eq!(busy_body["error"]["retryable"], true);
-    assert_eq!(fifth_signal.available_permits(), 0, "rejected body was polled");
+    assert_eq!(overflow_signal.available_permits(), 0, "rejected body was polled");
 
     let management = app.clone().oneshot(
         Request::builder()
@@ -304,6 +307,59 @@ async fn router_admission_rejects_unpolled_fifth_body_and_releases_exactly_one_s
     replacement.abort();
     let _ = replacement.await;
     for task in held.into_iter().skip(1) {
+        task.abort();
+        let _ = task.await;
+    }
+}
+
+/// A hundred concurrent inference requests are ordinary traffic, not overload.
+/// The shipped default ceiling must admit every one of them: a request refused
+/// by admission never reaches body extraction, so counting one poll signal per
+/// request proves all hundred were admitted rather than answered 503.
+#[tokio::test]
+async fn default_ceiling_admits_a_hundred_concurrent_inference_requests() {
+    let dir = TestDir::new("burst");
+    let state = Arc::new(
+        AppState::new(&GatewayConfig {
+            max_concurrent_inference: mahoquot_gateway::state::MAX_CONCURRENT_INFERENCE_REQUESTS,
+            ..config_for(&dir)
+        })
+        .expect("state"),
+    );
+    let app = create_app(Arc::clone(&state));
+    let gate = state.inference_gate();
+    assert!(
+        gate.available_permits() >= 100,
+        "the shipped ceiling must cover a hundred concurrent requests, got {}",
+        gate.available_permits()
+    );
+
+    const BURST: usize = 100;
+    let polled = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut held = Vec::new();
+    for _ in 0..BURST {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .header(header::AUTHORIZATION, format!("Bearer {TEST_API_KEY}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(pending_body(Arc::clone(&polled)))
+            .unwrap();
+        held.push(tokio::spawn(app.clone().oneshot(request)));
+    }
+    for admitted in 0..BURST {
+        tokio::time::timeout(Duration::from_secs(5), polled.acquire())
+            .await
+            .expect("every request inside the ceiling must reach body extraction")
+            .unwrap()
+            .forget();
+        assert!(
+            !held[admitted].is_finished(),
+            "request {admitted} answered early instead of being admitted"
+        );
+    }
+
+    for task in held {
         task.abort();
         let _ = task.await;
     }

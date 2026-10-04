@@ -39,6 +39,11 @@ pub struct GatewayConfig {
     pub catalog_cache_path: Option<PathBuf>,
     pub history_queue_capacity: usize,
     pub history_batch_size: usize,
+    /// Ceiling on concurrently admitted upstream inference requests. Held for
+    /// the downstream body lifetime, so it is an overload ceiling (immediate
+    /// retryable 503 past it), not a normal-path limit. Sized well above real
+    /// concurrency so ordinary bursts never reach it.
+    pub max_concurrent_inference: usize,
     /// Captcha scene endpoint override for the zcode plan gateway (tests,
     /// relays steering a different plan origin). Falls back to
     /// `ZCODE_CAPTCHA_CONFIG_URL`, then the official client config URL.
@@ -66,6 +71,7 @@ impl Default for GatewayConfig {
             catalog_cache_path: None,
             history_queue_capacity: 1024,
             history_batch_size: 64,
+            max_concurrent_inference: crate::state::MAX_CONCURRENT_INFERENCE_REQUESTS,
             captcha_config_url: None,
             captcha_solver_bin: None,
         }
@@ -127,6 +133,11 @@ impl GatewayConfig {
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(64);
+        let max_concurrent_inference = std::env::var("MAX_CONCURRENT_INFERENCE")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(crate::state::MAX_CONCURRENT_INFERENCE_REQUESTS);
         let captcha_config_url = std::env::var("ZCODE_CAPTCHA_CONFIG_URL")
             .ok()
             .filter(|value| !value.trim().is_empty());
@@ -152,6 +163,7 @@ impl GatewayConfig {
             auth_refresh_enabled,
             history_queue_capacity,
             history_batch_size,
+            max_concurrent_inference,
             captcha_config_url,
             captcha_solver_bin,
         })

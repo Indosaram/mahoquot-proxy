@@ -154,12 +154,17 @@ impl ScopedKeyTracker {
     }
 }
 
-/// Concurrent upstream inference requests the gateway admits at once. The
-/// permit is owned by the downstream response body, so it is released when the
-/// body finishes loading or the client disconnects — never at the headers.
-/// This is an intentional overload ceiling (immediate 503 past it), not a
-/// request-size limit: the 512 MiB body cap is untouched.
-pub const MAX_CONCURRENT_INFERENCE_REQUESTS: usize = 4;
+/// Default ceiling on concurrent upstream inference requests. The permit is
+/// owned by the downstream response body, so it is released when the body
+/// finishes loading or the client disconnects — never at the headers.
+///
+/// This is an overload ceiling (immediate retryable 503 past it), not a
+/// request-size limit: the 512 MiB body cap is untouched. It sits deliberately
+/// far above real concurrency, so an ordinary burst of a hundred concurrent
+/// requests is normal traffic rather than overload. Override it with the
+/// MAX_CONCURRENT_INFERENCE environment variable when a deployment needs a
+/// different ceiling.
+pub const MAX_CONCURRENT_INFERENCE_REQUESTS: usize = 512;
 
 /// Guarded per-account usage-poll backoff.
 ///
@@ -647,7 +652,7 @@ impl AppState {
             usage_poll_backoff: PollBackoffStore::default(),
             devin_refresh_in_flight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             inference_gate: Arc::new(tokio::sync::Semaphore::new(
-                MAX_CONCURRENT_INFERENCE_REQUESTS,
+                config.max_concurrent_inference,
             )),
             rescan_gate: std::sync::Mutex::new(()),
             router,
@@ -1478,12 +1483,18 @@ mod integration_tests {
     }
 
     #[test]
-    fn inference_gate_is_exhausted_after_four_permits_and_recovers_on_drop() {
+    fn inference_gate_is_exhausted_at_ceiling_and_recovers_on_drop() {
         let (state, _member) = state_with_one_account();
         let gate = state.inference_gate();
+        let ceiling = gate.available_permits();
+        assert!(
+            ceiling >= 100,
+            "the default ceiling must swallow a hundred concurrent requests, got {}",
+            ceiling
+        );
 
         let mut held = Vec::new();
-        for _ in 0..MAX_CONCURRENT_INFERENCE_REQUESTS {
+        for _ in 0..ceiling {
             held.push(
                 gate.clone()
                     .try_acquire_owned()

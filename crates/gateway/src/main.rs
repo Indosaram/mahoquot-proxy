@@ -103,6 +103,16 @@ pub struct ServeArgs {
     /// Logging filter level
     #[arg(long, env = "LOG_LEVEL", default_value = "info")]
     pub log_level: String,
+
+    /// Ceiling on concurrently admitted upstream inference requests. Held for
+    /// the downstream response body lifetime; requests past it get an immediate
+    /// retryable 503. Sized far above real concurrency.
+    #[arg(
+        long,
+        env = "MAX_CONCURRENT_INFERENCE",
+        default_value_t = mahoquot_gateway::state::MAX_CONCURRENT_INFERENCE_REQUESTS
+    )]
+    pub max_concurrent_inference: usize,
 }
 
 impl ServeArgs {
@@ -135,6 +145,12 @@ impl ServeArgs {
             120
         };
 
+        let max_concurrent_inference = if self.max_concurrent_inference > 0 {
+            self.max_concurrent_inference
+        } else {
+            mahoquot_gateway::state::MAX_CONCURRENT_INFERENCE_REQUESTS
+        };
+
         Ok(GatewayConfig {
             port: self.port,
             auth_dir,
@@ -152,6 +168,7 @@ impl ServeArgs {
                 .map(|dir| PathBuf::from(dir).join("models-v1.signed.json")),
             history_queue_capacity: 1024,
             history_batch_size: 64,
+            max_concurrent_inference,
             captcha_config_url: std::env::var("ZCODE_CAPTCHA_CONFIG_URL")
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
