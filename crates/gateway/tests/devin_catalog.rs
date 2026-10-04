@@ -131,6 +131,7 @@ fn test_gateway_config(auth_dir: &Path) -> GatewayConfig {
         history_batch_size: 64,
         captcha_config_url: None,
         captcha_solver_bin: None,
+        max_concurrent_inference: mahoquot_gateway::state::MAX_CONCURRENT_INFERENCE_REQUESTS,
     }
 }
 
@@ -1511,6 +1512,10 @@ fn test_account_snapshot_permissions_debug_redacts_token() {
         effective_base_url: "https://api.devin.example.com".to_string(),
         devin_models: Some(vec!["devin/glm-5-2".to_string()]),
         devin_discovered: None,
+        // Pre-existing defect at HEAD: runtime_state::AccountSnapshotPermissions
+        // gained `antigravity_models` and this committed literal was never updated,
+        // so this target did not compile before this commit either.
+        antigravity_models: None,
         unsupported_models: vec![],
     };
 
