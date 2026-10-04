@@ -526,6 +526,58 @@ mod provider_kind_contract_tests {
     }
 
     #[test]
+    fn codex_cooldown_lifts_when_fresh_poll_shows_free_quota() {
+        let now_unix = 1_791_078_397;
+        let until_ms = (now_unix + 7_200) * 1000;
+        let codex = AccountMember::for_test(ProviderAccount::Codex(CodexAccount {
+            email: "test@example.com".to_string(),
+            ..Default::default()
+        }));
+        let window = |used: f64, reset_after: i64| crate::usage::QuotaWindow {
+            used_percent: Some(used),
+            reset_after_seconds: Some(reset_after),
+            reset_at_unix: Some(now_unix + reset_after),
+            ..Default::default()
+        };
+
+        // Still exhausted: the bench must hold.
+        codex.set_health(Health::Cooldown { until_unix_ms: until_ms });
+        codex.set_usage(crate::usage::AccountUsage {
+            primary: window(100.0, 7_200),
+            secondary: window(40.0, 400_000),
+            observed_at_unix: Some(now_unix),
+            refreshed_at_unix: Some(now_unix),
+            ..Default::default()
+        });
+        assert!(!codex.release_codex_cooldown_if_quota_free(now_unix));
+        assert_eq!(codex.health(), Health::Cooldown { until_unix_ms: until_ms });
+
+        // A reset credit freed both windows: the stale deadline must not pin it.
+        codex.set_usage(crate::usage::AccountUsage {
+            primary: window(0.0, 18_000),
+            secondary: window(0.0, 604_800),
+            observed_at_unix: Some(now_unix),
+            refreshed_at_unix: Some(now_unix),
+            ..Default::default()
+        });
+        assert!(codex.release_codex_cooldown_if_quota_free(now_unix));
+        assert_eq!(codex.health(), Health::Available);
+
+        // No quota reading at all is not evidence of free quota.
+        let unknown = AccountMember::for_test(ProviderAccount::Codex(CodexAccount {
+            email: "unknown@example.com".to_string(),
+            ..Default::default()
+        }));
+        unknown.set_health(Health::Cooldown { until_unix_ms: until_ms });
+        assert!(!unknown.release_codex_cooldown_if_quota_free(now_unix));
+
+        // Auth failures are never cleared by a quota poll.
+        codex.set_health(Health::AuthFailed);
+        assert!(!codex.release_codex_cooldown_if_quota_free(now_unix));
+        assert_eq!(codex.health(), Health::AuthFailed);
+    }
+
+    #[test]
     fn group_cooldowns_survive_a_credential_rescan() {
         let account = AntigravityAccount {
             email: "test@example.com".to_string(),
@@ -1126,6 +1178,39 @@ impl AccountMember {
                 *guard = Health::Available;
             }
         }
+    }
+
+    /// Lift a Codex account-wide cooldown once a fresh quota poll shows the
+    /// included quota is no longer exhausted.
+    ///
+    /// A 429 benches the account until the reported window reset, but a reset
+    /// credit (or an upstream reset) can free the quota long before that. A
+    /// benched account receives no traffic, so `record_ok` never runs to clear
+    /// it and the account sits idle at 0% used until the stale deadline.
+    /// Returns whether the cooldown was lifted.
+    pub fn release_codex_cooldown_if_quota_free(&self, now_unix: i64) -> bool {
+        if self.kind() != ProviderKind::Codex {
+            return false;
+        }
+        let usage = self.usage_snapshot_at(now_unix);
+        let has_reading = [&usage.primary, &usage.secondary]
+            .iter()
+            .any(|window| window.used_percent.is_some());
+        if !has_reading
+            || usage.is_codex_hard_limit_reached()
+            || usage.is_codex_included_quota_exhausted(None, now_unix)
+        {
+            return false;
+        }
+        let mut guard = self
+            .health
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if matches!(*guard, Health::Cooldown { .. }) {
+            *guard = Health::Available;
+            return true;
+        }
+        false
     }
 
     pub fn cline_trackers(&self) -> &crate::cline_usage::ClineTrackers {

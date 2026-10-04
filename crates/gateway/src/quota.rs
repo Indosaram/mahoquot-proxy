@@ -952,6 +952,9 @@ async fn refresh_codex_usage(
             .unwrap_or_default();
     }
     member.set_usage(usage);
+    if member.release_codex_cooldown_if_quota_free(now) {
+        tracing::info!(account = %member.id, "codex quota available again; cooldown lifted");
+    }
     Ok(())
 }
 
