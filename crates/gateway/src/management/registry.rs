@@ -71,6 +71,41 @@ async fn get_registry(State(state): State<Arc<AppState>>) -> Json<ModelRegistryS
     Json(safe_status(&state))
 }
 
+#[derive(Serialize)]
+struct RegistryModelEntry {
+    id: String,
+    owned_by: String,
+    providers: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct RegistryModelsResponse {
+    models: Vec<RegistryModelEntry>,
+}
+
+/// Which providers can serve which model. `owned_by` is a vendor label and
+/// cannot answer that question, so the answer comes from the registry bindings
+/// — the same provider ids `oauth-excluded-models` accepts.
+async fn get_registry_models(State(state): State<Arc<AppState>>) -> Json<RegistryModelsResponse> {
+    let pool = state.pool.load();
+    let mut models: Vec<RegistryModelEntry> = pool
+        .registry
+        .models()
+        .iter()
+        .map(|(id, descriptor)| RegistryModelEntry {
+            id: id.as_str().to_string(),
+            owned_by: descriptor.owned_by.clone(),
+            providers: descriptor
+                .bindings
+                .keys()
+                .map(|provider| provider.as_str().to_string())
+                .collect(),
+        })
+        .collect();
+    models.sort_by(|a, b| a.id.cmp(&b.id));
+    Json(RegistryModelsResponse { models })
+}
+
 async fn refresh_registry(
     State(state): State<Arc<AppState>>,
 ) -> (StatusCode, Json<RefreshResponse>) {
@@ -470,6 +505,7 @@ fn claim_stale_devin_refreshes(
 pub fn registry_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/model-registry", get(get_registry).post(refresh_registry))
+        .route("/model-registry/models", get(get_registry_models))
         .route("/devin/models/refresh", post(refresh_devin_models))
         .route("/devin/models/status", get(get_devin_models_status))
         .route("/devin/models", get(get_devin_models_status))
