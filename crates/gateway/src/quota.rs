@@ -6,7 +6,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::account::{AccountMember, ProviderKind};
 use crate::state::AppState;
 use crate::usage::{
-    parse_clinepass_usage_summary, parse_cursor_usage_summary, parse_kiro_usage_summary,
+    parse_clinepass_usage_summary, parse_cursor_usage_summary, parse_inferx_balance,
+    parse_kiro_usage_summary,
     ResetCredit, WhamResetCreditList, WhamUsage,
 };
 
@@ -337,11 +338,13 @@ async fn refresh_account_usage_inner(
     }
 }
 
-/// Generic accounts expose no per-provider quota API, except ClinePass: a
-/// `cline-pass` account on the canonical Cline endpoint reports the three
-/// subscription windows (5-hour / weekly / monthly) from `usage-limits` with
-/// the account's own API key as bearer auth. Everything else stays
-/// Unsupported so the UI renders "unknown" instead of a fake 0%.
+/// Generic accounts expose no per-provider quota API, except two hardcoded
+/// adapters: ClinePass (a `cline-pass` account on the canonical Cline
+/// endpoint reports the three subscription windows from `usage-limits`) and
+/// InferX (a prepaid marketplace whose `/v1/balance` reports a wallet in
+/// microcredits). Both authenticate with the account's own API key as bearer
+/// auth. Everything else stays Unsupported so the UI renders "unknown"
+/// instead of a fake 0%.
 async fn refresh_generic_usage(
     state: &AppState,
     member: &Arc<AccountMember>,
@@ -350,6 +353,25 @@ async fn refresh_generic_usage(
         Some(profile) => profile,
         None => return Err(QuotaError::Unsupported),
     };
+    // InferX is a prepaid wallet rather than a subscription, so its balance is
+    // the only quantity the upstream reports.
+    if provider.eq_ignore_ascii_case("inferx") {
+        let base = member
+            .upstream_override
+            .clone()
+            .or_else(|| member.generic_base_url())
+            .unwrap_or_default();
+        if base.trim().is_empty() {
+            return Err(QuotaError::Unsupported);
+        }
+        let url = format!("{}/balance", base.trim_end_matches('/'));
+        let client = state.client_for_member(member);
+        return refresh_json_usage(member, &client, &url, |body, now| {
+            parse_inferx_balance(body, now).unwrap_or_default()
+        })
+        .await;
+    }
+
     let is_clinepass = provider.eq_ignore_ascii_case("cline-pass")
         || models
             .iter()

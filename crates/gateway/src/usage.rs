@@ -972,6 +972,32 @@ pub fn parse_clinepass_usage_summary(
     })
 }
 
+/// InferX marketplace wallet. `GET /v1/balance` authenticates with the
+/// account's own key as bearer auth and reports the prepaid wallet in integer
+/// microcredits. There are no quota windows, so this fills only the credit
+/// fields rather than inventing a percentage the endpoint never reports.
+///
+/// Contract: `{microcreditsPerCredit, unit, wallet:{available, balance, held}}`.
+/// `available` is the spendable amount (`balance - held`) and is what an
+/// operator acts on, so it is the quantity reported here.
+pub fn parse_inferx_balance(body: &serde_json::Value, now_unix: i64) -> Option<AccountUsage> {
+    let per_credit = body
+        .get("microcreditsPerCredit")
+        .and_then(|v| v.as_f64())
+        .filter(|v| *v > 0.0)?;
+    let available = body
+        .get("wallet")?
+        .get("available")
+        .and_then(|v| v.as_f64())?;
+    let credits = available / per_credit;
+    Some(AccountUsage {
+        credits_balance: Some(credits),
+        has_credits: Some(credits > 0.0),
+        observed_at_unix: Some(now_unix),
+        ..Default::default()
+    })
+}
+
 /// One `balances[]` entry lifted out of a ZCode desktop log line.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ZcodeBalanceEntry {
@@ -2392,6 +2418,56 @@ mod tests {
         .is_none());
         let unknown_only = serde_json::json!({"success": true, "data": {"limits": [{"type": "yearly", "percentUsed": 1.0}]}});
         assert!(parse_clinepass_usage_summary(&unknown_only, now).is_none());
+    }
+
+    #[test]
+    fn inferx_balance_reports_spendable_credits() {
+        let now = 1_800_000_000;
+        let body = serde_json::json!({
+            "microcreditsPerCredit": 1_000_000,
+            "unit": "microcredits",
+            "wallet": {"available": 14_995_198, "balance": 15_000_000, "held": 4_802}
+        });
+        let usage = parse_inferx_balance(&body, now).expect("inferx balance");
+        assert_eq!(usage.credits_balance, Some(14.995198));
+        assert_eq!(usage.has_credits, Some(true));
+        assert_eq!(usage.observed_at_unix, Some(now));
+        // The endpoint reports no windows; a fabricated percent would be a lie.
+        assert!(usage.primary.used_percent.is_none());
+        assert!(usage.secondary.used_percent.is_none());
+        assert!(usage.groups.is_empty());
+    }
+
+    #[test]
+    fn inferx_balance_rejects_malformed_payloads() {
+        let now = 1_800_000_000;
+        assert!(parse_inferx_balance(&serde_json::json!({}), now).is_none());
+        // A zero divisor would turn the ratio into NaN/inf, never a balance.
+        assert!(parse_inferx_balance(
+            &serde_json::json!({"microcreditsPerCredit": 0, "wallet": {"available": 5}}),
+            now
+        )
+        .is_none());
+        assert!(
+            parse_inferx_balance(
+                &serde_json::json!({"microcreditsPerCredit": 1_000_000}),
+                now
+            )
+            .is_none(),
+            "a payload without a wallet is not a balance"
+        );
+    }
+
+    #[test]
+    fn inferx_balance_reports_an_empty_wallet_as_zero_not_unknown() {
+        let now = 1_800_000_000;
+        let usage = parse_inferx_balance(
+            &serde_json::json!({"microcreditsPerCredit": 1_000_000, "wallet": {"available": 0}}),
+            now,
+        )
+        .expect("a drained wallet is still a reported balance");
+        assert_eq!(usage.credits_balance, Some(0.0));
+        assert_eq!(usage.has_credits, Some(false));
     }
 
     #[test]
