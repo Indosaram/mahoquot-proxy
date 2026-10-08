@@ -341,6 +341,13 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&state),
         std::time::Duration::from_secs(config.usage_poll_secs),
     );
+    // Re-reads the signed model catalog on the configured interval. Without it
+    // the gateway served the compile-time embedded catalog until an operator
+    // triggered a refresh by hand.
+    let catalog_refresh = mahoquot_gateway::registry::spawn_catalog_refresh_poller(
+        Arc::clone(&state),
+        mahoquot_gateway::registry::catalog_refresh_check_interval(),
+    );
     mahoquot_gateway::egress_supervisor::spawn_egress_supervisor(
         state.clone(),
         std::time::Duration::from_secs(10),
@@ -356,6 +363,7 @@ async fn main() -> anyhow::Result<()> {
     // flight must not write behind the flush, and neither task may outlive the
     // server.
     usage_poller.shutdown().await;
+    catalog_refresh.shutdown().await;
     flush_worker.shutdown().await;
     // Final snapshot before the process exits, so a replay that arrived inside
     // the coalescing window is not lost.

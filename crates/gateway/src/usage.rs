@@ -1171,6 +1171,19 @@ pub struct WhamModelUsageEntry {
     pub credits_would_enable: Option<bool>,
 }
 
+/// Whether a `model_usage` key is an upstream conversation identifier rather
+/// than a model.
+///
+/// The usage payload mixes per-conversation counters into `model_usage` under a
+/// `chat_<digits>` namespace. Treating those keys as models invented catalog
+/// entries such as `chat_20706`, so they are dropped at ingestion instead. The
+/// match is deliberately narrow: real ids such as `tab_flash_lite_preview` also
+/// carry underscores and must survive.
+pub fn is_conversation_id(id: &str) -> bool {
+    id.strip_prefix("chat_")
+        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct WhamAdditionalRateLimit {
     pub limit_name: String,
@@ -1422,6 +1435,7 @@ impl WhamUsage {
         // 4. Model availability metadata (NOT invented percentages from usage counters)
         let model_availability = self.model_usage.map(|mu| {
             mu.into_iter()
+                .filter(|(id, _)| !is_conversation_id(id))
                 .map(|(k, v)| {
                     (
                         k,
@@ -3507,6 +3521,18 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn conversation_ids_never_become_model_availability() {
+        let raw = r#"{"model_usage":{"gemini-3-flash":{"available":true},"chat_20706":{"available":true},"tab_flash_lite_preview":{"available":true}}}"#;
+        let wham: WhamUsage = serde_json::from_str(raw).expect("deserializes");
+
+        let usage = wham.into_account_usage(1_790_954_000);
+        let avail = usage.model_availability.expect("availability present");
+
+        assert!(avail.contains_key("gemini-3-flash"));
+        assert!(avail.contains_key("tab_flash_lite_preview"));
+        assert!(!avail.contains_key("chat_20706"));
+    }
     fn parses_live_pro_wham_payload_with_chatpass_and_model_availability() {
         let raw = r#"{
           "rate_limit": {

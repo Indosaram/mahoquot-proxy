@@ -184,6 +184,19 @@ pub struct GenericAccount {
     pub disabled: bool,
 }
 
+/// Strips the routing prefix that selects which Claude lane serves a model.
+///
+/// The prefix is a lane selector, not evidence about the model: only the
+/// catalog's bindings decide whether the id is a Claude model at all.
+fn strip_claude_route_prefix(model: &str) -> &str {
+    model
+        .strip_prefix("anthropic-")
+        .or_else(|| model.strip_prefix("anthropic/"))
+        .or_else(|| model.strip_prefix("nekos-"))
+        .or_else(|| model.strip_prefix("nekos/"))
+        .unwrap_or(model)
+}
+
 impl ProviderKind {
     /// Whether this provider can serve the model at all. The four newer
     /// providers publish a closed catalogue, so they must not claim a model they
@@ -191,11 +204,25 @@ impl ProviderKind {
     /// request and send it to the wrong upstream. Codex keeps its historical
     /// open-ended rule, since its model names are not enumerable.
     pub fn serves_model(&self, model: &str) -> bool {
+        self.serves_model_in(mahoquot_registry::embedded_snapshot(), model)
+    }
+
+    /// Registry-authoritative variant of [`Self::serves_model`].
+    ///
+    /// The provider a model belongs to is read from the active catalog's
+    /// bindings, never inferred from the model's name: an id that reads like a
+    /// native Anthropic model but is bound to Antigravity must not be claimed by
+    /// a Claude account.
+    pub fn serves_model_in(
+        &self,
+        snapshot: &mahoquot_registry::RegistrySnapshot,
+        model: &str,
+    ) -> bool {
         match self {
             ProviderKind::Codex => {
-                !is_antigravity_model(model)
-                    && !mahoquot_providers::is_claude_model(model)
-                    && !mahoquot_providers::is_zcode_model(model)
+                !mahoquot_providers::antigravity::is_antigravity_model_in_snapshot(snapshot, model)
+                    && !mahoquot_providers::claude::is_claude_model_in_snapshot(snapshot, model)
+                    && !mahoquot_providers::zcode::is_zcode_model_in_snapshot(snapshot, model)
                     && !model.starts_with("cursor-")
                     && !model.starts_with("cursor/")
                     && !model.starts_with("kiro/")
@@ -204,38 +231,34 @@ impl ProviderKind {
                     && !model.starts_with("nekos-")
                     && !model.starts_with("nekos/")
                     && model != "auto-kiro"
-                    && !mahoquot_providers::is_vertex_model(model)
+                    && !mahoquot_providers::vertex::is_vertex_model_in_snapshot(snapshot, model)
                     && !model.starts_with("devin-")
                     && !model.starts_with("devin/")
                     && model != "devin"
             }
-            ProviderKind::Antigravity => is_antigravity_model(model),
-            ProviderKind::Claude => {
-                if let Some(stripped) = model
-                    .strip_prefix("anthropic-")
-                    .or_else(|| model.strip_prefix("anthropic/"))
-                {
-                    mahoquot_providers::is_claude_model(stripped) || stripped.starts_with("claude-")
-                } else if let Some(stripped) = model
-                    .strip_prefix("nekos-")
-                    .or_else(|| model.strip_prefix("nekos/"))
-                {
-                    mahoquot_providers::is_claude_model(stripped) || stripped.starts_with("claude-")
-                } else {
-                    mahoquot_providers::is_claude_model(model) || model.starts_with("claude-")
-                }
+            ProviderKind::Antigravity => {
+                mahoquot_providers::antigravity::is_antigravity_model_in_snapshot(snapshot, model)
             }
+            ProviderKind::Claude => mahoquot_providers::claude::is_claude_model_in_snapshot(
+                snapshot,
+                strip_claude_route_prefix(model),
+            ),
             ProviderKind::Cursor => {
-                model.starts_with("cursor/") || mahoquot_providers::is_cursor_model(model)
+                model.starts_with("cursor/")
+                    || mahoquot_providers::cursor::is_cursor_model_in_snapshot(snapshot, model)
             }
             ProviderKind::Kiro => {
                 model == "auto-kiro"
-                    || model
-                        .strip_prefix("kiro/")
-                        .is_some_and(mahoquot_providers::is_kiro_model)
+                    || model.strip_prefix("kiro/").is_some_and(|stripped| {
+                        mahoquot_providers::kiro::is_kiro_model_in_snapshot(snapshot, stripped)
+                    })
             }
-            ProviderKind::Zcode => mahoquot_providers::is_zcode_model(model),
-            ProviderKind::Vertex => mahoquot_providers::is_vertex_model(model),
+            ProviderKind::Zcode => {
+                mahoquot_providers::zcode::is_zcode_model_in_snapshot(snapshot, model)
+            }
+            ProviderKind::Vertex => {
+                mahoquot_providers::vertex::is_vertex_model_in_snapshot(snapshot, model)
+            }
             ProviderKind::Devin => false,
             ProviderKind::Generic => true,
         }
@@ -323,6 +346,94 @@ mod provider_kind_contract_tests {
         assert!(codex.serves_model("o3-mini"));
         assert!(codex.serves_model("text-embedding-3-small"));
         assert!(codex.serves_model("custom-codex-open-model"));
+    }
+
+    /// Regression: the provider that serves a model is read from the catalog's
+    /// bindings, never from the shape of the model's id. A model bound only to
+    /// Antigravity must not be claimed by the Claude kind, and vice versa.
+    #[test]
+    fn provider_membership_follows_catalog_bindings_not_model_names() {
+        let registry = mahoquot_registry::embedded_snapshot();
+        let claude = mahoquot_registry::ProviderId::claude();
+        let antigravity = mahoquot_registry::ProviderId::antigravity();
+
+        let mut claude_bound = 0usize;
+        let mut antigravity_only = 0usize;
+
+        for (id, descriptor) in registry.models() {
+            let model = id.as_str();
+            if descriptor.bindings.contains_key(&claude) {
+                assert!(
+                    ProviderKind::Claude.serves_model_in(registry, model),
+                    "Claude must serve its catalog-bound model {model}"
+                );
+                assert!(
+                    ProviderKind::Claude.serves_model_in(registry, &format!("anthropic-{model}")),
+                    "the anthropic- lane prefix must resolve to the same Claude binding"
+                );
+                claude_bound += 1;
+            } else if descriptor.bindings.contains_key(&antigravity) {
+                assert!(
+                    !ProviderKind::Claude.serves_model_in(registry, model),
+                    "Claude must not claim Antigravity-only model {model}"
+                );
+                assert!(
+                    !ProviderKind::Claude.serves_model_in(registry, &format!("anthropic-{model}")),
+                    "an anthropic- prefix must not smuggle in Antigravity-only {model}"
+                );
+                assert!(
+                    !ProviderKind::Claude.serves_model_in(registry, &format!("nekos-{model}")),
+                    "a nekos- prefix must not smuggle in Antigravity-only {model}"
+                );
+                antigravity_only += 1;
+            }
+        }
+
+        assert!(
+            claude_bound > 0 && antigravity_only > 0,
+            "the catalog must exercise both sides of the boundary"
+        );
+    }
+
+    /// The account-level gate must agree with the kind-level one: a Claude
+    /// credential is never a candidate for an Antigravity-only model.
+    #[test]
+    fn claude_account_does_not_claim_antigravity_bound_models() {
+        let registry = mahoquot_registry::embedded_snapshot();
+        let claude = mahoquot_registry::ProviderId::claude();
+        let antigravity = mahoquot_registry::ProviderId::antigravity();
+
+        let member = AccountMember::for_test_with_id(
+            "claude-official",
+            ProviderAccount::Claude(
+                serde_json::from_value(serde_json::json!({
+                    "type": "claude",
+                    "email": "official@anthropic.com",
+                }))
+                .unwrap(),
+            ),
+        );
+
+        let mut checked = 0usize;
+        for (id, descriptor) in registry.models() {
+            let model = id.as_str();
+            if descriptor.bindings.contains_key(&claude) {
+                assert!(
+                    member.supports_model_in(registry, model),
+                    "Claude account must support its catalog-bound model {model}"
+                );
+            } else if descriptor.bindings.contains_key(&antigravity) {
+                assert!(
+                    !member.supports_model_in(registry, model),
+                    "Claude account must not support Antigravity-only model {model}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(
+            checked > 0,
+            "the catalog must bind models to Antigravity alone"
+        );
     }
 
     #[test]
@@ -541,7 +652,9 @@ mod provider_kind_contract_tests {
         };
 
         // Still exhausted: the bench must hold.
-        codex.set_health(Health::Cooldown { until_unix_ms: until_ms });
+        codex.set_health(Health::Cooldown {
+            until_unix_ms: until_ms,
+        });
         codex.set_usage(crate::usage::AccountUsage {
             primary: window(100.0, 7_200),
             secondary: window(40.0, 400_000),
@@ -550,7 +663,12 @@ mod provider_kind_contract_tests {
             ..Default::default()
         });
         assert!(!codex.release_codex_cooldown_if_quota_free(now_unix));
-        assert_eq!(codex.health(), Health::Cooldown { until_unix_ms: until_ms });
+        assert_eq!(
+            codex.health(),
+            Health::Cooldown {
+                until_unix_ms: until_ms
+            }
+        );
 
         // A reset credit freed both windows: the stale deadline must not pin it.
         codex.set_usage(crate::usage::AccountUsage {
@@ -568,7 +686,9 @@ mod provider_kind_contract_tests {
             email: "unknown@example.com".to_string(),
             ..Default::default()
         }));
-        unknown.set_health(Health::Cooldown { until_unix_ms: until_ms });
+        unknown.set_health(Health::Cooldown {
+            until_unix_ms: until_ms,
+        });
         assert!(!unknown.release_codex_cooldown_if_quota_free(now_unix));
 
         // Auth failures are never cleared by a quota poll.
@@ -1256,7 +1376,14 @@ impl AccountMember {
 
     /// Whether this member is a third-party relay (nekos / ccapi) rather than
     /// direct upstream.
+    ///
+    /// Only static relay API key accounts targeting a relay host are classified
+    /// as nekos relay accounts. OAuth subscription accounts using an upstream
+    /// override (e.g. proxying through ccapi) remain official subscription accounts.
     pub fn is_nekos_relay(&self) -> bool {
+        if self.relay_api_key().is_none() {
+            return false;
+        }
         self.upstream_override
             .as_deref()
             .into_iter()
@@ -1455,12 +1582,16 @@ impl AccountMember {
         let usage = self.usage.read().unwrap_or_else(|p| p.into_inner());
         match &usage.model_availability {
             Some(discovered) => {
-                discovered.get(model).and_then(|m| m.available).unwrap_or(false)
-                    || discovered.get(stripped).and_then(|m| m.available).unwrap_or(false)
+                discovered
+                    .get(model)
+                    .and_then(|m| m.available)
+                    .unwrap_or(false)
+                    || discovered
+                        .get(stripped)
+                        .and_then(|m| m.available)
+                        .unwrap_or(false)
             }
-            None => {
-                is_antigravity_model(model) || is_antigravity_model(stripped)
-            }
+            None => is_antigravity_model(model) || is_antigravity_model(stripped),
         }
     }
 
@@ -1700,6 +1831,20 @@ impl AccountMember {
     }
 
     pub fn supports_model(&self, model: &str) -> bool {
+        self.supports_model_in(mahoquot_registry::embedded_snapshot(), model)
+    }
+
+    /// Registry-authoritative variant of [`Self::supports_model`].
+    ///
+    /// A Claude account claims exactly the models the active catalog binds to the
+    /// claude provider. The name-shaped fallback is deliberately gone: it made a
+    /// Claude account answer for Antigravity's `-thinking` and `-5-5-*` entries
+    /// purely because their ids read like Anthropic model names.
+    pub fn supports_model_in(
+        &self,
+        snapshot: &mahoquot_registry::RegistrySnapshot,
+        model: &str,
+    ) -> bool {
         let declared = {
             let guard = self
                 .inner
@@ -1720,28 +1865,20 @@ impl AccountMember {
                     self.supports_devin_model(model, &canonical, upstream)
                 }
                 ProviderAccount::Claude(_) => {
-                    if let Some(stripped) = model
-                        .strip_prefix("anthropic-")
-                        .or_else(|| model.strip_prefix("anthropic/"))
-                    {
-                        !self.is_nekos_relay()
-                            && (mahoquot_providers::is_claude_model(stripped)
-                                || stripped.starts_with("claude-"))
-                    } else if let Some(stripped) = model
-                        .strip_prefix("nekos-")
-                        .or_else(|| model.strip_prefix("nekos/"))
-                    {
-                        self.is_nekos_relay()
-                            && (mahoquot_providers::is_claude_model(stripped)
-                                || stripped.starts_with("claude-"))
+                    let bound = mahoquot_providers::claude::is_claude_model_in_snapshot(
+                        snapshot,
+                        strip_claude_route_prefix(model),
+                    );
+                    if model.starts_with("anthropic-") || model.starts_with("anthropic/") {
+                        !self.is_nekos_relay() && bound
+                    } else if model.starts_with("nekos-") || model.starts_with("nekos/") {
+                        self.is_nekos_relay() && bound
                     } else {
-                        mahoquot_providers::is_claude_model(model) || model.starts_with("claude-")
+                        bound
                     }
                 }
-                ProviderAccount::Antigravity(_) => {
-                    self.supports_antigravity_model(model)
-                }
-                account => account.kind().serves_model(model),
+                ProviderAccount::Antigravity(_) => self.supports_antigravity_model(model),
+                account => account.kind().serves_model_in(snapshot, model),
             }
         };
         if !declared {

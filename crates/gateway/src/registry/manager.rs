@@ -260,6 +260,15 @@ impl CatalogManager {
         self.lkg_cache.path()
     }
 
+    /// Whether the periodic refresh is due, given the configured interval and the
+    /// last completed attempt. A never-attempted catalog is always due, which is
+    /// what makes a booted gateway pick up a newer signed catalog on its own
+    /// instead of serving the embedded snapshot until an operator POSTs.
+    pub fn refresh_due(&self, now: u64, interval_secs: u64) -> bool {
+        !self.refresh_in_flight()
+            && refresh_is_due(self.status().last_refresh_at, now, interval_secs)
+    }
+
     /// Apply a verified remote catalog update:
     /// 1. Cryptographically verify signature, anti-downgrade threshold, timestamp skew, and domain invariants.
     /// 2. Write verified payload and envelope atomically to LKG disk cache via tempfile + sync + rename with 0600 mode.
@@ -292,7 +301,12 @@ impl CatalogManager {
         now: u64,
     ) -> Result<Arc<RegistrySnapshot>, CatalogError> {
         let _apply = self.apply_lock.lock().unwrap();
-        let settings = self.settings.read().unwrap().as_ref().and_then(|s| s.upgrade());
+        let settings = self
+            .settings
+            .read()
+            .unwrap()
+            .as_ref()
+            .and_then(|s| s.upgrade());
         let _settings_write = settings.as_ref().map(|s| s.composition_lock());
         let current_active = self.active_snapshot.load();
         let lkg_ver = self.status().lkg_version;
@@ -310,18 +324,29 @@ impl CatalogManager {
         verified_snapshot.source = CatalogSource::RemoteSigned;
         let new_snapshot = Arc::new(verified_snapshot);
         let composed = match settings.as_ref() {
-            Some(settings) => Arc::new(settings.current().validate_against_registry(&new_snapshot)
-                .map_err(|err| CatalogError::InvalidState(err.to_string()))?),
+            Some(settings) => Arc::new(
+                settings
+                    .current()
+                    .validate_against_registry(&new_snapshot)
+                    .map_err(|err| CatalogError::InvalidState(err.to_string()))?,
+            ),
             None => new_snapshot.clone(),
         };
         let commit = || -> anyhow::Result<()> {
-            self.lkg_cache.write_atomically(envelope, canonical_payload)?;
+            self.lkg_cache
+                .write_atomically(envelope, canonical_payload)?;
             self.active_snapshot.store(new_snapshot.clone());
             Ok(())
         };
-        let runtime = self.unified_runtime.read().unwrap().as_ref().and_then(|r| r.upgrade());
+        let runtime = self
+            .unified_runtime
+            .read()
+            .unwrap()
+            .as_ref()
+            .and_then(|r| r.upgrade());
         if let Some(runtime) = runtime {
-            runtime.update_registry_with_commit(composed, commit)
+            runtime
+                .update_registry_with_commit(composed, commit)
                 .map_err(|err| CatalogError::InvalidState(err.to_string()))?;
         } else {
             commit().map_err(|err| CatalogError::InvalidState(err.to_string()))?;
@@ -449,6 +474,26 @@ impl CatalogManager {
                     "model registry refresh completed"
                 );
             }
+            // A pinned URL that was never published is the expected state of a
+            // deployment running on the embedded catalog. Record the attempt so
+            // the poller backs off to its interval, but leave the active catalog
+            // healthy instead of raising a staleness signal.
+            Err(CatalogError::RemoteUnpublished) => {
+                if let Ok(mut status) = self.status.write() {
+                    status.last_refresh_duration_ms = Some(duration_ms);
+                    status.last_refresh_at = Some(now);
+                    status.last_refresh_success = true;
+                    status.stale = false;
+                    status.last_rejection_reason = None;
+                    status.last_error = None;
+                }
+                tracing::debug!(
+                    outcome = "unpublished",
+                    duration_ms,
+                    "no signed catalog is published at the pinned URL; keeping the active catalog"
+                );
+                return Ok(self.current_snapshot());
+            }
             Err(err) => {
                 self.metrics
                     .registry_refresh
@@ -496,6 +541,9 @@ impl CatalogManager {
         if sig_resp.status() == reqwest::StatusCode::NOT_MODIFIED {
             return Ok(self.current_snapshot());
         }
+        if sig_resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(CatalogError::RemoteUnpublished);
+        }
 
         let sig_resp = sig_resp
             .error_for_status()
@@ -507,8 +555,8 @@ impl CatalogManager {
             .and_then(|h| h.to_str().ok())
             .map(|s| s.to_string());
 
-        let sig_bytes = read_stream_bounded_body(sig_resp, self.config.max_response_bytes, "signature")
-            .await?;
+        let sig_bytes =
+            read_stream_bounded_body(sig_resp, self.config.max_response_bytes, "signature").await?;
 
         let sig_text = String::from_utf8(sig_bytes)
             .map_err(|e| CatalogError::Http(format!("signature not UTF-8: {e}")))?;
@@ -530,6 +578,9 @@ impl CatalogManager {
         if cat_resp.status() == reqwest::StatusCode::NOT_MODIFIED {
             return Ok(self.current_snapshot());
         }
+        if cat_resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(CatalogError::RemoteUnpublished);
+        }
 
         let cat_resp = cat_resp
             .error_for_status()
@@ -541,8 +592,8 @@ impl CatalogManager {
             .and_then(|h| h.to_str().ok())
             .map(|s| s.to_string());
 
-        let payload_bytes = read_stream_bounded_body(cat_resp, self.config.max_response_bytes, "catalog")
-            .await?;
+        let payload_bytes =
+            read_stream_bounded_body(cat_resp, self.config.max_response_bytes, "catalog").await?;
 
         // 3. Verify and atomically apply
         if envelope.catalog_version == self.active_version() {
@@ -615,6 +666,7 @@ fn rejection_reason(error: &CatalogError) -> &'static str {
         CatalogError::Registry(_) => "registry",
         CatalogError::Verification(_) => "verification",
         CatalogError::Http(_) => "http",
+        CatalogError::RemoteUnpublished => "unpublished",
         CatalogError::InvalidState(_) => "invalid_state",
     }
 }
@@ -656,5 +708,136 @@ fn validate_url(url_str: &str) -> Result<(), CatalogError> {
         other => Err(CatalogError::Http(format!(
             "unsupported URL scheme '{other}' in {url_str}"
         ))),
+    }
+}
+
+/// Owns the periodic catalog refresh task so shutdown cancels it instead of
+/// leaving it detached with a live `Arc<AppState>`.
+pub struct CatalogRefreshHandle {
+    stop: Arc<tokio::sync::Notify>,
+    join: tokio::task::JoinHandle<()>,
+}
+
+impl CatalogRefreshHandle {
+    /// Signals the loop to stop, then aborts and awaits the join under a bounded
+    /// wait so a shutdown during an in-flight fetch never holds the process open.
+    pub async fn shutdown(self) {
+        self.stop.notify_one();
+        self.join.abort();
+        let _ = tokio::time::timeout(Duration::from_secs(5), self.join).await;
+    }
+}
+
+/// How often the poller wakes to re-evaluate the configured refresh interval.
+/// This is a check cadence, not the refresh interval itself: settings are
+/// re-read every tick so an operator toggling `refresh-enabled` or changing
+/// `refresh-interval-secs` takes effect without restarting the gateway.
+const CATALOG_REFRESH_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Drives the periodic signed-catalog refresh that the offline-first lifecycle
+/// documents (embedded -> LKG -> remote signed).
+///
+/// Without this loop nothing ever re-read the registry: the gateway booted on the
+/// compile-time embedded snapshot and stayed there until an operator POSTed
+/// `/v0/management/model-registry`, so a model added to the published catalog
+/// never reached a running gateway.
+///
+/// The first tick fires immediately, which is what makes a fresh boot adopt a
+/// newer signed catalog (or an existing LKG) on its own.
+pub fn spawn_catalog_refresh_poller(
+    state: Arc<crate::state::AppState>,
+    check_every: Duration,
+) -> CatalogRefreshHandle {
+    let stop = Arc::new(tokio::sync::Notify::new());
+    let stop_signal = Arc::clone(&stop);
+    let join = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(check_every);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {}
+                _ = stop_signal.notified() => break,
+            }
+            // An absent `model-catalog` block is not "refresh disabled": the
+            // settings defaults (enabled, pinned URLs, 3600s) are the contract,
+            // so an operator who never wrote the block still gets updates.
+            let settings = state
+                .settings
+                .current()
+                .model_catalog
+                .clone()
+                .unwrap_or_default();
+            if !settings.refresh_enabled {
+                continue;
+            }
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_secs())
+                .unwrap_or_default();
+            if state
+                .catalog
+                .refresh_due(now, settings.refresh_interval_secs)
+            {
+                let _ = state.catalog.enqueue_refresh();
+            }
+        }
+    });
+    CatalogRefreshHandle { stop, join }
+}
+
+/// The check cadence the gateway uses when it spawns the poller.
+pub fn catalog_refresh_check_interval() -> Duration {
+    CATALOG_REFRESH_CHECK_INTERVAL
+}
+
+/// Pure due check behind [`CatalogManager::refresh_due`].
+///
+/// A catalog that has never been refreshed is due immediately, so a boot adopts
+/// a newer signed catalog or an existing LKG without waiting a full interval.
+pub fn refresh_is_due(last_refresh_at: Option<u64>, now: u64, interval_secs: u64) -> bool {
+    match last_refresh_at {
+        None => true,
+        Some(last) => now.saturating_sub(last) >= interval_secs,
+    }
+}
+
+#[cfg(test)]
+mod refresh_poll_tests {
+    use super::*;
+
+    #[test]
+    fn a_never_refreshed_catalog_is_due_immediately() {
+        assert!(refresh_is_due(None, 1_700_000_000, 3600));
+    }
+
+    #[test]
+    fn a_recent_refresh_holds_until_the_interval_elapses() {
+        let last = 1_700_000_000u64;
+        assert!(!refresh_is_due(Some(last), last + 3_599, 3600));
+        assert!(refresh_is_due(Some(last), last + 3_600, 3600));
+        assert!(refresh_is_due(Some(last), last + 7_200, 3600));
+    }
+
+    #[test]
+    fn a_clock_that_moved_backwards_does_not_panic() {
+        assert!(!refresh_is_due(Some(1_700_000_000), 1_699_999_000, 3600));
+    }
+
+    /// An absent `model-catalog` block must not disable refreshing: the settings
+    /// defaults are the contract the poller falls back to.
+    #[test]
+    fn absent_catalog_settings_still_refresh_on_the_default_interval() {
+        let settings = crate::management::settings::ModelCatalogSettings::default();
+        assert!(settings.refresh_enabled);
+        assert_eq!(settings.refresh_interval_secs, 3600);
+        assert!(!settings.url.is_empty());
+        assert!(!settings.signature_url.is_empty());
+    }
+
+    #[test]
+    fn the_booted_manager_reports_the_first_refresh_as_due() {
+        let manager = CatalogManager::boot(CatalogConfig::default(), 1_700_000_000);
+        assert!(manager.status().last_refresh_at.is_none());
+        assert!(manager.refresh_due(1_700_000_000, 3600));
     }
 }

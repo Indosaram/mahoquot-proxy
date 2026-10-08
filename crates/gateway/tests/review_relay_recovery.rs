@@ -22,6 +22,7 @@ const CODEX_REQUEST: &str = r#"{"model":"gpt-5.6-sol","stream":false,"input":"hi
 const FORBIDDEN_BODY: &str = r#"{"error":{"message":"workspace policy denied this request"}}"#;
 const UNAUTHORIZED_BODY: &str = r#"{"error":{"message":"credential is no longer valid"}}"#;
 const REFUSED_GRANT: &str = r#"{"error":"invalid_grant"}"#;
+const VALIDATION_BODY: &str = r#"{"code":403,"message":"Verify your account to continue.","status":"PERMISSION_DENIED","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"VALIDATION_REQUIRED","domain":"cloudcode-pa.googleapis.com","metadata":{"validation_url":"https://accounts.google.com/signin/continue?fixture=1"}}]}"#;
 const REFRESHED_TOKENS: &str = r#"{"access_token":"refreshed_at_123","refresh_token":"refreshed_rt_123","id_token":"refreshed_idt_123","token_type":"Bearer","expires_in":3600}"#;
 
 struct Fixture {
@@ -260,6 +261,41 @@ async fn a_forbidden_denial_fails_over_without_quarantining_the_account() {
         "{body}"
     );
     assert_eq!(health_of(&state), vec![Health::Available; 2]);
+}
+
+#[tokio::test]
+async fn antigravity_validation_identifies_the_account_and_requires_reauthentication() {
+    // Given an Antigravity account with an account-verification challenge.
+    let mut fixture = Fixture::new("qg-antigravity-validation");
+    let listener = bind_fixture_listener().await;
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    fixture.servers.push(tokio::spawn(async move {
+        axum::serve(listener, Router::new().fallback(|| async {
+            (StatusCode::FORBIDDEN, [("content-type", "application/json")], VALIDATION_BODY)
+        })).await.unwrap();
+    }));
+    std::fs::write(fixture.dir.join("antigravity-verify.json"), serde_json::json!({
+        "type": "antigravity", "identity_slug": "verify@example.test",
+        "email": "verify@example.test", "access_token": "fixture-token",
+        "refresh_token": "fixture-refresh", "project_id": "fixture-project",
+        "expired": "2099-01-01T00:00:00Z", "upstream_override": upstream
+    }).to_string()).unwrap();
+    let state = state_for(&fixture.dir, "http://127.0.0.1:1/unused".to_string(), false);
+
+    // When the request receives VALIDATION_REQUIRED.
+    let (status, body) = relay(Arc::clone(&state), "/v1/chat/completions",
+        r#"{"model":"gemini-3.8-flash-high","messages":[{"role":"user","content":"hi"}]}"#).await;
+
+    // Then the response identifies the account and preserves Google's challenge.
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(health_of(&state), vec![Health::AuthFailed]);
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["account_id"], state.pool.load().members[0].id());
+    assert!(body["message"].as_str().unwrap().contains("verify@example.test"));
+    assert_eq!(body["details"][0]["reason"], "VALIDATION_REQUIRED");
+    let error = state.monitor.last_error(state.pool.load().members[0].id()).unwrap();
+    assert_eq!(error.status, 403);
+    assert!(error.message.contains("VALIDATION_REQUIRED"));
 }
 
 /// With refresh disabled there is no second chance: a 401 is terminal and the

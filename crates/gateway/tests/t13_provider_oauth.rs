@@ -760,9 +760,43 @@ struct MockAntigravityServerState {
 
 #[tokio::test]
 async fn test_antigravity_oauth_flow_end_to_end() {
+    antigravity_oauth_flow(None, false, false).await;
+}
+
+#[tokio::test]
+async fn antigravity_reauthentication_updates_original_credential() {
+    antigravity_oauth_flow(Some(true), false, false).await;
+}
+
+#[tokio::test]
+async fn antigravity_login_reuses_matching_email_credential() {
+    antigravity_oauth_flow(Some(false), false, false).await;
+}
+
+#[tokio::test]
+async fn antigravity_reauthentication_rejects_a_different_google_account() {
+    antigravity_oauth_flow(Some(true), true, false).await;
+}
+
+#[tokio::test]
+async fn antigravity_eligibility_denial_preserves_existing_credentials() {
+    antigravity_oauth_flow(Some(true), false, true).await;
+}
+
+async fn antigravity_oauth_flow(reauth: Option<bool>, different_account: bool, eligibility_denied: bool) {
     let auth_dir = unique_temp_dir("qg-t13-antigravity");
     std::fs::remove_dir_all(&auth_dir).ok();
     std::fs::create_dir_all(&auth_dir).unwrap();
+
+    let original_name = "antigravity-original-import.json";
+    if reauth.is_some() {
+        std::fs::write(auth_dir.join(original_name), json!({
+            "type": "antigravity", "email": if different_account { "other@studio.dev" } else { "antigravity.user@studio.dev" },
+            "identity_slug": "original-import", "access_token": "old-access",
+            "refresh_token": "old-refresh", "project_id": "old-project",
+            "expired": "2099-01-01T00:00:00Z", "label": "Preserved label"
+        }).to_string()).unwrap();
+    }
 
     let server_state = MockAntigravityServerState {
         token_hits: Arc::new(AtomicUsize::new(0)),
@@ -823,9 +857,15 @@ async fn test_antigravity_oauth_flow_end_to_end() {
                     );
                     let body_json: Value = serde_json::from_str(&body).unwrap();
                     assert_eq!(body_json["metadata"]["ideType"], "ANTIGRAVITY");
-                    Json(json!({
+                    if eligibility_denied {
+                        return (StatusCode::FORBIDDEN, Json(json!({"error": {
+                            "code": 403, "message": "Verify your account to continue.",
+                            "details": [{"reason": "VALIDATION_REQUIRED"}]
+                        }})));
+                    }
+                    (StatusCode::OK, Json(json!({
                         "cloudaicompanionProject": "mock-cca-project-456"
-                    }))
+                    })))
                 },
             ),
         )
@@ -850,7 +890,7 @@ async fn test_antigravity_oauth_flow_end_to_end() {
     let app = create_app(app_state.clone());
 
     // 1. Request antigravity auth URL
-    let start_uri = format!(
+    let mut start_uri = format!(
         "/v0/management/antigravity-auth-url?auth_url={}&token_url={}&userinfo_url={}&load_url={}&redirect_uri={}",
         url_encode(auth_endpoint),
         url_encode(&token_url),
@@ -858,6 +898,14 @@ async fn test_antigravity_oauth_flow_end_to_end() {
         url_encode(&load_url),
         url_encode("http://localhost:51121/oauth-callback")
     );
+    if reauth == Some(true) {
+        start_uri.push_str(&format!("&credential_name={original_name}"));
+    }
+    if reauth.is_some() {
+        let member = app_state.pool.load().members[0].clone();
+        app_state.force_health(&member.id, mahoquot_types::Health::AuthFailed);
+        app_state.monitor.record_error(&member.id, 403, "VALIDATION_REQUIRED");
+    }
     let start = app
         .clone()
         .oneshot(
@@ -905,6 +953,21 @@ async fn test_antigravity_oauth_flow_end_to_end() {
         .unwrap();
     assert_eq!(callback.status(), StatusCode::OK);
 
+    if different_account || eligibility_denied {
+        let status = app.oneshot(Request::builder()
+            .uri(format!("/v0/management/get-auth-status?state={state}"))
+            .header(header::AUTHORIZATION, format!("Bearer {API_KEY}"))
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(body_json(status).await["status"], "error");
+        let saved: Value = serde_json::from_slice(&std::fs::read(auth_dir.join(original_name)).unwrap()).unwrap();
+        assert_eq!(saved["access_token"], "old-access");
+        assert_eq!(app_state.pool.load().members.len(), 1);
+        assert!(!auth_dir.join("antigravity-antigravity.user_studio.dev.json").exists());
+        mock_task.abort();
+        std::fs::remove_dir_all(auth_dir).unwrap();
+        return;
+    }
+
     // 3. Assert token exchange fields
     assert_eq!(server_state.token_hits.load(Ordering::SeqCst), 1);
     assert_eq!(server_state.userinfo_hits.load(Ordering::SeqCst), 1);
@@ -925,7 +988,7 @@ async fn test_antigravity_oauth_flow_end_to_end() {
     assert!(raw_token_body.contains("code_verifier="));
 
     // 4. Assert antigravity-<email>.json credential file exists and has correct fields
-    let cred_file = auth_dir.join("antigravity-antigravity.user_studio.dev.json");
+    let cred_file = auth_dir.join(if reauth.is_some() { original_name } else { "antigravity-antigravity.user_studio.dev.json" });
     assert!(
         cred_file.exists(),
         "antigravity credential file must exist: {cred_file:?}"
@@ -942,6 +1005,14 @@ async fn test_antigravity_oauth_flow_end_to_end() {
     assert_eq!(account.expires_in, 3600);
     assert!(account.timestamp > 0);
     assert!(!account.disabled);
+    if reauth.is_some() {
+        let saved: Value = serde_json::from_str(&cred_raw).unwrap();
+        assert_eq!(saved["identity_slug"], "original-import");
+        assert_eq!(saved["label"], "Preserved label");
+        assert!(!auth_dir.join("antigravity-antigravity.user_studio.dev.json").exists());
+        assert_eq!(app_state.pool.load().members.len(), 1);
+        assert!(app_state.monitor.last_error(&app_state.pool.load().members[0].id).is_none());
+    }
 
     // 5. Assert it joins the runtime pool
     let pool_members = app_state.pool.load().members.clone();

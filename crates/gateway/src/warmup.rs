@@ -150,10 +150,8 @@ pub fn available_models(state: &AppState, m: &AccountMember) -> Vec<String> {
         return vec![];
     }
     let provider = m.provider_name();
-    state
-        .pool
-        .load()
-        .registry
+    let pool = state.pool.load();
+    pool.registry
         .models()
         .iter()
         .filter(|(id, desc)| {
@@ -168,7 +166,9 @@ pub fn available_models(state: &AppState, m: &AccountMember) -> Vec<String> {
                     || id.as_str().contains("deepseek")
                     || id.as_str().contains("glm")));
 
-            is_provider_match && m.supports_model(id.as_str())
+            // The live registry decides membership; the account only narrows
+            // it to what it has actually been observed to serve.
+            is_provider_match && m.supports_model_in(&pool.registry, id.as_str())
         })
         .map(|(id, _)| id.as_str().to_owned())
         .collect()

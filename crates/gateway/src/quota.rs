@@ -701,9 +701,14 @@ async fn try_claude_usage(state: &AppState, member: &Arc<AccountMember>) -> Resu
                     cost_usd: totals.total_cost_usd,
                 },
             );
-            member.set_usage(crate::usage::parse_relay_account_usage(
-                &payload, totals, samples, now,
-            ));
+            let mut usage =
+                crate::usage::parse_relay_account_usage(&payload, totals, samples, now);
+            // Without these, `set_usage` inherits the previous failure's status
+            // and error text, so one transient send error stays on screen forever.
+            usage.refreshed_at_unix = Some(now);
+            usage.refresh_status = Some("ok".to_string());
+            usage.last_refresh_error = None;
+            member.set_usage(usage);
             return Ok(());
         }
         return Err(QuotaError::Upstream(
@@ -749,10 +754,13 @@ async fn try_claude_usage(state: &AppState, member: &Arc<AccountMember>) -> Resu
         .json()
         .await
         .map_err(|e| QuotaError::Upstream(e.to_string()))?;
-    let parsed = crate::usage::parse_claude_usage_summary(&body, now_unix());
+    let mut parsed = crate::usage::parse_claude_usage_summary(&body, now_unix());
     if parsed.observed_at_unix.is_none() {
         return Err(QuotaError::Upstream("usage payload had no windows".into()));
     }
+    parsed.refreshed_at_unix = Some(now_unix());
+    parsed.refresh_status = Some("ok".to_string());
+    parsed.last_refresh_error = None;
     member.set_usage(parsed);
     Ok(())
 }

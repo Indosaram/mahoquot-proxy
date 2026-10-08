@@ -17,6 +17,14 @@ pub enum CatalogError {
     #[error("HTTP error: {0}")]
     Http(String),
 
+    /// The remote catalog has never been published (404 on the pinned URLs).
+    ///
+    /// This is the normal state of an offline-first deployment that ships only
+    /// the embedded catalog: it is not a failure, so it must not mark the active
+    /// catalog stale or raise an operator-facing error.
+    #[error("remote catalog is not published")]
+    RemoteUnpublished,
+
     #[error("invalid state: {0}")]
     InvalidState(String),
 }

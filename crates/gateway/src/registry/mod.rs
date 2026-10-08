@@ -9,6 +9,7 @@ pub use crate::runtime_state::{
 pub use cache::{LkgCache, SignedCatalogPackage};
 pub use error::CatalogError;
 pub use manager::{
-    CatalogConfig, CatalogManager, CatalogStatus, RefreshEnqueue, RuntimeCatalog,
+    catalog_refresh_check_interval, spawn_catalog_refresh_poller, CatalogConfig, CatalogManager,
+    CatalogRefreshHandle, CatalogStatus, RefreshEnqueue, RuntimeCatalog,
     DEFAULT_REMOTE_CATALOG_URL, DEFAULT_REMOTE_SIGNATURE_URL,
 };

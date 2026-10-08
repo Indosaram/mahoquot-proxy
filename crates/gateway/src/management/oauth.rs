@@ -113,6 +113,7 @@ pub fn create_antigravity_auth_url(
         "client_secret": client_secret,
         "userinfo_url": userinfo_url,
         "load_url": load_url,
+        "credential_name": params.get("credential_name"),
     })
     .to_string();
 
@@ -280,7 +281,15 @@ async fn exchange_antigravity_code(
         .await;
 
     if let Ok(resp) = load_resp {
-        if resp.status().is_success() {
+        let status = resp.status();
+        if status == StatusCode::FORBIDDEN {
+            let body: Value = resp.json().await.map_err(|e| e.to_string())?;
+            let error = body.get("error").unwrap_or(&body);
+            return Err(format!(
+                "Antigravity eligibility check failed for {email}: {}. Verify this Google account in your browser, then reauthenticate.",
+                error.get("message").and_then(Value::as_str).unwrap_or("Google denied account eligibility")
+            ));
+        } else if status.is_success() {
             if let Ok(data) = resp.json::<Value>().await {
                 project_id = extract_antigravity_project_id(&data);
             }
@@ -328,7 +337,7 @@ async fn exchange_antigravity_code(
         .unwrap_or(0);
     let expired_rfc3339 = format_rfc3339(now_secs.saturating_add(expires_in.max(0) as u64));
 
-    let credential = json!({
+    let mut credential = json!({
         "type": "antigravity",
         "access_token": access_token,
         "refresh_token": refresh_token,
@@ -342,8 +351,48 @@ async fn exchange_antigravity_code(
 
     let filename = format!("antigravity-{}.json", sanitize_filename(&email));
     let auth_dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
+    let mut target = auth_dir.join(filename);
+    let requested_name = extra_meta.get("credential_name").and_then(Value::as_str);
+    let mut existing = None;
+    if let Some(name) = requested_name {
+        if name.is_empty() || name.contains(['/', '\\']) || !name.ends_with(".json") {
+            return Err("Invalid reauthentication credential name".to_string());
+        }
+        target = auth_dir.join(name);
+        let raw = tokio::fs::read(&target).await.map_err(|e| format!("Cannot read reauthentication target: {e}"))?;
+        existing = Some(serde_json::from_slice::<Value>(&raw).map_err(|e| e.to_string())?);
+    } else {
+        let mut entries = tokio::fs::read_dir(&auth_dir).await.map_err(|e| e.to_string())?;
+        while let Some(entry) = entries.next_entry().await.map_err(|e| e.to_string())? {
+            if entry.path().extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let raw = tokio::fs::read(entry.path()).await.map_err(|e| e.to_string())?;
+            if let Ok(value) = serde_json::from_slice::<Value>(&raw) {
+                if value["type"] == "antigravity" && value["email"].as_str().is_some_and(|old| old.eq_ignore_ascii_case(&email)) {
+                    if existing.is_some() {
+                        return Err("Multiple credentials match this Google account; reauthenticate from its account card".to_string());
+                    }
+                    target = entry.path();
+                    existing = Some(value);
+                }
+            }
+        }
+    }
+    if let Some(mut old) = existing {
+        if old["type"] != "antigravity" || !old["email"].as_str().is_some_and(|value| value.eq_ignore_ascii_case(&email)) {
+            return Err("Reauthentication used a different Google account; sign in with the original account".to_string());
+        }
+        if refresh_token.is_empty() {
+            credential["refresh_token"] = old["refresh_token"].clone();
+        }
+        if let (Some(old), Some(new)) = (old.as_object_mut(), credential.as_object()) {
+            old.extend(new.clone());
+        }
+        credential = old;
+    }
     let rendered = serde_json::to_string_pretty(&credential).map_err(|error| error.to_string())?;
-    write_session_credential(session, &auth_dir.join(filename), rendered.as_bytes())?;
+    write_session_credential(session, &target, rendered.as_bytes())?;
 
     session.saved_account_email = Some(email);
     session.status = SessionStatus::Completed;
@@ -2137,6 +2186,13 @@ pub async fn oauth_callback(
                     Ok(()) => {
                         if let Err(error) = state.rescan_pool() {
                             eprintln!("pool rescan failed after Antigravity onboarding: {error}");
+                        }
+                        for member in &state.pool.load().members {
+                            if member.kind() == crate::account::ProviderKind::Antigravity
+                                && member.email() == session.saved_account_email
+                            {
+                                state.monitor.clear_error(&member.id);
+                            }
                         }
                     }
                     Err(error) => session.status = SessionStatus::Failed(error),

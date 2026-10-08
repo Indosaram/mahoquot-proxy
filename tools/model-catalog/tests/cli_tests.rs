@@ -69,7 +69,13 @@ fn test_cli_validate_valid_catalog() {
     let (success, stdout, stderr) = run_catalog_tool(&["validate", cat.to_str().unwrap()]);
     assert!(success, "validation should succeed. stderr: {}", stderr);
     assert!(stdout.contains("Catalog valid:"));
-    assert!(stdout.contains("version: v1"));
+    // The version is derived from the catalog itself: pinning the literal makes
+    // this fail every time the shipped catalog is legitimately republished.
+    let embedded = mahoquot_registry::embedded_snapshot().version().0;
+    assert!(
+        stdout.contains(&format!("version: v{embedded}")),
+        "validate output must report the embedded catalog version v{embedded}, got: {stdout}"
+    );
 }
 
 #[test]
@@ -221,7 +227,11 @@ fn test_cli_verify_anti_downgrade() {
     ]);
     assert!(sign_ok, "sign failed: {}", sign_err);
 
-    // Active version is 2, incoming is 1 -> must fail
+    // The active version is pinned one above the shipped catalog, so the signed
+    // payload is always an incoming downgrade. Deriving it keeps this true as the
+    // catalog is republished.
+    let incoming = mahoquot_registry::embedded_snapshot().version().0;
+    let active = (incoming + 1).to_string();
     let (verify_ok, _, stderr) = run_catalog_tool(&[
         "verify",
         "--input",
@@ -229,7 +239,7 @@ fn test_cli_verify_anti_downgrade() {
         "--signature",
         out_sig.to_str().unwrap(),
         "--active-version",
-        "2",
+        active.as_str(),
     ]);
     assert!(!verify_ok, "downgrade should be rejected");
     assert!(stderr.contains("anti-downgrade check failed") || stderr.contains("Error"));

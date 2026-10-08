@@ -199,3 +199,76 @@ async fn claude_usage_is_polled_without_any_relayed_traffic() {
     mock_task.abort();
     std::fs::remove_dir_all(auth_dir).ok();
 }
+
+/// A transient poll failure must not outlive the next successful poll: the
+/// console reads `refresh_status`/`last_refresh_error` and used to keep showing
+/// "Quota refresh failed" after the endpoint had recovered.
+#[tokio::test]
+async fn claude_usage_success_clears_a_previous_refresh_failure() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    let usage_app = Router::new().route(
+        "/api/oauth/usage",
+        axum::routing::get(|| async {
+            axum::Json(serde_json::json!({
+                "five_hour": { "utilization": 12.0, "resets_at": "2026-08-30T03:50:00.351899+00:00" },
+                "seven_day": { "utilization": 34.0, "resets_at": "2026-09-02T00:00:00.351925+00:00" }
+            }))
+        }),
+    );
+    let mock_task = tokio::spawn(async move {
+        axum::serve(listener, usage_app).await.unwrap();
+    });
+
+    let auth_dir = common::unique_temp_dir("t16-claude-clears-error");
+    std::fs::write(
+        auth_dir.join("claude-recover.json"),
+        serde_json::to_string(&serde_json::json!({
+            "identity_slug": "claude-recover",
+            "access_token": "claude-token",
+            "refresh_token": "claude-refresh",
+            "email": "u@claude.test",
+            "expired": "2099-01-01T00:00:00Z",
+            "type": "claude",
+            "upstream_override": upstream,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let config = GatewayConfig {
+        auth_dir: auth_dir.clone(),
+        api_keys: mahoquot_gateway::inbound::ApiKeys::from_env_value("relay-key"),
+        auth_refresh_enabled: false,
+        max_failover: 3,
+        config_path: auth_dir.join("config.yaml"),
+        ..GatewayConfig::default()
+    };
+    let state = Arc::new(AppState::new(&config).unwrap());
+    let member = state
+        .pool
+        .load()
+        .members
+        .iter()
+        .find(|m| m.kind() == mahoquot_gateway::account::ProviderKind::Claude)
+        .expect("claude member")
+        .clone();
+
+    member.record_quota_refresh_failure(
+        "error sending request for url (https://api.anthropic.com/api/oauth/usage)",
+    );
+    assert_eq!(member.usage_snapshot().refresh_status.as_deref(), Some("error"));
+
+    mahoquot_gateway::quota::refresh_account_usage(&state, &member)
+        .await
+        .expect("poll claude usage");
+
+    let usage = member.usage_snapshot();
+    assert_eq!(usage.primary.used_percent, Some(12.0));
+    assert_eq!(usage.refresh_status.as_deref(), Some("ok"));
+    assert_eq!(usage.last_refresh_error, None);
+    assert!(usage.refreshed_at_unix.is_some());
+
+    mock_task.abort();
+    std::fs::remove_dir_all(auth_dir).ok();
+}

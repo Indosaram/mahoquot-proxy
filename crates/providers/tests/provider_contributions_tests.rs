@@ -157,7 +157,30 @@ fn test_claude_typed_contribution_and_capabilities() {
             "is_claude_model must return true for legacy model {id}"
         );
     }
-    assert_eq!(contrib.models.len(), 13);
+    // The catalog carries the whole current Claude line, not just the legacy
+    // 3.x/4.5 generation: a model missing here could not be requested from a
+    // Claude account at all. The count is derived from the catalog rather than
+    // pinned, so legitimately adding a model does not break this test.
+    let expected = mahoquot_registry::embedded_snapshot()
+        .contribution_for_provider(&ProviderId::claude())
+        .model_ids();
+    assert_eq!(contrib.models.len(), expected.len());
+    for id in [
+        "claude-fable-5",
+        "claude-fable-5-1",
+        "claude-opus-4-7",
+        "claude-opus-4-8",
+        "claude-opus-5",
+        "claude-sonnet-5",
+        "claude-opus-5-5",
+        "claude-sonnet-5-5",
+        "claude-haiku-5-5",
+    ] {
+        assert!(
+            contrib.supports_model(id),
+            "Claude contribution must support the current model {id}"
+        );
+    }
 
     let thinking_caps = contrib
         .capability_profile("claude-opus-4-5-20251101-thinking")

@@ -244,9 +244,27 @@ pub fn allow_list_admits(allow_list: &[String], candidate: &str) -> bool {
             .any(|allowed| allowed == "*" || allowed == candidate)
 }
 
+/// Whether the active catalog binds this model to the routing provider, read
+/// from the descriptor the registry publishes rather than from the model's
+/// name. An id that reads like a native Anthropic model but is bound to
+/// Antigravity (for example the `-thinking` and `-5-5-*` entries) must keep its
+/// antigravity identity: inferring the provider from the id is what let those
+/// models surface under the Claude lane.
+pub fn model_bound_to_provider(
+    registry: &mahoquot_registry::RegistrySnapshot,
+    model_id: &str,
+    provider_id: &mahoquot_registry::ProviderId,
+) -> bool {
+    mahoquot_registry::ModelId::new(model_id)
+        .ok()
+        .and_then(|id| registry.models().get(&id))
+        .is_some_and(|descriptor| descriptor.bindings.contains_key(provider_id))
+}
+
 pub fn expand_prefixed_models(
     entries: Vec<ModelEntry>,
     members: &[std::sync::Arc<AccountMember>],
+    registry: &mahoquot_registry::RegistrySnapshot,
 ) -> Vec<ModelEntry> {
     let has_official_claude = members.iter().any(|m| {
         m.kind() == ProviderKind::Claude && !m.is_nekos_relay() && !m.is_manually_disabled()
@@ -259,11 +277,10 @@ pub fn expand_prefixed_models(
         return entries;
     }
 
+    let claude_provider = mahoquot_registry::ProviderId::claude();
     let mut result = entries.clone();
     for entry in &entries {
-        if mahoquot_providers::is_claude_model(&entry.id)
-            || (entry.id.starts_with("claude-") && entry.owned_by != "google")
-        {
+        if model_bound_to_provider(registry, &entry.id, &claude_provider) {
             if has_official_claude {
                 result.push(ModelEntry {
                     id: format!("anthropic/{}", entry.id),
@@ -313,7 +330,7 @@ pub fn scoped_model_entries(
     }
 
     let visible = project_model_entries(&pool.registry, &permitted);
-    let visible = expand_prefixed_models(visible, &permitted);
+    let visible = expand_prefixed_models(visible, &permitted, &pool.registry);
     // Keep the published entry order and any account-contributed models that
     // projection alone would not reproduce.
     let mut entries: Vec<ModelEntry> = pool
@@ -1103,8 +1120,12 @@ mod tests {
         ];
 
         // 1. Both official and nekos active -> both prefixes generated
-        let expanded =
-            expand_prefixed_models(base_entries.clone(), &[official.clone(), nekos.clone()]);
+        let registry = mahoquot_registry::embedded_snapshot();
+        let expanded = expand_prefixed_models(
+            base_entries.clone(),
+            &[official.clone(), nekos.clone()],
+            registry,
+        );
         let ids: Vec<&str> = expanded.iter().map(|e| e.id.as_str()).collect();
         assert!(ids.contains(&"claude-3-7-sonnet-20250219"));
         assert!(ids.contains(&"anthropic-claude-3-7-sonnet-20250219"));
@@ -1115,18 +1136,83 @@ mod tests {
         assert!(!ids.contains(&"nekos-gpt-4o"));
 
         // 2. Only official active -> only anthropic prefixes generated
-        let expanded = expand_prefixed_models(base_entries.clone(), &[official]);
+        let expanded = expand_prefixed_models(base_entries.clone(), &[official], registry);
         let ids: Vec<&str> = expanded.iter().map(|e| e.id.as_str()).collect();
         assert!(ids.contains(&"anthropic-claude-3-7-sonnet-20250219"));
         assert!(ids.contains(&"anthropic/claude-3-7-sonnet-20250219"));
         assert!(!ids.contains(&"nekos-claude-3-7-sonnet-20250219"));
 
         // 3. Only nekos active -> only nekos prefixes generated
-        let expanded = expand_prefixed_models(base_entries, &[nekos]);
+        let expanded = expand_prefixed_models(base_entries, &[nekos], registry);
         let ids: Vec<&str> = expanded.iter().map(|e| e.id.as_str()).collect();
         assert!(!ids.contains(&"anthropic-claude-3-7-sonnet-20250219"));
         assert!(ids.contains(&"nekos-claude-3-7-sonnet-20250219"));
         assert!(ids.contains(&"nekos/claude-3-7-sonnet-20250219"));
+    }
+
+    /// Regression: a model id that reads like a native Anthropic model but is
+    /// bound to Antigravity must never gain an `anthropic-`/`nekos-` alias. The
+    /// expansion used to key off the model's name, which surfaced Antigravity's
+    /// `-thinking` and `-5-5-*` entries under the Claude lanes.
+    #[test]
+    fn prefixed_expansion_follows_catalog_bindings_not_model_names() {
+        let registry = mahoquot_registry::embedded_snapshot();
+        let claude = ProviderId::claude();
+        let antigravity = ProviderId::antigravity();
+
+        let antigravity_only = registry
+            .models()
+            .iter()
+            .find(|(_, descriptor)| {
+                descriptor.bindings.contains_key(&antigravity)
+                    && !descriptor.bindings.contains_key(&claude)
+            })
+            .map(|(id, _)| id.as_str().to_string())
+            .expect("catalog must bind at least one model to Antigravity alone");
+        let claude_bound = registry
+            .models()
+            .iter()
+            .find(|(_, descriptor)| descriptor.bindings.contains_key(&claude))
+            .map(|(id, _)| id.as_str().to_string())
+            .expect("catalog must bind at least one model to Claude");
+
+        let official = Arc::new(AccountMember::for_test_with_id(
+            "claude-official",
+            ProviderAccount::Claude(
+                serde_json::from_value(json!({
+                    "type": "claude",
+                    "email": "official@anthropic.com",
+                }))
+                .unwrap(),
+            ),
+        ));
+
+        let base_entries = vec![
+            ModelEntry {
+                id: antigravity_only.clone(),
+                owned_by: "google".to_string(),
+            },
+            ModelEntry {
+                id: claude_bound.clone(),
+                owned_by: "anthropic".to_string(),
+            },
+        ];
+
+        let expanded = expand_prefixed_models(base_entries, &[official], registry);
+        let ids: Vec<&str> = expanded.iter().map(|e| e.id.as_str()).collect();
+
+        assert!(
+            !ids.contains(&format!("anthropic-{antigravity_only}").as_str()),
+            "Antigravity-only {antigravity_only} must not gain an anthropic alias"
+        );
+        assert!(
+            !ids.contains(&format!("anthropic/{antigravity_only}").as_str()),
+            "Antigravity-only {antigravity_only} must not gain an anthropic alias"
+        );
+        assert!(
+            ids.contains(&format!("anthropic-{claude_bound}").as_str()),
+            "Claude-bound {claude_bound} must gain an anthropic alias"
+        );
     }
 
     #[test]

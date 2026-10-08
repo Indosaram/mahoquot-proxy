@@ -110,6 +110,56 @@ fn runtime_candidates_obey_exclusions_and_canonical_unsupported_models() {
 }
 
 #[test]
+fn bare_claude_models_never_route_to_the_relay_account() {
+    // Given: one official subscription account and one nekos/ccapi relay account.
+    let auth_dir = common::unique_temp_dir("proxy-bare-claude-lane");
+    std::fs::write(
+        auth_dir.join("claude-official.json"),
+        json!({
+            "type": "claude", "identity_slug": "official",
+            "access_token": "fixture", "expired": "2099-01-01T00:00:00Z"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        auth_dir.join("claude-ccapi.json"),
+        json!({
+            "type": "claude", "identity_slug": "claude-ccapi",
+            "api_key": "sk-clb-fixture",
+            "upstream_override": "https://ccapi.labs.mengmota.com/anthropic",
+            "usage_override": "https://claude.nekos.me"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let state = AppState::new(&GatewayConfig {
+        auth_dir: auth_dir.clone(),
+        config_path: auth_dir.join("config.yaml"),
+        auth_refresh_enabled: false,
+        ..GatewayConfig::default()
+    })
+    .unwrap();
+    let pool = state.pool.load_full();
+    assert_eq!(pool.members.len(), 2);
+    let canonical = "claude-3-7-sonnet-20250219";
+
+    // When: candidates are projected for the bare, anthropic- and nekos- spellings.
+    let ids = |model: &str| -> Vec<bool> {
+        pool.routable_accounts_for_model(model)
+            .iter()
+            .map(|m| m.is_nekos_relay())
+            .collect()
+    };
+
+    // Then: the bare id is the subscription lane and the relay needs its prefix.
+    assert_eq!(ids(canonical), vec![false]);
+    assert_eq!(ids(&format!("anthropic-{canonical}")), vec![false]);
+    assert_eq!(ids(&format!("nekos-{canonical}")), vec![true]);
+    std::fs::remove_dir_all(auth_dir).unwrap();
+}
+
+#[test]
 fn sse_decodes_optional_spaces_multiline_data_and_all_line_endings() {
     // Given: equivalent SSE events, including a split UTF-8 character.
     for frame in [

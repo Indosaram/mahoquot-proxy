@@ -256,6 +256,9 @@ impl PoolSnapshot {
                     {
                         return false;
                     }
+                    None if m.kind() == ProviderKind::Claude && m.is_nekos_relay() => {
+                        return false;
+                    }
                     _ => {}
                 }
                 resolved.eligible_bindings.iter().any(|binding| {
@@ -443,6 +446,11 @@ fn registry_with_account_contributions(
                         if !avail.available.unwrap_or(true) {
                             continue;
                         }
+                        // The usage payload carries per-conversation counters under the
+                        // same map; they are not models and must never be published.
+                        if crate::usage::is_conversation_id(model_name) {
+                            continue;
+                        }
                         let model_id = match ModelId::new(model_name) {
                             Ok(id) => id,
                             Err(err) => {
@@ -524,7 +532,7 @@ pub fn compute_candidate_composition(
     let registry = Arc::new(effective_registry);
 
     let models = crate::models_route::project_model_entries(&registry, &members);
-    let models = crate::models_route::expand_prefixed_models(models, &members);
+    let models = crate::models_route::expand_prefixed_models(models, &members, &registry);
 
     Ok(RuntimeComposition::new(
         generation, members, models, registry,

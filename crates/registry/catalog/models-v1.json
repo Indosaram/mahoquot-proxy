@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 5,
   "source": "embedded_fallback",
   "models": {
     "claude-3-5-sonnet-20241022": {
@@ -64,6 +64,68 @@
         "context_limit": "200000"
       }
     },
+    "claude-fable-5": {
+      "id": "claude-fable-5",
+      "owned_by": "anthropic",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "claude": {
+          "provider_id": "claude",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1000000"
+      }
+    },
+    "claude-fable-5-1": {
+      "id": "claude-fable-5-1",
+      "owned_by": "anthropic",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "claude": {
+          "provider_id": "claude",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1000000"
+      }
+    },
     "claude-haiku-4-5": {
       "id": "claude-haiku-4-5",
       "owned_by": "anthropic",
@@ -124,6 +186,37 @@
       "aliases": [],
       "metadata": {
         "context_limit": "200000"
+      }
+    },
+    "claude-haiku-5-5": {
+      "id": "claude-haiku-5-5",
+      "owned_by": "anthropic",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "claude": {
+          "provider_id": "claude",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1000000"
       }
     },
     "claude-opus-4-5": {
@@ -281,8 +374,101 @@
         "context_limit": "250000"
       }
     },
+    "claude-opus-4-7": {
+      "id": "claude-opus-4-7",
+      "owned_by": "anthropic",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "claude": {
+          "provider_id": "claude",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1000000"
+      }
+    },
+    "claude-opus-4-8": {
+      "id": "claude-opus-4-8",
+      "owned_by": "anthropic",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "claude": {
+          "provider_id": "claude",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1000000"
+      }
+    },
     "claude-opus-5": {
       "id": "claude-opus-5",
+      "owned_by": "anthropic",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "claude": {
+          "provider_id": "claude",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1000000"
+      }
+    },
+    "claude-opus-5-5": {
+      "id": "claude-opus-5-5",
       "owned_by": "anthropic",
       "capabilities": [
         "chat",
@@ -451,6 +637,92 @@
       "aliases": [],
       "metadata": {
         "context_limit": "1000000"
+      }
+    },
+    "claude-sonnet-5": {
+      "id": "claude-sonnet-5",
+      "owned_by": "anthropic",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "claude": {
+          "provider_id": "claude",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1000000"
+      }
+    },
+    "claude-sonnet-5-5": {
+      "id": "claude-sonnet-5-5",
+      "owned_by": "anthropic",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "claude": {
+          "provider_id": "claude",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1000000"
+      }
+    },
+    "cline-free/gemini-3.8-flash": {
+      "id": "cline-free/gemini-3.8-flash",
+      "owned_by": "google",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1048576"
+      }
+    },
+    "cline-free/mimo-v2.6-flash": {
+      "id": "cline-free/mimo-v2.6-flash",
+      "owned_by": "xiaomi",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1048576"
       }
     },
     "cursor-fast": {
@@ -3542,30 +3814,6 @@
       "aliases": [],
       "metadata": {
         "context_limit": "256000"
-      }
-    },
-    "cline-free/gemini-3.8-flash": {
-      "id": "cline-free/gemini-3.8-flash",
-      "owned_by": "google",
-      "capabilities": [
-        "chat",
-        "tools"
-      ],
-      "aliases": [],
-      "metadata": {
-        "context_limit": "1048576"
-      }
-    },
-    "cline-free/mimo-v2.6-flash": {
-      "id": "cline-free/mimo-v2.6-flash",
-      "owned_by": "xiaomi",
-      "capabilities": [
-        "chat",
-        "tools"
-      ],
-      "aliases": [],
-      "metadata": {
-        "context_limit": "1048576"
       }
     }
   },

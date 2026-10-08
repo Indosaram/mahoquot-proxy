@@ -2492,7 +2492,15 @@ fn eligible_indices(
                     continue;
                 }
             }
-            None => {}
+            // A bare `claude-*` id is the subscription lane: the nekos/ccapi relay
+            // is reachable only through the explicit `nekos-` prefix.
+            None => {
+                if member.kind() == crate::account::ProviderKind::Claude
+                    && member.is_nekos_relay()
+                {
+                    continue;
+                }
+            }
         }
         // A quota group benched by its own 429 (Antigravity gemini vs 3p)
         // excludes only the models that bill against it.
@@ -5071,11 +5079,12 @@ mod routing_tests {
         );
         assert_eq!(eligible, vec![nekos_idx]);
 
-        // 5. Bare unprefixed model routes to BOTH accounts
+        // 5. Bare unprefixed model is the subscription lane: it routes ONLY to
+        // official accounts and never falls back to the nekos/ccapi relay
         let route = resolve_route(&pool, Some("claude-3-7-sonnet-20250219"), None)
             .unwrap()
             .unwrap();
-        let mut eligible = eligible_indices(
+        let eligible = eligible_indices(
             &pool,
             Some(&route),
             Some("claude-3-7-sonnet-20250219"),
@@ -5084,10 +5093,7 @@ mod routing_tests {
             None,
             &state,
         );
-        eligible.sort();
-        let mut expected = vec![official_idx, nekos_idx];
-        expected.sort();
-        assert_eq!(eligible, expected);
+        assert_eq!(eligible, vec![official_idx]);
 
         // 6. Date-less shorthand models also resolve properly
         let route = resolve_route(&pool, Some("anthropic-claude-3-7-sonnet"), None)

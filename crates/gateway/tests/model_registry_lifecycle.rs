@@ -914,8 +914,16 @@ async fn test_lifecycle_09_account_add_delete_during_refresh() {
     let (signer, keyring) = test_signer_and_keyring("key-09");
     let now = 1_700_000_000;
 
+    // Versions are derived from the embedded catalog so this scenario keeps
+    // exercising a genuine upgrade as the shipped catalog advances; hardcoding
+    // them would make the incoming version stop being newer than the embedded
+    // one and the refresh would be rejected as a downgrade.
+    let embedded = mahoquot_registry::embedded_snapshot().version().0;
+    let v1 = embedded;
+    let v2 = embedded + 1;
+
     // Initial catalog V1 has model-1
-    let (snap_v1, payload_v1) = sample_catalog(1, "claude-v1");
+    let (snap_v1, payload_v1) = sample_catalog(v1, "claude-v1");
     let env_v1 = signer
         .sign_catalog(snap_v1.version(), now, None, &payload_v1)
         .unwrap();
@@ -924,7 +932,7 @@ async fn test_lifecycle_09_account_add_delete_during_refresh() {
         .unwrap();
 
     // Catalog V2 adds model-2
-    let mut builder_v2 = RegistryBuilder::new(CatalogVersion(2), CatalogSource::RemoteSigned);
+    let mut builder_v2 = RegistryBuilder::new(CatalogVersion(v2), CatalogSource::RemoteSigned);
     builder_v2.register_provider(ProviderId::claude(), ProviderPolicy::Closed);
     let mut m1 = ModelDescriptor::new(ModelId::new("claude-v1").unwrap(), "anthropic");
     m1.capabilities.insert(ModelCapability::Chat);
@@ -1056,7 +1064,7 @@ async fn test_lifecycle_09_account_add_delete_during_refresh() {
 
     // Verify atomic state: both accounts and catalog V2 are present
     let snap_after_refresh = runtime.load();
-    assert_eq!(snap_after_refresh.registry().version(), CatalogVersion(2));
+    assert_eq!(snap_after_refresh.registry().version(), CatalogVersion(v2));
     assert_eq!(snap_after_refresh.members().len(), 2);
     assert_eq!(
         snap_after_refresh
@@ -1371,6 +1379,81 @@ async fn test_lifecycle_12_stream_bounded_response_reading() {
     assert_eq!(manager.active_version(), CatalogVersion(100));
 
     // Cleanup server
+    let _ = shutdown_tx.send(());
+    server_handle.await.unwrap();
+    assert_port_released(port);
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+/// A pinned URL that was never published is the normal state of an offline-first
+/// deployment, not a failure: the refresh must keep the active catalog healthy
+/// instead of raising a staleness signal on every poll.
+#[tokio::test]
+async fn an_unpublished_remote_catalog_leaves_the_active_catalog_healthy() {
+    let tmp = unique_temp_dir("unpublished-catalog");
+    let lkg_path = tmp.join("models-v1.signed.json");
+
+    // Every pinned path answers 404.
+    let app = Router::new()
+        .route(
+            "/models-v1.json.sig",
+            get(|| async { (StatusCode::NOT_FOUND, "Not Found") }),
+        )
+        .route(
+            "/models-v1.json",
+            get(|| async { (StatusCode::NOT_FOUND, "Not Found") }),
+        );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let server_handle = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+
+    let now = 1_700_000_000;
+    let manager = CatalogManager::boot(
+        CatalogConfig {
+            cache_path: Some(lkg_path),
+            remote_catalog_url: Some(format!("http://127.0.0.1:{port}/models-v1.json")),
+            remote_signature_url: Some(format!("http://127.0.0.1:{port}/models-v1.json.sig")),
+            ..Default::default()
+        },
+        now,
+    );
+
+    let before = manager.active_version();
+    let result = manager.fetch_and_update().await;
+    assert!(
+        result.is_ok(),
+        "an unpublished catalog must not fail the refresh cycle"
+    );
+    assert_eq!(
+        manager.active_version(),
+        before,
+        "the active catalog must be preserved"
+    );
+
+    let status = manager.status();
+    assert!(
+        !status.stale,
+        "an unpublished remote catalog must not mark the active catalog stale"
+    );
+    assert!(
+        status.last_refresh_at.is_some(),
+        "the attempt must still be recorded so the poller backs off"
+    );
+    assert_eq!(status.last_rejection_reason, None);
+    assert_eq!(status.last_error, None);
+
     let _ = shutdown_tx.send(());
     server_handle.await.unwrap();
     assert_port_released(port);
