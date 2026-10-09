@@ -1100,6 +1100,11 @@ mod tests {
                 serde_json::from_value(serde_json::json!({
                     "type": "claude",
                     "email": "nekos@ccapi.com",
+                    // A relay account authenticates with a static x-api-key;
+                    // that key is what distinguishes it from an OAuth
+                    // subscription account that merely points upstream_override
+                    // at the same host.
+                    "api_key": "relay-static-key",
                 }))
                 .unwrap(),
             ),

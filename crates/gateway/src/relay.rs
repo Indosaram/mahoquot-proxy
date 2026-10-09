@@ -3764,6 +3764,18 @@ pub async fn handle_relay(
                     return false;
                 }
             }
+            // `eligible` was computed before this request attempted anything,
+            // and a quota poll can land while the walk is still running. A
+            // spent Claude account answers a streaming request with `200 OK`
+            // plus an SSE error frame, which cannot be failed over, so re-check
+            // it here the same way the initial selection does.
+            if member.kind() == crate::account::ProviderKind::Claude
+                && member
+                    .usage_snapshot()
+                    .is_claude_included_quota_exhausted(now_ms / 1000)
+            {
+                return false;
+            }
             select_model.is_none_or(|model| member.group_available(model, now_ms))
         });
         let chosen_idx = match select_index(&state, &pool, &hint, &eligible, &attempted) {
