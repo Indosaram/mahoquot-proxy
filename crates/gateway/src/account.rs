@@ -1181,6 +1181,27 @@ pub fn model_quota_group<'a>(provider: &str, model: &'a str) -> Option<&'a str> 
     }
 }
 
+/// Reserved bench-scope key for a cooldown that covers the whole account
+/// rather than one quota group. The NUL prefix cannot collide with a group
+/// name, which always comes from provider display text.
+const ACCOUNT_BENCH_SCOPE: &str = "\u{0}account";
+
+/// Why an account, or one of its quota groups, is benched.
+///
+/// A deadline alone cannot describe a bench: a plan cap and a transient rate
+/// limit both only "end later". Recording the cause is what lets the
+/// exhaustion response say `daily-exhausted` when upstream actually named a
+/// plan window, instead of applying that wording to every bench.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BenchKind {
+    /// Upstream named a plan cap (daily or weekly window) that has to run out.
+    QuotaExhausted,
+    /// A transient rate limit the account recovers from on its own.
+    RateLimited,
+    /// The account's credit balance ran out; waiting will not help.
+    OutOfCredit,
+}
+
 /// Split a trailing `-${4-digit month/day}` off a model id, returning the id
 /// without it. Anything that does not look like that suffix is left alone.
 pub(crate) fn split_date_suffix(model: &str) -> Option<&str> {
@@ -1207,6 +1228,11 @@ pub struct AccountMember {
     /// records why, which is what lets the exhaustion 503 tell an operator to
     /// top up instead of naming a reset that will never arrive.
     pub credit_benched: Arc<RwLock<BTreeMap<String, i64>>>,
+    /// Why each benched quota group is benched, keyed exactly like
+    /// `group_cooldowns` (plus [`ACCOUNT_BENCH_SCOPE`] for an account-wide
+    /// bench). A missing entry means the cause was never recorded, which
+    /// callers must report as unknown rather than assume was a plan cap.
+    pub bench_kinds: Arc<RwLock<BTreeMap<String, BenchKind>>>,
     pub active_requests: Arc<AtomicU64>,
     pub last_activity: Arc<std::sync::Mutex<tokio::time::Instant>>,
     pub upstream_override: Option<String>,
@@ -1261,6 +1287,7 @@ impl AccountMember {
             health: Arc::new(RwLock::new(Health::Available)),
             group_cooldowns: Arc::new(RwLock::new(BTreeMap::new())),
             credit_benched: Arc::new(RwLock::new(BTreeMap::new())),
+            bench_kinds: Arc::new(RwLock::new(BTreeMap::new())),
             active_requests: Arc::new(AtomicU64::new(0)),
             last_activity: Arc::new(std::sync::Mutex::new(tokio::time::Instant::now())),
             upstream_override: None,
@@ -1606,6 +1633,7 @@ impl AccountMember {
             health: Arc::clone(&self.health),
             group_cooldowns: Arc::clone(&self.group_cooldowns),
             credit_benched: Arc::clone(&self.credit_benched),
+            bench_kinds: Arc::clone(&self.bench_kinds),
             active_requests: Arc::clone(&self.active_requests),
             last_activity: Arc::clone(&self.last_activity),
             upstream_override: self.upstream_override.clone(),
@@ -2003,6 +2031,59 @@ impl AccountMember {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.get(group).is_some_and(|until| *until > now_unix_ms)
+    }
+
+    /// Records why `model`'s quota group is benched. Returns false when the
+    /// provider has no group split, so the caller records an account-wide
+    /// cause instead.
+    pub fn set_group_bench_kind(&self, model: &str, kind: BenchKind) -> bool {
+        let Some(group) = self.quota_group_for(model) else {
+            return false;
+        };
+        self.bench_kinds
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(group.to_string(), kind);
+        true
+    }
+
+    /// Records why the whole account is benched, for providers whose models
+    /// share one pool.
+    pub fn set_account_bench_kind(&self, kind: BenchKind) {
+        self.bench_kinds
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(ACCOUNT_BENCH_SCOPE.to_string(), kind);
+    }
+
+    /// Why this account cannot serve `model` right now, when both a recorded
+    /// cause and a still-active deadline exist.
+    ///
+    /// `None` means the account is not benched for `model`, or the bench
+    /// predates the recorded cause. Callers must treat that as unknown rather
+    /// than assume a plan cap.
+    pub fn bench_kind_for_model(&self, model: &str, now_unix_ms: i64) -> Option<BenchKind> {
+        let kinds = self
+            .bench_kinds
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(group) = self.quota_group_for(model) {
+            let group_active = self
+                .group_cooldowns
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(group)
+                .is_some_and(|deadline| *deadline > now_unix_ms);
+            if group_active {
+                return kinds.get(group).copied();
+            }
+        }
+        match self.health() {
+            Health::Cooldown { until_unix_ms } if until_unix_ms > now_unix_ms => {
+                kinds.get(ACCOUNT_BENCH_SCOPE).copied()
+            }
+            _ => None,
+        }
     }
 
     pub fn is_expired(&self, now_unix: i64) -> bool {
@@ -2674,6 +2755,7 @@ pub fn load_account_members(auth_dir: &Path) -> anyhow::Result<Vec<Arc<AccountMe
             })),
             group_cooldowns: Arc::new(RwLock::new(BTreeMap::new())),
             credit_benched: Arc::new(RwLock::new(BTreeMap::new())),
+            bench_kinds: Arc::new(RwLock::new(BTreeMap::new())),
             active_requests: Arc::new(AtomicU64::new(0)),
             last_activity: Arc::new(std::sync::Mutex::new(tokio::time::Instant::now())),
             upstream_override,

@@ -186,7 +186,12 @@ impl StreamCapture {
                             .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
                             .unwrap_or(0);
                         let until = cooldown_deadline_ms(now_ms, 300);
-                        bench_exhausted_quota(current, outcome.model.as_deref(), until);
+                        bench_exhausted_quota(
+                            current,
+                            outcome.model.as_deref(),
+                            until,
+                            crate::account::BenchKind::RateLimited,
+                        );
                     } else if code == "unauthenticated" {
                         current.set_health(Health::AuthFailed);
                     }
@@ -197,7 +202,12 @@ impl StreamCapture {
                         .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
                         .unwrap_or(0);
                     let until = cooldown_deadline_ms(now_ms, 300);
-                    bench_exhausted_quota(&outcome.member, outcome.model.as_deref(), until);
+                    bench_exhausted_quota(
+                        &outcome.member,
+                        outcome.model.as_deref(),
+                        until,
+                        crate::account::BenchKind::RateLimited,
+                    );
                 } else if code == "unauthenticated" {
                     outcome.member.set_health(Health::AuthFailed);
                 }
@@ -1720,6 +1730,16 @@ async fn record_cooldown(
     // headers before the body extraction consumes the response.
     let header_until_unix_ms = cooldown_deadline_from_headers(resp.headers(), now_ms);
     let failure = extract_failure(resp, status_code).await;
+    // Record why this account is benched. Without it the exhaustion response
+    // can only see a deadline, and a transient rate limit becomes
+    // indistinguishable from a plan cap that has to run out.
+    let bench_kind = if failure_is_insufficient_credits(&failure.body) {
+        crate::account::BenchKind::OutOfCredit
+    } else if failure_is_limit_exhaustion(&failure.body) {
+        crate::account::BenchKind::QuotaExhausted
+    } else {
+        crate::account::BenchKind::RateLimited
+    };
 
     let (effective_model, until_unix_ms) = if member.provider_name() == "cline" {
         if let Some((cap_model, reset_secs)) = parse_cline_cap_error(&failure.body) {
@@ -1755,7 +1775,12 @@ async fn record_cooldown(
             bench_cline_cap(member, cap_model, model, until_unix_ms);
         }
     } else {
-        bench_exhausted_quota(member, effective_model.as_deref().or(model), until_unix_ms);
+        bench_exhausted_quota(
+            member,
+            effective_model.as_deref().or(model),
+            until_unix_ms,
+            bench_kind,
+        );
     }
     member.record_fail();
     state.metrics.failed_over.fetch_add(1, Ordering::Relaxed);
@@ -1774,11 +1799,23 @@ async fn record_cooldown(
 /// bench only the family that actually ran out, so a Gemini limit no longer
 /// makes the account's untouched Claude and GPT allowance unroutable. Providers
 /// with a single pool keep the account-wide cooldown.
-fn bench_exhausted_quota(member: &AccountMember, model: Option<&str>, until_unix_ms: i64) {
-    if model.is_some_and(|model| member.set_group_cooldown(model, until_unix_ms)) {
-        return;
+///
+/// `kind` records *why* alongside the deadline, so the exhaustion response can
+/// describe the real cause instead of calling every bench a plan cap.
+fn bench_exhausted_quota(
+    member: &AccountMember,
+    model: Option<&str>,
+    until_unix_ms: i64,
+    kind: crate::account::BenchKind,
+) {
+    if let Some(model) = model {
+        if member.set_group_cooldown(model, until_unix_ms) {
+            member.set_group_bench_kind(model, kind);
+            return;
+        }
     }
     member.set_health(Health::Cooldown { until_unix_ms });
+    member.set_account_bench_kind(kind);
 }
 
 /// Bench a cline cap under **both** model names it can be routed by.
@@ -1797,10 +1834,20 @@ fn bench_cline_cap(
     requested_model: Option<&str>,
     until_unix_ms: i64,
 ) {
-    bench_exhausted_quota(member, Some(cap_model), until_unix_ms);
+    bench_exhausted_quota(
+        member,
+        Some(cap_model),
+        until_unix_ms,
+        crate::account::BenchKind::QuotaExhausted,
+    );
     if let Some(requested) = requested_model {
         if requested != cap_model {
-            bench_exhausted_quota(member, Some(requested), until_unix_ms);
+            bench_exhausted_quota(
+                member,
+                Some(requested),
+                until_unix_ms,
+                crate::account::BenchKind::QuotaExhausted,
+            );
         }
     }
 }
@@ -1819,6 +1866,12 @@ fn label_credit_bench(
     until_unix_ms: i64,
 ) {
     member.set_group_credit_bench(cap_model, until_unix_ms);
+    // The credit label is the authoritative cause, so record it as the bench
+    // reason too: that is what lets the response tell an operator to top up
+    // instead of naming a reset that will never arrive.
+    if !member.set_group_bench_kind(cap_model, crate::account::BenchKind::OutOfCredit) {
+        member.set_account_bench_kind(crate::account::BenchKind::OutOfCredit);
+    }
     if let Some(requested) = requested_model {
         if requested != cap_model {
             member.set_group_credit_bench(requested, until_unix_ms);
@@ -1905,9 +1958,18 @@ fn format_reset_eta(total_secs: u64) -> String {
     }
 }
 
-/// Earliest future reset (unix secs) across the pool for `canonical_model`:
-/// per-quota-group benches first, then account-wide cooldowns. Returns None
-/// when no benched deadline lies ahead.
+/// Whether `member` is a plausible server of `model`.
+///
+/// Used to keep one provider's bench from being blamed on a model it cannot
+/// serve at all: a Codex account in a five-minute cooldown says nothing about
+/// whether a Gemini request can run.
+fn member_may_serve_model(member: &AccountMember, model: &str) -> bool {
+    member.quota_group_for(model).is_some() || member.supports_model(model)
+}
+
+/// Earliest future reset (unix secs) across the accounts that can serve
+/// `canonical_model`: per-quota-group benches first, then account-wide
+/// cooldowns. Returns None when no benched deadline lies ahead.
 fn earliest_exhaustion_reset_unix_secs(
     pool: &crate::state::PoolSnapshot,
     canonical_model: Option<&str>,
@@ -1915,6 +1977,9 @@ fn earliest_exhaustion_reset_unix_secs(
     let now = now_unix_secs();
     let mut earliest: Option<i64> = None;
     for member in &pool.members {
+        if canonical_model.is_some_and(|model| !member_may_serve_model(member, model)) {
+            continue;
+        }
         for reset in [
             canonical_model.and_then(|model| member.group_reset_at_unix(model)),
             member.reset_at_unix(),
@@ -1930,34 +1995,76 @@ fn earliest_exhaustion_reset_unix_secs(
     earliest
 }
 
-/// Whether every account benched for `canonical_model` is blocked by an empty
-/// credit balance rather than a timed quota.
+/// Why the pool cannot serve `canonical_model` right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PoolBenchCause {
+    /// Every benched account named a plan cap that has to run out.
+    QuotaExhausted,
+    /// Every benched account hit a transient rate limit.
+    RateLimited,
+    /// Every benched account is short of credit rather than out of time.
+    OutOfCredit,
+    /// The causes disagree, or a bench predates the recorded reason. The
+    /// wording falls back to the one upstream confirms.
+    Mixed,
+}
+
+/// Classify the benches that actually block `canonical_model`.
 ///
-/// One account benched some other way returns false, so the response keeps
-/// its daily wording instead of replacing one unverified claim with the
-/// opposite one.
-fn benched_pool_is_out_of_credit(
+/// Only accounts that can serve the model are consulted, so one provider's
+/// cooldown cannot decide what the response says about another's model. An
+/// account with no recorded cause counts as both cap and transient, which
+/// resolves to [`PoolBenchCause::Mixed`] and keeps the conservative wording
+/// rather than inventing a claim upstream never made.
+fn benched_pool_cause(
     pool: &crate::state::PoolSnapshot,
     canonical_model: Option<&str>,
-) -> bool {
-    let Some(model) = canonical_model else {
-        return false;
-    };
+) -> Option<PoolBenchCause> {
+    let model = canonical_model?;
     let now = now_unix_secs();
+    let now_ms = now.saturating_mul(1000);
     let mut saw_benched = false;
+    let mut cap = false;
+    let mut transient = false;
+    let mut credit = false;
     for member in &pool.members {
-        if !member
+        if !member_may_serve_model(member, model) {
+            continue;
+        }
+        let group_benched = member
             .group_reset_at_unix(model)
-            .is_some_and(|reset| reset > now)
-        {
+            .is_some_and(|reset| reset > now);
+        let account_benched = matches!(
+            member.health(),
+            Health::Cooldown { until_unix_ms } if until_unix_ms > now_ms
+        );
+        if !group_benched && !account_benched {
             continue;
         }
         saw_benched = true;
-        if !member.group_credit_benched(model, now * 1000) {
-            return false;
+        if member.group_credit_benched(model, now_ms) {
+            credit = true;
+            continue;
+        }
+        match member.bench_kind_for_model(model, now_ms) {
+            Some(crate::account::BenchKind::OutOfCredit) => credit = true,
+            Some(crate::account::BenchKind::QuotaExhausted) => cap = true,
+            Some(crate::account::BenchKind::RateLimited) => transient = true,
+            None => {
+                cap = true;
+                transient = true;
+            }
         }
     }
-    saw_benched
+    if !saw_benched {
+        return None;
+    }
+    match (credit, cap, transient) {
+        (true, false, false) => Some(PoolBenchCause::OutOfCredit),
+        (false, true, false) => Some(PoolBenchCause::QuotaExhausted),
+        (false, false, true) => Some(PoolBenchCause::RateLimited),
+        _ => Some(PoolBenchCause::Mixed),
+    }
 }
 
 /// The 503 a client receives when every account that can serve the model is
@@ -1976,20 +2083,32 @@ fn exhaustion_failure_response(
     let positive_retry_after = retry_after_secs.filter(|secs| *secs > 0);
     let eta = positive_retry_after.map(format_reset_eta);
     let model_text = canonical_model.unwrap_or("the requested model");
-    let out_of_credit = benched_pool_is_out_of_credit(pool, canonical_model);
-    let message = match (out_of_credit, eta) {
-        (true, Some(eta)) => format!(
-            "all pool accounts are out of credit for model '{model_text}'; add credits to resume, earliest retry in {eta}"
-        ),
-        (true, None) => format!(
-            "all pool accounts are out of credit for model '{model_text}'; add credits to resume"
-        ),
-        (false, Some(eta)) => format!(
-            "all pool accounts are daily-exhausted for model '{model_text}'; earliest known quota reset in {eta}"
-        ),
-        (false, None) => format!(
-            "all pool accounts are daily-exhausted for model '{model_text}'"
-        ),
+    let cause = benched_pool_cause(pool, canonical_model);
+    let message = match cause {
+        Some(PoolBenchCause::OutOfCredit) => match eta {
+            Some(eta) => format!(
+                "all pool accounts are out of credit for model '{model_text}'; add credits to resume, earliest retry in {eta}"
+            ),
+            None => format!(
+                "all pool accounts are out of credit for model '{model_text}'; add credits to resume"
+            ),
+        },
+        // A transient rate limit clears on its own, so the response must not
+        // claim a daily cap that upstream never named.
+        Some(PoolBenchCause::RateLimited) => match eta {
+            Some(eta) => format!(
+                "every account that can serve model '{model_text}' is temporarily rate-limited; earliest retry in {eta}"
+            ),
+            None => format!(
+                "every account that can serve model '{model_text}' is temporarily rate-limited"
+            ),
+        },
+        _ => match eta {
+            Some(eta) => format!(
+                "all pool accounts are daily-exhausted for model '{model_text}'; earliest known quota reset in {eta}"
+            ),
+            None => format!("all pool accounts are daily-exhausted for model '{model_text}'"),
+        },
     };
     let payload = serde_json::json!({
         "type": "error",
@@ -4678,6 +4797,88 @@ mod routing_tests {
         let text = read_body(exhaustion_failure_response(&pool, Some(model))).await;
         assert!(text.contains("daily-exhausted"), "{text}");
         assert!(!text.contains("out of credit"), "{text}");
+
+        let _ = std::fs::remove_dir_all(auth_dir);
+    }
+
+    #[tokio::test]
+    async fn a_transient_rate_limit_is_not_reported_as_a_daily_exhaustion() {
+        let (state, auth_dir) = state_with_credentials(
+            "transient",
+            &[("generic-cline.json", cline_credential("cline-t"))],
+        );
+        let pool = state.pool.load_full();
+
+        let model = "z-ai/glm-5.3-flash";
+        let until = (now_unix_secs() + 120) * 1000;
+        let member = pool.members[0].clone();
+        bench_exhausted_quota(
+            &member,
+            Some(model),
+            until,
+            crate::account::BenchKind::RateLimited,
+        );
+
+        // A two-minute cooldown cannot be a daily cap, so the response must
+        // describe the rate limit instead of inventing an exhaustion.
+        let text = read_body(exhaustion_failure_response(&pool, Some(model))).await;
+        assert!(text.contains("temporarily rate-limited"), "{text}");
+        assert!(!text.contains("daily-exhausted"), "{text}");
+
+        let _ = std::fs::remove_dir_all(auth_dir);
+    }
+
+    #[tokio::test]
+    async fn an_unrecorded_bench_keeps_the_conservative_wording() {
+        let (state, auth_dir) = state_with_credentials(
+            "unrecorded",
+            &[("generic-cline.json", cline_credential("cline-u"))],
+        );
+        let pool = state.pool.load_full();
+
+        let model = "z-ai/glm-5.3-flash";
+        let until = (now_unix_secs() + 300) * 1000;
+        let member = pool.members[0].clone();
+        // Bench with a deadline but no recorded cause, the shape a bench had
+        // before the cause was tracked. The response must not guess.
+        assert!(member.set_group_cooldown(model, until));
+
+        let text = read_body(exhaustion_failure_response(&pool, Some(model))).await;
+        assert!(text.contains("daily-exhausted"), "{text}");
+        assert!(!text.contains("temporarily rate-limited"), "{text}");
+
+        let _ = std::fs::remove_dir_all(auth_dir);
+    }
+
+    #[tokio::test]
+    async fn the_reset_estimate_ignores_accounts_that_cannot_serve_the_model() {
+        let (state, auth_dir) = six_provider_state();
+        let pool = state.pool.load_full();
+
+        let codex = pool
+            .members
+            .iter()
+            .find(|member| member.provider_name() == "codex")
+            .expect("the codex fixture is loaded")
+            .clone();
+        bench_exhausted_quota(
+            &codex,
+            None,
+            (now_unix_secs() + 9_999) * 1000,
+            crate::account::BenchKind::RateLimited,
+        );
+
+        // A Codex cooldown says nothing about a Gemini request, so advertising
+        // it as the reset time would point the client at the wrong window.
+        assert_eq!(
+            earliest_exhaustion_reset_unix_secs(&pool, Some("gemini-3.8-flash-high")),
+            None,
+            "a cooldown on an account that cannot serve the model is not a reset"
+        );
+        assert!(
+            earliest_exhaustion_reset_unix_secs(&pool, Some("gpt-5.6-sol")).is_some(),
+            "the same cooldown still counts for a model that account serves"
+        );
 
         let _ = std::fs::remove_dir_all(auth_dir);
     }
