@@ -720,8 +720,9 @@ async fn try_claude_usage(state: &AppState, member: &Arc<AccountMember>) -> Resu
         return Err(QuotaError::Unauthorized);
     }
     let base = member
-        .upstream_override
+        .usage_override
         .as_deref()
+        .or(member.upstream_override.as_deref())
         .unwrap_or(CLAUDE_API_BASE)
         .trim_end_matches('/');
 

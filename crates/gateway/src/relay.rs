@@ -373,9 +373,12 @@ async fn record_request_outcome(state: &AppState, record: OutcomeRecord<'_>) {
         latency_ms: record.elapsed_ms,
         fast,
     });
-    state
-        .telemetry
-        .record_with_account(timestamp, &record.provider, record.account, record.success);
+    state.telemetry.record_with_account(
+        timestamp,
+        &record.provider,
+        record.account,
+        record.success,
+    );
     if let (Some(account), Some(token_usage)) = (record.account, record.token_usage) {
         state.telemetry.record_tokens(
             timestamp,
@@ -1201,7 +1204,8 @@ async fn send_upstream(
     }
     let req_start = std::time::Instant::now();
     let (resp, cursor_reply) = if protocol == compat::Protocol::Cursor {
-        let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(compat::cursor::CURSOR_REPLY_QUEUE_CAPACITY);
+        let (tx, rx) =
+            tokio::sync::mpsc::channel::<Bytes>(compat::cursor::CURSOR_REPLY_QUEUE_CAPACITY);
         // The initial request body is mandatory: a full (or closed) queue here
         // would mean the connection is already unusable, so surface it instead
         // of silently dropping the body.
@@ -1476,8 +1480,7 @@ const CLINE_CREDIT_BACKOFF_SECS: i64 = 300;
 /// Deadline a Cline 402 benches until: the upstream-reported reset when the
 /// body carries one, otherwise the credit backoff.
 pub(crate) fn cline_402_fallback(body: &[u8], requested_model: String) -> (String, i64) {
-    parse_cline_cap_error(body)
-        .unwrap_or_else(|| (requested_model, CLINE_CREDIT_BACKOFF_SECS))
+    parse_cline_cap_error(body).unwrap_or_else(|| (requested_model, CLINE_CREDIT_BACKOFF_SECS))
 }
 
 /// Cooldown deadline for an upstream-supplied `Retry-After`, in unix ms.
@@ -1579,8 +1582,14 @@ pub(crate) fn resolve_cline_deadline(
     if reported_secs < MAX_COOLDOWN_SECS {
         return candidate;
     }
-    let known = tracker.map(|tracker| tracker.estimated_reset_unix()).unwrap_or(0);
-    if known > now_secs { known } else { candidate }
+    let known = tracker
+        .map(|tracker| tracker.estimated_reset_unix())
+        .unwrap_or(0);
+    if known > now_secs {
+        known
+    } else {
+        candidate
+    }
 }
 
 /// A 429 whose body says the account ran out of usage budget rather than
@@ -1725,14 +1734,7 @@ async fn record_cooldown(
             // Upstream named the exact reset: reconcile the 24h tracker so the
             // estimate is exact and the budget counts as consumed.
             tracker.on_cap_429(reset_at);
-            persist_cline_cap_event(
-                state,
-                member,
-                &cap_model,
-                now_ms,
-                reset_at,
-                false,
-            );
+            persist_cline_cap_event(state, member, &cap_model, now_ms, reset_at, false);
             (Some(cap_model), deadline_ms)
         } else {
             (model.map(ToString::to_string), header_until_unix_ms)
@@ -1745,7 +1747,9 @@ async fn record_cooldown(
     // checks the requested model, the 429 body names what upstream billed.
     // Every other path benches exactly the model it was called with.
     if member.provider_name() == "cline"
-        && effective_model.as_deref().is_some_and(|cap| Some(cap) != model)
+        && effective_model
+            .as_deref()
+            .is_some_and(|cap| Some(cap) != model)
     {
         if let Some(cap_model) = effective_model.as_deref() {
             bench_cline_cap(member, cap_model, model, until_unix_ms);
@@ -2252,7 +2256,10 @@ fn account_declares_binding_model(
     }
 
     if member.kind() == crate::account::ProviderKind::Antigravity {
-        if pool.account_permissions(member.id()).is_some_and(|p| p.antigravity_models.is_none()) {
+        if pool
+            .account_permissions(member.id())
+            .is_some_and(|p| p.antigravity_models.is_none())
+        {
             return provider.binding.source != mahoquot_registry::CatalogSource::Discovered;
         }
         return pool.is_antigravity_model_eligible(member.id(), &provider.upstream_model);
@@ -2425,9 +2432,7 @@ fn eligible_indices(
                         .settings
                         .current()
                         .is_codex_account_credit_enabled(member.id());
-                    if !credit_enabled
-                        && usage.is_codex_included_quota_exhausted(None, now_unix)
-                    {
+                    if !credit_enabled && usage.is_codex_included_quota_exhausted(None, now_unix) {
                         return false;
                     }
                 }
@@ -2495,8 +2500,7 @@ fn eligible_indices(
             // A bare `claude-*` id is the subscription lane: the nekos/ccapi relay
             // is reachable only through the explicit `nekos-` prefix.
             None => {
-                if member.kind() == crate::account::ProviderKind::Claude
-                    && member.is_nekos_relay()
+                if member.kind() == crate::account::ProviderKind::Claude && member.is_nekos_relay()
                 {
                     continue;
                 }
@@ -2668,8 +2672,8 @@ fn capture_usage(member: &AccountMember, headers: &HeaderMap) {
 #[cfg(test)]
 mod cline_deadline_tests {
     use super::{
-        bench_cline_cap, cline_402_fallback, resolve_cline_deadline,
-        CLINE_CREDIT_BACKOFF_SECS, MAX_COOLDOWN_SECS,
+        bench_cline_cap, cline_402_fallback, resolve_cline_deadline, CLINE_CREDIT_BACKOFF_SECS,
+        MAX_COOLDOWN_SECS,
     };
     use crate::cline_usage::{ClineDailyTracker, DAY_SECS};
 
@@ -4127,21 +4131,17 @@ pub async fn handle_relay(
                     now_unix,
                     reset_secs,
                 );
-                record_cline_quota_bucket(&member, &cap_model, reset_at - now_unix, now_unix, 100.0);
+                record_cline_quota_bucket(
+                    &member,
+                    &cap_model,
+                    reset_at - now_unix,
+                    now_unix,
+                    100.0,
+                );
                 tracker.on_cap_429(reset_at);
                 persist_cline_cap_event(&state, &member, &cap_model, now_ms, reset_at, true);
-                bench_cline_cap(
-                    &member,
-                    &cap_model,
-                    plan.model.as_deref(),
-                    reset_at * 1000,
-                );
-                label_credit_bench(
-                    &member,
-                    &cap_model,
-                    plan.model.as_deref(),
-                    reset_at * 1000,
-                );
+                bench_cline_cap(&member, &cap_model, plan.model.as_deref(), reset_at * 1000);
+                label_credit_bench(&member, &cap_model, plan.model.as_deref(), reset_at * 1000);
                 last_failure = Some(failure);
                 continue;
             }
@@ -4174,12 +4174,15 @@ pub async fn handle_relay(
                 } else {
                     &mut body
                 };
-                let validation_required = error.get("details")
+                let validation_required = error
+                    .get("details")
                     .and_then(serde_json::Value::as_array)
-                    .is_some_and(|details| details.iter().any(|detail| {
-                        detail.get("reason").and_then(serde_json::Value::as_str)
-                            == Some("VALIDATION_REQUIRED")
-                    }));
+                    .is_some_and(|details| {
+                        details.iter().any(|detail| {
+                            detail.get("reason").and_then(serde_json::Value::as_str)
+                                == Some("VALIDATION_REQUIRED")
+                        })
+                    });
                 if validation_required {
                     let email = member.email().unwrap_or_else(|| member.id().to_string());
                     let message = format!("Google account verification required for {email} (VALIDATION_REQUIRED). Verify this Google account in your browser, then reauthenticate in the app.");
@@ -4187,7 +4190,9 @@ pub async fn handle_relay(
                     error["account_id"] = serde_json::json!(member.id());
                     member.set_health(Health::AuthFailed);
                     member.record_fail();
-                    state.monitor.record_error(member.id(), status_code, &message);
+                    state
+                        .monitor
+                        .record_error(member.id(), status_code, &message);
                     state.metrics.failed_over.fetch_add(1, Ordering::Relaxed);
                     last_failure = Some(FinalFailure {
                         body: Bytes::from(body.to_string()),
@@ -4605,7 +4610,11 @@ mod routing_tests {
             &[("generic-cline.json", cline_credential("cline-a"))],
         );
         let pool = state.pool.load_full();
-        assert_eq!(pool.members.len(), 1, "the cline fixture is the only account");
+        assert_eq!(
+            pool.members.len(),
+            1,
+            "the cline fixture is the only account"
+        );
 
         let model = "z-ai/glm-5.3-flash";
         let until = (now_unix_secs() + 300) * 1000;
@@ -4986,7 +4995,8 @@ mod routing_tests {
             "identity_slug": "claude-official",
             "access_token": "token1",
             "refresh_token": "refresh1",
-            "expired": "2099-01-01T00:00:00Z"
+            "expired": "2099-01-01T00:00:00Z",
+            "upstream_override": "https://ccapi.labs.mengmota.com/anthropic"
         }"#;
         let nekos_cred = r#"{
             "type": "claude",
@@ -5132,6 +5142,21 @@ mod routing_tests {
             &pool,
             Some(&route),
             Some("anthropic-claude-opus-5"),
+            0,
+            None,
+            None,
+            &state,
+        );
+        assert_eq!(eligible, vec![official_idx]);
+
+        // 8. Bare claude-opus-5-5 routes cleanly to official
+        let route = resolve_route(&pool, Some("claude-opus-5-5"), None)
+            .unwrap()
+            .unwrap();
+        let eligible = eligible_indices(
+            &pool,
+            Some(&route),
+            Some("claude-opus-5-5"),
             0,
             None,
             None,
