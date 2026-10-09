@@ -131,12 +131,17 @@ fn matches_codex_model(
         if models == requested_model {
             return true;
         }
-        if (models == "bengalfox" && (requested_model == "gpt-5.3-codex-spark" || requested_model == "spark"))
-            || ((models == "gpt-5.3-codex-spark" || models == "spark") && requested_model == "bengalfox")
+        if (models == "bengalfox"
+            && (requested_model == "gpt-5.3-codex-spark" || requested_model == "spark"))
+            || ((models == "gpt-5.3-codex-spark" || models == "spark")
+                && requested_model == "bengalfox")
         {
             return true;
         }
-        if models.split(|c| c == ',' || c == ' ').any(|m| m.trim() == requested_model) {
+        if models
+            .split(|c| c == ',' || c == ' ')
+            .any(|m| m.trim() == requested_model)
+        {
             return true;
         }
     }
@@ -144,9 +149,13 @@ fn matches_codex_model(
         if id == requested_model {
             return true;
         }
-        if let Some(base) = id.strip_suffix("-primary").or_else(|| id.strip_suffix("-secondary")) {
+        if let Some(base) = id
+            .strip_suffix("-primary")
+            .or_else(|| id.strip_suffix("-secondary"))
+        {
             if base == requested_model
-                || (base == "bengalfox" && (requested_model == "gpt-5.3-codex-spark" || requested_model == "spark"))
+                || (base == "bengalfox"
+                    && (requested_model == "gpt-5.3-codex-spark" || requested_model == "spark"))
             {
                 return true;
             }
@@ -166,17 +175,13 @@ impl AccountUsage {
         self.overage_limit_reached == Some(true)
     }
 
-    /// Whether this account's included plan quota (monthly, weekly, or short session window)
-    /// has reached 100% and is currently active.
+    /// Whether either flat quota window (`primary` / `secondary`) reports 100%
+    /// and is still inside its reset horizon.
     ///
-    /// When this is true, an account with `credits_after_limit: false` (default) is gated
-    /// from selection, but an account with `credits_after_limit: true` (user opt-in) is
-    /// allowed to continue serving requests and draw down available credits.
-    pub fn is_codex_included_quota_exhausted(
-        &self,
-        requested_model: Option<&str>,
-        now_unix: i64,
-    ) -> bool {
+    /// Shared by every provider that meters through flat session/weekly
+    /// windows, so Claude and Codex cannot drift apart on what "exhausted"
+    /// means.
+    fn flat_window_exhausted(&self, now_unix: i64) -> bool {
         for window in [&self.primary, &self.secondary] {
             if window.is_empty() {
                 continue;
@@ -195,11 +200,50 @@ impl AccountUsage {
                 }
             }
         }
+        false
+    }
+
+    /// Whether a Claude subscription account has spent its session/weekly
+    /// window.
+    ///
+    /// Claude reports flat `five_hour` / `seven_day` windows from
+    /// `api.anthropic.com/api/oauth/usage`, so the flat-window rule is the
+    /// whole test: there are no per-model groups to consult.
+    ///
+    /// This gate exists because upstream does not always report exhaustion as
+    /// an HTTP 429. A streaming request answers `200 OK` and then delivers the
+    /// rate-limit error as an SSE `error` frame, so the relay has already
+    /// committed the response by the time it learns the account is spent — it
+    /// can neither fail over nor bench it, and every later request lands on
+    /// the same account. Eligibility is the only point where the pool can
+    /// still route around a spent account.
+    pub fn is_claude_included_quota_exhausted(&self, now_unix: i64) -> bool {
+        self.flat_window_exhausted(now_unix)
+    }
+
+    /// Whether this account's included plan quota (monthly, weekly, or short session window)
+    /// has reached 100% and is currently active.
+    ///
+    /// When this is true, an account with `credits_after_limit: false` (default) is gated
+    /// from selection, but an account with `credits_after_limit: true` (user opt-in) is
+    /// allowed to continue serving requests and draw down available credits.
+    pub fn is_codex_included_quota_exhausted(
+        &self,
+        requested_model: Option<&str>,
+        now_unix: i64,
+    ) -> bool {
+        if self.flat_window_exhausted(now_unix) {
+            return true;
+        }
 
         if let Some(model) = requested_model {
             for group in &self.groups {
                 for bucket in &group.buckets {
-                    if matches_codex_model(group.models.as_deref(), bucket.bucket_id.as_deref(), model) {
+                    if matches_codex_model(
+                        group.models.as_deref(),
+                        bucket.bucket_id.as_deref(),
+                        model,
+                    ) {
                         if let Some(percent) = bucket.used_percent {
                             if percent >= 100.0 {
                                 if let Some(reset_at) = bucket.reset_at_unix {
@@ -273,10 +317,16 @@ impl AccountUsage {
                 }
                 _ if incoming.window_minutes.is_none()
                     && incoming.limit_name.is_none()
-                    && !self.primary.is_empty() => Some(&mut self.primary),
+                    && !self.primary.is_empty() =>
+                {
+                    Some(&mut self.primary)
+                }
                 _ if incoming.window_minutes.is_none()
                     && incoming.limit_name.is_none()
-                    && !self.secondary.is_empty() => Some(&mut self.secondary),
+                    && !self.secondary.is_empty() =>
+                {
+                    Some(&mut self.secondary)
+                }
                 _ if self.primary.is_empty() => Some(&mut self.primary),
                 _ if self.secondary.is_empty() => Some(&mut self.secondary),
                 _ => None,
@@ -299,13 +349,17 @@ impl AccountUsage {
         }
         if !header_usage.groups.is_empty() {
             for hg in header_usage.groups {
-                if let Some(existing) = self.groups.iter_mut().find(|g| {
-                    g.models.is_some() && g.models == hg.models
-                }) {
+                if let Some(existing) = self
+                    .groups
+                    .iter_mut()
+                    .find(|g| g.models.is_some() && g.models == hg.models)
+                {
                     for bucket in hg.buckets {
-                        if let Some(existing_bucket) = existing.buckets.iter_mut().find(|b| {
-                            b.bucket_id.is_some() && b.bucket_id == bucket.bucket_id
-                        }) {
+                        if let Some(existing_bucket) = existing
+                            .buckets
+                            .iter_mut()
+                            .find(|b| b.bucket_id.is_some() && b.bucket_id == bucket.bucket_id)
+                        {
                             merge_quota_bucket(existing_bucket, bucket);
                         } else {
                             existing.buckets.push(bucket);
@@ -2762,7 +2816,11 @@ mod tests {
     #[test]
     fn session_window_carries_its_own_reset_time() {
         let u = parse_codex_headers(&live_headers(), 1_787_900_000);
-        let spark = u.groups.iter().find(|g| g.models.as_deref() == Some("bengalfox")).unwrap();
+        let spark = u
+            .groups
+            .iter()
+            .find(|g| g.models.as_deref() == Some("bengalfox"))
+            .unwrap();
         assert_eq!(spark.buckets[0].used_percent, Some(0.0));
         assert_eq!(spark.buckets[0].reset_at_unix, Some(1_787_909_818));
     }
@@ -2775,7 +2833,11 @@ mod tests {
         assert_eq!(u.primary.window_minutes, Some(10080));
         assert_eq!(u.primary.used_percent, Some(16.0));
         assert!(u.secondary.is_empty());
-        let spark = u.groups.iter().find(|g| g.models.as_deref() == Some("bengalfox")).unwrap();
+        let spark = u
+            .groups
+            .iter()
+            .find(|g| g.models.as_deref() == Some("bengalfox"))
+            .unwrap();
         assert_eq!(spark.buckets.len(), 2);
         assert_eq!(spark.buckets[0].window.as_deref(), Some("300m"));
         assert_eq!(spark.buckets[1].window.as_deref(), Some("10080m"));
@@ -3310,9 +3372,7 @@ mod tests {
                 },
             );
         }
-        let appended_before = store
-            .appended
-            .load(std::sync::atomic::Ordering::Relaxed);
+        let appended_before = store.appended.load(std::sync::atomic::Ordering::Relaxed);
 
         let active: std::collections::BTreeSet<String> =
             ["kept-a".to_string(), "kept-b".to_string()]
@@ -3511,11 +3571,19 @@ mod tests {
         // Crucial: BOTH named limits must survive in `groups` with their distinct identities!
         // Duration dedup must NOT have collapsed or discarded either model group.
         assert_eq!(usage.groups.len(), 2);
-        let names: Vec<&str> = usage.groups.iter().map(|g| g.display_name.as_deref().unwrap()).collect();
+        let names: Vec<&str> = usage
+            .groups
+            .iter()
+            .map(|g| g.display_name.as_deref().unwrap())
+            .collect();
         assert!(names.contains(&"GPT-5.3-Codex-Spark"));
         assert!(names.contains(&"GPT-6-Astra"));
 
-        let astra_group = usage.groups.iter().find(|g| g.models.as_deref() == Some("gpt-6-astra")).unwrap();
+        let astra_group = usage
+            .groups
+            .iter()
+            .find(|g| g.models.as_deref() == Some("gpt-6-astra"))
+            .unwrap();
         assert_eq!(astra_group.buckets.len(), 2);
         assert_eq!(astra_group.buckets[0].used_percent, Some(33.0));
     }
@@ -3580,7 +3648,11 @@ mod tests {
         assert!(usage.secondary.is_empty());
 
         // Chatpass mapped into distinct QuotaGroup with actual quota window:
-        let chatpass = usage.groups.iter().find(|g| g.display_name.as_deref() == Some("Chatpass")).expect("chatpass group");
+        let chatpass = usage
+            .groups
+            .iter()
+            .find(|g| g.display_name.as_deref() == Some("Chatpass"))
+            .expect("chatpass group");
         assert_eq!(chatpass.buckets.len(), 1);
         assert_eq!(chatpass.buckets[0].used_percent, Some(0.0));
         assert_eq!(chatpass.buckets[0].window.as_deref(), Some("10080m"));
@@ -3588,8 +3660,16 @@ mod tests {
 
         // Model usage preserved as metadata in model_availability, NOT converted into percentages:
         let avail = usage.model_availability.expect("model availability");
-        assert_eq!(avail.get("gpt-6-astra").and_then(|m| m.available), Some(true));
-        assert_eq!(avail.get("gpt-6-astra").and_then(|m| m.credits_would_enable), Some(false));
+        assert_eq!(
+            avail.get("gpt-6-astra").and_then(|m| m.available),
+            Some(true)
+        );
+        assert_eq!(
+            avail
+                .get("gpt-6-astra")
+                .and_then(|m| m.credits_would_enable),
+            Some(false)
+        );
 
         // Freshness set on full poll:
         assert_eq!(usage.refreshed_at_unix, Some(1_790_954_000));
@@ -3621,11 +3701,19 @@ mod tests {
         let wham: WhamUsage = serde_json::from_str(raw).expect("parse");
         let usage = wham.into_account_usage(1_790_000_000);
 
-        let cr = usage.groups.iter().find(|g| g.display_name.as_deref() == Some("Code Review")).expect("code review group");
+        let cr = usage
+            .groups
+            .iter()
+            .find(|g| g.display_name.as_deref() == Some("Code Review"))
+            .expect("code review group");
         assert_eq!(cr.buckets[0].used_percent, Some(50.0));
         assert_eq!(cr.buckets[0].window.as_deref(), Some("1440m"));
 
-        let addl = usage.groups.iter().find(|g| g.display_name.as_deref() == Some("Experimental Preview")).expect("additional group");
+        let addl = usage
+            .groups
+            .iter()
+            .find(|g| g.display_name.as_deref() == Some("Experimental Preview"))
+            .expect("additional group");
         assert_eq!(addl.buckets[0].used_percent, Some(80.0));
         assert_eq!(addl.buckets[0].window.as_deref(), Some("60m"));
         assert_eq!(addl.buckets[0].reset_at_unix, None);
@@ -3645,26 +3733,91 @@ mod tests {
     }
 
     #[test]
+    fn claude_exhaustion_detects_spent_session_window() {
+        let now = 1_000_000;
+        let mut u = AccountUsage::default();
+        assert!(
+            !u.is_claude_included_quota_exhausted(now),
+            "an account with no polled usage is not exhausted"
+        );
+
+        // The live shape from `api.anthropic.com/api/oauth/usage`: the 5h
+        // session window at 100% with a reset still ahead.
+        u.primary = QuotaWindow {
+            used_percent: Some(100.0),
+            window_minutes: Some(300),
+            reset_at_unix: Some(now + 600),
+            limit_name: Some("Session".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            u.is_claude_included_quota_exhausted(now),
+            "100% session with a future reset is exhausted"
+        );
+
+        // Once the window rolls over the account must come back.
+        u.primary.reset_at_unix = Some(now - 1);
+        assert!(
+            !u.is_claude_included_quota_exhausted(now),
+            "a reset that already passed frees the account"
+        );
+
+        // Partially spent is routable.
+        u.primary.used_percent = Some(35.0);
+        u.primary.reset_at_unix = Some(now + 600);
+        assert!(
+            !u.is_claude_included_quota_exhausted(now),
+            "35% is not exhausted"
+        );
+
+        // A spent weekly window gates just as a spent session window does.
+        u.primary = QuotaWindow::default();
+        u.secondary = QuotaWindow {
+            used_percent: Some(100.0),
+            window_minutes: Some(10_080),
+            reset_at_unix: Some(now + 600),
+            limit_name: Some("Weekly".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            u.is_claude_included_quota_exhausted(now),
+            "100% weekly with a future reset is exhausted"
+        );
+    }
+
+    #[test]
     fn codex_exhaustion_detects_future_reset_over_100_percent() {
         let now = 1_000_000;
         let mut u = AccountUsage::default();
-        assert!(!u.is_codex_included_quota_exhausted(None, now), "empty/unknown is not exhausted");
+        assert!(
+            !u.is_codex_included_quota_exhausted(None, now),
+            "empty/unknown is not exhausted"
+        );
 
         u.primary = QuotaWindow {
             used_percent: Some(100.0),
             reset_at_unix: Some(now + 60),
             ..Default::default()
         };
-        assert!(u.is_codex_included_quota_exhausted(None, now), "100% with future reset is exhausted");
+        assert!(
+            u.is_codex_included_quota_exhausted(None, now),
+            "100% with future reset is exhausted"
+        );
 
         // Past reset means window reset has occurred
         u.primary.reset_at_unix = Some(now - 10);
-        assert!(!u.is_codex_included_quota_exhausted(None, now), "100% with past reset is not exhausted");
+        assert!(
+            !u.is_codex_included_quota_exhausted(None, now),
+            "100% with past reset is not exhausted"
+        );
 
         // 99% is not exhausted
         u.primary.used_percent = Some(99.0);
         u.primary.reset_at_unix = Some(now + 60);
-        assert!(!u.is_codex_included_quota_exhausted(None, now), "99% is not exhausted");
+        assert!(
+            !u.is_codex_included_quota_exhausted(None, now),
+            "99% is not exhausted"
+        );
     }
 
     #[test]
@@ -3679,16 +3832,25 @@ mod tests {
             ..Default::default()
         };
         u.observed_at_unix = Some(now - 100);
-        assert!(u.is_codex_included_quota_exhausted(None, now), "fresh burst 100% is exhausted");
+        assert!(
+            u.is_codex_included_quota_exhausted(None, now),
+            "fresh burst 100% is exhausted"
+        );
 
         // Stale burst window reading (> 300s)
         u.observed_at_unix = Some(now - 400);
-        assert!(!u.is_codex_included_quota_exhausted(None, now), "stale burst reading is not held forever");
+        assert!(
+            !u.is_codex_included_quota_exhausted(None, now),
+            "stale burst reading is not held forever"
+        );
 
         // Explicit overage limit reached
         let mut u_overage = AccountUsage::default();
         u_overage.overage_limit_reached = Some(true);
-        assert!(u_overage.is_codex_hard_limit_reached(), "overage_limit_reached is hard limit");
+        assert!(
+            u_overage.is_codex_hard_limit_reached(),
+            "overage_limit_reached is hard limit"
+        );
     }
 
     #[test]
@@ -3708,8 +3870,14 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(u.is_codex_included_quota_exhausted(Some("bengalfox"), now), "spark model is exhausted");
-        assert!(!u.is_codex_included_quota_exhausted(Some("gpt-5.6-sol"), now), "other models are unaffected");
+        assert!(
+            u.is_codex_included_quota_exhausted(Some("bengalfox"), now),
+            "spark model is exhausted"
+        );
+        assert!(
+            !u.is_codex_included_quota_exhausted(Some("gpt-5.6-sol"), now),
+            "other models are unaffected"
+        );
     }
 
     #[test]
@@ -3731,7 +3899,10 @@ mod tests {
         assert_eq!(usage.overage_limit_reached, Some(true));
 
         let mut headers = HashMap::new();
-        headers.insert("x-codex-credits-overage-limit-reached".to_string(), "true".to_string());
+        headers.insert(
+            "x-codex-credits-overage-limit-reached".to_string(),
+            "true".to_string(),
+        );
         headers.insert("x-codex-credits-balance".to_string(), "20.0".to_string());
         let header_usage = parse_codex_headers(&headers, 1_000);
         assert_eq!(header_usage.overage_limit_reached, Some(true));

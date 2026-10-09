@@ -2436,6 +2436,17 @@ fn eligible_indices(
                         return false;
                     }
                 }
+                // A spent Claude subscription answers a streaming request with
+                // `200 OK` plus an SSE `error` frame, so the 429 path below
+                // never sees it. Eligibility is the last point at which the
+                // pool can still route around the account.
+                if member.kind() == crate::account::ProviderKind::Claude
+                    && member
+                        .usage_snapshot()
+                        .is_claude_included_quota_exhausted(now_unix)
+                {
+                    return false;
+                }
                 true
             })
             .map(|(index, _)| index)
@@ -2483,6 +2494,15 @@ fn eligible_indices(
             {
                 continue;
             }
+        }
+        // A spent Claude subscription answers a streaming request with
+        // `200 OK` plus an SSE `error` frame, so the 429 path never sees it.
+        if member.kind() == crate::account::ProviderKind::Claude
+            && member
+                .usage_snapshot()
+                .is_claude_included_quota_exhausted(now_ms / 1000)
+        {
+            continue;
         }
         match prefix {
             Some(ModelPrefix::Anthropic) => {
