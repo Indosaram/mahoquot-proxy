@@ -140,10 +140,13 @@ fn result(m: &AccountMember, detail: &str) -> WarmupResult {
     }
 }
 fn supported(m: &AccountMember) -> bool {
-    matches!(
-        m.provider_name().as_str(),
-        "codex" | "antigravity" | "cline"
-    )
+    match m.provider_name().as_str() {
+        "codex" | "antigravity" | "cline" => true,
+        // Only OAuth subscription accounts have a 5h window to prime; a static
+        // relay key (nekos/ccapi) bills per call and has no window.
+        "claude" => m.relay_api_key().is_none(),
+        _ => false,
+    }
 }
 pub fn available_models(state: &AppState, m: &AccountMember) -> Vec<String> {
     if !supported(m) {
@@ -165,6 +168,10 @@ pub fn available_models(state: &AppState, m: &AccountMember) -> Vec<String> {
                 && (id.as_str().contains("gemini")
                     || id.as_str().contains("deepseek")
                     || id.as_str().contains("glm")));
+            // The Claude 5h window is account-wide, so the cheapest model
+            // primes it as well as any other.
+            let is_provider_match =
+                is_provider_match && (provider != "claude" || id.as_str().starts_with("claude-haiku"));
 
             // The live registry decides membership; the account only narrows
             // it to what it has actually been observed to serve.
@@ -432,6 +439,22 @@ fn warmup_request(m: &AccountMember, model: &str) -> Option<WarmupRequest> {
             json!({"model":model,"messages":[{"role":"user","content":"."}],"stream":true,"max_tokens":1}),
             headers,
         )),
+        // Subscription OAuth only: `supported` excludes static relay keys.
+        ProviderAccount::Claude(_) => Some((
+            crate::url::build_provider_url(
+                crate::account::ProviderKind::Claude,
+                m.upstream_override.as_deref(),
+                mahoquot_providers::claude::CLAUDE_MESSAGES_PATH,
+            ),
+            json!({
+                "model": model,
+                "max_tokens": 1,
+                "stream": true,
+                "system": [{"type":"text","text":crate::compat::claude::CLAUDE_CODE_SYSTEM_INSTRUCTION}],
+                "messages": [{"role":"user","content":"."}]
+            }),
+            headers,
+        )),
         _ => None,
     }
 }
@@ -471,6 +494,13 @@ fn validate(body: &[u8], provider: &str) -> bool {
                     v["choices"][0]["finish_reason"].as_str(),
                     Some("stop" | "length")
                 );
+            }
+            "claude" => {
+                // One output token may be whitespace-only, so a counted output
+                // token is as good as visible text.
+                content |= v["delta"]["text"].as_str().is_some_and(|s| !s.is_empty())
+                    || v["usage"]["output_tokens"].as_u64().is_some_and(|n| n > 0);
+                terminal |= v["type"] == "message_stop";
             }
             "antigravity" => {
                 let v = v.get("response").unwrap_or(&v);
@@ -954,6 +984,30 @@ mod tests {
                 warmup_request(&AccountMember::for_test(account), "discovered-model").is_some()
             );
         }
+    }
+    #[test]
+    fn claude_warmup_sends_one_token_haiku_to_subscription_accounts_only() {
+        let oauth = AccountMember::for_test(ProviderAccount::Claude(Default::default()));
+        assert!(supported(&oauth));
+        let (url, body, headers) = warmup_request(&oauth, "claude-haiku-5-5").unwrap();
+        assert!(url.ends_with("/v1/messages"));
+        assert_eq!(body["max_tokens"], 1);
+        assert_eq!(body["model"], "claude-haiku-5-5");
+        assert!(headers.iter().any(|(k, _)| k == "anthropic-beta"));
+        assert!(!headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("authorization")));
+
+        let relay = AccountMember::for_test(ProviderAccount::Claude(
+            mahoquot_providers::ClaudeAccount {
+                api_key: Some("relay-key".into()),
+                ..Default::default()
+            },
+        ));
+        assert!(!supported(&relay));
+
+        let one_token = b"event: message_start\ndata: {\"type\":\"message_start\"}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":1}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        assert!(validate(one_token, "claude"));
+        let spent = b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\"}}\n\n";
+        assert!(!validate(spent, "claude"));
     }
     #[test]
     fn warmup_done_only_is_not_success() {
