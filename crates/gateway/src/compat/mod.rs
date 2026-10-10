@@ -156,6 +156,107 @@ pub async fn open_stream(
     }
 }
 
+/// Upper bound on the Anthropic preamble buffered while looking for an early
+/// `error` event; real preambles (`message_start` + `ping`) are well below it.
+const ANTHROPIC_PREAMBLE_CAP: usize = 64 * 1024;
+
+/// What the leading complete SSE frames of an Anthropic stream say.
+enum AnthropicPreamble {
+    /// Only `message_start` / `ping` so far; more bytes are needed.
+    Pending,
+    /// A content-bearing event arrived; the stream is genuinely served.
+    Served,
+    /// The upstream answered HTTP 200 but its first real event is an error.
+    Failed(String),
+}
+
+fn classify_anthropic_preamble(buf: &[u8]) -> AnthropicPreamble {
+    let text = String::from_utf8_lossy(buf).replace("\r\n", "\n");
+    let mut frames: Vec<&str> = text.split("\n\n").collect();
+    // The trailing piece is an incomplete frame (or empty after the final
+    // delimiter); it is judged once its delimiter arrives.
+    frames.pop();
+    for frame in frames {
+        let data: String = frame
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(str::trim_start)
+            .collect();
+        let Ok(value) = serde_json::from_str::<Value>(&data) else {
+            if frame.trim().is_empty() || frame.lines().all(|l| l.starts_with(':')) {
+                continue;
+            }
+            return AnthropicPreamble::Served;
+        };
+        match value.get("type").and_then(Value::as_str) {
+            Some("message_start") | Some("ping") => continue,
+            Some("error") => {
+                let error = value.get("error");
+                let kind = error
+                    .and_then(|e| e.get("type"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let message = error
+                    .and_then(|e| e.get("message"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("upstream error");
+                let code = match kind {
+                    "rate_limit_error" => "resource_exhausted",
+                    "overloaded_error" | "api_error" => "unavailable",
+                    // A request-shaped error repeats on every account; let
+                    // it reach the client as the upstream sent it.
+                    _ => return AnthropicPreamble::Served,
+                };
+                return AnthropicPreamble::Failed(format!("{code}: {message}"));
+            }
+            _ => return AnthropicPreamble::Served,
+        }
+    }
+    AnthropicPreamble::Pending
+}
+
+/// Opens an Anthropic SSE stream, holding back only its preamble until the
+/// first content-bearing event. Relays such as CCAPI report a spent account on
+/// streaming requests as HTTP 200 + `message_start` + `event: error`; surfacing
+/// that as `Err` before any byte is committed lets the relay fail over to the
+/// next account instead of handing the client a rate-limit error. On deadline
+/// or cap the buffered bytes are released unchanged.
+pub async fn open_anthropic_stream(
+    resp: reqwest::Response,
+    deadline: std::time::Duration,
+) -> Result<(Bytes, UpstreamStream), String> {
+    let (first, stream) = open_stream(resp, Protocol::Anthropic).await?;
+    hold_anthropic_preamble(first, stream, deadline).await
+}
+
+async fn hold_anthropic_preamble(
+    first: Bytes,
+    mut stream: UpstreamStream,
+    deadline: std::time::Duration,
+) -> Result<(Bytes, UpstreamStream), String> {
+    let until = tokio::time::Instant::now() + deadline;
+    let mut buf = bytes::BytesMut::from(&first[..]);
+    loop {
+        match classify_anthropic_preamble(&buf) {
+            AnthropicPreamble::Failed(reason) => return Err(reason),
+            AnthropicPreamble::Served => return Ok((buf.freeze(), stream)),
+            AnthropicPreamble::Pending if buf.len() >= ANTHROPIC_PREAMBLE_CAP => {
+                return Ok((buf.freeze(), stream))
+            }
+            AnthropicPreamble::Pending => {}
+        }
+        match tokio::time::timeout_at(until, stream.next()).await {
+            Ok(Some(Ok(chunk))) => buf.extend_from_slice(&chunk),
+            Ok(Some(Err(err))) => return Err(err.to_string()),
+            Ok(None) => {
+                let ended: UpstreamStream = Box::pin(futures::stream::empty());
+                return Ok((buf.freeze(), ended));
+            }
+            Err(_) => return Ok((buf.freeze(), stream)),
+        }
+    }
+}
+
 pub async fn collect_stream(first: Bytes, mut stream: UpstreamStream) -> Result<Vec<u8>, String> {
     let mut raw = Vec::new();
     extend_nonstream_bounded(&mut raw, &first)?;
@@ -884,6 +985,57 @@ mod bounded_stream_tests {
         assert!(text.contains("error"), "expected a terminal error frame: {text}");
         assert_eq!(polls, 0, "the upstream must not be polled after the frame limit");
         assert_eq!(drops, 1, "the upstream must be dropped when the stream ends");
+    }
+
+    fn chunks(parts: &[&'static str]) -> UpstreamStream {
+        let items: Vec<reqwest::Result<Bytes>> =
+            parts.iter().map(|p| Ok(Bytes::from_static(p.as_bytes()))).collect();
+        Box::pin(futures::stream::iter(items))
+    }
+
+    const MESSAGE_START: &str = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\"}}\n\n";
+
+    #[tokio::test]
+    async fn a_200_stream_that_opens_with_a_rate_limit_error_fails_over() {
+        let error = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"This request would exceed your account's rate limit. Please try again later.\"}}\n\n";
+        let result = hold_anthropic_preamble(
+            Bytes::from_static(MESSAGE_START.as_bytes()),
+            chunks(&[error]),
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        let reason = result.err().expect("rate-limit preamble must fail over");
+        assert!(reason.starts_with("resource_exhausted: "), "{reason}");
+        assert!(reason.contains("rate limit"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn a_served_stream_releases_every_buffered_byte_in_order() {
+        let block = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0}\n\n";
+        let tail = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        let (first, mut rest) = hold_anthropic_preamble(
+            Bytes::from_static(MESSAGE_START.as_bytes()),
+            chunks(&[block, tail]),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("served stream");
+        assert_eq!(first, Bytes::from(format!("{MESSAGE_START}{block}")));
+        assert_eq!(rest.next().await.unwrap().unwrap(), Bytes::from_static(tail.as_bytes()));
+        assert!(rest.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_request_shaped_stream_error_is_passed_through_not_failed_over() {
+        let error = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"bad\"}}\n\n";
+        let (first, _) = hold_anthropic_preamble(
+            Bytes::from_static(MESSAGE_START.as_bytes()),
+            chunks(&[error]),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("request errors reach the client verbatim");
+        assert!(first.ends_with(error.as_bytes()));
     }
 
     #[test]

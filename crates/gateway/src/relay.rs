@@ -3322,6 +3322,8 @@ async fn finish_success(
         )
         .await
         .map_err(|_| "upstream request timed out during preflight".to_string())??
+    } else if protocol == compat::Protocol::Anthropic {
+        compat::open_anthropic_stream(resp, get_preflight_deadline(headers)).await?
     } else {
         compat::open_stream(resp, protocol).await?
     };
@@ -4222,7 +4224,9 @@ pub async fn handle_relay(
                     {
                         break;
                     }
-                    failover_budget += 1;
+                    if code != "resource_exhausted" {
+                        failover_budget += 1;
+                    }
                     continue;
                 }
             }
