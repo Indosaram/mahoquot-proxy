@@ -96,7 +96,22 @@ impl AnthropicDecoder {
                 if value.pointer("/delta/stop_reason").and_then(Value::as_str) == Some("max_tokens") {
                     out.push(CodexEvent::OutputLimitReached);
                 }
-                self.output_tokens = value["usage"]["output_tokens"].as_u64().unwrap_or(0);
+                let usage = &value["usage"];
+                self.output_tokens = usage["output_tokens"].as_u64().unwrap_or(0);
+                // Relays such as CCAPI open Opus streams with a placeholder
+                // message_start whose usage is all zero and report the real
+                // input/cache counts only here; prefer them when present.
+                if let Some(input) = usage["input_tokens"].as_u64() {
+                    self.input_tokens = input;
+                }
+                if let Some(read) = usage["cache_read_input_tokens"].as_u64() {
+                    self.cache_read_tokens = read;
+                    self.cache_read_tokens_known = true;
+                }
+                if let Some(write) = usage["cache_creation_input_tokens"].as_u64() {
+                    self.cache_write_tokens = write;
+                    self.cache_write_tokens_known = true;
+                }
             }
             Some("message_stop") => {
                 self.started = false;
@@ -1488,6 +1503,35 @@ mod contract_tests {
         let msg = &out["choices"][0]["message"];
         assert_eq!(msg["content"], "Here is the answer.");
         assert_eq!(msg["reasoning_content"], "Let me ponder.");
+    }
+
+    #[test]
+    fn relay_usage_reported_only_on_message_delta_is_kept() {
+        let mut decoder = ClaudeDecoder::new();
+        let mut events = Vec::new();
+        decoder.decode(
+            br#"{"type":"message_start","message":{"id":"msg_early","usage":{"input_tokens":0,"output_tokens":0}}}"#,
+            &mut events,
+        );
+        decoder.decode(
+            br#"{"type":"message_delta","usage":{"input_tokens":3,"cache_read_input_tokens":12705,"cache_creation_input_tokens":9,"output_tokens":4}}"#,
+            &mut events,
+        );
+        decoder.decode(br#"{"type":"message_stop"}"#, &mut events);
+
+        let completed = events
+            .iter()
+            .find_map(|e| match e {
+                CodexEvent::Completed { usage } => usage.as_ref(),
+                _ => None,
+            })
+            .expect("completed usage");
+        assert_eq!(completed.prompt_tokens, 3);
+        assert_eq!(completed.cached_tokens, 12705);
+        assert!(completed.cached_tokens_known);
+        assert_eq!(completed.cache_write_tokens, 9);
+        assert!(completed.cache_write_tokens_known);
+        assert_eq!(completed.completion_tokens, 4);
     }
 
     #[test]
