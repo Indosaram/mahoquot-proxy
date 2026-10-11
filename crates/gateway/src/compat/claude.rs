@@ -560,6 +560,54 @@ pub fn ensure_claude_code_system_instruction(body: &mut Value) {
     }
 }
 
+/// Anthropic only caches a prefix up to an explicit `cache_control`
+/// breakpoint. Translated OpenAI requests carry none, so only the prefix the
+/// relay marks itself (the system prompt) gets cached and the growing
+/// conversation is re-billed as uncached input every turn. Marks the last
+/// message block, which caches system + tools + history as one prefix.
+///
+/// `system` is deliberately left untouched: the CCAPI relay keeps a string
+/// system it caches itself, but drops a system that arrives as content
+/// blocks (measured 2026-10-12: block-form system cost the same input tokens
+/// as no system at all). A request that already carries a breakpoint is left
+/// as sent.
+pub fn apply_prompt_cache_breakpoints(body: &mut Value) {
+    if body.to_string().contains("\"cache_control\"") {
+        return;
+    }
+    let ephemeral = || json!({"type": "ephemeral"});
+    let Some(message) = body
+        .get_mut("messages")
+        .and_then(Value::as_array_mut)
+        .and_then(|messages| messages.last_mut())
+    else {
+        return;
+    };
+    if let Some(Value::String(text)) = message.get("content") {
+        if !text.is_empty() {
+            message["content"] =
+                json!([{"type": "text", "text": text, "cache_control": ephemeral()}]);
+        }
+        return;
+    }
+    // Thinking blocks cannot carry cache_control.
+    if let Some(block) = message
+        .get_mut("content")
+        .and_then(Value::as_array_mut)
+        .and_then(|blocks| {
+            blocks.iter_mut().rev().find(|block| {
+                !matches!(
+                    block.get("type").and_then(Value::as_str),
+                    Some("thinking") | Some("redacted_thinking")
+                )
+            })
+        })
+        .and_then(Value::as_object_mut)
+    {
+        block.insert("cache_control".to_string(), ephemeral());
+    }
+}
+
 fn anthropic_tool_name(name: &str) -> String {
     const BUILTINS: [&str; 4] = ["web_search", "code_execution", "text_editor", "computer"];
     if name.starts_with("custom_") || BUILTINS.contains(&name) {
@@ -1597,5 +1645,51 @@ mod openai_to_anthropic_tests {
         ensure_claude_code_system_instruction(&mut body);
         let arr2 = body["system"].as_array().unwrap();
         assert_eq!(arr2.len(), 2);
+    }
+
+    #[test]
+    fn translated_requests_mark_only_the_conversation_tail_for_caching() {
+        let mut body = openai_to_anthropic(&json!({
+            "model": "claude-opus-5-5",
+            "messages": [
+                {"role": "system", "content": "rules"},
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": null, "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "read", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+            ],
+        }))
+        .unwrap();
+        super::ensure_claude_code_system_instruction(&mut body);
+        super::apply_prompt_cache_breakpoints(&mut body);
+
+        // The relay drops block-form system prompts, so it must stay a string.
+        assert!(body["system"].as_str().expect("system stays a string").ends_with("rules"));
+        let messages = body["messages"].as_array().unwrap();
+        let tail = messages.last().unwrap()["content"].as_array().unwrap();
+        assert_eq!(tail.last().unwrap()["type"], "tool_result");
+        assert_eq!(tail.last().unwrap()["cache_control"]["type"], "ephemeral");
+        assert_eq!(body.to_string().matches("\"cache_control\"").count(), 1);
+    }
+
+    #[test]
+    fn client_breakpoints_are_left_untouched_and_thinking_is_skipped() {
+        let sent = json!({
+            "system": [{"type": "text", "text": "s", "cache_control": {"type": "ephemeral"}}],
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        let mut body = sent.clone();
+        super::apply_prompt_cache_breakpoints(&mut body);
+        assert_eq!(body, sent);
+
+        let mut body = json!({
+            "messages": [{"role": "assistant", "content": [
+                {"type": "text", "text": "a"},
+                {"type": "thinking", "thinking": "t", "signature": "x"},
+            ]}],
+        });
+        super::apply_prompt_cache_breakpoints(&mut body);
+        let blocks = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
+        assert!(blocks[1].get("cache_control").is_none());
     }
 }

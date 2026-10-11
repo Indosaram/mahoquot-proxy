@@ -1001,6 +1001,7 @@ fn resolve_target(
                 && member.relay_api_key().is_none()
             {
                 compat::claude::ensure_claude_code_system_instruction(&mut anthropic_val);
+                compat::claude::apply_prompt_cache_breakpoints(&mut anthropic_val);
             }
 
             if member.kind() == crate::account::ProviderKind::Zcode {
