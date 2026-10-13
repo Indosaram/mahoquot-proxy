@@ -38,9 +38,11 @@ impl AnthropicDecoder {
                 let usage = &value["message"]["usage"];
                 self.input_tokens = usage["input_tokens"].as_u64().unwrap_or(0);
                 self.cache_read_tokens = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
-                self.cache_write_tokens = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+                self.cache_write_tokens =
+                    usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
                 self.cache_read_tokens_known = usage["cache_read_input_tokens"].as_u64().is_some();
-                self.cache_write_tokens_known = usage["cache_creation_input_tokens"].as_u64().is_some();
+                self.cache_write_tokens_known =
+                    usage["cache_creation_input_tokens"].as_u64().is_some();
                 out.push(CodexEvent::Created {
                     response_id: value["message"]["id"]
                         .as_str()
@@ -93,7 +95,8 @@ impl AnthropicDecoder {
                 _ => {}
             },
             Some("message_delta") => {
-                if value.pointer("/delta/stop_reason").and_then(Value::as_str) == Some("max_tokens") {
+                if value.pointer("/delta/stop_reason").and_then(Value::as_str) == Some("max_tokens")
+                {
                     out.push(CodexEvent::OutputLimitReached);
                 }
                 let usage = &value["usage"];
@@ -329,7 +332,9 @@ pub fn anthropic_to_openai(body: &Value) -> Result<Value, String> {
             Some("none") => json!("none"),
             Some("any") => json!("required"),
             Some("tool") => {
-                let name = choice["name"].as_str().filter(|name| !name.is_empty())
+                let name = choice["name"]
+                    .as_str()
+                    .filter(|name| !name.is_empty())
                     .ok_or_else(|| "tool_choice tool requires a name".to_string())?;
                 json!({"type":"function","function":{"name":name}})
             }
@@ -337,7 +342,8 @@ pub fn anthropic_to_openai(body: &Value) -> Result<Value, String> {
         };
         out.insert("tool_choice".to_string(), mapped);
         if let Some(disabled) = choice.get("disable_parallel_tool_use") {
-            let disabled = disabled.as_bool()
+            let disabled = disabled
+                .as_bool()
                 .ok_or_else(|| "disable_parallel_tool_use must be boolean".to_string())?;
             out.insert("parallel_tool_calls".to_string(), json!(!disabled));
         }
@@ -364,7 +370,16 @@ pub fn openai_to_anthropic(body: &Value) -> Result<Value, String> {
             .unwrap_or("user");
         if role == "system" || role == "developer" {
             if let Some(text) = message.get("content").and_then(content_text) {
-                system.push(text.to_string());
+                if out.is_empty() {
+                    system.push(text.to_string());
+                } else {
+                    // Moving a later instruction ahead of the existing history
+                    // changes every cached message prefix. Keep its position.
+                    out.push(json!({
+                        "role": "user",
+                        "content": [{"type": "text", "text": text}],
+                    }));
+                }
             }
             continue;
         }
@@ -462,16 +477,20 @@ pub fn openai_to_anthropic(body: &Value) -> Result<Value, String> {
             _ => return Err("unsupported OpenAI tool_choice".to_string()),
         }),
         Some(choice) if choice["type"] == "function" => {
-            let name = choice["function"]["name"].as_str().filter(|name| !name.is_empty())
+            let name = choice["function"]["name"]
+                .as_str()
+                .filter(|name| !name.is_empty())
                 .ok_or_else(|| "tool_choice function requires a name".to_string())?;
             Some(json!({"type":"tool","name":anthropic_tool_name(name)}))
         }
         Some(_) => return Err("unsupported OpenAI tool_choice".to_string()),
     };
     if let Some(parallel) = body.get("parallel_tool_calls") {
-        let parallel = parallel.as_bool()
+        let parallel = parallel
+            .as_bool()
             .ok_or_else(|| "parallel_tool_calls must be boolean".to_string())?;
-        choice.get_or_insert_with(|| json!({"type":"auto"}))["disable_parallel_tool_use"] = json!(!parallel);
+        choice.get_or_insert_with(|| json!({"type":"auto"}))["disable_parallel_tool_use"] =
+            json!(!parallel);
     }
     if let Some(choice) = choice {
         result["tool_choice"] = choice;
@@ -784,8 +803,13 @@ pub fn messages_payload_full(
     }
     for (id, name, args) in tool_calls {
         let input = serde_json::from_str::<Value>(args).unwrap_or_else(|_| json!({}));
+        let block_type = if name == "web_search" {
+            "server_tool_use"
+        } else {
+            "tool_use"
+        };
         content.push(json!({
-            "type": "tool_use",
+            "type": block_type,
             "id": id,
             "name": name,
             "input": input
@@ -1056,7 +1080,11 @@ impl AnthropicStreamRenderer {
             // Redacted reasoning has no Anthropic wire representation without
             // upstream redacted data; the marker only keeps the state explicit.
             CodexEvent::ReasoningRedacted => {}
-            CodexEvent::ToolCallBegin { call_id, name, output_index } => {
+            CodexEvent::ToolCallBegin {
+                call_id,
+                name,
+                output_index,
+            } => {
                 self.close_thinking(&mut out);
                 self.close_text(&mut out);
                 let index = self.next_content_index;
@@ -1068,7 +1096,10 @@ impl AnthropicStreamRenderer {
                     json!({"type":"content_block_start","index":index,"content_block":{"type":"tool_use","id":call_id,"name":name,"input":{}}}),
                 ));
             }
-            CodexEvent::ToolArgsDelta { delta, output_index } => {
+            CodexEvent::ToolArgsDelta {
+                delta,
+                output_index,
+            } => {
                 let index = self.tool_indices.get(&output_index).copied().unwrap_or(1);
                 out.push(Self::frame(
                     "content_block_delta",
@@ -1138,11 +1169,65 @@ mod contract_tests {
     use super::*;
 
     #[test]
+    fn later_system_instructions_preserve_the_cached_history_prefix() {
+        let initial = json!({
+            "model": "fixture",
+            "messages": [
+                {"role": "system", "content": "base instruction"},
+                {"role": "developer", "content": "initial policy"},
+                {"role": "user", "content": "question"},
+                {"role": "assistant", "content": "answer"},
+            ],
+        });
+        let before = openai_to_anthropic(&initial).unwrap();
+        for role in ["system", "developer"] {
+            let mut next = initial.clone();
+            next["messages"].as_array_mut().unwrap().push(json!({
+                "role": role,
+                "content": "new instruction",
+            }));
+            let after = openai_to_anthropic(&next).unwrap();
+            assert_eq!(after["system"], before["system"]);
+            assert_eq!(
+                &after["messages"].as_array().unwrap()[..2],
+                before["messages"].as_array().unwrap()
+            );
+            assert_eq!(after["messages"][2]["role"], "user");
+            assert_eq!(
+                after["messages"][2]["content"][0]["text"],
+                "new instruction"
+            );
+        }
+    }
+
+    #[test]
     fn r23_blocks_allocate_from_zero_and_never_reuse_indices() {
         for events in [
-            vec![CodexEvent::ReasoningDelta("think".into()), CodexEvent::TextDelta("answer".into()), CodexEvent::ToolCallBegin { output_index: 0, call_id: "a".into(), name: "lookup".into() }],
-            vec![CodexEvent::ToolCallBegin { output_index: 0, call_id: "a".into(), name: "lookup".into() }],
-            vec![CodexEvent::TextDelta("before".into()), CodexEvent::ToolCallBegin { output_index: 0, call_id: "a".into(), name: "lookup".into() }, CodexEvent::TextDelta("after".into()), CodexEvent::ReasoningSignature("sig".into()), CodexEvent::TextDelta("end".into())],
+            vec![
+                CodexEvent::ReasoningDelta("think".into()),
+                CodexEvent::TextDelta("answer".into()),
+                CodexEvent::ToolCallBegin {
+                    output_index: 0,
+                    call_id: "a".into(),
+                    name: "lookup".into(),
+                },
+            ],
+            vec![CodexEvent::ToolCallBegin {
+                output_index: 0,
+                call_id: "a".into(),
+                name: "lookup".into(),
+            }],
+            vec![
+                CodexEvent::TextDelta("before".into()),
+                CodexEvent::ToolCallBegin {
+                    output_index: 0,
+                    call_id: "a".into(),
+                    name: "lookup".into(),
+                },
+                CodexEvent::TextDelta("after".into()),
+                CodexEvent::ReasoningSignature("sig".into()),
+                CodexEvent::TextDelta("end".into()),
+            ],
         ] {
             let expected_blocks = events.len();
             let mut renderer = AnthropicStreamRenderer::new("fixture".into(), 1);
@@ -1151,7 +1236,10 @@ mod contract_tests {
                 let tool = matches!(&event, CodexEvent::ToolCallBegin { .. });
                 frames.extend(renderer.render(event));
                 if tool {
-                    frames.extend(renderer.render(CodexEvent::ToolArgsDelta { output_index: 0, delta: "{}".into() }));
+                    frames.extend(renderer.render(CodexEvent::ToolArgsDelta {
+                        output_index: 0,
+                        delta: "{}".into(),
+                    }));
                 }
             }
             frames.extend(renderer.close_unterminated());
@@ -1161,7 +1249,8 @@ mod contract_tests {
             let mut stops = 0;
             for frame in frames {
                 let raw = std::str::from_utf8(&frame).unwrap();
-                let payload: Value = serde_json::from_str(raw.split_once("data: ").unwrap().1.trim()).unwrap();
+                let payload: Value =
+                    serde_json::from_str(raw.split_once("data: ").unwrap().1.trim()).unwrap();
                 match payload["type"].as_str().unwrap() {
                     "content_block_start" => {
                         assert_eq!(open, None);
@@ -1186,7 +1275,11 @@ mod contract_tests {
 
     #[test]
     fn r24_history_names_match_definitions_without_double_prefix() {
-        for (name, expected) in [("lookup", "custom_lookup"), ("custom_lookup", "custom_lookup"), ("web_search", "web_search")] {
+        for (name, expected) in [
+            ("lookup", "custom_lookup"),
+            ("custom_lookup", "custom_lookup"),
+            ("web_search", "web_search"),
+        ] {
             let out = openai_to_anthropic(&json!({
                 "model":"fixture", "tools":[{"type":"function","function":{"name":name}}],
                 "messages":[{"role":"assistant","tool_calls":[{"id":"a","function":{"name":name,"arguments":"{}"}}]},
@@ -1204,8 +1297,16 @@ mod contract_tests {
             (json!("auto"), json!({"type":"auto"}), json!("auto")),
             (json!("none"), json!({"type":"none"}), json!("none")),
             (json!("required"), json!({"type":"any"}), json!("required")),
-            (json!({"type":"function","function":{"name":"lookup"}}), json!({"type":"tool","name":"custom_lookup"}), json!({"type":"function","function":{"name":"custom_lookup"}})),
-            (json!({"type":"function","function":{"name":"web_search"}}), json!({"type":"tool","name":"web_search"}), json!({"type":"function","function":{"name":"web_search"}})),
+            (
+                json!({"type":"function","function":{"name":"lookup"}}),
+                json!({"type":"tool","name":"custom_lookup"}),
+                json!({"type":"function","function":{"name":"custom_lookup"}}),
+            ),
+            (
+                json!({"type":"function","function":{"name":"web_search"}}),
+                json!({"type":"tool","name":"web_search"}),
+                json!({"type":"function","function":{"name":"web_search"}}),
+            ),
         ] {
             for parallel in [None, Some(false), Some(true)] {
                 let mut input = json!({"model":"fixture","messages":[],"tool_choice":openai});
@@ -1218,15 +1319,30 @@ mod contract_tests {
                 assert_eq!(out["tool_choice"], expected);
                 let back = anthropic_to_openai(&out).unwrap();
                 assert_eq!(back["tool_choice"], native_choice);
-                assert_eq!(back.get("parallel_tool_calls"), input.get("parallel_tool_calls"));
+                assert_eq!(
+                    back.get("parallel_tool_calls"),
+                    input.get("parallel_tool_calls")
+                );
             }
         }
-        let out = openai_to_anthropic(&json!({"model":"fixture","messages":[],"parallel_tool_calls":false})).unwrap();
-        assert_eq!(out["tool_choice"], json!({"type":"auto","disable_parallel_tool_use":true}));
+        let out = openai_to_anthropic(
+            &json!({"model":"fixture","messages":[],"parallel_tool_calls":false}),
+        )
+        .unwrap();
+        assert_eq!(
+            out["tool_choice"],
+            json!({"type":"auto","disable_parallel_tool_use":true})
+        );
         let out = openai_to_anthropic(&json!({"model":"fixture","messages":[],"tool_choice":{"type":"function","function":{"name":"custom_lookup"}}})).unwrap();
         assert_eq!(out["tool_choice"]["name"], "custom_lookup");
-        assert!(openai_to_anthropic(&json!({"model":"fixture","messages":[],"tool_choice":"invalid"})).is_err());
-        assert!(anthropic_to_openai(&json!({"model":"fixture","messages":[],"tool_choice":{"type":"invalid"}})).is_err());
+        assert!(openai_to_anthropic(
+            &json!({"model":"fixture","messages":[],"tool_choice":"invalid"})
+        )
+        .is_err());
+        assert!(anthropic_to_openai(
+            &json!({"model":"fixture","messages":[],"tool_choice":{"type":"invalid"}})
+        )
+        .is_err());
     }
 
     #[test]
@@ -1707,7 +1823,10 @@ mod openai_to_anthropic_tests {
         super::apply_prompt_cache_breakpoints(&mut body);
 
         // The relay drops block-form system prompts, so it must stay a string.
-        assert!(body["system"].as_str().expect("system stays a string").ends_with("rules"));
+        assert!(body["system"]
+            .as_str()
+            .expect("system stays a string")
+            .ends_with("rules"));
         let messages = body["messages"].as_array().unwrap();
         let tail = messages.last().unwrap()["content"].as_array().unwrap();
         assert_eq!(tail.last().unwrap()["type"], "tool_result");
