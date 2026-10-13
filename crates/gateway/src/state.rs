@@ -398,6 +398,7 @@ pub struct AppState {
     pub model_restrictions: AtomicBool,
     pub settings: Arc<SettingsStore>,
     pub scheduler: crate::scheduler::SchedulerRegistry,
+    pub claude_reset_order: crate::claude_reset_order::ClaudeResetOrder,
     pub history: crate::request_history::HistoryService,
     pub signature_ledger: Arc<crate::compat::signature_ledger::SignatureLedger>,
     pub telemetry: Arc<TelemetryStore>,
@@ -640,6 +641,7 @@ impl AppState {
         let state = Self {
             settings,
             scheduler,
+            claude_reset_order: crate::claude_reset_order::ClaudeResetOrder::default(),
             history,
             signature_ledger,
             telemetry,

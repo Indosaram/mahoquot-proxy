@@ -1,5 +1,6 @@
 pub mod account;
 pub mod capability;
+pub mod claude_reset_order;
 pub mod cline_usage;
 pub mod compat;
 pub mod config;
