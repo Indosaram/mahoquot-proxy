@@ -19,6 +19,27 @@ pub struct AnthropicDecoder {
     cache_read_tokens_known: bool,
     cache_write_tokens_known: bool,
     next_tool_index: u64,
+    diagnostics: StreamDiagnostics,
+}
+
+/// What one upstream Anthropic message actually carried. Kept so a stream that
+/// ends without visible content can be told apart: an upstream that omitted
+/// `output_tokens` versus one that reported zero, and the real `stop_reason`
+/// (e.g. `refusal`) that the OpenAI-shaped downstream collapses into `stop`.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct StreamDiagnostics {
+    pub message_id: Option<String>,
+    pub stop_reason: Option<String>,
+    pub output_tokens_reported: bool,
+    pub text_deltas: u64,
+    pub thinking_deltas: u64,
+    pub tool_calls: u64,
+}
+
+impl StreamDiagnostics {
+    pub fn has_visible_output(&self) -> bool {
+        self.text_deltas > 0 || self.tool_calls > 0
+    }
 }
 
 pub type ClaudeDecoder = AnthropicDecoder;
@@ -43,6 +64,10 @@ impl AnthropicDecoder {
                 self.cache_read_tokens_known = usage["cache_read_input_tokens"].as_u64().is_some();
                 self.cache_write_tokens_known =
                     usage["cache_creation_input_tokens"].as_u64().is_some();
+                self.diagnostics = StreamDiagnostics {
+                    message_id: value["message"]["id"].as_str().map(str::to_string),
+                    ..StreamDiagnostics::default()
+                };
                 out.push(CodexEvent::Created {
                     response_id: value["message"]["id"]
                         .as_str()
@@ -51,6 +76,7 @@ impl AnthropicDecoder {
                 });
             }
             Some("content_block_start") if value["content_block"]["type"] == "tool_use" => {
+                self.diagnostics.tool_calls += 1;
                 out.push(CodexEvent::ToolCallBegin {
                     output_index: self.next_tool_index,
                     call_id: value["content_block"]["id"]
@@ -68,6 +94,9 @@ impl AnthropicDecoder {
             Some("content_block_delta") => match value["delta"]["type"].as_str() {
                 Some("text_delta") => {
                     if let Some(text) = value["delta"]["text"].as_str() {
+                        if !text.trim().is_empty() {
+                            self.diagnostics.text_deltas += 1;
+                        }
                         out.push(CodexEvent::TextDelta(text.to_string()));
                     }
                 }
@@ -76,6 +105,7 @@ impl AnthropicDecoder {
                         .as_str()
                         .or_else(|| value["delta"]["text"].as_str())
                     {
+                        self.diagnostics.thinking_deltas += 1;
                         out.push(CodexEvent::ReasoningDelta(text.to_string()));
                     }
                 }
@@ -99,8 +129,12 @@ impl AnthropicDecoder {
                 {
                     out.push(CodexEvent::OutputLimitReached);
                 }
+                if let Some(stop) = value.pointer("/delta/stop_reason").and_then(Value::as_str) {
+                    self.diagnostics.stop_reason = Some(stop.to_string());
+                }
                 let usage = &value["usage"];
                 self.output_tokens = usage["output_tokens"].as_u64().unwrap_or(0);
+                self.diagnostics.output_tokens_reported = usage["output_tokens"].as_u64().is_some();
                 // Relays such as CCAPI open Opus streams with a placeholder
                 // message_start whose usage is all zero and report the real
                 // input/cache counts only here; prefer them when present.
@@ -118,6 +152,17 @@ impl AnthropicDecoder {
             }
             Some("message_stop") => {
                 self.started = false;
+                if !self.diagnostics.has_visible_output() {
+                    let d = &self.diagnostics;
+                    tracing::warn!(
+                        message_id = d.message_id.as_deref().unwrap_or(""),
+                        stop_reason = d.stop_reason.as_deref().unwrap_or("<missing>"),
+                        output_tokens = self.output_tokens,
+                        output_tokens_reported = d.output_tokens_reported,
+                        thinking_deltas = d.thinking_deltas,
+                        "anthropic upstream message ended without text or tool calls"
+                    );
+                }
                 out.push(CodexEvent::Completed {
                     usage: Some(Usage {
                         prompt_tokens: self.input_tokens,
@@ -139,6 +184,10 @@ impl AnthropicDecoder {
             }),
             _ => {}
         }
+    }
+
+    pub fn diagnostics(&self) -> &StreamDiagnostics {
+        &self.diagnostics
     }
 
     pub fn finish(&mut self, out: &mut Vec<CodexEvent>) {
@@ -1619,6 +1668,59 @@ mod contract_tests {
         let msg = &out["choices"][0]["message"];
         assert_eq!(msg["content"], "Here is the answer.");
         assert_eq!(msg["reasoning_content"], "Let me ponder.");
+    }
+
+    #[test]
+    fn empty_stream_keeps_upstream_stop_reason_and_missing_output_tokens() {
+        let mut decoder = ClaudeDecoder::new();
+        let mut events = Vec::new();
+        decoder.decode(
+            br#"{"type":"message_start","message":{"id":"msg_empty","usage":{"input_tokens":4}}}"#,
+            &mut events,
+        );
+        decoder.decode(
+            br#"{"type":"message_delta","delta":{"stop_reason":"refusal"},"usage":{}}"#,
+            &mut events,
+        );
+        decoder.decode(br#"{"type":"message_stop"}"#, &mut events);
+
+        let d = decoder.diagnostics();
+        assert_eq!(d.message_id.as_deref(), Some("msg_empty"));
+        assert_eq!(d.stop_reason.as_deref(), Some("refusal"));
+        assert!(!d.output_tokens_reported);
+        assert!(!d.has_visible_output());
+    }
+
+    #[test]
+    fn diagnostics_count_content_and_reset_per_message() {
+        let mut decoder = ClaudeDecoder::new();
+        let mut events = Vec::new();
+        for frame in [
+            json!({"type":"message_start","message":{"id":"msg_a","usage":{}}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hm"}}),
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"hi"}}),
+            json!({"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"t","name":"x","input":{}}}),
+            json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":0}}),
+            json!({"type":"message_stop"}),
+        ] {
+            decoder.decode(frame.to_string().as_bytes(), &mut events);
+        }
+        let d = decoder.diagnostics().clone();
+        assert_eq!((d.text_deltas, d.thinking_deltas, d.tool_calls), (1, 1, 1));
+        assert!(d.output_tokens_reported);
+        assert!(d.has_visible_output());
+
+        decoder.decode(
+            br#"{"type":"message_start","message":{"id":"msg_b","usage":{}}}"#,
+            &mut events,
+        );
+        assert_eq!(
+            decoder.diagnostics(),
+            &StreamDiagnostics {
+                message_id: Some("msg_b".into()),
+                ..StreamDiagnostics::default()
+            }
+        );
     }
 
     #[test]
