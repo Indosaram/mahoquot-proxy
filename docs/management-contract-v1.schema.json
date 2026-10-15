@@ -379,7 +379,9 @@
     "GET /v0/management/model-registry": "crates/gateway/src/management/registry.rs",
     "POST /v0/management/model-registry": "crates/gateway/src/management/registry.rs",
     "POST /v0/management/devin/import-cli": "crates/gateway/src/management/creds.rs",
-    "POST /v0/management/devin/models/refresh": "crates/gateway/src/management/registry.rs"
+    "POST /v0/management/devin/models/refresh": "crates/gateway/src/management/registry.rs",
+    "GET /v0/management/omo-profile": "crates/gateway/src/management/omo_profile.rs",
+    "PUT /v0/management/omo-profile": "crates/gateway/src/management/omo_profile.rs"
   },
   "$defs": {
     "devin-import-cli": {

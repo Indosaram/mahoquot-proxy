@@ -153,13 +153,40 @@ impl SettingsStore {
     where
         F: FnOnce(&mut Settings),
     {
+        match self.commit_edit(|next| {
+            edit(next);
+            Ok::<(), std::convert::Infallible>(())
+        }) {
+            Ok(outcome) => outcome,
+            Err(never) => match never {},
+        }
+    }
+
+    /// Like `mutate`, but `edit` may refuse the change. A refusal is returned
+    /// as the outer `Err` before anything is validated, persisted or
+    /// published, and the check inside `edit` runs under the same lock as the
+    /// write, so it is an atomic compare-and-set against the live document.
+    pub fn try_mutate<F, E>(&self, edit: F) -> Result<Result<Arc<Settings>, SettingsError>, E>
+    where
+        F: FnOnce(&mut Settings) -> Result<(), E>,
+    {
+        self.commit_edit(edit)
+    }
+
+    fn commit_edit<F, E>(&self, edit: F) -> Result<Result<Arc<Settings>, SettingsError>, E>
+    where
+        F: FnOnce(&mut Settings) -> Result<(), E>,
+    {
         let _write = self
             .mutate_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut next = Settings::clone(&self.current());
-        edit(&mut next);
+        edit(&mut next)?;
+        Ok(self.validate_persist_publish(next))
+    }
 
+    fn validate_persist_publish(&self, next: Settings) -> Result<Arc<Settings>, SettingsError> {
         let active_snapshot = self.active_snapshot();
         let candidate_registry = next.validate_against_registry(&active_snapshot)?;
 
@@ -255,6 +282,35 @@ mod tests {
         // and so does the file on disk
         let on_disk = Settings::load(&path).expect("reloads");
         assert_eq!(on_disk.request_retry, 9);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn try_mutate_refusal_changes_neither_memory_nor_file() {
+        // given a store backed by a file
+        let dir = temp_dir("try-refuse");
+        let path = dir.join("config.yaml");
+        let store = SettingsStore::load_or(path.clone(), Settings::default()).expect("loads");
+        let bytes_before = std::fs::read(&path).expect("file");
+        // when the edit changes the draft and then refuses
+        let refused = store.try_mutate(|s| {
+            s.request_retry = 9;
+            Err("stale")
+        });
+        // then the refusal comes back and nothing was published or persisted
+        assert!(matches!(refused, Err("stale")));
+        assert_eq!(store.current().request_retry, 0);
+        assert_eq!(std::fs::read(&path).expect("file"), bytes_before);
+        // and an accepted edit still persists and publishes
+        store
+            .try_mutate(|s| {
+                s.request_retry = 4;
+                Ok::<(), &str>(())
+            })
+            .expect("not refused")
+            .expect("mutates");
+        assert_eq!(store.current().request_retry, 4);
+        assert_eq!(Settings::load(&path).expect("reloads").request_retry, 4);
         std::fs::remove_dir_all(&dir).ok();
     }
 
