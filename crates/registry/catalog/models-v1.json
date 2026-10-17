@@ -3815,6 +3815,131 @@
       "metadata": {
         "context_limit": "256000"
       }
+    },
+    "gemini-4-argon": {
+      "id": "gemini-4-argon",
+      "owned_by": "google",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "antigravity": {
+          "provider_id": "antigravity",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100,
+          "upstream_model_id": "gemini-4-argon-high"
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1048576"
+      }
+    },
+    "gemini-4-argon-high": {
+      "id": "gemini-4-argon-high",
+      "owned_by": "google",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "antigravity": {
+          "provider_id": "antigravity",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1048576"
+      }
+    },
+    "gemini-4-argon-medium": {
+      "id": "gemini-4-argon-medium",
+      "owned_by": "google",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "antigravity": {
+          "provider_id": "antigravity",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1048576"
+      }
+    },
+    "gemini-4-argon-low": {
+      "id": "gemini-4-argon-low",
+      "owned_by": "google",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "antigravity": {
+          "provider_id": "antigravity",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1048576"
+      }
     }
   },
   "providers": {
