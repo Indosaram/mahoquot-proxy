@@ -431,7 +431,7 @@
       },
       "green_test": {
         "path": "crates/gateway/tests/t14_management_route_parity.rs",
-        "needle": "unimplemented_pluginhost_routes_are_not_advertised_as_handlers"
+        "needle": "plugin_routes_are_registered_and_unknown_plugin_paths_fall_back"
       },
       "evidence": ".omo/ulw-loop/opencodex-cliproxy-auth-proxy/evidence/aistudio-pluginhost-green.txt"
     },

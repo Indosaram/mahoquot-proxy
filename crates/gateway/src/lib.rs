@@ -7,7 +7,9 @@ pub mod cp_routes;
 pub mod devin_catalog;
 pub mod egress_supervisor;
 pub mod inbound;
+pub mod interactions;
 pub mod management;
+pub mod media;
 pub mod metrics;
 pub mod models_route;
 pub mod monitor;
@@ -17,6 +19,7 @@ pub mod quota;
 pub mod realtime;
 pub mod registry;
 pub mod relay;
+pub mod relay_payload;
 pub mod request_history;
 pub mod routes;
 pub mod runtime_state;
@@ -29,3 +32,17 @@ pub mod url;
 pub mod usage;
 pub mod v1beta;
 pub mod warmup;
+
+pub mod discovery;
+pub mod tui;
+
+pub mod loopback_guard;
+
+pub mod home;
+
+pub mod resp;
+
+pub mod plugins;
+
+pub mod aistudio;
+pub mod wsrelay;

@@ -59,11 +59,6 @@ fn set_usize(target: &mut usize, body: &Value) -> WriteResult {
     Ok(())
 }
 
-fn set_string(target: &mut String, body: &Value) -> WriteResult {
-    *target = valued::<String>(body)?;
-    Ok(())
-}
-
 /// Upstream accepts several spellings per strategy and answers with the
 /// canonical one, rejecting anything else with 400 `invalid strategy`.
 pub fn normalize_routing_strategy(raw: &str) -> Option<&'static str> {
@@ -175,7 +170,13 @@ pub const SCALARS: &[Scalar] = &[
         path: "/proxy-url",
         key: "proxy-url",
         read: |s| json!(s.proxy_url),
-        write: |s, b| set_string(&mut s.proxy_url, b),
+        write: |s, b| {
+            let candidate = valued::<String>(b)?;
+            crate::proxy_policy::validate_proxy_url_candidate(&candidate)
+                .map_err(|_| Refusal::Message("invalid proxy url"))?;
+            s.proxy_url = candidate;
+            Ok(())
+        },
         clear: Some(|s, _| {
             s.proxy_url.clear();
             Ok(())
@@ -193,6 +194,12 @@ pub const SCALARS: &[Scalar] = &[
                 .unwrap_or(b);
             let map: std::collections::BTreeMap<String, super::settings::ProviderProxyPolicy> =
                 serde_json::from_value(candidate.clone()).map_err(|_| Refusal::InvalidBody)?;
+            for policy in map.values() {
+                if policy.enabled && !policy.url.trim().is_empty() {
+                    crate::proxy_policy::validate_proxy_url_candidate(&policy.url)
+                        .map_err(|_| Refusal::Message("invalid proxy url"))?;
+                }
+            }
             s.proxy_providers = map;
             Ok(())
         },

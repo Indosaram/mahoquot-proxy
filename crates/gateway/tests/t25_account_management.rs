@@ -7,7 +7,7 @@ use axum::body::Body;
 use axum::http::{header, Method, Request, StatusCode};
 use axum::routing::post;
 use axum::Router;
-use common::{unique_temp_dir, CODEX_PATH};
+use common::{configure_management_secret, unique_temp_dir, with_loopback_peer, CODEX_PATH};
 use http_body_util::BodyExt;
 use mahoquot_gateway::config::GatewayConfig;
 use mahoquot_gateway::inbound::ApiKeys;
@@ -20,6 +20,117 @@ use tower::ServiceExt;
 const MANAGEMENT_KEY: &str = "task-12-management-key";
 const BOUND_KEY: &str = "task-12-bound-key";
 const EXPORT_SECRET: &str = "task-12-export-secret";
+/// Dedicated management secret (Task 26): management and /admin accept only
+/// this key, never an inbound inference key.
+/// Export authorization re-presents this same secret
+/// (`accounts::export_authorized`), so the export tests' secret is it.
+const MGMT_SECRET: &str = EXPORT_SECRET;
+
+#[tokio::test]
+async fn effective_auth_dir_agrees_for_startup_bulk_rescan_and_list() {
+    for explicit_yaml_dir in [false, true] {
+        let root = unique_temp_dir("mahoquot-t25-effective-auth-dir");
+        let launch_dir = root.join("launch-auth");
+        let yaml_dir = root.join("yaml-auth");
+        std::fs::create_dir_all(&launch_dir).expect("launch dir");
+        std::fs::create_dir_all(&yaml_dir).expect("yaml dir");
+        let effective_dir = if explicit_yaml_dir {
+            &yaml_dir
+        } else {
+            &launch_dir
+        };
+        let credential_path = effective_dir.join("codex-loaded.json");
+        std::fs::write(
+            &credential_path,
+            codex_credential("loaded", "loaded@example.test").to_string(),
+        )
+        .expect("credential");
+        let config_path = root.join("config.yaml");
+        let mut yaml = format!("api-keys:\n- {MANAGEMENT_KEY}\nrouting:\n  strategy: fill-first\n");
+        if explicit_yaml_dir {
+            yaml.push_str(&format!(
+                "auth-dir: {}\n",
+                json!(yaml_dir.display().to_string())
+            ));
+        }
+        std::fs::write(&config_path, &yaml).expect("config");
+        configure_management_secret(&config_path, MGMT_SECRET);
+        // The startup document (with the management secret) must survive
+        // gateway boot byte-for-byte.
+        let yaml = std::fs::read_to_string(&config_path).expect("config with secret");
+        let config = GatewayConfig {
+            auth_dir: launch_dir.clone(),
+            config_path: config_path.clone(),
+            auth_refresh_enabled: false,
+            ..GatewayConfig::default()
+        };
+        let state = Arc::new(AppState::new(&config).expect("state"));
+        let ctx = TestContext {
+            auth_dir: root,
+            app: create_app(Arc::clone(&state)),
+            state,
+        };
+        assert_eq!(
+            std::path::Path::new(&ctx.state.settings.current().auth_dir),
+            effective_dir.as_path(),
+        );
+        assert_eq!(
+            ctx.state
+                .find_member("loaded")
+                .expect("startup member")
+                .file_path,
+            credential_path
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config_path).expect("config read"),
+            yaml
+        );
+        let response = management(
+            &ctx.app,
+            Method::POST,
+            "/auth-files/bulk",
+            Some(json!({"action": "disable", "names": ["codex-loaded.json"]})),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            json_body(response).await,
+            json!({"status": "ok", "changed": 1})
+        );
+        assert_eq!(
+            ctx.state
+                .find_member("loaded")
+                .expect("disabled member")
+                .health(),
+            Health::Disabled
+        );
+        let saved: Value =
+            serde_json::from_slice(&std::fs::read(&credential_path).expect("credential read"))
+                .expect("credential JSON");
+        assert_eq!(saved["disabled"], true);
+        ctx.state.rescan_pool().expect("rescan");
+        assert_eq!(
+            ctx.state
+                .find_member("loaded")
+                .expect("rescanned member")
+                .file_path,
+            credential_path
+        );
+        let response = management(&ctx.app, Method::GET, "/auth-files", None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let files = json_body(response).await;
+        assert_eq!(files["files"].as_array().expect("files").len(), 1);
+        assert_eq!(files["files"][0]["name"], "codex-loaded.json");
+        assert_eq!(files["files"][0]["disabled"], true);
+        assert_eq!(
+            std::fs::read_to_string(&config_path).expect("config read"),
+            yaml
+        );
+        if explicit_yaml_dir {
+            assert!(!launch_dir.join("codex-loaded.json").exists());
+        }
+    }
+}
 
 #[tokio::test]
 async fn r13_status_rejects_invalid_json_and_internal_metadata_without_writing() {
@@ -36,17 +147,43 @@ async fn r13_status_rejects_invalid_json_and_internal_metadata_without_writing()
         ("telemetry.json", "{}"),
     ] {
         std::fs::write(ctx.auth_dir.join(name), raw).unwrap();
-        let response = management(&ctx.app, Method::PATCH, "/auth-files/status",
-            Some(json!({"name":name,"disabled":true}))).await;
+        let response = management(
+            &ctx.app,
+            Method::PATCH,
+            "/auth-files/status",
+            Some(json!({"name":name,"disabled":true})),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{name}");
-        assert_eq!(std::fs::read_to_string(ctx.auth_dir.join(name)).unwrap(), raw);
+        assert_eq!(
+            std::fs::read_to_string(ctx.auth_dir.join(name)).unwrap(),
+            raw
+        );
     }
-    assert_eq!(management(&ctx.app, Method::GET, "/auth-files", None).await.status(), StatusCode::OK);
+    assert_eq!(
+        management(&ctx.app, Method::GET, "/auth-files", None)
+            .await
+            .status(),
+        StatusCode::OK
+    );
     let mut legacy = codex_credential("legacy", "legacy@example.test");
     legacy["type"] = json!("plus");
-    std::fs::write(ctx.auth_dir.join("codex-legacy-plus.json"), legacy.to_string()).unwrap();
-    assert_eq!(management(&ctx.app, Method::PATCH, "/auth-files/status",
-        Some(json!({"name":"codex-legacy-plus.json","disabled":true}))).await.status(), StatusCode::OK);
+    std::fs::write(
+        ctx.auth_dir.join("codex-legacy-plus.json"),
+        legacy.to_string(),
+    )
+    .unwrap();
+    assert_eq!(
+        management(
+            &ctx.app,
+            Method::PATCH,
+            "/auth-files/status",
+            Some(json!({"name":"codex-legacy-plus.json","disabled":true}))
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
 }
 
 #[tokio::test]
@@ -60,10 +197,28 @@ async fn r25_non_codex_filename_accounts_remain_distinct_across_rescan() {
     }
     ctx.state.rescan_pool().unwrap();
     assert_eq!(ctx.state.pool.load().members.len(), 2);
-    ctx.state.find_member("claude-work").expect("work identity").ok_count.store(7, Ordering::Relaxed);
+    ctx.state
+        .find_member("claude-work")
+        .expect("work identity")
+        .ok_count
+        .store(7, Ordering::Relaxed);
     ctx.state.rescan_pool().unwrap();
-    assert_eq!(ctx.state.find_member("claude-work").unwrap().ok_count.load(Ordering::Relaxed), 7);
-    assert_eq!(ctx.state.find_member("claude-personal").unwrap().ok_count.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        ctx.state
+            .find_member("claude-work")
+            .unwrap()
+            .ok_count
+            .load(Ordering::Relaxed),
+        7
+    );
+    assert_eq!(
+        ctx.state
+            .find_member("claude-personal")
+            .unwrap()
+            .ok_count
+            .load(Ordering::Relaxed),
+        0
+    );
 }
 static NEXT_PORT: AtomicU16 = AtomicU16::new(18870);
 
@@ -90,6 +245,7 @@ fn context(tag: &str, inbound_keys: &[&str]) -> TestContext {
         auth_refresh_enabled: false,
         ..GatewayConfig::default()
     };
+    configure_management_secret(&config.config_path, MGMT_SECRET);
     let state = Arc::new(AppState::new(&config).expect("state"));
     let app = create_app(Arc::clone(&state));
     TestContext {
@@ -124,7 +280,7 @@ async fn management_with_export(
     let mut builder = Request::builder()
         .method(method)
         .uri(format!("/v0/management{path}"))
-        .header(header::AUTHORIZATION, format!("Bearer {MANAGEMENT_KEY}"));
+        .header("X-Management-Key", MGMT_SECRET);
     if let Some(secret) = export_secret {
         builder = builder.header("x-mahoquot-export-authorization", secret);
     }
@@ -136,7 +292,7 @@ async fn management_with_export(
         None => Body::empty(),
     };
     app.clone()
-        .oneshot(builder.body(request_body).unwrap())
+        .oneshot(with_loopback_peer(builder.body(request_body).unwrap()))
         .await
         .unwrap()
 }
@@ -439,13 +595,13 @@ async fn ordinary_account_hides_relay_fields() {
     let stats = ctx
         .app
         .clone()
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .uri("/admin/stats")
-                .header(header::AUTHORIZATION, format!("Bearer {MANAGEMENT_KEY}"))
+                .header("X-Management-Key", MGMT_SECRET)
                 .body(Body::empty())
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     let stats = json_body(stats).await;
@@ -638,7 +794,11 @@ async fn bulk_status_order_and_manual_priority_persist_across_restart() {
     )
     .await;
     assert_eq!(imported.status(), StatusCode::CREATED);
-    ctx.state.find_member("alpha").unwrap().ok_count.store(10, Ordering::Relaxed);
+    ctx.state
+        .find_member("alpha")
+        .unwrap()
+        .ok_count
+        .store(10, Ordering::Relaxed);
     for id in ["alpha", "beta"] {
         let member = ctx.state.find_member(id).unwrap();
         let mut usage = member.usage_snapshot();
@@ -647,7 +807,10 @@ async fn bulk_status_order_and_manual_priority_persist_across_restart() {
     }
     let mut scheduler_settings = (*ctx.state.scheduler.settings()).clone();
     scheduler_settings.enabled = true;
-    ctx.state.scheduler.update_settings(scheduler_settings, &ctx.state.pool.load().members).unwrap();
+    ctx.state
+        .scheduler
+        .update_settings(scheduler_settings, &ctx.state.pool.load().members)
+        .unwrap();
     ctx.state
         .find_member("beta")
         .unwrap()
@@ -703,11 +866,22 @@ async fn bulk_status_order_and_manual_priority_persist_across_restart() {
     let status = disable.status();
     let disable = json_body(disable).await;
     assert_eq!(status, StatusCode::OK, "bulk disable: {disable}");
-    let alpha = ctx.state.find_member("alpha").expect("disabled identity retained");
+    let alpha = ctx
+        .state
+        .find_member("alpha")
+        .expect("disabled identity retained");
     assert_eq!(alpha.health(), Health::Disabled);
     assert_eq!(alpha.ok_count.load(Ordering::Relaxed), 10);
-    assert!(!ctx.state.scheduler.snapshot().order.contains(&"alpha".to_string()));
-    assert_eq!(ctx.state.scheduler.snapshot().selected.as_deref(), Some("beta"));
+    assert!(!ctx
+        .state
+        .scheduler
+        .snapshot()
+        .order
+        .contains(&"alpha".to_string()));
+    assert_eq!(
+        ctx.state.scheduler.snapshot().selected.as_deref(),
+        Some("beta")
+    );
     assert_eq!(
         ctx.state
             .find_member("beta")
@@ -732,9 +906,24 @@ async fn bulk_status_order_and_manual_priority_persist_across_restart() {
         json_body(enable).await
     );
 
-    assert_eq!(ctx.state.find_member("alpha").unwrap().health(), Health::Available);
-    assert_eq!(ctx.state.find_member("alpha").unwrap().ok_count.load(Ordering::Relaxed), 10);
-    assert!(ctx.state.scheduler.snapshot().order.contains(&"alpha".to_string()));
+    assert_eq!(
+        ctx.state.find_member("alpha").unwrap().health(),
+        Health::Available
+    );
+    assert_eq!(
+        ctx.state
+            .find_member("alpha")
+            .unwrap()
+            .ok_count
+            .load(Ordering::Relaxed),
+        10
+    );
+    assert!(ctx
+        .state
+        .scheduler
+        .snapshot()
+        .order
+        .contains(&"alpha".to_string()));
     let restarted_config = GatewayConfig {
         auth_dir: ctx.auth_dir.clone(),
         config_path: ctx.auth_dir.join("config.yaml"),

@@ -124,37 +124,20 @@ pub fn project_model_entries(
     for (model_id, descriptor) in registry.models() {
         let id_str = model_id.as_str();
 
-        if registry
-            .exclusions()
-            .contains(&mahoquot_registry::ModelExclusionRule {
-                model_id: model_id.clone(),
-                provider_id: None,
-            })
-        {
+        let Ok(resolved) = registry.resolve(id_str) else {
             continue;
-        }
+        };
 
-        let mut can_serve = false;
-
-        for (provider_id, binding) in &descriptor.bindings {
-            if registry
-                .exclusions()
-                .contains(&mahoquot_registry::ModelExclusionRule {
-                    model_id: model_id.clone(),
-                    provider_id: Some(provider_id.clone()),
-                })
-            {
-                continue;
-            }
-
-            if active_members
-                .iter()
-                .any(|m| member_matches_provider_binding(m, provider_id, binding, model_id))
-            {
-                can_serve = true;
-                break;
-            }
-        }
+        let can_serve = resolved.eligible_bindings.iter().any(|binding| {
+            active_members.iter().any(|member| {
+                member_matches_provider_binding(
+                    member,
+                    &binding.provider_id,
+                    binding,
+                    &resolved.canonical_id,
+                )
+            })
+        });
 
         if can_serve {
             let owned_by = if !descriptor.owned_by.is_empty() {
@@ -261,11 +244,11 @@ pub fn model_bound_to_provider(
         .is_some_and(|descriptor| descriptor.bindings.contains_key(provider_id))
 }
 
-pub fn expand_prefixed_models(
-    entries: Vec<ModelEntry>,
+pub fn prefixed_model_aliases(
+    entries: &[ModelEntry],
     members: &[std::sync::Arc<AccountMember>],
     registry: &mahoquot_registry::RegistrySnapshot,
-) -> Vec<ModelEntry> {
+) -> Vec<(String, String, String)> {
     let has_official_claude = members.iter().any(|m| {
         m.kind() == ProviderKind::Claude && !m.is_nekos_relay() && !m.is_manually_disabled()
     });
@@ -274,34 +257,57 @@ pub fn expand_prefixed_models(
     });
 
     if !has_official_claude && !has_nekos_claude {
-        return entries;
+        return Vec::new();
     }
 
     let claude_provider = mahoquot_registry::ProviderId::claude();
-    let mut result = entries.clone();
-    for entry in &entries {
+    let mut pairs = Vec::new();
+    for entry in entries {
         if model_bound_to_provider(registry, &entry.id, &claude_provider) {
             if has_official_claude {
-                result.push(ModelEntry {
-                    id: format!("anthropic/{}", entry.id),
-                    owned_by: "anthropic".to_string(),
-                });
-                result.push(ModelEntry {
-                    id: format!("anthropic-{}", entry.id),
-                    owned_by: "anthropic".to_string(),
-                });
+                pairs.push((
+                    format!("anthropic/{}", entry.id),
+                    entry.id.clone(),
+                    "anthropic".to_string(),
+                ));
+                pairs.push((
+                    format!("anthropic-{}", entry.id),
+                    entry.id.clone(),
+                    "anthropic".to_string(),
+                ));
             }
             if has_nekos_claude {
-                result.push(ModelEntry {
-                    id: format!("nekos/{}", entry.id),
-                    owned_by: "nekos".to_string(),
-                });
-                result.push(ModelEntry {
-                    id: format!("nekos-{}", entry.id),
-                    owned_by: "nekos".to_string(),
-                });
+                pairs.push((
+                    format!("nekos/{}", entry.id),
+                    entry.id.clone(),
+                    "nekos".to_string(),
+                ));
+                pairs.push((
+                    format!("nekos-{}", entry.id),
+                    entry.id.clone(),
+                    "nekos".to_string(),
+                ));
             }
         }
+    }
+    pairs
+}
+
+pub fn expand_prefixed_models(
+    entries: Vec<ModelEntry>,
+    members: &[std::sync::Arc<AccountMember>],
+    registry: &mahoquot_registry::RegistrySnapshot,
+) -> Vec<ModelEntry> {
+    let pairs = prefixed_model_aliases(&entries, members, registry);
+    if pairs.is_empty() {
+        return entries;
+    }
+    let mut result = entries;
+    for (prefixed_id, _, owned_by) in pairs {
+        result.push(ModelEntry {
+            id: prefixed_id,
+            owned_by,
+        });
     }
     result
 }
@@ -414,6 +420,48 @@ pub fn model_entries(providers: &[ProviderKind], env_override: Option<&str>) -> 
     }
 
     entries
+}
+
+pub fn resolve_visible_models(
+    pool: &crate::state::PoolSnapshot,
+    scoped_key: Option<&std::sync::Arc<crate::management::settings::ScopedApiKey>>,
+) -> Vec<ModelEntry> {
+    match scoped_key {
+        Some(scoped) => scoped_model_entries(pool, scoped),
+        None => pool.models.clone(),
+    }
+}
+
+pub fn find_model_entry(
+    pool: &crate::state::PoolSnapshot,
+    scoped_key: Option<&std::sync::Arc<crate::management::settings::ScopedApiKey>>,
+    id: &str,
+) -> Option<ModelEntry> {
+    let mut seen = std::collections::HashSet::new();
+    resolve_visible_models(pool, scoped_key)
+        .into_iter()
+        .filter(|entry| seen.insert(entry.id.clone()))
+        .find(|entry| entry.id == id)
+}
+
+pub fn single_model_payload(entry: &ModelEntry, created_unix: i64) -> Value {
+    json!({
+        "id": entry.id,
+        "object": "model",
+        "created": created_unix,
+        "owned_by": entry.owned_by,
+    })
+}
+
+pub fn model_not_found_payload(id: &str) -> Value {
+    json!({
+        "error": {
+            "message": format!("The model '{id}' does not exist"),
+            "type": "invalid_request_error",
+            "param": "model",
+            "code": "model_not_found"
+        }
+    })
 }
 
 pub fn models_payload(entries: &[ModelEntry], created_unix: i64) -> Value {
@@ -868,6 +916,137 @@ mod tests {
     }
 
     #[test]
+    fn test_projection_requires_loaded_winning_binding() {
+        use mahoquot_registry::{
+            CatalogSource, CatalogVersion, ModelDescriptor, ModelId, ProviderBinding,
+            ProviderPolicy, RegistryBuilder,
+        };
+        let mut builder = RegistryBuilder::new(CatalogVersion(1), CatalogSource::LocalOverride);
+        builder.register_provider(ProviderId::codex(), ProviderPolicy::Open);
+        builder.register_provider(ProviderId::claude(), ProviderPolicy::Discovered);
+        let competing_id = ModelId::new("fixture-competing-route").unwrap();
+        let open_id = ModelId::new("fixture-open-route").unwrap();
+        let open_binding = ProviderBinding::new(
+            ProviderId::codex(),
+            ProviderPolicy::Open,
+            CatalogSource::LocalOverride,
+        );
+        builder
+            .add_model(
+                ModelDescriptor::new(competing_id.clone(), "fixture")
+                    .with_binding(open_binding.clone())
+                    .with_binding(ProviderBinding::new(
+                        ProviderId::claude(),
+                        ProviderPolicy::Discovered,
+                        CatalogSource::Discovered,
+                    )),
+            )
+            .unwrap();
+        builder
+            .add_model(ModelDescriptor::new(open_id.clone(), "fixture").with_binding(open_binding))
+            .unwrap();
+        let registry = builder.build().unwrap();
+        let codex = Arc::new(AccountMember::for_test(ProviderAccount::Codex(
+            mahoquot_providers::CodexAccount::default(),
+        )));
+
+        let without_winner = project_model_entries(&registry, &[Arc::clone(&codex)]);
+        assert_eq!(without_winner.len(), 1);
+        assert_eq!(without_winner[0].id, open_id.as_str());
+
+        let with_winner = project_model_entries(
+            &registry,
+            &[codex, test_claude_account("fixture-winner", false)],
+        );
+        assert_eq!(with_winner.len(), 2);
+        assert!(with_winner
+            .iter()
+            .any(|entry| entry.id == competing_id.as_str()));
+        assert!(with_winner.iter().any(|entry| entry.id == open_id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn google_owned_foreign_model_is_projected_out_before_usage_selection() {
+        use mahoquot_registry::{
+            CatalogSource, CatalogVersion, ModelCapability, ModelDescriptor, ModelId,
+            ProviderBinding, ProviderPolicy, RegistryBuilder,
+        };
+        use tokio::io::AsyncWriteExt;
+
+        let mut builder = RegistryBuilder::new(CatalogVersion(1), CatalogSource::EmbeddedFallback);
+        builder.register_provider(ProviderId::codex(), ProviderPolicy::Open);
+        builder.register_provider(ProviderId::antigravity(), ProviderPolicy::Closed);
+        let foreign = ModelId::new("cline-free/gemini-3.8-flash").unwrap();
+        let native = ModelId::new("gemini-fixture-live").unwrap();
+        let mut foreign_descriptor = ModelDescriptor::new(foreign.clone(), "google");
+        foreign_descriptor
+            .capabilities
+            .extend([ModelCapability::Chat, ModelCapability::Tools]);
+        foreign_descriptor
+            .metadata
+            .insert("context_limit".into(), "1048576".into());
+        builder.add_model(foreign_descriptor).unwrap();
+        builder
+            .add_model(
+                ModelDescriptor::new(native.clone(), "google").with_binding(
+                    ProviderBinding::new(
+                        ProviderId::antigravity(),
+                        ProviderPolicy::Closed,
+                        CatalogSource::EmbeddedFallback,
+                    )
+                    .with_capabilities([ModelCapability::Chat, ModelCapability::Tools]),
+                ),
+            )
+            .unwrap();
+        let registry = builder.build().unwrap();
+        assert_eq!(registry.models().first_key_value().unwrap().0, &foreign);
+        assert_eq!(registry.get_model(&foreign).unwrap().owned_by, "google");
+        assert!(registry.get_model(&foreign).unwrap().bindings.is_empty());
+        assert!(matches!(
+            registry.resolve(foreign.as_str()),
+            Err(mahoquot_registry::RegistryError::UnknownModel(_))
+        ));
+        let members = [test_antigravity_account("usage-fixture", false)];
+        let projected = project_model_entries(&registry, &members);
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].id, native.as_str());
+        assert!(!projected.iter().any(|entry| entry.id == foreign.as_str()));
+        let catalog = serde_json::to_vec(&models_payload(&projected, 0)).unwrap();
+        let selector = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../scripts/qa/cases/usage.mjs");
+        let mut child = tokio::process::Command::new("bun")
+            .args(["-e", "const {selectFixtureGeminiModel}=await import(process.argv[1]); const catalog=await new Response(Bun.stdin).json(); process.stdout.write(selectFixtureGeminiModel(catalog));"])
+            .arg(selector)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn().unwrap();
+        let output = tokio::time::timeout(std::time::Duration::from_secs(10), async move {
+            let mut stdin = child.stdin.take().unwrap();
+            stdin.write_all(&catalog).await.unwrap();
+            stdin.shutdown().await.unwrap();
+            drop(stdin);
+            child.wait_with_output().await.unwrap()
+        })
+        .await
+        .expect("projection-to-selector deadline");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let selected = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(selected, native.as_str());
+        let route = registry.resolve(&selected).unwrap();
+        assert_eq!(route.eligible_bindings.len(), 1);
+        assert_eq!(
+            route.eligible_bindings[0].provider_id,
+            ProviderId::antigravity()
+        );
+    }
+
+    #[test]
     fn test_project_model_entries_fixture_model_and_absent_accounts() {
         use mahoquot_registry::{
             CatalogSource, CatalogVersion, ModelCapability, ModelDescriptor, ModelId,
@@ -1265,5 +1444,110 @@ mod tests {
             std::slice::from_ref(&member),
             now_unix + 301
         ));
+    }
+
+    #[test]
+    fn test_task_12_single_model_detail_and_slash_ids() {
+        let claude_member = test_claude_account("claude-1", false);
+        let entries = vec![
+            ModelEntry {
+                id: "claude-sonnet-4-6".to_string(),
+                owned_by: "anthropic".to_string(),
+            },
+            ModelEntry {
+                id: "anthropic/claude-sonnet-4-6".to_string(),
+                owned_by: "anthropic".to_string(),
+            },
+            ModelEntry {
+                id: "custom/vendor/slash-model".to_string(),
+                owned_by: "custom-vendor".to_string(),
+            },
+        ];
+
+        let snapshot = crate::state::PoolSnapshot {
+            generation: 1,
+            models_created_unix: 1728000000,
+            members: vec![claude_member],
+            models: entries.clone(),
+            registry: Arc::new(mahoquot_registry::embedded_snapshot().clone()),
+            permissions: Arc::new(std::collections::HashMap::new()),
+        };
+
+        let created_unix = snapshot.models_created_unix;
+        let collection = models_payload(&entries, created_unix);
+        let collection_data = collection["data"].as_array().unwrap();
+
+        // 1. Slash ID lookup returns exact matching entry
+        let slash_entry = find_model_entry(&snapshot, None, "anthropic/claude-sonnet-4-6")
+            .expect("must find slash ID");
+        assert_eq!(slash_entry.id, "anthropic/claude-sonnet-4-6");
+        assert_eq!(slash_entry.owned_by, "anthropic");
+
+        // 2. Single model payload matches the collection object exactly across injected seconds without sleep
+        let detail_payload = single_model_payload(&slash_entry, snapshot.models_created_unix);
+        let collection_slash_item = collection_data
+            .iter()
+            .find(|item| item["id"] == "anthropic/claude-sonnet-4-6")
+            .unwrap();
+        assert_eq!(&detail_payload, collection_slash_item);
+
+        let refreshed_snapshot = crate::state::PoolSnapshot {
+            models_created_unix: created_unix + 1,
+            ..snapshot.clone()
+        };
+        let refreshed_collection = models_payload(&entries, refreshed_snapshot.models_created_unix);
+        let refreshed_item = refreshed_collection["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == "anthropic/claude-sonnet-4-6")
+            .unwrap();
+        let refreshed_detail =
+            single_model_payload(&slash_entry, refreshed_snapshot.models_created_unix);
+        assert_eq!(&refreshed_detail, refreshed_item);
+        assert_ne!(refreshed_item["created"], collection_slash_item["created"]);
+
+        // 3. Multi-slash ID lookup
+        let multi_slash = find_model_entry(&snapshot, None, "custom/vendor/slash-model")
+            .expect("must find multi-slash ID");
+        assert_eq!(multi_slash.id, "custom/vendor/slash-model");
+        assert_eq!(multi_slash.owned_by, "custom-vendor");
+
+        let multi_payload = single_model_payload(&multi_slash, created_unix);
+        let collection_multi_item = collection_data
+            .iter()
+            .find(|item| item["id"] == "custom/vendor/slash-model")
+            .unwrap();
+        assert_eq!(&multi_payload, collection_multi_item);
+
+        // 4. Missing ID returns None and 404 payload format
+        assert!(find_model_entry(&snapshot, None, "nonexistent-model").is_none());
+        assert!(find_model_entry(&snapshot, None, "vendor/missing").is_none());
+        let not_found = model_not_found_payload("vendor/missing");
+        assert_eq!(not_found["error"]["code"], "model_not_found");
+        assert_eq!(not_found["error"]["type"], "invalid_request_error");
+
+        // 5. Scoped key hiding model returns None
+        let scoped_key = Arc::new(crate::management::settings::ScopedApiKey {
+            id: "k1".to_string(),
+            name: "test".to_string(),
+            key_identifier: "ident".to_string(),
+            key_prefix: "pref".to_string(),
+            raw_key: None,
+            allowed_models: vec!["claude-sonnet-4-6".to_string()],
+            allowed_providers: vec![],
+            allowed_accounts: vec![],
+            token_limit: 0,
+            token_used: 0,
+            is_active: true,
+            created_at_ms: 0,
+            expires_at_ms: None,
+        });
+        // Allowed model found
+        assert!(find_model_entry(&snapshot, Some(&scoped_key), "claude-sonnet-4-6").is_some());
+        // Hidden slash model returns None
+        assert!(
+            find_model_entry(&snapshot, Some(&scoped_key), "anthropic/claude-sonnet-4-6").is_none()
+        );
     }
 }

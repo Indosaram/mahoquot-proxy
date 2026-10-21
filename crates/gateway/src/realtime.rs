@@ -12,8 +12,20 @@
 use base64::Engine;
 use rand::RngCore;
 use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::RwLock;
 
-const EPHEMERAL_TTL_SECS: u64 = 600;
+pub mod media;
+
+pub const DEFAULT_EPHEMERAL_TTL_SECS: u64 = 600;
+const MIN_EPHEMERAL_TTL_SECS: u64 = 10;
+const MAX_EPHEMERAL_TTL_SECS: u64 = 7200;
+const MAX_SECRETS: usize = 1024;
+const MAX_SECRETS_PER_ISSUER: usize = 64;
+pub const MAX_SECRET_BODY_BYTES: usize = 64 * 1024;
+pub const MAX_SDP_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_REALTIME_MODEL: &str = "gpt-realtime";
 
 fn token(prefix: &str, bytes: usize) -> String {
@@ -25,11 +37,77 @@ fn token(prefix: &str, bytes: usize) -> String {
     )
 }
 
-fn now_unix() -> u64 {
+pub fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[derive(Clone)]
+pub struct RealtimeSecret {
+    pub issuer: String,
+    pub model: String,
+    pub scope: Option<Arc<crate::management::settings::ScopedApiKey>>,
+    pub expires_at: u64,
+    expires_instant: Instant,
+    pub member_id: Option<String>,
+}
+
+#[derive(Default)]
+pub struct RealtimeStore {
+    secrets: RwLock<HashMap<String, RealtimeSecret>>,
+}
+
+impl RealtimeStore {
+    pub async fn mint(
+        &self,
+        issuer: String,
+        model: String,
+        scope: Option<Arc<crate::management::settings::ScopedApiKey>>,
+        member_id: Option<String>,
+        lifetime_secs: u64,
+    ) -> Result<(String, u64), &'static str> {
+        let lifetime = lifetime_secs.clamp(MIN_EPHEMERAL_TTL_SECS, MAX_EPHEMERAL_TTL_SECS);
+        let now = Instant::now();
+        let expires_at = now_unix().saturating_add(lifetime);
+        let mut secrets = self.secrets.write().await;
+        secrets.retain(|_, secret| secret.expires_instant > now);
+        if secrets.len() >= MAX_SECRETS {
+            return Err("realtime secret capacity reached");
+        }
+        if secrets
+            .values()
+            .filter(|secret| secret.issuer == issuer)
+            .count()
+            >= MAX_SECRETS_PER_ISSUER
+        {
+            return Err("realtime issuer secret capacity reached");
+        }
+        let value = token("ek_", 32);
+        secrets.insert(
+            value.clone(),
+            RealtimeSecret {
+                issuer,
+                model,
+                scope,
+                member_id,
+                expires_at,
+                expires_instant: now + Duration::from_secs(lifetime),
+            },
+        );
+        Ok((value, expires_at))
+    }
+
+    pub async fn lookup(&self, value: &str) -> Option<RealtimeSecret> {
+        if !value.starts_with("ek_") {
+            return None;
+        }
+        let now = Instant::now();
+        let mut secrets = self.secrets.write().await;
+        secrets.retain(|_, secret| secret.expires_instant > now);
+        secrets.get(value).cloned()
+    }
 }
 
 /// `{"error":{"code":..,"message":..,"param":null,"type":"not_supported_error"}}`
@@ -98,23 +176,21 @@ fn requested_model(body: &Value) -> String {
         .to_string()
 }
 
-pub fn client_secret(body: &Value) -> Value {
-    let expires_at = now_unix() + EPHEMERAL_TTL_SECS;
+pub fn client_secret(body: &Value, value: String, expires_at: u64) -> Value {
     json!({
-        "value": token("ek_", 32),
+        "value": value,
         "expires_at": expires_at,
         "session": session_object(&requested_model(body), expires_at),
     })
 }
 
-pub fn legacy_session(body: &Value) -> Value {
-    let expires_at = now_unix() + EPHEMERAL_TTL_SECS;
+pub fn legacy_session(body: &Value, secret: String, expires_at: u64) -> Value {
     let mut out = session_object(&requested_model(body), expires_at);
     out.as_object_mut()
         .expect("session_object builds a map")
         .insert(
             "client_secret".into(),
-            json!({"expires_at": expires_at, "value": token("ek_", 32)}),
+            json!({"expires_at": expires_at, "value": secret}),
         );
     out
 }
@@ -156,7 +232,7 @@ mod tests {
 
     #[test]
     fn client_secret_carries_prefixed_token_and_nested_session() {
-        let v = client_secret(&json!({}));
+        let v = client_secret(&json!({}), "ek_test".into(), 100);
         assert!(v["value"].as_str().unwrap().starts_with("ek_"));
         assert!(v["session"]["id"].as_str().unwrap().starts_with("sess_"));
         assert_eq!(v["session"]["model"], DEFAULT_REALTIME_MODEL);
@@ -166,7 +242,11 @@ mod tests {
 
     #[test]
     fn legacy_session_nests_the_secret_instead_of_the_session() {
-        let v = legacy_session(&json!({"model": "gpt-realtime-mini"}));
+        let v = legacy_session(
+            &json!({"model": "gpt-realtime-mini"}),
+            "ek_test".into(),
+            100,
+        );
         assert!(v["client_secret"]["value"]
             .as_str()
             .unwrap()
@@ -174,5 +254,17 @@ mod tests {
         assert_eq!(v["model"], "gpt-realtime-mini");
         assert_eq!(v["object"], "realtime.session");
         assert_eq!(v["expires_at"], v["client_secret"]["expires_at"]);
+    }
+
+    #[tokio::test]
+    async fn store_binds_issuer_and_clamps_lifetime() {
+        let store = RealtimeStore::default();
+        let (secret, expiry) = store
+            .mint("issuer".into(), "gpt-realtime".into(), None, None, 1)
+            .await
+            .unwrap();
+        assert!(secret.starts_with("ek_"));
+        assert_eq!(expiry, now_unix() + MIN_EPHEMERAL_TTL_SECS);
+        assert_eq!(store.lookup(&secret).await.unwrap().issuer, "issuer");
     }
 }

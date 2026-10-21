@@ -105,10 +105,8 @@ mod reservation_tests {
 
     #[test]
     fn retain_accounts_keeps_live_accounts_and_other_instances() {
-        let root = std::env::temp_dir().join(format!(
-            "mahoquot-reservation-keep-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("mahoquot-reservation-keep-{}", std::process::id()));
         let registry = SchedulerRegistry::load(&root.join("config.yaml"), &[]);
         registry.reserve("instance-a", "codex-a").unwrap();
         registry.reserve("instance-b", "codex-b").unwrap();

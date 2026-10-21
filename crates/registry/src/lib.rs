@@ -508,6 +508,25 @@ impl ProviderBinding {
     }
 }
 
+/// The pinned catalog's provider-specific thinking support, stored losslessly
+/// in descriptor metadata so signed and embedded snapshots share one contract.
+#[derive(Clone, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ThinkingSupport {
+    pub min: i64,
+    pub max: i64,
+    pub zero_allowed: bool,
+    pub dynamic_allowed: bool,
+    pub levels: Vec<String>,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum ThinkingCapability {
+    Unknown,
+    Unsupported,
+    Supported(ThinkingSupport),
+}
+
 #[derive(Clone, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ModelDescriptor {
     pub id: ModelId,
@@ -571,6 +590,35 @@ impl ModelDescriptor {
 
     pub fn binding_for(&self, provider: &ProviderId) -> Option<&ProviderBinding> {
         self.bindings.get(provider)
+    }
+
+    pub fn thinking_capability(&self, provider: &str) -> Result<ThinkingCapability, RegistryError> {
+        let key = format!("thinking.{provider}");
+        let Some(raw) = self.metadata.get(&key) else {
+            return Ok(ThinkingCapability::Unknown);
+        };
+        let support: Option<ThinkingSupport> = serde_json::from_str(raw).map_err(|error| {
+            RegistryError::DeserializationError(format!("{} {key}: {error}", self.id))
+        })?;
+        let Some(support) = support else {
+            return Ok(ThinkingCapability::Unsupported);
+        };
+        let levels = [
+            "none", "auto", "minimal", "low", "medium", "high", "xhigh", "max",
+        ];
+        if support.min < 0
+            || support.max < support.min
+            || support
+                .levels
+                .iter()
+                .any(|level| !levels.contains(&level.as_str()))
+        {
+            return Err(RegistryError::DeserializationError(format!(
+                "{} {key}: invalid thinking profile",
+                self.id
+            )));
+        }
+        Ok(ThinkingCapability::Supported(support))
     }
 }
 
@@ -914,6 +962,13 @@ impl RegistrySnapshot {
             .providers
             .iter()
             .filter(|(_, &policy)| policy == ProviderPolicy::Open)
+            .filter(|(pid, _)| {
+                [&req_id, &canonical_id].iter().all(|id| {
+                    id.as_str()
+                        .split_once('/')
+                        .is_none_or(|(namespace, _)| namespace == pid.as_str())
+                })
+            })
             .map(|(id, _)| id.clone())
             .collect();
 
@@ -1697,3 +1752,5 @@ pub fn embedded_snapshot() -> &'static RegistrySnapshot {
             .expect("embedded catalog must be valid JSON matching RegistrySnapshot schema")
     })
 }
+
+pub mod store;

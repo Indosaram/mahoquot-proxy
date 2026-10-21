@@ -7,8 +7,7 @@ use crate::account::{AccountMember, ProviderKind};
 use crate::state::AppState;
 use crate::usage::{
     parse_clinepass_usage_summary, parse_cursor_usage_summary, parse_inferx_balance,
-    parse_kiro_usage_summary,
-    ResetCredit, WhamResetCreditList, WhamUsage,
+    parse_kiro_usage_summary, ResetCredit, WhamResetCreditList, WhamUsage,
 };
 
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
@@ -319,7 +318,9 @@ async fn refresh_account_usage_inner(
                 .as_deref()
                 .map(|base| format!("{}/auth/usage-summary", base.trim_end_matches('/')))
                 .unwrap_or_else(|| CURSOR_USAGE_URL.to_string());
-            let client = state.client_for_member(member);
+            let client = state.try_client_for_member(member).map_err(|error| {
+                QuotaError::Upstream(format!("proxy client construction failed: {error}"))
+            })?;
             refresh_json_usage(member, &client, &url, parse_cursor_usage_summary).await
         }
         ProviderKind::Kiro => {
@@ -328,7 +329,9 @@ async fn refresh_account_usage_inner(
                 .as_deref()
                 .map(|base| format!("{}/getUsageLimits", base.trim_end_matches('/')))
                 .unwrap_or_else(|| KIRO_USAGE_URL.to_string());
-            let client = state.client_for_member(member);
+            let client = state.try_client_for_member(member).map_err(|error| {
+                QuotaError::Upstream(format!("proxy client construction failed: {error}"))
+            })?;
             refresh_json_usage(member, &client, &url, parse_kiro_usage_summary).await
         }
         ProviderKind::Zcode => refresh_zcode_usage(state, member).await,
@@ -365,7 +368,9 @@ async fn refresh_generic_usage(
             return Err(QuotaError::Unsupported);
         }
         let url = format!("{}/balance", base.trim_end_matches('/'));
-        let client = state.client_for_member(member);
+        let client = state.try_client_for_member(member).map_err(|error| {
+            QuotaError::Upstream(format!("proxy client construction failed: {error}"))
+        })?;
         return refresh_json_usage(member, &client, &url, |body, now| {
             parse_inferx_balance(body, now).unwrap_or_default()
         })
@@ -390,7 +395,9 @@ async fn refresh_generic_usage(
     } else {
         return Err(QuotaError::Unsupported);
     };
-    let client = state.client_for_member(member);
+    let client = state.try_client_for_member(member).map_err(|error| {
+        QuotaError::Upstream(format!("proxy client construction failed: {error}"))
+    })?;
     refresh_json_usage(member, &client, &url, |body, now| {
         parse_clinepass_usage_summary(body, now).unwrap_or_default()
     })
@@ -410,6 +417,13 @@ async fn refresh_zcode_usage(
     match try_zcode_balance_probe(state, member, now_unix).await {
         Ok(()) => return Ok(()),
         Err(QuotaError::Unauthorized) => return Err(QuotaError::Unauthorized),
+        Err(error @ QuotaError::Upstream(_))
+            if error
+                .to_string()
+                .starts_with("proxy client construction failed:") =>
+        {
+            return Err(error);
+        }
         Err(_) => {}
     }
     let logs_dir = std::env::var("ZCODE_LOGS_DIR")
@@ -478,7 +492,9 @@ async fn try_zcode_balance_probe(
         urlencode_component(mahoquot_providers::zcode::ZCODE_APP_VERSION),
         urlencode_component(&platform),
     );
-    let client = state.client_for_member(member);
+    let client = state.try_client_for_member(member).map_err(|error| {
+        QuotaError::Upstream(format!("proxy client construction failed: {error}"))
+    })?;
     let mut request = client.get(&url).timeout(Duration::from_secs(20));
     for (name, value) in mahoquot_providers::zcode::plan_billing_headers(
         &jwt,
@@ -654,7 +670,9 @@ async fn try_claude_usage(state: &AppState, member: &Arc<AccountMember>) -> Resu
                 "relay account has no upstream_override".into(),
             ));
         }
-        let client = state.client_for_member(member);
+        let client = state.try_client_for_member(member).map_err(|error| {
+            QuotaError::Upstream(format!("proxy client construction failed: {error}"))
+        })?;
         let mut last_missing: Option<String> = None;
         for base in bases {
             let resp = client
@@ -701,8 +719,7 @@ async fn try_claude_usage(state: &AppState, member: &Arc<AccountMember>) -> Resu
                     cost_usd: totals.total_cost_usd,
                 },
             );
-            let mut usage =
-                crate::usage::parse_relay_account_usage(&payload, totals, samples, now);
+            let mut usage = crate::usage::parse_relay_account_usage(&payload, totals, samples, now);
             // Without these, `set_usage` inherits the previous failure's status
             // and error text, so one transient send error stays on screen forever.
             usage.refreshed_at_unix = Some(now);
@@ -726,7 +743,9 @@ async fn try_claude_usage(state: &AppState, member: &Arc<AccountMember>) -> Resu
         .unwrap_or(CLAUDE_API_BASE)
         .trim_end_matches('/');
 
-    let client = state.client_for_member(member);
+    let client = state.try_client_for_member(member).map_err(|error| {
+        QuotaError::Upstream(format!("proxy client construction failed: {error}"))
+    })?;
     let resp = client
         .get(format!("{base}{CLAUDE_USAGE_PATH}"))
         .header("Authorization", format!("Bearer {token}"))
@@ -829,7 +848,9 @@ async fn try_antigravity_quota(
         .ok()
         .and_then(|u| u.model_availability.clone());
 
-    let client = state.client_for_member(member);
+    let client = state.try_client_for_member(member).map_err(|error| {
+        QuotaError::Upstream(format!("proxy client construction failed: {error}"))
+    })?;
     let resp = client
         .post(&url)
         .header("Authorization", format!("Bearer {token}"))
@@ -978,8 +999,9 @@ async fn try_antigravity_quota(
     member.set_usage(usage);
 
     if availability_changed {
-        state.runtime.trigger_coalesced_refresh()
-            .map_err(|error| QuotaError::Upstream(format!("model catalog publication failed: {error}")))?;
+        state.runtime.trigger_coalesced_refresh().map_err(|error| {
+            QuotaError::Upstream(format!("model catalog publication failed: {error}"))
+        })?;
     }
     Ok(())
 }
@@ -999,7 +1021,9 @@ async fn refresh_codex_usage(
         .as_deref()
         .map(|base| format!("{}/backend-api/wham/usage", base.trim_end_matches('/')))
         .unwrap_or_else(|| CODEX_USAGE_URL.to_string());
-    let client = state.client_for_member(member);
+    let client = state.try_client_for_member(member).map_err(|error| {
+        QuotaError::Upstream(format!("proxy client construction failed: {error}"))
+    })?;
     let mut req = client
         .get(usage_url)
         .header("Authorization", format!("Bearer {token}"))
@@ -1077,7 +1101,9 @@ async fn fetch_codex_reset_credits(
             )
         })
         .unwrap_or_else(|| CODEX_RESET_CREDITS_URL.to_string());
-    let client = state.client_for_member(member);
+    let client = state.try_client_for_member(member).map_err(|error| {
+        QuotaError::Upstream(format!("proxy client construction failed: {error}"))
+    })?;
     let mut req = client
         .get(url)
         .header("Authorization", format!("Bearer {token}"))
@@ -1124,7 +1150,9 @@ async fn try_consume_reset_credit(
             )
         })
         .unwrap_or_else(|| CODEX_RESET_URL.to_string());
-    let client = state.client_for_member(member);
+    let client = state.try_client_for_member(member).map_err(|error| {
+        QuotaError::Upstream(format!("proxy client construction failed: {error}"))
+    })?;
     let mut req = client
         .post(reset_url)
         .header("Authorization", format!("Bearer {token}"))
@@ -1313,6 +1341,13 @@ pub fn spawn_usage_poller(state: Arc<AppState>, every: Duration) -> UsagePollerH
                 _ = ticker.tick() => {}
                 _ = stop_signal.notified() => break,
             }
+            // While Home coordinates this node it owns credential state and
+            // quota (Task 32), so local accounts are not polled upstream. A
+            // configured Home client counts even before its first sync, so the
+            // immediate first tick does not race the initial Home handshake.
+            if crate::home::get_active_home_client().is_some_and(|home| home.enabled()) {
+                continue;
+            }
             // The refresh itself is cancellable: a shutdown during a long poll
             // must not hold the process open for the whole upstream timeout.
             tokio::select! {
@@ -1352,6 +1387,63 @@ mod tests {
             codex_usage_status_error(reqwest::StatusCode::TOO_MANY_REQUESTS),
             Some(QuotaError::RateLimited)
         ));
+    }
+
+    #[tokio::test]
+    async fn quota_consumer_does_not_dial_direct_after_proxy_build_failure() {
+        struct TempAuthDir(std::path::PathBuf);
+        impl Drop for TempAuthDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let upstream = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 18858))
+            .await
+            .expect("mock upstream bind");
+        let upstream_url = "http://127.0.0.1:18858";
+        let dir = std::env::temp_dir().join(format!("mahoquot-quota-proxy-{}", uuid_v4()));
+        std::fs::create_dir_all(&dir).expect("create auth dir");
+        let _auth_dir = TempAuthDir(dir.clone());
+        let credential = serde_json::json!({
+            "type": "generic",
+            "identity_slug": "inferx-proxy-failure",
+            "provider": "inferx",
+            "label": "InferX",
+            "adapter": "openai-chat",
+            "base_url": upstream_url,
+            "upstream_override": "http://127.0.0.1:18858",
+            "api_key": "fixture-key",
+            "models": ["inferx/test"],
+            "proxy_url": "ftp://invalid-proxy",
+        });
+        std::fs::write(
+            dir.join("generic-inferx.json"),
+            serde_json::to_vec(&credential).expect("serialize credential"),
+        )
+        .expect("write credential");
+        let config = crate::config::GatewayConfig {
+            auth_dir: dir.clone(),
+            config_path: dir.join("config.yaml"),
+            ..crate::config::GatewayConfig::default()
+        };
+        let state = Arc::new(AppState::new(&config).expect("state"));
+        let member = state.pool.load_full().members[0].clone();
+
+        match tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                result = refresh_account_usage(&state, &member) => {
+                    assert!(matches!(result, Err(QuotaError::Upstream(message)) if message.starts_with("proxy client construction failed:")));
+                }
+                accepted = upstream.accept() => {
+                    let _ = accepted.expect("mock upstream accept");
+                    panic!("quota consumer must not bypass the invalid proxy and dial direct");
+                }
+            }
+        }).await {
+            Ok(()) => {}
+            Err(_) => panic!("quota consumer did not finish within its test deadline"),
+        }
     }
 
     #[test]
@@ -1525,12 +1617,16 @@ mod tests {
     #[test]
     fn retain_poll_backoff_drops_removed_accounts() {
         let (state, dir) = temp_poller_state();
-        retain_poll_backoff(&state, &["gone".to_string(), "live".to_string()].into_iter().collect());
+        retain_poll_backoff(
+            &state,
+            &["gone".to_string(), "live".to_string()]
+                .into_iter()
+                .collect(),
+        );
         assert!(set_poll_backoff(&state, "gone", 9_999));
         assert!(set_poll_backoff(&state, "live", 9_999));
 
-        let active: std::collections::BTreeSet<String> =
-            ["live".to_string()].into_iter().collect();
+        let active: std::collections::BTreeSet<String> = ["live".to_string()].into_iter().collect();
         assert_eq!(retain_poll_backoff(&state, &active), 1);
         assert_eq!(poll_backoff_until(&state, "gone"), None);
         assert_eq!(poll_backoff_until(&state, "live"), Some(9_999));

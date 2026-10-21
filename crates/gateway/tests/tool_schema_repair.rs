@@ -177,11 +177,9 @@ fn tools_14_nullable_union_drops_property_from_required() {
         direct_schema(&request)["properties"]["offset"]["default"],
         json!(1)
     );
-    assert!(
-        bridge_schema(&request)["properties"]["offset"]
-            .get("default")
-            .is_none()
-    );
+    assert!(bridge_schema(&request)["properties"]["offset"]
+        .get("default")
+        .is_none());
 }
 
 #[test]
@@ -218,7 +216,10 @@ fn tools_14_all_object_union_merges_and_mixed_union_keeps_first_branch() {
         // Both object variants merge into one schema; only the shared
         // required name survives the intersection.
         let shutdown = &schema["properties"]["shutdown"];
-        assert!(shutdown.get("anyOf").is_none(), "union survived: {shutdown}");
+        assert!(
+            shutdown.get("anyOf").is_none(),
+            "union survived: {shutdown}"
+        );
         assert_eq!(shutdown["type"], "object");
         assert_eq!(shutdown["properties"]["reason"]["type"], "string");
         assert_eq!(shutdown["properties"]["approve"]["type"], "boolean");

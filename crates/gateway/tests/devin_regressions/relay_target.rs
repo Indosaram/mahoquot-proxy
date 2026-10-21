@@ -13,13 +13,19 @@ fn relay_uses_api_server_url_when_explicit_override_is_absent() {
         json!({
             "type": "devin", "identity_slug": "fixture", "access_token": "fixture-token",
             "api_server_url": "http://127.0.0.1:54321"
-        }).to_string(),
-    ).unwrap();
+        })
+        .to_string(),
+    )
+    .unwrap();
 
     // When the loader feeds the actual relay URL builder.
     let members = load_account_members(&dir).unwrap();
     let member = &members[0];
-    let target = build_provider_url(member.kind(), member.upstream_override.as_deref(), CHAT_PATH);
+    let target = build_provider_url(
+        member.kind(),
+        member.upstream_override.as_deref(),
+        CHAT_PATH,
+    );
     std::fs::remove_dir_all(dir).unwrap();
 
     // Then it targets the fixture, never the default API server (no HTTP is sent).
@@ -36,13 +42,19 @@ fn relay_uses_explicit_override_when_native_endpoint_differs() {
             "type": "devin", "identity_slug": "fixture", "access_token": "fixture-token",
             "api_server_url": "http://127.0.0.1:54321",
             "upstream_override": "http://127.0.0.1:54322"
-        }).to_string(),
-    ).unwrap();
+        })
+        .to_string(),
+    )
+    .unwrap();
 
     // When the loader feeds the actual relay URL builder.
     let members = load_account_members(&dir).unwrap();
     let member = &members[0];
-    let target = build_provider_url(member.kind(), member.upstream_override.as_deref(), CHAT_PATH);
+    let target = build_provider_url(
+        member.kind(),
+        member.upstream_override.as_deref(),
+        CHAT_PATH,
+    );
     std::fs::remove_dir_all(dir).unwrap();
 
     // Then the explicit override wins.

@@ -119,7 +119,12 @@ async fn start_fixture() -> (
         .expect("fixture bind");
     let addr = listener.local_addr().expect("fixture addr");
     let task = tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("fixture server");
+        axum::serve(
+            listener,
+            (app).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .expect("fixture server");
     });
     (state, addr, task)
 }
@@ -196,7 +201,7 @@ async fn task_14_qa_scenario() {
         ..GatewayConfig::default()
     };
 
-    let state = Arc::new(AppState::new(&config).expect("app state created"));
+    let state = Arc::new(AppState::new(&common::managed_ref(&config)).expect("app state created"));
     let app = create_app(Arc::clone(&state));
 
     let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{QA_PORT}"))
@@ -205,16 +210,21 @@ async fn task_14_qa_scenario() {
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let server_task = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                let _ = shutdown_rx.await;
-            })
-            .await
-            .expect("gateway server");
+        axum::serve(
+            listener,
+            (app).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+        .expect("gateway server");
     });
 
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5)).build().expect("bounded HTTP client");
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("bounded HTTP client");
     let uri = format!("http://127.0.0.1:{QA_PORT}/v0/management/model-registry");
     let mut http_evidence = String::new();
 
@@ -277,10 +287,8 @@ async fn task_14_qa_scenario() {
     http_evidence.push_str("\n\n---\n\n");
 
     assert_eq!(status2, reqwest::StatusCode::UNAUTHORIZED);
-    assert_eq!(
-        body2,
-        r#"{"error":{"message":"invalid api key","type":"invalid_request_error"}}"#
-    );
+    // Task 26: the dedicated management gate answers with its own body.
+    assert_eq!(body2, r#"{"error":"missing management key"}"#);
     assert_no_secrets(&body2);
 
     // -------------------------------------------------------------------------
@@ -418,10 +426,15 @@ async fn task_14_qa_scenario() {
     // Graceful shutdown of gateway server
     let _ = shutdown_tx.send(());
     tokio::time::timeout(Duration::from_secs(5), server_task)
-        .await.expect("gateway shutdown deadline").expect("gateway server shut down cleanly");
+        .await
+        .expect("gateway shutdown deadline")
+        .expect("gateway server shut down cleanly");
 
     fixture_task.abort();
-    assert!(fixture_task.await.expect_err("fixture cancelled").is_cancelled());
+    assert!(fixture_task
+        .await
+        .expect_err("fixture cancelled")
+        .is_cancelled());
 
     // Verify port 18875 is freed
     let check_listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{QA_PORT}")).await;

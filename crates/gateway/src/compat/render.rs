@@ -134,7 +134,8 @@ impl GeminiChunkRenderer {
                 return;
             };
 
-            let mut part = json!({"functionCall":{"id":tool.call_id,"name":tool.name,"args":parsed}});
+            let mut part =
+                json!({"functionCall":{"id":tool.call_id,"name":tool.name,"args":parsed}});
             if let Some(signature) = self
                 .replay
                 .as_ref()
@@ -214,7 +215,15 @@ impl GeminiChunkRenderer {
                     return out;
                 }
                 self.terminated = true;
-                out.push(self.frame_for(json!([]), Some(if self.output_limit_reached { "MAX_TOKENS" } else { "STOP" }), usage.as_ref()));
+                out.push(self.frame_for(
+                    json!([]),
+                    Some(if self.output_limit_reached {
+                        "MAX_TOKENS"
+                    } else {
+                        "STOP"
+                    }),
+                    usage.as_ref(),
+                ));
                 out
             }
             CodexEvent::Failed { message } => {
@@ -237,7 +246,11 @@ impl GeminiChunkRenderer {
             return out;
         }
         self.terminated = true;
-        let finish = if self.output_limit_reached { "MAX_TOKENS" } else { "STOP" };
+        let finish = if self.output_limit_reached {
+            "MAX_TOKENS"
+        } else {
+            "STOP"
+        };
         out.push(self.frame_for(json!([]), Some(finish), None));
         out
     }
@@ -537,7 +550,8 @@ impl Aggregator {
         let mut parts = Vec::new();
         for event in self.native_events {
             for frame in renderer.render(event) {
-                let payload: Value = serde_json::from_slice(&frame[6..]).expect("renderer emits JSON");
+                let payload: Value =
+                    serde_json::from_slice(&frame[6..]).expect("renderer emits JSON");
                 if let Some(emitted) = payload
                     .pointer("/candidates/0/content/parts")
                     .and_then(Value::as_array)
@@ -641,19 +655,37 @@ mod openai_stream_tests {
         for value in [None, Some(0), Some(17)] {
             // Given normalized usage retaining upstream presence.
             let usage = Usage {
-                prompt_tokens: 30, completion_tokens: 2, total_tokens: 32,
-                cached_tokens: value.unwrap_or(0), cached_tokens_known: value.is_some(),
-                cache_write_tokens: value.unwrap_or(0), cache_write_tokens_known: value.is_some(),
+                prompt_tokens: 30,
+                completion_tokens: 2,
+                total_tokens: 32,
+                cached_tokens: value.unwrap_or(0),
+                cached_tokens_known: value.is_some(),
+                cache_write_tokens: value.unwrap_or(0),
+                cache_write_tokens_known: value.is_some(),
                 reasoning_tokens: 0,
             };
             // When rendered to client usage.
             let wire = usage_value(&usage);
             // Then missing fields stay absent while genuine zeros survive.
-            assert_eq!(wire.pointer("/prompt_tokens_details/cached_tokens").and_then(Value::as_u64), value);
-            assert_eq!(wire.pointer("/prompt_tokens_details/cache_write_tokens").and_then(Value::as_u64), value);
+            assert_eq!(
+                wire.pointer("/prompt_tokens_details/cached_tokens")
+                    .and_then(Value::as_u64),
+                value
+            );
+            assert_eq!(
+                wire.pointer("/prompt_tokens_details/cache_write_tokens")
+                    .and_then(Value::as_u64),
+                value
+            );
             let mut aggregate = Aggregator::new("gemini".into(), 1);
             aggregate.push(CodexEvent::Completed { usage: Some(usage) });
-            assert_eq!(aggregate.into_gemini().pointer("/usageMetadata/cachedContentTokenCount").and_then(Value::as_u64), value);
+            assert_eq!(
+                aggregate
+                    .into_gemini()
+                    .pointer("/usageMetadata/cachedContentTokenCount")
+                    .and_then(Value::as_u64),
+                value
+            );
         }
     }
 
@@ -868,5 +900,4 @@ mod gemini_stream_tests {
             "finishReason must stay inside the Gemini enum: {out}"
         );
     }
-
 }

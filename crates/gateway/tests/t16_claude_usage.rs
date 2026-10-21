@@ -37,7 +37,12 @@ async fn claude_relay_records_subscription_usage_in_admin_stats() {
         )
     }));
     let mock_task = tokio::spawn(async move {
-        axum::serve(listener, upstream_app).await.unwrap();
+        axum::serve(
+            listener,
+            (upstream_app).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
 
     let auth_dir = common::unique_temp_dir("t16-claude-usage");
@@ -64,13 +69,16 @@ async fn claude_relay_records_subscription_usage_in_admin_stats() {
         config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
-    let state = Arc::new(AppState::new(&config).unwrap());
+    let state = Arc::new(AppState::new(&common::managed_ref(&config)).unwrap());
     let gateway_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let gateway = format!("http://{}", gateway_listener.local_addr().unwrap());
     let gateway_task = tokio::spawn(async move {
-        axum::serve(gateway_listener, create_app(state))
-            .await
-            .unwrap();
+        axum::serve(
+            gateway_listener,
+            (create_app(state)).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
 
     let relayed = reqwest::Client::new()
@@ -147,7 +155,12 @@ async fn claude_usage_is_polled_without_any_relayed_traffic() {
         }),
     );
     let mock_task = tokio::spawn(async move {
-        axum::serve(listener, usage_app).await.unwrap();
+        axum::serve(
+            listener,
+            (usage_app).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
 
     let auth_dir = common::unique_temp_dir("t16-claude-poll");
@@ -174,7 +187,7 @@ async fn claude_usage_is_polled_without_any_relayed_traffic() {
         config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
-    let state = Arc::new(AppState::new(&config).unwrap());
+    let state = Arc::new(AppState::new(&common::managed_ref(&config)).unwrap());
     let snapshot = state.pool.load();
     let member = snapshot
         .members
@@ -217,7 +230,12 @@ async fn claude_usage_success_clears_a_previous_refresh_failure() {
         }),
     );
     let mock_task = tokio::spawn(async move {
-        axum::serve(listener, usage_app).await.unwrap();
+        axum::serve(
+            listener,
+            (usage_app).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
 
     let auth_dir = common::unique_temp_dir("t16-claude-clears-error");
@@ -244,7 +262,7 @@ async fn claude_usage_success_clears_a_previous_refresh_failure() {
         config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
-    let state = Arc::new(AppState::new(&config).unwrap());
+    let state = Arc::new(AppState::new(&common::managed_ref(&config)).unwrap());
     let member = state
         .pool
         .load()
@@ -257,7 +275,10 @@ async fn claude_usage_success_clears_a_previous_refresh_failure() {
     member.record_quota_refresh_failure(
         "error sending request for url (https://api.anthropic.com/api/oauth/usage)",
     );
-    assert_eq!(member.usage_snapshot().refresh_status.as_deref(), Some("error"));
+    assert_eq!(
+        member.usage_snapshot().refresh_status.as_deref(),
+        Some("error")
+    );
 
     mahoquot_gateway::quota::refresh_account_usage(&state, &member)
         .await

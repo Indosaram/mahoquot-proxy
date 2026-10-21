@@ -23,8 +23,8 @@ use serde_json::{Map, Value};
 use super::devin_proto::{
     chat_message_request_type, chat_message_source, planner_mode, step_type, trajectory_type,
     ChatMessagePrompt, ChatMessageResponse, ChatToolCall, ChatToolDefinition,
-    CompletionConfiguration, CortexTrajectoryReference, GetChatMessageRequest,
-    GetCascadeModelConfigsRequest, ImageData, Metadata,
+    CompletionConfiguration, CortexTrajectoryReference, GetCascadeModelConfigsRequest,
+    GetChatMessageRequest, ImageData, Metadata,
 };
 use super::events::{CodexEvent, Usage};
 use super::split_data_url;
@@ -150,7 +150,9 @@ pub fn build_chat_request(
     // Unsupported options are rejected, never silently dropped.
     if let Some(n) = obj.get("n").and_then(Value::as_u64) {
         if n > 1 {
-            return Err(format!("n={n} is unsupported: Devin maps one completion per request"));
+            return Err(format!(
+                "n={n} is unsupported: Devin maps one completion per request"
+            ));
         }
     }
     if let Some(rf) = obj.get("response_format") {
@@ -182,12 +184,19 @@ pub fn build_chat_request(
         }
     }
     if tool_choice.is_some() && tool_choice_str.is_none() && !tool_choice.unwrap().is_null() {
-        return Err("forced tool_choice object is unsupported: Devin has no forced-tool mapping".to_string());
+        return Err(
+            "forced tool_choice object is unsupported: Devin has no forced-tool mapping"
+                .to_string(),
+        );
     }
     let send_tools = tool_choice_str != Some("none");
     let mut tools = Vec::new();
     if send_tools {
-        for tool in obj.get("tools").and_then(Value::as_array).unwrap_or(&Vec::new()) {
+        for tool in obj
+            .get("tools")
+            .and_then(Value::as_array)
+            .unwrap_or(&Vec::new())
+        {
             let function = tool
                 .get("function")
                 .or_else(|| (tool.get("name").is_some()).then_some(tool))
@@ -238,7 +247,10 @@ pub fn build_chat_request(
 
     let mut prompts = Vec::new();
     for message in messages {
-        let role = message.get("role").and_then(Value::as_str).unwrap_or("user");
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("user");
         if role == "system" || role == "developer" {
             continue;
         }
@@ -363,7 +375,9 @@ fn build_prompt(
                 .and_then(Value::as_array)
                 .unwrap_or(&Vec::new())
             {
-                let function = call.get("function").ok_or("assistant tool call missing function")?;
+                let function = call
+                    .get("function")
+                    .ok_or("assistant tool call missing function")?;
                 prompt.tool_calls.push(ChatToolCall {
                     id: Some(
                         call.get("id")
@@ -426,10 +440,8 @@ fn image_parts(content: Option<&Value>) -> Result<Vec<ImageData>, String> {
                 .and_then(|img| img.get("url"))
                 .and_then(Value::as_str)
                 .map(|url| {
-                    let (media_type, data) =
-                        split_data_url(url).ok_or_else(|| {
-                            "remote image url is unsupported".to_string()
-                        })?;
+                    let (media_type, data) = split_data_url(url)
+                        .ok_or_else(|| "remote image url is unsupported".to_string())?;
                     Ok(ImageData {
                         base64_data: Some(data.to_string()),
                         mime_type: Some(media_type.to_string()),
@@ -553,7 +565,10 @@ impl DevinDecoder {
             let flags = self.buf[0];
             let len = u32::from_be_bytes(self.buf[1..5].try_into().expect("5 bytes read")) as usize;
             if len > MAX_FRAME_SIZE {
-                self.fail(format!("connect frame too large: {len} bytes > {MAX_FRAME_SIZE}"), out);
+                self.fail(
+                    format!("connect frame too large: {len} bytes > {MAX_FRAME_SIZE}"),
+                    out,
+                );
                 return;
             }
 
@@ -603,11 +618,21 @@ impl DevinDecoder {
             return;
         }
         if !self.outcome.terminated {
-            self.fail("connect stream ended without EndStream frame".to_string(), out);
+            self.fail(
+                "connect stream ended without EndStream frame".to_string(),
+                out,
+            );
             return;
         }
-        if self.tools.iter().any(|t| t.call_id.is_none() || t.name.is_none()) {
-            self.fail("unresolved tool missing ID or name at stream end".to_string(), out);
+        if self
+            .tools
+            .iter()
+            .any(|t| t.call_id.is_none() || t.name.is_none())
+        {
+            self.fail(
+                "unresolved tool missing ID or name at stream end".to_string(),
+                out,
+            );
             return;
         }
         for tool in &mut self.tools {
@@ -706,7 +731,11 @@ impl DevinDecoder {
         let args_val = delta.arguments_json.filter(|a| !a.is_empty());
 
         let index = if let Some(id) = id_val.as_ref() {
-            if let Some(idx) = self.tools.iter().position(|t| t.call_id.as_deref() == Some(id)) {
+            if let Some(idx) = self
+                .tools
+                .iter()
+                .position(|t| t.call_id.as_deref() == Some(id))
+            {
                 idx
             } else {
                 let pending_indices: Vec<usize> = self
@@ -721,7 +750,8 @@ impl DevinDecoder {
                     idx
                 } else if pending_indices.len() > 1 {
                     self.fail(
-                        "ambiguous tool ID resolution: multiple pending tools missing ID".to_string(),
+                        "ambiguous tool ID resolution: multiple pending tools missing ID"
+                            .to_string(),
                         out,
                     );
                     return;
@@ -799,7 +829,10 @@ impl DevinDecoder {
 
     fn decode_end_stream(&mut self, payload: &[u8], out: &mut Vec<CodexEvent>) {
         if self.outcome.terminated {
-            self.fail("duplicate EndStream frame in connect stream".to_string(), out);
+            self.fail(
+                "duplicate EndStream frame in connect stream".to_string(),
+                out,
+            );
             return;
         }
         let value: Value = match serde_json::from_slice(payload) {
@@ -844,8 +877,18 @@ mod tests {
         // Large same-chunk payload: 512 KiB
         chunk.resize(5 + 512 * 1024, 0xAA);
         decoder.decode(&chunk, &mut events);
-        assert!(events.iter().any(|e| matches!(e, CodexEvent::Failed { .. })));
-        assert!(decoder.buf.capacity() < 1024 * 1024, "capacity was: {}", decoder.buf.capacity());
-        assert!(decoder.buf.len() <= 5, "retained buffer was: {}", decoder.buf.len());
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, CodexEvent::Failed { .. })));
+        assert!(
+            decoder.buf.capacity() < 1024 * 1024,
+            "capacity was: {}",
+            decoder.buf.capacity()
+        );
+        assert!(
+            decoder.buf.len() <= 5,
+            "retained buffer was: {}",
+            decoder.buf.len()
+        );
     }
 }

@@ -13,12 +13,12 @@ use mahoquot_types::{Health, PoolMember};
 
 use crate::cp_routes;
 use crate::inbound::require_api_key;
+use crate::inbound::ResolvedAuth;
 use crate::models_route::models_payload;
 use crate::monitor::PromAccount;
 use crate::relay::{handle_relay, RelayMode};
 use crate::state::AppState;
 use axum::Extension;
-use crate::inbound::ResolvedAuth;
 
 // Agent clients replay the whole conversation on every turn, so an inbound
 // request legitimately carries megabytes of history; axum's 2 MiB default
@@ -31,6 +31,7 @@ pub fn create_app(state: Arc<AppState>) -> Router {
     // /admin/stats stays behind the key: it exposes account emails and reset times.
     let authed_routes = Router::new()
         .route("/v1/models", get(models_handler))
+        .route("/v1/models/{*model_id}", get(model_detail_handler))
         .route("/models", get(models_handler))
         .route("/v1", get(cp_routes::root))
         .route("/v1/", get(cp_routes::root))
@@ -59,6 +60,7 @@ pub fn create_app(state: Arc<AppState>) -> Router {
         )
         .route("/v1/chat/completions", post(chat_completions_handler))
         .route("/chat/completions", post(chat_completions_handler))
+        .route("/v1/ws", get(crate::aistudio::worker_upgrade))
         .route("/v1/completions", post(completions_handler))
         .route("/completions", post(completions_handler))
         .route("/v1/messages", post(messages_handler))
@@ -106,7 +108,7 @@ pub fn create_app(state: Arc<AppState>) -> Router {
         .route("/videos/extensions", post(cp_routes::videos))
         .route("/v1/videos/{request_id}", get(cp_routes::videos_by_id))
         .route("/videos/{request_id}", get(cp_routes::videos_by_id))
-        .route("/openai/v1/videos", post(cp_routes::openai_videos))
+        .route("/openai/v1/videos", post(cp_routes::videos))
         .route(
             "/openai/v1/videos/{video_id}",
             get(cp_routes::openai_videos),
@@ -127,7 +129,7 @@ pub fn create_app(state: Arc<AppState>) -> Router {
         .route("/v1/realtime/calls", post(cp_routes::realtime_offer))
         .route(
             "/v1/realtime/calls/{call_id}",
-            get(cp_routes::realtime_call_get),
+            get(cp_routes::realtime_call_get_owned),
         )
         .route(
             "/v1/realtime/calls/{call_id}/hangup",
@@ -168,17 +170,25 @@ pub fn create_app(state: Arc<AppState>) -> Router {
         )
         .route("/v1beta/interactions", post(cp_routes::v1beta_interactions))
         .route("/interactions", post(cp_routes::v1beta_interactions))
-        .layer(from_fn_with_state(
-            Arc::clone(&state),
-            inference_admission,
-        ))
+        .route("/v1/audio/speech", post(cp_routes::speech))
+        .route("/audio/speech", post(cp_routes::speech))
+        .route("/v1/tts", post(cp_routes::speech))
+        .route("/tts", post(cp_routes::speech))
+        .layer(Extension(Arc::new(std::sync::Mutex::new(
+            crate::interactions::InteractionsStore::default(),
+        ))))
+        .layer(from_fn_with_state(Arc::clone(&state), inference_admission))
+        // Inbound key auth sits inside the realtime store layer: axum runs the
+        // outermost layer first, so the store extension is already on the
+        // request when require_api_key resolves an `ek_` ephemeral secret.
         .layer(from_fn_with_state(
             Arc::new(crate::inbound::ApiKeys::with_live_settings(
                 Arc::clone(&state.settings),
-                crate::inbound::ApiKeys::new(state.api_keys.values().to_vec()),
+                (*state.api_keys).clone(),
             )),
             require_api_key,
-        ));
+        ))
+        .layer(Extension(Arc::clone(&state.realtime)));
 
     // Public surface: Prometheus scrapers and liveness probes never send credentials,
     // and CLIProxyAPI exposes its metrics endpoint unauthenticated too.
@@ -205,6 +215,10 @@ pub fn create_app(state: Arc<AppState>) -> Router {
             "/v0/management",
             crate::management::management_router(Arc::clone(&state)),
         )
+        .nest("/v0/management", crate::compat::meta::onboarding_routes())
+        .merge(crate::management::store::routes::v8_management_router(
+            Arc::clone(&state),
+        ))
         .merge(authed_routes)
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .layer(from_fn(cors))
@@ -349,80 +363,6 @@ async fn inference_admission(
     })
 }
 
-#[cfg(test)]
-mod permit_body_tests {
-    use super::*;
-    use http_body::Body as _;
-    use http_body::{Frame, SizeHint};
-    use std::convert::Infallible;
-    use std::task::{Context, Poll};
-
-    struct OneFrameThenEnd(bool);
-
-    impl http_body::Body for OneFrameThenEnd {
-        type Data = bytes::Bytes;
-        type Error = Infallible;
-
-        fn poll_frame(
-            mut self: std::pin::Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-            if self.0 {
-                Poll::Ready(None)
-            } else {
-                self.0 = true;
-                Poll::Ready(Some(Ok(Frame::data(bytes::Bytes::from_static(b"body")))))
-            }
-        }
-
-        fn is_end_stream(&self) -> bool {
-            self.0
-        }
-
-        fn size_hint(&self) -> SizeHint {
-            SizeHint::default()
-        }
-    }
-
-    #[test]
-    fn permit_is_released_at_eof_while_body_remains_alive() {
-        let gate = Arc::new(tokio::sync::Semaphore::new(1));
-        let permit = gate.clone().try_acquire_owned().unwrap();
-        let mut body = PermitBody {
-            inner: OneFrameThenEnd(false),
-            permit: std::cell::RefCell::new(Some(permit)),
-        };
-        let waker = futures::task::noop_waker();
-        let mut cx = Context::from_waker(&waker);
-
-        assert!(matches!(std::pin::Pin::new(&mut body).poll_frame(&mut cx), Poll::Ready(Some(Ok(_)))));
-        assert_eq!(gate.available_permits(), 0);
-        assert!(matches!(std::pin::Pin::new(&mut body).poll_frame(&mut cx), Poll::Ready(None)));
-        assert_eq!(gate.available_permits(), 1);
-        drop(body);
-        assert_eq!(gate.available_permits(), 1);
-    }
-
-    #[test]
-    fn permit_is_released_when_body_reports_end_stream() {
-        let gate = Arc::new(tokio::sync::Semaphore::new(1));
-        let permit = gate.clone().try_acquire_owned().unwrap();
-        let mut body = PermitBody {
-            inner: OneFrameThenEnd(true),
-            permit: std::cell::RefCell::new(Some(permit)),
-        };
-        let waker = futures::task::noop_waker();
-        let mut cx = Context::from_waker(&waker);
-
-        assert!(body.is_end_stream());
-        assert!(matches!(std::pin::Pin::new(&mut body).poll_frame(&mut cx), Poll::Ready(None)));
-        assert_eq!(gate.available_permits(), 1);
-        drop(body);
-        assert_eq!(gate.available_permits(), 1);
-    }
-
-}
-
 async fn healthz_handler() -> impl IntoResponse {
     Json(serde_json::json!({
         "status": "ok",
@@ -439,21 +379,45 @@ async fn models_handler(
     State(state): State<Arc<AppState>>,
     Extension(auth): Extension<ResolvedAuth>,
 ) -> impl IntoResponse {
-    let now_unix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
     let scoped_key = auth.identity.scoped();
 
     let pool = state.pool.load();
     // A scoped key must not learn about models it could never route to, so the
     // catalog is narrowed to its own providers, accounts and model allow list.
-    let models = match scoped_key {
+    let mut models = match scoped_key {
         Some(scoped) => crate::models_route::scoped_model_entries(&pool, scoped),
         None => pool.models.clone(),
     };
 
-    Json(models_payload(&models, now_unix))
+    let aistudio_models = state.aistudio.visible_models(scoped_key.map(|v| &**v));
+    for m in aistudio_models {
+        if !models.iter().any(|existing| existing.id == m.id) {
+            models.push(m);
+        }
+    }
+
+    Json(models_payload(&models, pool.models_created_unix))
+}
+
+async fn model_detail_handler(
+    State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<ResolvedAuth>,
+    axum::extract::Path(model_id): axum::extract::Path<String>,
+) -> Response {
+    let pool = state.pool.load();
+    let scoped_key = auth.identity.scoped();
+    let Some(entry) = crate::models_route::find_model_entry(&pool, scoped_key, &model_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(crate::models_route::model_not_found_payload(&model_id)),
+        )
+            .into_response();
+    };
+    Json(crate::models_route::single_model_payload(
+        &entry,
+        pool.models_created_unix,
+    ))
+    .into_response()
 }
 
 async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -535,9 +499,7 @@ async fn admin_reset_handler(
         let pool = state.pool.load();
         pool.members
             .iter()
-            .find(|member| {
-                member.id == id && member.kind() == crate::account::ProviderKind::Codex
-            })
+            .find(|member| member.id == id && member.kind() == crate::account::ProviderKind::Codex)
             .or_else(|| pool.members.iter().find(|member| member.id == id))
             .cloned()
     };
@@ -586,10 +548,22 @@ async fn messages_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    handle_relay(state, &auth, RelayMode::Anthropic, "/v1/messages", &headers, body).await
+    handle_relay(
+        state,
+        &auth,
+        RelayMode::Anthropic,
+        "/v1/messages",
+        &headers,
+        body,
+    )
+    .await
 }
 
-async fn count_tokens_handler(State(state): State<Arc<AppState>>, Extension(auth): Extension<ResolvedAuth>, body: Bytes) -> Response {
+async fn count_tokens_handler(
+    State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<ResolvedAuth>,
+    body: Bytes,
+) -> Response {
     let parsed: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
@@ -609,16 +583,23 @@ async fn count_tokens_handler(State(state): State<Arc<AppState>>, Extension(auth
         .unwrap_or("");
     let snapshot = state.pool.load();
     if let Some(key) = auth.identity.scoped() {
-        if !crate::models_route::scoped_model_entries(&snapshot, key).iter().any(|entry| entry.id == model) {
-            return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error":{"type":"permission_error"}}))).into_response();
+        if !crate::models_route::scoped_model_entries(&snapshot, key)
+            .iter()
+            .any(|entry| entry.id == model)
+        {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"error":{"type":"permission_error"}})),
+            )
+                .into_response();
         }
     }
     let is_supported = crate::capability::resolve_for_capability(
-            &snapshot,
-            model,
-            mahoquot_registry::ModelCapability::CountTokens,
-        )
-        .is_some();
+        &snapshot,
+        model,
+        mahoquot_registry::ModelCapability::CountTokens,
+    )
+    .is_some();
 
     if !is_supported {
         return (
@@ -725,4 +706,86 @@ async fn codex_responses_handler(
         body,
     )
     .await
+}
+
+#[cfg(test)]
+mod permit_body_tests {
+    use super::*;
+    use http_body::Body as _;
+    use http_body::{Frame, SizeHint};
+    use std::convert::Infallible;
+    use std::task::{Context, Poll};
+
+    struct OneFrameThenEnd(bool);
+
+    impl http_body::Body for OneFrameThenEnd {
+        type Data = bytes::Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            if self.0 {
+                Poll::Ready(None)
+            } else {
+                self.0 = true;
+                Poll::Ready(Some(Ok(Frame::data(bytes::Bytes::from_static(b"body")))))
+            }
+        }
+
+        fn is_end_stream(&self) -> bool {
+            self.0
+        }
+
+        fn size_hint(&self) -> SizeHint {
+            SizeHint::default()
+        }
+    }
+
+    #[test]
+    fn permit_is_released_at_eof_while_body_remains_alive() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = gate.clone().try_acquire_owned().unwrap();
+        let mut body = PermitBody {
+            inner: OneFrameThenEnd(false),
+            permit: std::cell::RefCell::new(Some(permit)),
+        };
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(matches!(
+            std::pin::Pin::new(&mut body).poll_frame(&mut cx),
+            Poll::Ready(Some(Ok(_)))
+        ));
+        assert_eq!(gate.available_permits(), 0);
+        assert!(matches!(
+            std::pin::Pin::new(&mut body).poll_frame(&mut cx),
+            Poll::Ready(None)
+        ));
+        assert_eq!(gate.available_permits(), 1);
+        drop(body);
+        assert_eq!(gate.available_permits(), 1);
+    }
+
+    #[test]
+    fn permit_is_released_when_body_reports_end_stream() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = gate.clone().try_acquire_owned().unwrap();
+        let mut body = PermitBody {
+            inner: OneFrameThenEnd(true),
+            permit: std::cell::RefCell::new(Some(permit)),
+        };
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(body.is_end_stream());
+        assert!(matches!(
+            std::pin::Pin::new(&mut body).poll_frame(&mut cx),
+            Poll::Ready(None)
+        ));
+        assert_eq!(gate.available_permits(), 1);
+        drop(body);
+        assert_eq!(gate.available_permits(), 1);
+    }
 }

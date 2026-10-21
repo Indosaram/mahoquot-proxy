@@ -12,14 +12,29 @@ use mahoquot_gateway::{config::GatewayConfig, routes::create_app, state::AppStat
 use mahoquot_types::Strategy;
 use tower::ServiceExt;
 
+const MANAGEMENT_KEY: &str = "t6-dedicated-management-key";
+
 #[tokio::test]
 async fn authenticated_shutdown_drains_before_server_exit() {
     let auth_dir = common::unique_temp_dir("qg-t6-shutdown");
+    let config_path = auth_dir.join("config.yaml");
     let config = GatewayConfig {
         auth_dir: auth_dir.clone(),
         api_keys: mahoquot_gateway::inbound::ApiKeys::new(vec!["shutdown-key".to_string()]),
+        config_path: config_path.clone(),
         ..GatewayConfig::default()
     };
+    mahoquot_gateway::management::settings::Settings {
+        api_keys: vec!["shutdown-key".to_string()],
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: MANAGEMENT_KEY.to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(&config_path)
+    .expect("persist management secret");
     let state = Arc::new(AppState::new(&config).unwrap());
     let started = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
@@ -67,7 +82,7 @@ async fn authenticated_shutdown_drains_before_server_exit() {
         .expect("slow request must start");
     let shutdown = client
         .post(format!("http://{address}/v0/management/shutdown"))
-        .bearer_auth("shutdown-key")
+        .header("X-Management-Key", MANAGEMENT_KEY)
         .send()
         .await
         .unwrap();
@@ -150,6 +165,17 @@ async fn config_yaml_api_keys_are_enforced() {
 async fn runtime_api_key_replacement_is_enforced_immediately() {
     let auth_dir = common::unique_temp_dir("mahoquot-runtime-api-key");
     std::fs::write(auth_dir.join("config.yaml"), "api-keys:\n  - old-key\n").expect("config.yaml");
+    mahoquot_gateway::management::settings::Settings {
+        api_keys: vec!["old-key".to_string()],
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: MANAGEMENT_KEY.to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(&auth_dir.join("config.yaml"))
+    .expect("persist management secret");
     let app = create_app(Arc::new(
         AppState::new(&gateway_config(&auth_dir)).expect("state"),
     ));
@@ -157,15 +183,15 @@ async fn runtime_api_key_replacement_is_enforced_immediately() {
     assert_eq!(models_status(&app, Some("old-key")).await, StatusCode::OK);
     let response = app
         .clone()
-        .oneshot(
+        .oneshot(common::with_loopback_peer(
             Request::builder()
                 .method(Method::PUT)
                 .uri("/v0/management/api-keys")
-                .header(header::AUTHORIZATION, "Bearer old-key")
+                .header("X-Management-Key", MANAGEMENT_KEY)
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"["new-key"]"#))
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -192,7 +218,7 @@ async fn empty_effective_api_key_set_keeps_local_default_open() {
 }
 
 #[tokio::test]
-async fn management_uses_the_same_api_key_as_proxy_routes() {
+async fn management_requires_its_dedicated_api_key() {
     let auth_dir =
         std::env::temp_dir().join(format!("mahoquot-unified-key-{}", std::process::id()));
     std::fs::create_dir_all(&auth_dir).expect("auth dir");
@@ -215,29 +241,40 @@ async fn management_uses_the_same_api_key_as_proxy_routes() {
         catalog_cache_path: None,
         max_concurrent_inference: mahoquot_gateway::state::MAX_CONCURRENT_INFERENCE_REQUESTS,
     };
+    mahoquot_gateway::management::settings::Settings {
+        api_keys: vec!["one-key".to_string()],
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: MANAGEMENT_KEY.to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(&config.config_path)
+    .expect("persist management secret");
     let app = create_app(Arc::new(AppState::new(&config).expect("state")));
 
     let allowed = app
         .clone()
-        .oneshot(
+        .oneshot(common::with_loopback_peer(
             Request::builder()
                 .uri("/v0/management/auth-files")
-                .header(header::AUTHORIZATION, "Bearer one-key")
+                .header("X-Management-Key", MANAGEMENT_KEY)
                 .body(Body::empty())
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(allowed.status(), StatusCode::OK);
 
     let denied = app
-        .oneshot(
+        .oneshot(common::with_loopback_peer(
             Request::builder()
                 .uri("/v0/management/auth-files")
-                .header(header::AUTHORIZATION, "Bearer wrong")
+                .header("X-Management-Key", "wrong")
                 .body(Body::empty())
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);

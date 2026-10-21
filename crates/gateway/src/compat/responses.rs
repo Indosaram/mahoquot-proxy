@@ -19,8 +19,127 @@
 //!    equivalence between streaming and non-streaming outputs.
 
 use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashSet;
+
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
+use ring::aead::{self, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
+use ring::rand::{SecureRandom, SystemRandom};
+use sha2::{Digest, Sha256};
+
+const COMPACTION_CAPSULE_PREFIX: &str = "cpa-ag-compact-v1:";
+const COMPACTION_SECRET_KEY: &[u8] = b"CLIProxyAPI";
+
+#[derive(Serialize, Deserialize)]
+struct CompactionPayload {
+    summary: String,
+    model: String,
+    created_at: u64,
+}
+
+pub fn is_recognized_compaction_capsule(capsule: &str) -> bool {
+    capsule.starts_with(COMPACTION_CAPSULE_PREFIX)
+}
+
+fn derive_compaction_key() -> LessSafeKey {
+    let mut hasher = Sha256::new();
+    hasher.update(COMPACTION_SECRET_KEY);
+    let key_bytes = hasher.finalize();
+    let unbound = UnboundKey::new(&AES_256_GCM, &key_bytes).expect("AES_256_GCM key");
+    LessSafeKey::new(unbound)
+}
+
+// These public helpers are exercised by t25; this file is also included by a narrower test target.
+#[allow(dead_code)]
+pub fn seal_compaction_capsule(summary: &str, model: &str) -> Result<String, String> {
+    let payload = CompactionPayload {
+        summary: summary.to_string(),
+        model: model.to_string(),
+        created_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    };
+    let json_bytes = serde_json::to_vec(&payload).map_err(|e| e.to_string())?;
+
+    let rng = SystemRandom::new();
+    let mut nonce_bytes = [0u8; 12];
+    rng.fill(&mut nonce_bytes)
+        .map_err(|e| format!("rng error: {e}"))?;
+    let nonce =
+        Nonce::try_assume_unique_for_key(&nonce_bytes).map_err(|_| "invalid nonce".to_string())?;
+
+    let key = derive_compaction_key();
+    let mut in_out = json_bytes;
+    key.seal_in_place_append_tag(nonce, aead::Aad::empty(), &mut in_out)
+        .map_err(|e| format!("seal error: {e}"))?;
+
+    let mut combined = nonce_bytes.to_vec();
+    combined.extend_from_slice(&in_out);
+    let encoded = URL_SAFE_NO_PAD.encode(&combined);
+    Ok(format!("{COMPACTION_CAPSULE_PREFIX}{encoded}"))
+}
+
+// These public helpers are exercised by t25; this file is also included by a narrower test target.
+#[allow(dead_code)]
+pub fn unseal_compaction_capsule(capsule: &str) -> Result<String, String> {
+    if !is_recognized_compaction_capsule(capsule) {
+        return Err("unrecognized capsule prefix".to_string());
+    }
+    let encoded = &capsule[COMPACTION_CAPSULE_PREFIX.len()..];
+    let decoded = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|e| format!("decode error: {e}"))?;
+    if decoded.len() < 12 + 16 {
+        return Err("invalid capsule: payload too short".to_string());
+    }
+    let (nonce_bytes, ct) = decoded.split_at(12);
+    let nonce =
+        Nonce::try_assume_unique_for_key(nonce_bytes).map_err(|_| "invalid nonce".to_string())?;
+    let mut ct_vec = ct.to_vec();
+    let key = derive_compaction_key();
+    let pt = key
+        .open_in_place(nonce, aead::Aad::empty(), &mut ct_vec)
+        .map_err(|e| format!("invalid or tampered capsule: {e}"))?;
+    let payload: CompactionPayload =
+        serde_json::from_slice(pt).map_err(|e| format!("invalid JSON in capsule: {e}"))?;
+    Ok(payload.summary)
+}
+
+pub fn unseal_compaction_capsule_for_model(
+    capsule: &str,
+    expected_model: &str,
+) -> Result<String, String> {
+    if !is_recognized_compaction_capsule(capsule) {
+        return Err("unrecognized capsule prefix".to_string());
+    }
+    let encoded = &capsule[COMPACTION_CAPSULE_PREFIX.len()..];
+    let decoded = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|e| format!("decode error: {e}"))?;
+    if decoded.len() < 12 + 16 {
+        return Err("invalid capsule: payload too short".to_string());
+    }
+    let (nonce_bytes, ct) = decoded.split_at(12);
+    let nonce =
+        Nonce::try_assume_unique_for_key(nonce_bytes).map_err(|_| "invalid nonce".to_string())?;
+    let mut ct_vec = ct.to_vec();
+    let key = derive_compaction_key();
+    let pt = key
+        .open_in_place(nonce, aead::Aad::empty(), &mut ct_vec)
+        .map_err(|e| format!("invalid or tampered capsule: {e}"))?;
+    let payload: CompactionPayload =
+        serde_json::from_slice(pt).map_err(|e| format!("invalid JSON in capsule: {e}"))?;
+    if !expected_model.is_empty() && payload.model != expected_model {
+        return Err(format!(
+            "model mismatch: capsule sealed for '{}' but requested for '{}'",
+            payload.model, expected_model
+        ));
+    }
+    Ok(payload.summary)
+}
 
 use crate::compat::events::{CodexEvent, Usage};
 use crate::compat::split_data_url;
@@ -137,7 +256,9 @@ pub fn responses_to_openai(req: &Value) -> Result<Value, ResponsesError> {
                 .unwrap_or("function");
             if tool_type != "function" {
                 return Err(ResponsesError::unsupported(
-                    format!("unsupported tool type '{tool_type}': only function tools are supported"),
+                    format!(
+                        "unsupported tool type '{tool_type}': only function tools are supported"
+                    ),
                     Some("tools"),
                 ));
             }
@@ -147,11 +268,9 @@ pub fn responses_to_openai(req: &Value) -> Result<Value, ResponsesError> {
                 .and_then(|f| f.get("name"))
                 .or_else(|| tool.get("name"))
                 .and_then(Value::as_str);
-            let name = name
-                .filter(|n| !n.trim().is_empty())
-                .ok_or_else(|| {
-                    ResponsesError::invalid_request("tool function missing name", Some("tools"))
-                })?;
+            let name = name.filter(|n| !n.trim().is_empty()).ok_or_else(|| {
+                ResponsesError::invalid_request("tool function missing name", Some("tools"))
+            })?;
 
             let description = tool
                 .get("function")
@@ -223,6 +342,8 @@ pub fn responses_to_openai(req: &Value) -> Result<Value, ResponsesError> {
     let mut defined_tool_calls: HashSet<String> = HashSet::new();
     let mut answered_tool_calls: HashSet<String> = HashSet::new();
 
+    let target_model = obj.get("model").and_then(Value::as_str).unwrap_or("");
+
     match obj.get("input") {
         Some(Value::String(text)) => {
             messages.push(json!({
@@ -235,6 +356,31 @@ pub fn responses_to_openai(req: &Value) -> Result<Value, ResponsesError> {
                 let item_type = item.get("type").and_then(Value::as_str);
 
                 match item_type {
+                    Some("compaction") => {
+                        let capsule = item
+                            .get("encrypted_content")
+                            .or_else(|| item.get("content"))
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| {
+                                ResponsesError::invalid_request(
+                                    "missing compaction encrypted_content",
+                                    Some("input"),
+                                )
+                            })?;
+
+                        let unsealed = unseal_compaction_capsule_for_model(capsule, target_model)
+                            .map_err(|err| {
+                            ResponsesError::invalid_request(
+                                format!("invalid compaction capsule: {err}"),
+                                Some("input"),
+                            )
+                        })?;
+
+                        messages.push(json!({
+                            "role": "developer",
+                            "content": unsealed,
+                        }));
+                    }
                     Some("function_call") => {
                         let call_id = item
                             .get("call_id")
@@ -348,10 +494,7 @@ pub fn responses_to_openai(req: &Value) -> Result<Value, ResponsesError> {
                     }
                     _ => {
                         // Regular message turn
-                        let role = item
-                            .get("role")
-                            .and_then(Value::as_str)
-                            .unwrap_or("user");
+                        let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
 
                         let mut text_parts = Vec::new();
                         let mut image_parts = Vec::new();
@@ -386,7 +529,9 @@ pub fn responses_to_openai(req: &Value) -> Result<Value, ResponsesError> {
                                     let ptype = part.get("type").and_then(Value::as_str);
                                     match ptype {
                                         Some("input_text") | Some("text") | Some("output_text") => {
-                                            if let Some(t) = part.get("text").and_then(Value::as_str) {
+                                            if let Some(t) =
+                                                part.get("text").and_then(Value::as_str)
+                                            {
                                                 text_parts.push(t.to_string());
                                             }
                                         }
@@ -394,10 +539,16 @@ pub fn responses_to_openai(req: &Value) -> Result<Value, ResponsesError> {
                                             let url_opt = part
                                                 .get("image_url")
                                                 .and_then(|u| {
-                                                    u.get("url").and_then(Value::as_str).or_else(|| u.as_str())
+                                                    u.get("url")
+                                                        .and_then(Value::as_str)
+                                                        .or_else(|| u.as_str())
                                                 })
-                                                .or_else(|| part.get("data").and_then(Value::as_str))
-                                                .or_else(|| part.get("url").and_then(Value::as_str));
+                                                .or_else(|| {
+                                                    part.get("data").and_then(Value::as_str)
+                                                })
+                                                .or_else(|| {
+                                                    part.get("url").and_then(Value::as_str)
+                                                });
 
                                             let Some(url) = url_opt else {
                                                 return Err(ResponsesError::invalid_request(
@@ -434,10 +585,14 @@ pub fn responses_to_openai(req: &Value) -> Result<Value, ResponsesError> {
                                             {
                                                 reasoning_text = Some(r.to_string());
                                             }
-                                            if let Some(sig) = part.get("signature").and_then(Value::as_str) {
+                                            if let Some(sig) =
+                                                part.get("signature").and_then(Value::as_str)
+                                            {
                                                 reasoning_signature = Some(sig.to_string());
                                             }
-                                            if part.get("redacted").and_then(Value::as_bool) == Some(true) {
+                                            if part.get("redacted").and_then(Value::as_bool)
+                                                == Some(true)
+                                            {
                                                 reasoning_redacted = true;
                                             }
                                         }
@@ -445,7 +600,9 @@ pub fn responses_to_openai(req: &Value) -> Result<Value, ResponsesError> {
                                             reasoning_redacted = true;
                                         }
                                         _ => {
-                                            if let Some(t) = part.get("text").and_then(Value::as_str) {
+                                            if let Some(t) =
+                                                part.get("text").and_then(Value::as_str)
+                                            {
                                                 text_parts.push(t.to_string());
                                             }
                                         }
@@ -598,6 +755,37 @@ pub struct ResponsesStreamRenderer {
     text_state: TextItemState,
     tools: Vec<ToolCallItem>,
     next_output_index: u64,
+    /// Monotonic `sequence_number` for locally rendered events (Task 9).
+    next_sequence: u64,
+}
+
+/// Stamps a monotonic `sequence_number` into each locally rendered SSE frame.
+fn stamp_sequence(frames: Vec<Bytes>, next: &mut u64) -> Vec<Bytes> {
+    frames
+        .into_iter()
+        .map(|frame| {
+            let text = String::from_utf8_lossy(&frame);
+            let Some(start) = text.find("\ndata: ") else {
+                return frame;
+            };
+            let head = &text[..start + "\ndata: ".len()];
+            let data = text[head.len()..].trim_end_matches('\n');
+            let Ok(mut payload) = serde_json::from_str::<Value>(data) else {
+                return frame;
+            };
+            let Some(object) = payload.as_object_mut() else {
+                return frame;
+            };
+            object.insert("sequence_number".into(), json!(*next));
+            *next += 1;
+            let mut buf = head.as_bytes().to_vec();
+            if serde_json::to_writer(&mut buf, &payload).is_err() {
+                return frame;
+            }
+            buf.extend_from_slice(b"\n\n");
+            Bytes::from(buf)
+        })
+        .collect()
 }
 
 impl ResponsesStreamRenderer {
@@ -618,6 +806,7 @@ impl ResponsesStreamRenderer {
             text_state: TextItemState::Unstarted,
             tools: Vec::new(),
             next_output_index: 0,
+            next_sequence: 0,
         }
     }
 
@@ -725,6 +914,11 @@ impl ResponsesStreamRenderer {
     }
 
     pub fn render(&mut self, event: CodexEvent) -> Vec<Bytes> {
+        let frames = self.render_unstamped(event);
+        stamp_sequence(frames, &mut self.next_sequence)
+    }
+
+    fn render_unstamped(&mut self, event: CodexEvent) -> Vec<Bytes> {
         if self.terminated {
             return Vec::new();
         }
@@ -953,6 +1147,11 @@ impl ResponsesStreamRenderer {
     }
 
     pub fn close_unterminated(&mut self) -> Vec<Bytes> {
+        let frames = self.close_unstamped();
+        stamp_sequence(frames, &mut self.next_sequence)
+    }
+
+    fn close_unstamped(&mut self) -> Vec<Bytes> {
         if self.terminated {
             return Vec::new();
         }
@@ -988,11 +1187,32 @@ impl ResponsesStreamRenderer {
     /// Assembles the complete canonical Responses JSON response object.
     pub fn current_response(&self) -> Value {
         let mut output_items = Vec::new();
+        // Reasoning is its own Responses output item (Task 9): the summary
+        // text, and the provider signature as encrypted_content for replay.
+        if !self.reasoning_accumulator.is_empty()
+            || self.reasoning_signature.is_some()
+            || self.reasoning_redacted
+        {
+            let mut reasoning = json!({
+                "id": "rs_0",
+                "type": "reasoning",
+                "summary": if self.reasoning_accumulator.is_empty() {
+                    json!([])
+                } else {
+                    json!([{"type": "summary_text", "text": self.reasoning_accumulator}])
+                },
+            });
+            if let Some(ref sig) = self.reasoning_signature {
+                reasoning["encrypted_content"] = json!(sig);
+            }
+            output_items.push(reasoning);
+        }
 
         if !matches!(self.text_state, TextItemState::Unstarted) || !self.text_accumulator.is_empty()
         {
             let (item_id, item_status) = match self.text_state {
-                TextItemState::Open { ref item_id, .. } | TextItemState::Done { ref item_id, .. } => (
+                TextItemState::Open { ref item_id, .. }
+                | TextItemState::Done { ref item_id, .. } => (
                     item_id.clone(),
                     if self.output_limit_reached {
                         "incomplete"
@@ -1038,6 +1258,21 @@ impl ResponsesStreamRenderer {
             } else {
                 "completed"
             };
+            // Claude's server-side web search is surfaced as the Responses
+            // built-in search call, not as a client function call (Task 25).
+            if tool.name == "web_search" && tool.call_id.starts_with("srvtoolu_") {
+                let query = serde_json::from_str::<Value>(&tool.arguments)
+                    .ok()
+                    .and_then(|args| args.get("query").cloned())
+                    .unwrap_or(Value::Null);
+                output_items.push(json!({
+                    "id": tool.call_id,
+                    "type": "web_search_call",
+                    "status": status,
+                    "action": {"type": "search", "query": query},
+                }));
+                continue;
+            }
             output_items.push(json!({
                 "id": tool.item_id,
                 "type": "function_call",

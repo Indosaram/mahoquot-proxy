@@ -104,12 +104,12 @@ impl DevinMockProcess {
 
         let parsed: serde_json::Value = serde_json::from_str(&line_res)
             .unwrap_or_else(|e| panic!("failed to parse mock readiness JSON '{line_res}': {e}"));
-        let url = parsed["url"].as_str().expect("url must be string").to_string();
+        let url = parsed["url"]
+            .as_str()
+            .expect("url must be string")
+            .to_string();
 
-        Self {
-            _guard: guard,
-            url,
-        }
+        Self { _guard: guard, url }
     }
 
     async fn get_state(&self) -> serde_json::Value {
@@ -433,7 +433,10 @@ async fn test_devin_surfaces_responses_two_turn_tools() {
         .iter()
         .find(|item| item["type"] == "message")
         .expect("must emit message item in turn 2");
-    assert!(msg_item["content"][0]["text"].as_str().unwrap().contains("Seoul"));
+    assert!(msg_item["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("Seoul"));
 }
 
 #[tokio::test]
@@ -627,8 +630,7 @@ async fn test_devin_surfaces_anthropic_two_turn_tools_and_error_flag() {
     let captures = mock_state["captures"].as_array().expect("captures");
     let last_capture = captures.last().expect("last capture");
     assert_eq!(
-        last_capture["sanitized_body"]["has_tool_results"],
-        true,
+        last_capture["sanitized_body"]["has_tool_results"], true,
         "mock must confirm tool results arrived in Turn 2"
     );
 }

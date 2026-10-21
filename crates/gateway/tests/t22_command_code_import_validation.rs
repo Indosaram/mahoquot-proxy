@@ -11,6 +11,11 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use common::unique_temp_dir;
+use common::with_loopback_peer;
+
+/// Dedicated management secret (Task 26), distinct from the imported key the
+/// upstream validates.
+const MANAGEMENT_SECRET: &str = "t22-management-secret";
 use mahoquot_gateway::config::GatewayConfig;
 use mahoquot_gateway::routes::create_app;
 use mahoquot_gateway::state::AppState;
@@ -72,16 +77,17 @@ async fn models_handler(State(hits): State<Arc<AtomicUsize>>, headers: HeaderMap
 async fn import_command_code(app: &Router, api_key: &str) -> (StatusCode, serde_json::Value) {
     let response = app
         .clone()
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .method("POST")
                 .uri("/v0/management/command-code/import")
+                .header("X-Management-Key", MANAGEMENT_SECRET)
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     serde_json::json!({"api_key": api_key}).to_string(),
                 ))
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     let status = response.status();
@@ -104,9 +110,18 @@ async fn import_verifies_credentials_before_persisting() {
     let auth_dir = unique_temp_dir("mahoquot-command-code-validated");
     let (addr, hits) = spawn_mock_upstream().await;
     std::env::set_var("MAHOQUOT_COMMAND_CODE_BASE_URL", format!("http://{addr}"));
-    let app = create_app(Arc::new(
-        AppState::new(&gateway_config(&auth_dir)).expect("state"),
-    ));
+    let config = gateway_config(&auth_dir);
+    mahoquot_gateway::management::settings::Settings {
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: MANAGEMENT_SECRET.into(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(&config.config_path)
+    .expect("persist management settings");
+    let app = create_app(Arc::new(AppState::new(&config).expect("state")));
 
     let (status, body) = import_command_code(&app, "garbage-x").await;
     assert!(

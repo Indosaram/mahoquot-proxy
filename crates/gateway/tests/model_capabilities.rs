@@ -264,7 +264,8 @@ async fn realtime_and_count_token_surfaces_require_explicit_binding_capabilities
         .send()
         .await
         .unwrap();
-    assert_eq!(allowed_realtime.status(), StatusCode::OK);
+    // Task 21 receipt line 7 requires a selectable Codex transport for minting.
+    assert_eq!(allowed_realtime.status(), StatusCode::SERVICE_UNAVAILABLE);
 
     let rejected_realtime = client
         .post(format!("{gateway}/v1/realtime/sessions"))

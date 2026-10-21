@@ -294,9 +294,8 @@ impl CursorDecoder {
                         prompt_tokens: usage.input_tokens,
                         completion_tokens: usage.output_tokens,
                         total_tokens: usage.input_tokens + usage.output_tokens,
-                        cached_tokens: usage.cache_read_tokens + usage.cache_write_tokens,
-                        cached_tokens_known: usage.cache_read_tokens > 0
-                            || usage.cache_write_tokens > 0,
+                        cached_tokens: usage.cache_read_tokens,
+                        cached_tokens_known: usage.cache_read_tokens > 0,
                         reasoning_tokens: usage.reasoning_tokens,
                         cache_write_tokens: usage.cache_write_tokens,
                         cache_write_tokens_known: usage.cache_write_tokens > 0,
@@ -492,20 +491,36 @@ mod tests {
                 let body = serde_json::json!({"model":"cursor/auto-cost","messages":messages});
                 let frame = openai_to_cursor_connect(&body).unwrap();
                 assert_eq!(frame[0], 0);
-                assert_eq!(u32::from_be_bytes(frame[1..5].try_into().unwrap()) as usize, frame.len() - 5);
+                assert_eq!(
+                    u32::from_be_bytes(frame[1..5].try_into().unwrap()) as usize,
+                    frame.len() - 5
+                );
                 let envelope = proto::AgentClientMessage::decode(&frame[5..]).unwrap();
-                let Some(proto::agent_client_message::Message::RunRequest(run)) = envelope.message else {
+                let Some(proto::agent_client_message::Message::RunRequest(run)) = envelope.message
+                else {
                     panic!("missing run request");
                 };
-                let Some(proto::conversation_action::Action::UserMessageAction(action)) = run.action.unwrap().action else {
+                let Some(proto::conversation_action::Action::UserMessageAction(action)) =
+                    run.action.unwrap().action
+                else {
                     panic!("missing user action");
                 };
-                assert_eq!(action.user_message.unwrap().text, "search codebase", "{role} at {root_index}");
+                assert_eq!(
+                    action.user_message.unwrap().text,
+                    "search codebase",
+                    "{role} at {root_index}"
+                );
                 let state = run.conversation_state.unwrap();
-                let roots: Vec<Value> = state.root_prompt_messages_json.iter()
-                    .map(|bytes| serde_json::from_slice(bytes).unwrap()).collect();
-                let turns: Vec<Value> = state.turns.iter()
-                    .map(|bytes| serde_json::from_slice(bytes).unwrap()).collect();
+                let roots: Vec<Value> = state
+                    .root_prompt_messages_json
+                    .iter()
+                    .map(|bytes| serde_json::from_slice(bytes).unwrap())
+                    .collect();
+                let turns: Vec<Value> = state
+                    .turns
+                    .iter()
+                    .map(|bytes| serde_json::from_slice(bytes).unwrap())
+                    .collect();
                 assert_eq!(roots, vec![root]);
                 assert_eq!(turns, history);
             }
@@ -672,7 +687,8 @@ mod tests {
         assert!(events.iter().any(
             |event| matches!(event, CodexEvent::Completed { usage: Some(usage) }
             if usage.prompt_tokens == 150 && usage.completion_tokens == 42
-                && usage.cached_tokens == 10 && usage.reasoning_tokens == 11)
+                && usage.cached_tokens == 7 && usage.cache_write_tokens == 3
+                && usage.reasoning_tokens == 11)
         ));
     }
 
@@ -690,7 +706,11 @@ mod tests {
         // A later chunk must not resurrect the stream or add a second failure.
         decoder.decode(b"data: more", &mut events);
         decoder.finish(&mut events);
-        assert_eq!(events.len(), 1, "expected exactly one terminal failure: {events:?}");
+        assert_eq!(
+            events.len(),
+            1,
+            "expected exactly one terminal failure: {events:?}"
+        );
         assert!(matches!(events[0], CodexEvent::Failed { .. }));
     }
 

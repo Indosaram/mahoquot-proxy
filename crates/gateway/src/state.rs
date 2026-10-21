@@ -1,3 +1,509 @@
+#[cfg(test)]
+pub(crate) mod task2_proxy_consumers {
+    use super::*;
+    use axum::response::IntoResponse;
+    use prost::Message;
+    use serde_json::json;
+    use std::future::Future;
+    use std::time::Duration;
+    use tokio::sync::{mpsc, Semaphore};
+
+    pub(crate) async fn bounded<T>(future: impl Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(5), future)
+            .await
+            .expect("Task2 event deadline")
+    }
+
+    pub(crate) struct Peer {
+        pub(crate) url: String,
+        pub(crate) seen: mpsc::UnboundedReceiver<String>,
+        release: Arc<Semaphore>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Peer {
+        pub(crate) async fn start(label: &'static str) -> Self {
+            let mut listener = None;
+            for port in 18840..=18899 {
+                if let Ok(bound) =
+                    tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await
+                {
+                    listener = Some(bound);
+                    break;
+                }
+            }
+            let listener = listener.expect("reserved loopback port");
+            let url = format!("http://{}", listener.local_addr().expect("peer address"));
+            let (tx, seen) = mpsc::unbounded_channel();
+            let release = Arc::new(Semaphore::new(0));
+            let gate = Arc::clone(&release);
+            let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+                let tx = tx.clone();
+                let gate = Arc::clone(&gate);
+                async move {
+                    let path = uri.path().to_string();
+                    tx.send(path.clone()).expect("capture receiver");
+                    if path == "/held" {
+                        bounded(gate.acquire()).await.expect("release held request").forget();
+                    }
+                    match path.as_str() {
+                        "/backend-api/wham/usage" => axum::Json(json!({"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":0,"reset_at":1999999999,"limit_window_seconds":18000}}})).into_response(),
+                        "/backend-api/codex/responses" => (
+                            [("content-type", "text/event-stream")],
+                            "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"task2\"}}\n\nevent: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"task2\"}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"task2\",\"status\":\"completed\"}}\n\n",
+                        ).into_response(),
+                        "/refresh" | "/token" => axum::Json(json!({"access_token":format!("token-{label}"),"refresh_token":"dummy-refresh","expires_in":3600,"email":"task2@example.invalid"})).into_response(),
+                        "/v1/models" => axum::Json(json!({"data":[{"id":format!("model-{label}")}]})).into_response(),
+                        "/exa.api_server_pb.ApiServerService/GetCascadeModelConfigs" => {
+                            let payload = crate::compat::devin_proto::GetCascadeModelConfigsResponse {
+                                client_model_configs: vec![crate::compat::devin_proto::ClientModelConfig {
+                                    model_uid: Some(format!("model-{label}")), label: Some(format!("Model {label}")), ..Default::default()
+                                }],
+                            }.encode_to_vec();
+                            ([("content-type", "application/proto")], payload).into_response()
+                        }
+                        _ => label.into_response(),
+                    }
+                }
+            });
+            let task = tokio::spawn(async move {
+                axum::serve(listener, app).await.expect("peer serve");
+            });
+            Self {
+                url,
+                seen,
+                release,
+                task,
+            }
+        }
+
+        pub(crate) async fn captured(&mut self, path: &str) {
+            assert_eq!(bounded(self.seen.recv()).await.as_deref(), Some(path));
+        }
+
+        pub(crate) async fn close(mut self) {
+            self.release.add_permits(16);
+            self.task.abort();
+            // The listener is owned by the aborted task's future; a cancelled
+            // join proves that future (and its socket) was dropped. Re-binding
+            // the port here raced with concurrent tests claiming the same
+            // reserved port from 18840..=18899.
+            assert!(bounded(&mut self.task)
+                .await
+                .expect_err("aborted peer")
+                .is_cancelled());
+        }
+    }
+
+    impl Drop for Peer {
+        fn drop(&mut self) {
+            self.release.add_permits(16);
+            self.task.abort();
+        }
+    }
+
+    pub(crate) struct Fixture {
+        pub(crate) state: Arc<AppState>,
+        pub(crate) dir: std::path::PathBuf,
+    }
+
+    impl Fixture {
+        pub(crate) fn new(target: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("task2-consumers-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).expect("auth dir");
+            std::fs::write(dir.join("codex-task2-codex.json"), json!({
+                "type":"plus","identity_slug":"task2-codex","account_id":"dummy-account",
+                "access_token":"dummy-token","refresh_token":"dummy-refresh","id_token":"dummy-id",
+                "email":"task2@example.invalid","expired":"2099-01-01T00:00:00Z","upstream_override":target,"last_refresh":""
+            }).to_string()).expect("credential");
+            let state = Arc::new(
+                AppState::new(&crate::config::GatewayConfig {
+                    auth_dir: dir.clone(),
+                    config_path: dir.join("config.yaml"),
+                    strategy: Strategy::FillFirst,
+                    refresh_url: format!("{target}/refresh"),
+                    auth_refresh_enabled: false,
+                    ..Default::default()
+                })
+                .expect("state"),
+            );
+            Self { state, dir }
+        }
+
+        pub(crate) fn proxy(&self, url: &str) {
+            self.state
+                .settings
+                .mutate(|settings| settings.proxy_url = url.to_string())
+                .expect("publish proxy");
+        }
+
+        pub(crate) fn member(&self) -> Arc<AccountMember> {
+            self.state
+                .find_member("task2-codex")
+                .expect("fixture member")
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            if let Err(error) = std::fs::remove_dir_all(&self.dir) {
+                eprintln!("Task2 fixture cleanup: {error}");
+            }
+        }
+    }
+
+    async fn text(client: reqwest::Client, url: String) -> String {
+        let response = bounded(client.get(url).send())
+            .await
+            .expect("client request");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        bounded(response.text()).await.expect("response body")
+    }
+
+    #[tokio::test]
+    async fn publication_routes_new_families_while_old_client_finishes_on_old_proxy() {
+        // Given: capture is subscribed before dispatching a held old-client request.
+        let mut a = Peer::start("a").await;
+        let mut b = Peer::start("b").await;
+        let mut target = Peer::start("target").await;
+        let fixture = Fixture::new(&target.url);
+        fixture.proxy(&a.url);
+        let old = text(fixture.state.http_client(), format!("{}/held", target.url));
+        tokio::pin!(old);
+        bounded(async {
+            tokio::select! {
+                result = &mut old => panic!("old completed before release: {result}"),
+                event = a.seen.recv() => assert_eq!(event.as_deref(), Some("/held")),
+            }
+        })
+        .await;
+        // When: one settings publication changes the global proxy.
+        fixture.proxy(&b.url);
+        // Then: default/standard/Devin use B, direct uses target, old finishes A.
+        for client in [
+            fixture.state.http_client(),
+            fixture
+                .state
+                .try_client_for_member(&fixture.member())
+                .expect("member"),
+            fixture.state.devin_default_client(),
+            fixture
+                .state
+                .devin_client_for_target("dummy-devin")
+                .expect("Devin"),
+        ] {
+            assert_eq!(text(client, format!("{}/probe", target.url)).await, "b");
+            b.captured("/probe").await;
+        }
+        for client in [
+            fixture.state.direct_client(),
+            fixture.state.devin_direct_client(),
+        ] {
+            assert_eq!(
+                text(client, format!("{}/probe", target.url)).await,
+                "target"
+            );
+            target.captured("/probe").await;
+        }
+        a.release.add_permits(1);
+        assert_eq!(bounded(&mut old).await, "a");
+        assert!(a.seen.try_recv().is_err());
+        a.close().await;
+        b.close().await;
+        target.close().await;
+    }
+
+    #[tokio::test]
+    async fn provider_reload_credential_direct_and_invalid_refusal_keep_wire_policy() {
+        // Given: a cached provider A client and a different global B proxy.
+        let mut a = Peer::start("a").await;
+        let mut b = Peer::start("b").await;
+        let mut target = Peer::start("target").await;
+        let fixture = Fixture::new(&target.url);
+        fixture
+            .state
+            .settings
+            .mutate(|settings| {
+                settings.proxy_url = b.url.clone();
+                settings.proxy_providers.insert(
+                    "codex".into(),
+                    crate::management::settings::ProviderProxyPolicy {
+                        enabled: true,
+                        sticky: false,
+                        ttl_secs: 0,
+                        url: a.url.clone(),
+                    },
+                );
+            })
+            .expect("provider A");
+        assert_eq!(
+            text(
+                fixture
+                    .state
+                    .try_client_for_member(&fixture.member())
+                    .expect("account"),
+                format!("{}/probe", target.url)
+            )
+            .await,
+            "a"
+        );
+        a.captured("/probe").await;
+        let held = text(
+            fixture
+                .state
+                .try_client_for_member(&fixture.member())
+                .expect("old provider"),
+            format!("{}/held", target.url),
+        );
+        tokio::pin!(held);
+        bounded(async {
+            tokio::select! {
+                result = &mut held => panic!("provider completed before release: {result}"),
+                event = a.seen.recv() => assert_eq!(event.as_deref(), Some("/held")),
+            }
+        })
+        .await;
+        // When: provider-only settings publication invalidates A.
+        fixture
+            .state
+            .settings
+            .mutate(|settings| {
+                settings
+                    .proxy_providers
+                    .get_mut("codex")
+                    .expect("policy")
+                    .url = b.url.clone()
+            })
+            .expect("provider B");
+        // Then: member uses B, an unselected provider and credential directives bypass.
+        assert_eq!(
+            text(
+                fixture
+                    .state
+                    .try_client_for_member(&fixture.member())
+                    .expect("account"),
+                format!("{}/probe", target.url)
+            )
+            .await,
+            "b"
+        );
+        b.captured("/probe").await;
+        a.release.add_permits(1);
+        assert_eq!(bounded(&mut held).await, "a");
+        assert_eq!(
+            text(
+                fixture
+                    .state
+                    .try_client_for_target("unselected", "dummy")
+                    .expect("allowlist"),
+                format!("{}/probe", target.url)
+            )
+            .await,
+            "target"
+        );
+        target.captured("/probe").await;
+        for directive in ["direct", "none"] {
+            let mut member = AccountMember::for_test_with_id(
+                "direct",
+                crate::account::ProviderAccount::Codex(mahoquot_providers::CodexAccount::default()),
+            );
+            member.proxy_url = Some(directive.into());
+            assert_eq!(
+                text(
+                    fixture
+                        .state
+                        .try_client_for_member(&member)
+                        .expect("credential direct"),
+                    format!("{}/probe", target.url)
+                )
+                .await,
+                "target"
+            );
+            target.captured("/probe").await;
+        }
+        let bytes = std::fs::read(fixture.state.settings.path()).expect("settings bytes");
+        let snapshot = fixture.state.proxy.load_full();
+        assert!(fixture
+            .state
+            .settings
+            .mutate(|settings| settings
+                .proxy_providers
+                .get_mut("codex")
+                .expect("policy")
+                .url = "ftp://invalid".into())
+            .is_err());
+        assert_eq!(
+            std::fs::read(fixture.state.settings.path()).expect("settings bytes"),
+            bytes
+        );
+        assert!(Arc::ptr_eq(&snapshot, &fixture.state.proxy.load_full()));
+        assert_eq!(
+            text(
+                fixture
+                    .state
+                    .try_client_for_member(&fixture.member())
+                    .expect("unchanged"),
+                format!("{}/probe", target.url)
+            )
+            .await,
+            "b"
+        );
+        b.captured("/probe").await;
+        a.close().await;
+        b.close().await;
+        target.close().await;
+    }
+
+    #[tokio::test]
+    async fn quota_warmup_and_member_refresh_follow_publication_and_fail_before_direct_dispatch() {
+        let mut a = Peer::start("a").await;
+        let mut b = Peer::start("b").await;
+        let mut target = Peer::start("target").await;
+        let fixture = Fixture::new(&target.url);
+        for (proxy, peer, token) in [
+            (a.url.clone(), &mut a, "token-a"),
+            (b.url.clone(), &mut b, "token-b"),
+            ("direct".to_string(), &mut target, "token-target"),
+        ] {
+            fixture.proxy(&proxy);
+            let member = fixture.member();
+            bounded(crate::quota::refresh_account_usage(&fixture.state, &member))
+                .await
+                .expect("quota consumer");
+            peer.captured("/backend-api/wham/usage").await;
+            assert_eq!(
+                member
+                    .usage
+                    .read()
+                    .expect("usage")
+                    .refresh_status
+                    .as_deref(),
+                Some("ok")
+            );
+            let warm = bounded(crate::warmup::warm_account(&fixture.state, &member)).await;
+            assert!(warm.ok && warm.stream_validated, "warmup: {warm:?}");
+            peer.captured("/backend-api/codex/responses").await;
+            peer.captured("/backend-api/wham/usage").await;
+            let previous = member.access_token();
+            assert!(
+                bounded(fixture.state.refresh_member(&member, Some(&previous)))
+                    .await
+                    .expect("refresh consumer")
+            );
+            peer.captured("/refresh").await;
+            assert_eq!(member.access_token(), token);
+        }
+        let path = fixture.dir.join("codex-task2-codex.json");
+        let mut credential: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("credential bytes"))
+                .expect("credential JSON");
+        credential["proxy_url"] = json!("ftp://invalid");
+        std::fs::write(path, credential.to_string()).expect("invalid credential proxy");
+        fixture.state.rescan_pool().expect("reload credential");
+        let member = fixture.member();
+        assert!(
+            matches!(bounded(crate::quota::refresh_account_usage(&fixture.state, &member)).await,
+            Err(crate::quota::QuotaError::Upstream(message)) if message.starts_with("proxy client construction failed:"))
+        );
+        let warm = bounded(crate::warmup::warm_account(&fixture.state, &member)).await;
+        assert!(!warm.ok);
+        assert!(warm
+            .detail
+            .as_deref()
+            .expect("warmup construction error")
+            .starts_with("proxy client construction failed:"));
+        assert!(
+            matches!(bounded(fixture.state.refresh_member(&member, Some(&member.access_token()))).await,
+            Err(mahoquot_providers::refresh_exec::RefreshError::Parse(message)) if message.starts_with("proxy client construction failed:"))
+        );
+        assert!(a.seen.try_recv().is_err());
+        assert!(b.seen.try_recv().is_err());
+        assert!(target.seen.try_recv().is_err());
+        a.close().await;
+        b.close().await;
+        target.close().await;
+    }
+
+    #[tokio::test]
+    async fn direct_none_and_clear_clients_ignore_a_poisoned_environment_proxy() {
+        let mut poisoned = Peer::start("environment").await;
+        let mut target = Peer::start("target").await;
+        let dir = std::env::temp_dir().join(format!("task2-env-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("subprocess directory");
+        let mut child =
+            tokio::process::Command::new(std::env::current_exe().expect("test executable"))
+                .args([
+                    "--exact",
+                    "state::task2_proxy_consumers::environment_proxy_child",
+                    "--nocapture",
+                ])
+                .env("TASK2_DIRECT_TARGET", &target.url)
+                .env("TASK2_DIRECT_AUTH", &dir)
+                .env("HTTP_PROXY", &poisoned.url)
+                .env("HTTPS_PROXY", &poisoned.url)
+                .env("http_proxy", &poisoned.url)
+                .env("https_proxy", &poisoned.url)
+                .env("ALL_PROXY", &poisoned.url)
+                .env("all_proxy", &poisoned.url)
+                .env("NO_PROXY", "")
+                .env("no_proxy", "")
+                .kill_on_drop(true)
+                .spawn()
+                .expect("isolated environment child");
+        let status = match tokio::time::timeout(Duration::from_secs(10), child.wait()).await {
+            Ok(result) => result.expect("child exit"),
+            Err(error) => {
+                child.start_kill().expect("kill timed out child");
+                bounded(child.wait()).await.expect("reap timed out child");
+                panic!("environment child deadline: {error}");
+            }
+        };
+        assert!(status.success(), "environment child status: {status}");
+        for _ in 0..18 {
+            target.captured("/probe").await;
+        }
+        assert!(poisoned.seen.try_recv().is_err());
+        poisoned.close().await;
+        target.close().await;
+        std::fs::remove_dir_all(dir).expect("child fixture cleanup");
+    }
+
+    #[tokio::test]
+    async fn environment_proxy_child() {
+        let Ok(target) = std::env::var("TASK2_DIRECT_TARGET") else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(std::env::var("TASK2_DIRECT_AUTH").expect("child auth"));
+        let state = AppState::new(&crate::config::GatewayConfig {
+            auth_dir: dir.clone(),
+            config_path: dir.join("config.yaml"),
+            strategy: Strategy::FillFirst,
+            auth_refresh_enabled: false,
+            ..Default::default()
+        })
+        .expect("child state");
+        for directive in ["direct", "none", ""] {
+            state
+                .settings
+                .mutate(|settings| settings.proxy_url = directive.into())
+                .expect("directive");
+            for client in [
+                state.http_client(),
+                state.direct_client(),
+                state.devin_default_client(),
+                state.devin_direct_client(),
+                state
+                    .try_client_for_target("codex", "dummy")
+                    .expect("standard"),
+                state.devin_client_for_target("dummy").expect("Devin"),
+            ] {
+                assert_eq!(text(client, format!("{target}/probe")).await, "target");
+            }
+        }
+    }
+}
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -15,8 +521,7 @@ use crate::management::store::SettingsStore;
 use crate::metrics::{AdminStatsResponse, GatewayMetrics};
 use crate::monitor::MonitorState;
 pub use crate::runtime_state::{
-    compute_candidate_composition, PoolSnapshot, RefreshCoordinator, RuntimeComposition,
-    RuntimeState, UnifiedRuntimeState,
+    PoolSnapshot, RefreshCoordinator, RuntimeComposition, RuntimeState, UnifiedRuntimeState,
 };
 use crate::telemetry::TelemetryStore;
 
@@ -193,7 +698,12 @@ pub struct PollBackoffGuard<'a> {
 
 impl PollBackoffGuard<'_> {
     pub fn set(&mut self, account: &str, until_unix: i64) -> bool {
-        if self.inner.active.as_ref().is_some_and(|active| !active.contains(account)) {
+        if self
+            .inner
+            .active
+            .as_ref()
+            .is_some_and(|active| !active.contains(account))
+        {
             return false;
         }
         self.inner.entries.insert(account.to_string(), until_unix);
@@ -226,11 +736,17 @@ impl PollBackoffGuard<'_> {
         self.inner.entries.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.inner.entries.is_empty()
+    }
+
     pub fn retain<F>(&mut self, mut f: F)
     where
         F: FnMut(&String, &mut i64) -> bool,
     {
-        self.inner.entries.retain(|account, until| f(account, until));
+        self.inner
+            .entries
+            .retain(|account, until| f(account, until));
     }
 }
 
@@ -278,6 +794,7 @@ pub struct ProxyClientCache {
 struct ProxyClientCacheInner {
     /// Live pool ids; `None` until `retain_members` activates the allowlist.
     active: Option<std::collections::BTreeSet<String>>,
+    generation: u64,
     clients: std::collections::HashMap<String, reqwest::Client>,
 }
 
@@ -312,8 +829,20 @@ impl ProxyClientCache {
             .len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .generation
+    }
+
     pub fn clear(&self) {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner.generation = inner.generation.wrapping_add(1);
         inner.clients.clear();
     }
 
@@ -348,6 +877,24 @@ impl ProxyClientCache {
             .retain(|existing, _| existing == &key || !existing.starts_with(scope));
         inner.clients.insert(key, client);
     }
+
+    pub fn replace_scoped_generation(
+        &self,
+        generation: u64,
+        key: String,
+        scope: &str,
+        member_id: &str,
+        client: reqwest::Client,
+    ) {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if inner.generation != generation || !inner.admits(member_id) {
+            return;
+        }
+        inner
+            .clients
+            .retain(|existing, _| existing == &key || !existing.starts_with(scope));
+        inner.clients.insert(key, client);
+    }
 }
 
 /// Single-flight claim for one account's Devin catalog discovery. Dropping the
@@ -372,11 +919,7 @@ pub struct AppState {
     pub runtime: Arc<UnifiedRuntimeState>,
     pub catalog: Arc<crate::registry::CatalogManager>,
     pub models_env: Option<String>,
-    pub http_client: reqwest::Client,
-    /// Never proxied. Serves providers left out of an active `proxy-providers`
-    /// allowlist, so a per-provider proxy cannot capture everyone else's egress.
-    pub direct_client: reqwest::Client,
-    pub proxy_runtime: Arc<arc_swap::ArcSwap<crate::proxy_policy::ProxyRuntime>>,
+    pub proxy: Arc<arc_swap::ArcSwap<crate::proxy_policy::ProxySnapshot>>,
     pub proxy_clients: Arc<ProxyClientCache>,
     pub metrics: Arc<GatewayMetrics>,
     pub monitor: Arc<MonitorState>,
@@ -406,8 +949,6 @@ pub struct AppState {
     pub usage_samples: crate::usage::UsageSampleStore,
     pub usage_state: crate::usage::UsageStateStore,
     pub shutdown: Arc<tokio::sync::Notify>,
-    pub devin_http_client: reqwest::Client,
-    pub devin_direct_client: reqwest::Client,
     /// Per-account usage-poll backoff (unix secs). A 429 from a usage endpoint
     /// parks the account here so the poller stops keeping the throttle hot.
     /// The live-id allowlist shares this guard (see `PollBackoffStore`).
@@ -424,6 +965,18 @@ pub struct AppState {
     pub finalizer_notifiers: Arc<
         std::sync::Mutex<std::collections::HashMap<String, Vec<tokio::sync::mpsc::Sender<()>>>>,
     >,
+    pub aistudio: Arc<crate::aistudio::Relay>,
+    pub plugins: Option<Arc<crate::plugins::loader::PluginHost>>,
+    pub home: Option<Arc<crate::home::HomeClient>>,
+    pub realtime: Arc<crate::realtime::RealtimeStore>,
+    /// xAI encrypted-reasoning replay, scoped per caller/account/model/session.
+    pub xai_replay: Arc<std::sync::Mutex<crate::compat::xai::ReasoningReplay>>,
+    /// Kimi signed-thinking replay for Claude-format turns (Task 17).
+    pub kimi_replay: Arc<std::sync::Mutex<crate::compat::kimi::ReplayCache>>,
+    /// Opt-in LCP trajectory matcher (Task 13), bounded by routing settings.
+    pub lcp: std::sync::Mutex<mahoquot_router::lcp::Matcher>,
+    /// Explicit/inherited session bindings with wall-clock TTL (Task 13).
+    pub session_bindings: std::sync::Mutex<std::collections::HashMap<String, (String, i64)>>,
 }
 
 pub(crate) fn adopt_runtime_state(target: &AccountMember, previous: &Arc<AccountMember>) {
@@ -486,8 +1039,6 @@ pub(crate) fn adopt_runtime_state(target: &AccountMember, previous: &Arc<Account
 
 impl AppState {
     pub fn new(config: &GatewayConfig) -> anyhow::Result<Self> {
-        let members = load_account_members(&config.auth_dir)?;
-
         let router = Router::new(config.strategy);
         let metrics = Arc::new(GatewayMetrics::default());
         let monitor = Arc::new(MonitorState::default());
@@ -510,28 +1061,23 @@ impl AppState {
         router.set_strategy(initial_strategy);
 
         let initial_settings = settings.current();
-        let base_proxy = crate::proxy_policy::base_proxy_url(&initial_settings);
-        let http_client = crate::proxy_policy::build_http_client(base_proxy)
-            .map_err(|e| anyhow::anyhow!("failed to build reqwest client: {}", e))?;
-        let direct_client = crate::proxy_policy::build_http_client(None)
-            .map_err(|e| anyhow::anyhow!("failed to build reqwest client: {}", e))?;
-        let devin_http_client = crate::proxy_policy::build_devin_http_client(base_proxy)
-            .map_err(|e| anyhow::anyhow!("failed to build devin reqwest client: {}", e))?;
-        let devin_direct_client = crate::proxy_policy::build_devin_http_client(None)
-            .map_err(|e| anyhow::anyhow!("failed to build direct devin reqwest client: {}", e))?;
-
-        let proxy_runtime = Arc::new(arc_swap::ArcSwap::from_pointee(
-            crate::proxy_policy::ProxyRuntime::from_settings(&initial_settings),
-        ));
+        let mut members = load_account_members(std::path::Path::new(&initial_settings.auth_dir))?;
+        for member in &mut members {
+            Arc::get_mut(member)
+                .ok_or_else(|| anyhow::anyhow!("freshly loaded account unexpectedly shared"))?
+                .apply_config_retry(&initial_settings);
+        }
+        let initial_proxy_snapshot =
+            crate::proxy_policy::ProxySnapshot::from_settings(&initial_settings)
+                .map_err(|e| anyhow::anyhow!("failed to build initial proxy snapshot: {}", e))?;
+        let proxy = Arc::new(arc_swap::ArcSwap::from_pointee(initial_proxy_snapshot));
         let proxy_clients = Arc::new(ProxyClientCache::default());
 
-        let proxy_runtime_obs = Arc::clone(&proxy_runtime);
-        let proxy_clients_obs = Arc::clone(&proxy_clients);
-        settings.add_observer(Arc::new(move |published| {
-            proxy_runtime_obs.store(Arc::new(crate::proxy_policy::ProxyRuntime::from_settings(
-                published,
-            )));
-            proxy_clients_obs.clear();
+        let proxy_pub = Arc::clone(&proxy);
+        let proxy_clients_pub = Arc::clone(&proxy_clients);
+        settings.set_proxy_publisher(Arc::new(move |new_snapshot| {
+            proxy_pub.store(new_snapshot);
+            proxy_clients_pub.clear();
         }));
         let scoped_keys = Arc::new(ScopedKeyTracker::new(&settings.current().scoped_api_keys));
         // Every published settings document rebuilds the index, so a key that
@@ -608,17 +1154,22 @@ impl AppState {
             now,
             Arc::clone(&metrics),
         ));
+        catalog.bind_proxy(Arc::clone(&proxy));
         let base_registry = catalog.current_snapshot();
         let initial_registry = settings
             .current()
             .validate_against_registry(&base_registry)
             .map(Arc::new)
             .unwrap_or(base_registry);
-        let candidate = compute_candidate_composition(
+        let candidate = crate::runtime_state::compute_candidate_composition_with_created(
             1,
             members,
             initial_registry,
             config.models_env.as_deref(),
+            match catalog.active_created_unix() {
+                0 => now as i64,
+                created => created as i64,
+            },
         )
         .map_err(|e| anyhow::anyhow!("failed to compute initial composition: {e}"))?;
 
@@ -636,6 +1187,24 @@ impl AppState {
         settings.set_pool_publisher(Arc::new(move |registry| {
             runtime_for_publisher.update_registry(registry).map(|_| ())
         }));
+        let runtime_for_retry = Arc::clone(&runtime);
+        settings.add_observer(Arc::new(move |published| {
+            let current = runtime_for_retry.pool().load_full();
+            let members = current
+                .members
+                .iter()
+                .map(|member| {
+                    let mut updated = member.clone_for_snapshot(member.devin_catalog_state());
+                    updated.apply_config_retry(published);
+                    Arc::new(updated)
+                })
+                .collect();
+            if let Err(error) = runtime_for_retry.reload_accounts(members) {
+                tracing::error!(
+                    "failed to publish retry configuration for active members: {error}"
+                );
+            }
+        }));
 
         let state = Self {
             settings,
@@ -650,10 +1219,10 @@ impl AppState {
             usage_state,
             shutdown: Arc::new(tokio::sync::Notify::new()),
             usage_poll_backoff: PollBackoffStore::default(),
-            devin_refresh_in_flight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
-            inference_gate: Arc::new(tokio::sync::Semaphore::new(
-                config.max_concurrent_inference,
+            devin_refresh_in_flight: Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::new(),
             )),
+            inference_gate: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_inference)),
             rescan_gate: std::sync::Mutex::new(()),
             router,
             runtime,
@@ -661,11 +1230,7 @@ impl AppState {
             warmup: crate::warmup::WarmupRunner::default(),
             pool,
             models_env: config.models_env.clone(),
-            http_client,
-            direct_client,
-            devin_http_client,
-            devin_direct_client,
-            proxy_runtime,
+            proxy,
             proxy_clients,
             metrics,
             monitor,
@@ -685,6 +1250,14 @@ impl AppState {
             model_restrictions: AtomicBool::new(false),
             devin_cache: Arc::new(crate::devin_catalog::DevinDiscoveryCache::new()),
             finalizer_notifiers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            aistudio: Arc::new(crate::aistudio::Relay::new()),
+            plugins: None,
+            home: None,
+            realtime: Arc::new(crate::realtime::RealtimeStore::default()),
+            xai_replay: Arc::new(std::sync::Mutex::new(Default::default())),
+            kimi_replay: Arc::new(std::sync::Mutex::new(Default::default())),
+            lcp: std::sync::Mutex::new(Default::default()),
+            session_bindings: std::sync::Mutex::new(Default::default()),
         };
         // Bootstrap membership: every store that can outlive an account starts
         // with the initial pool's allowlist, so no later writer can recreate an
@@ -695,6 +1268,21 @@ impl AppState {
 
     pub fn set_routing_strategy(&self, strategy: mahoquot_types::Strategy) {
         self.router.set_strategy(strategy);
+    }
+
+    /// Re-applies the published `routing.strategy` to the live router. Every
+    /// whole-document write (v0 config.yaml, v8 config, Home snapshot) calls
+    /// this so the router never keeps a strategy the settings no longer hold.
+    pub fn sync_routing_strategy(&self) {
+        let current = self.settings.current();
+        let strategy = match current.routing.strategy.as_str() {
+            "fill-first" | "" => Some(mahoquot_types::Strategy::FillFirst),
+            "round-robin" => Some(mahoquot_types::Strategy::StrictRoundRobin),
+            other => crate::management::scalar_table::parse_routing_strategy(other),
+        };
+        if let Some(strategy) = strategy {
+            self.router.set_strategy(strategy);
+        }
     }
 
     pub fn find_member(&self, id: &str) -> Option<Arc<AccountMember>> {
@@ -717,7 +1305,12 @@ impl AppState {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let auth_dir = self.settings.current().auth_dir.clone();
-        let members = load_account_members(std::path::Path::new(&auth_dir))?;
+        let mut members = load_account_members(std::path::Path::new(&auth_dir))?;
+        for member in &mut members {
+            Arc::get_mut(member)
+                .ok_or_else(|| anyhow::anyhow!("freshly loaded account unexpectedly shared"))?
+                .apply_config_retry(&self.settings.current());
+        }
         // Surviving accounts keep their runtime state (health, counters, cached
         // usage): reloading them fresh would wipe cooldowns and quota caches on
         // every import or delete.
@@ -776,7 +1369,11 @@ impl AppState {
     /// Authorization check for management input (scheduler reserve), not a
     /// state-write gate.
     pub fn is_active_account(&self, id: &str) -> bool {
-        self.pool.load().members.iter().any(|member| member.id == id)
+        self.pool
+            .load()
+            .members
+            .iter()
+            .any(|member| member.id == id)
     }
 
     /// Admittance gate for upstream inference requests.
@@ -833,7 +1430,11 @@ impl AppState {
         member: &AccountMember,
         presented_token: Option<&str>,
     ) -> Result<bool, mahoquot_providers::refresh_exec::RefreshError> {
-        let client = self.client_for_member(member);
+        let client = self.try_client_for_member(member).map_err(|error| {
+            mahoquot_providers::refresh_exec::RefreshError::Parse(format!(
+                "proxy client construction failed: {error}"
+            ))
+        })?;
         let did_refresh = member
             .refresh(&client, &self.refresh_url, presented_token)
             .await?;
@@ -843,60 +1444,181 @@ impl AppState {
         Ok(did_refresh)
     }
 
-    pub fn client_for_member(&self, member: &AccountMember) -> reqwest::Client {
-        self.client_for_target(&member.provider_name(), member.id())
+    pub fn http_client(&self) -> reqwest::Client {
+        self.default_client()
     }
 
-    pub fn client_for_target(&self, provider_name: &str, member_id: &str) -> reqwest::Client {
+    pub fn default_client(&self) -> reqwest::Client {
+        self.proxy.load().default_client.clone()
+    }
+
+    pub fn direct_client(&self) -> reqwest::Client {
+        self.proxy.load().direct_client.clone()
+    }
+
+    pub fn devin_default_client(&self) -> reqwest::Client {
+        self.proxy.load().devin_default_client.clone()
+    }
+
+    pub fn devin_direct_client(&self) -> reqwest::Client {
+        self.proxy.load().devin_direct_client.clone()
+    }
+
+    pub fn client_for_member(&self, member: &AccountMember) -> reqwest::Client {
+        self.try_client_for_member(member)
+            .unwrap_or_else(|_| self.direct_client())
+    }
+
+    pub fn try_client_for_member(
+        &self,
+        member: &AccountMember,
+    ) -> Result<reqwest::Client, crate::proxy_policy::ProxyClientBuildError> {
         let now_unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        self.client_for_target_at(provider_name, member_id, now_unix)
+        self.try_client_for_member_at(member, now_unix)
+    }
+
+    pub fn try_client_for_member_at(
+        &self,
+        member: &AccountMember,
+        now_unix: u64,
+    ) -> Result<reqwest::Client, crate::proxy_policy::ProxyClientBuildError> {
+        self.try_client_for_target_at_with_override(
+            &member.provider_name(),
+            member.id(),
+            member.proxy_url.as_deref(),
+            now_unix,
+        )
+    }
+
+    pub fn client_for_target(&self, provider_name: &str, member_id: &str) -> reqwest::Client {
+        self.try_client_for_target(provider_name, member_id)
+            .unwrap_or_else(|_| self.direct_client())
+    }
+
+    pub fn try_client_for_target(
+        &self,
+        provider_name: &str,
+        member_id: &str,
+    ) -> Result<reqwest::Client, crate::proxy_policy::ProxyClientBuildError> {
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.try_client_for_target_at(provider_name, member_id, now_unix)
     }
 
     /// Time-injected core of `client_for_target`.
-    ///
-    /// A sticky TTL proxy mints a new upstream URL every rotation bucket. The
-    /// cached client is keyed by that URL, so without eviction the map would
-    /// keep one reqwest client (and its connection pool) per bucket forever.
-    /// On insert we keep only the newest URL per provider+member: the replaced
-    /// client is dropped, while a task that already cloned it finishes normally.
+    #[allow(dead_code)]
     pub(crate) fn client_for_target_at(
         &self,
         provider_name: &str,
         member_id: &str,
         now_unix: u64,
     ) -> reqwest::Client {
-        let runtime = self.proxy_runtime.load();
+        self.try_client_for_target_at(provider_name, member_id, now_unix)
+            .unwrap_or_else(|_| self.direct_client())
+    }
 
-        let Some(proxy_url) = runtime.session_proxy_url(provider_name, member_id, now_unix) else {
+    pub(crate) fn try_client_for_target_at(
+        &self,
+        provider_name: &str,
+        member_id: &str,
+        now_unix: u64,
+    ) -> Result<reqwest::Client, crate::proxy_policy::ProxyClientBuildError> {
+        self.try_client_for_target_at_with_override(provider_name, member_id, None, now_unix)
+    }
+
+    pub(crate) fn try_client_for_target_at_with_override(
+        &self,
+        provider_name: &str,
+        member_id: &str,
+        credential_proxy: Option<&str>,
+        now_unix: u64,
+    ) -> Result<reqwest::Client, crate::proxy_policy::ProxyClientBuildError> {
+        let snapshot = self.proxy.load();
+        let runtime = &snapshot.runtime;
+        let cache_gen = self.proxy_clients.generation();
+
+        let effective_proxy_url = if let Some(cred_url) = credential_proxy {
+            let trimmed = cred_url.trim();
+            if !trimmed.is_empty() {
+                if crate::proxy_policy::is_direct_or_none(trimmed) {
+                    Some("direct".to_string())
+                } else {
+                    Some(crate::proxy_policy::format_session_proxy_url(
+                        trimmed, member_id, false, 0, now_unix,
+                    ))
+                }
+            } else {
+                runtime.session_proxy_url(provider_name, member_id, now_unix)
+            }
+        } else {
+            runtime.session_proxy_url(provider_name, member_id, now_unix)
+        };
+
+        let Some(proxy_url) = effective_proxy_url else {
             // Toggling a provider on at runtime must not retroactively proxy
             // the providers that were never opted in.
-            return if runtime.scoped_routing_active() {
-                self.direct_client.clone()
+            return Ok(if runtime.scoped_routing_active() {
+                snapshot.direct_client.clone()
             } else {
-                self.http_client.clone()
-            };
+                snapshot.default_client.clone()
+            });
         };
+
+        if crate::proxy_policy::is_direct_or_none(&proxy_url) {
+            return Ok(snapshot.direct_client.clone());
+        }
 
         let cache_key = format!("{provider_name}|{member_id}|{proxy_url}");
         if let Some(client) = self.proxy_clients.get(&cache_key) {
-            return client;
+            return Ok(client);
         }
 
         match crate::proxy_policy::build_http_client(Some(&proxy_url)) {
             Ok(client) => {
                 let scope = format!("{provider_name}|{member_id}|");
-                self.proxy_clients
-                    .replace_scoped(cache_key, &scope, member_id, client.clone());
-                client
+                self.proxy_clients.replace_scoped_generation(
+                    cache_gen,
+                    cache_key,
+                    &scope,
+                    member_id,
+                    client.clone(),
+                );
+                Ok(client)
             }
             Err(err) => {
-                tracing::warn!("failed to build proxy client ({proxy_url}): {err}; falling back to default client");
-                self.http_client.clone()
+                tracing::error!(
+                    provider = %provider_name,
+                    member_id = %member_id,
+                    proxy_url = %proxy_url,
+                    "failed to configure outbound proxy: {err}"
+                );
+                Err(crate::proxy_policy::ProxyClientBuildError::ProxyConfig(
+                    err.to_string(),
+                ))
             }
         }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn client_for_target_at_with_override(
+        &self,
+        provider_name: &str,
+        member_id: &str,
+        credential_proxy: Option<&str>,
+        now_unix: u64,
+    ) -> reqwest::Client {
+        self.try_client_for_target_at_with_override(
+            provider_name,
+            member_id,
+            credential_proxy,
+            now_unix,
+        )
+        .unwrap_or_else(|_| self.direct_client())
     }
 
     /// Reusable HTTP/1.1 client with no-redirect policy for Devin discovery and Chat relay.
@@ -906,7 +1628,23 @@ impl AppState {
         &self,
         member: &AccountMember,
     ) -> Result<reqwest::Client, crate::proxy_policy::DevinClientBuildError> {
-        self.devin_client_for_target(member.id())
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.devin_client_for_member_at(member, now_unix)
+    }
+
+    pub fn devin_client_for_member_at(
+        &self,
+        member: &AccountMember,
+        now_unix: u64,
+    ) -> Result<reqwest::Client, crate::proxy_policy::DevinClientBuildError> {
+        self.devin_client_for_target_at_with_override(
+            member.id(),
+            member.proxy_url.as_deref(),
+            now_unix,
+        )
     }
 
     pub fn subscribe_finalizer(&self, account_or_event: &str) -> tokio::sync::mpsc::Receiver<()> {
@@ -968,16 +1706,46 @@ impl AppState {
         member_id: &str,
         now_unix: u64,
     ) -> Result<reqwest::Client, crate::proxy_policy::DevinClientBuildError> {
-        let runtime = self.proxy_runtime.load();
+        self.devin_client_for_target_at_with_override(member_id, None, now_unix)
+    }
 
-        let Some(proxy_url) = runtime.session_proxy_url("devin", member_id, now_unix) else {
+    pub(crate) fn devin_client_for_target_at_with_override(
+        &self,
+        member_id: &str,
+        credential_proxy: Option<&str>,
+        now_unix: u64,
+    ) -> Result<reqwest::Client, crate::proxy_policy::DevinClientBuildError> {
+        let snapshot = self.proxy.load();
+        let runtime = &snapshot.runtime;
+        let cache_gen = self.proxy_clients.generation();
+
+        let effective_proxy_url = if let Some(cred_url) = credential_proxy {
+            let trimmed = cred_url.trim();
+            if !trimmed.is_empty() {
+                if crate::proxy_policy::is_direct_or_none(trimmed) {
+                    Some("direct".to_string())
+                } else {
+                    Some(trimmed.to_string())
+                }
+            } else {
+                runtime.session_proxy_url("devin", member_id, now_unix)
+            }
+        } else {
+            runtime.session_proxy_url("devin", member_id, now_unix)
+        };
+
+        let Some(proxy_url) = effective_proxy_url else {
             // session_proxy_url(None) must honor global proxy semantics consistently with existing client_for_target
             return Ok(if runtime.scoped_routing_active() {
-                self.devin_direct_client.clone()
+                snapshot.devin_direct_client.clone()
             } else {
-                self.devin_http_client.clone()
+                snapshot.devin_default_client.clone()
             });
         };
+
+        if crate::proxy_policy::is_direct_or_none(&proxy_url) {
+            return Ok(snapshot.devin_direct_client.clone());
+        }
 
         let cache_key = format!("devin|{member_id}|{proxy_url}");
         if let Some(client) = self.proxy_clients.get(&cache_key) {
@@ -987,8 +1755,13 @@ impl AppState {
         match crate::proxy_policy::build_devin_http_client(Some(&proxy_url)) {
             Ok(client) => {
                 let scope = format!("devin|{member_id}|");
-                self.proxy_clients
-                    .replace_scoped(cache_key, &scope, member_id, client.clone());
+                self.proxy_clients.replace_scoped_generation(
+                    cache_gen,
+                    cache_key,
+                    &scope,
+                    member_id,
+                    client.clone(),
+                );
                 Ok(client)
             }
             Err(err) => {
@@ -1090,7 +1863,8 @@ impl AppState {
                         model_candidates
                             .iter()
                             .filter(|(model, _)| {
-                                declared.is_empty() || declared.iter().any(|id| id.as_str() == *model)
+                                declared.is_empty()
+                                    || declared.iter().any(|id| id.as_str() == *model)
                             })
                             .map(|(model, ids)| ((*model).to_string(), ids.contains(&m.id)))
                             .collect()
@@ -1150,7 +1924,11 @@ impl AppState {
                         None
                     },
                     credits_after_limit: if m.kind() == crate::account::ProviderKind::Codex {
-                        Some(self.settings.current().is_codex_account_credit_enabled(&m.id))
+                        Some(
+                            self.settings
+                                .current()
+                                .is_codex_account_credit_enabled(&m.id),
+                        )
                     } else {
                         None
                     },
@@ -1171,6 +1949,18 @@ impl AppState {
             history: self.telemetry.snapshot(),
             signature_ledger: self.signature_ledger.stats(),
         }
+    }
+
+    pub fn plugin_host(&self) -> Option<Arc<crate::plugins::loader::PluginHost>> {
+        self.plugins.clone()
+    }
+
+    pub fn set_plugin_host(&mut self, host: Option<Arc<crate::plugins::loader::PluginHost>>) {
+        self.plugins = host;
+    }
+
+    pub fn home_client(&self) -> Option<Arc<crate::home::HomeClient>> {
+        self.home.clone()
     }
 }
 
@@ -1371,7 +2161,6 @@ mod stats_tests {
 mod integration_tests {
     use super::*;
     use crate::management::settings::ProviderProxyPolicy;
-    use crate::proxy_policy::ProxyRuntime;
 
     fn state_with_one_account() -> (Arc<AppState>, Arc<crate::account::AccountMember>) {
         let auth_dir = std::env::temp_dir().join(format!(
@@ -1416,10 +2205,13 @@ mod integration_tests {
                 url: "http://127.0.0.1:18840".to_string(),
             },
         );
-        state.proxy_runtime.store(Arc::new(ProxyRuntime {
-            global_proxy_url: String::new(),
-            providers,
-        }));
+        let settings = crate::management::settings::Settings {
+            proxy_providers: providers,
+            ..crate::management::settings::Settings::default()
+        };
+        let snapshot =
+            crate::proxy_policy::ProxySnapshot::from_settings(&settings).expect("snapshot");
+        state.proxy.store(Arc::new(snapshot));
     }
 
     #[test]
@@ -1437,7 +2229,11 @@ mod integration_tests {
             "a rotation bucket must replace the member's previous client, not accumulate"
         );
         let again = state.client_for_target_at("cline", &member.id, 1_000_600);
-        assert_eq!(state.proxy_client_count(), 1, "the newest bucket stays cached");
+        assert_eq!(
+            state.proxy_client_count(),
+            1,
+            "the newest bucket stays cached"
+        );
 
         drop((first, second, again));
         assert_eq!(state.proxy_client_count(), 1);
@@ -1467,7 +2263,9 @@ mod integration_tests {
         let (state, _member) = state_with_one_account();
         install_sticky_policy(&state, "cline");
         state.proxy_clients.retain_members(
-            &["member-a".to_string(), "member-b".to_string()].into_iter().collect(),
+            &["member-a".to_string(), "member-b".to_string()]
+                .into_iter()
+                .collect(),
         );
 
         state.client_for_target_at("cline", "member-a", 3_000_000);
@@ -1529,5 +2327,172 @@ mod integration_tests {
             state.begin_devin_refresh("acct").is_some(),
             "dropping the guard must release the claim"
         );
+    }
+
+    #[test]
+    fn per_credential_override_wins_over_provider_and_global_policy() {
+        let (state, member) = state_with_one_account();
+        install_sticky_policy(&state, "cline");
+
+        // 1. With credential proxy set to direct, it returns direct client without caching in proxy_clients
+        let _direct_client = state.client_for_target_at_with_override(
+            "cline",
+            &member.id,
+            Some("direct"),
+            1_000_000,
+        );
+        assert_eq!(
+            state.proxy_client_count(),
+            0,
+            "direct client must not cache in proxy_clients"
+        );
+
+        // 2. With credential proxy set to custom URL, it caches for that credential-specific URL
+        let _cred_client = state.client_for_target_at_with_override(
+            "cline",
+            &member.id,
+            Some("http://127.0.0.1:18841"),
+            1_000_000,
+        );
+        assert_eq!(
+            state.proxy_client_count(),
+            1,
+            "credential proxy override must cache in proxy_clients"
+        );
+        let cached_key = format!("cline|{}|http://any=1:x@127.0.0.1:18841/", member.id);
+        assert!(
+            state.proxy_clients.get(&cached_key).is_some(),
+            "expected cache key for credential proxy URL"
+        );
+
+        // 3. Without credential override, it resolves provider policy (18840) and evicts older member cache
+        let _provider_client =
+            state.client_for_target_at_with_override("cline", &member.id, None, 1_000_000);
+        assert_eq!(state.proxy_client_count(), 1);
+        let provider_cached_key = format!(
+            "cline|{}|http://sess={}-b1666;any=1:x@127.0.0.1:18840/",
+            member.id, member.id
+        );
+        assert!(
+            state.proxy_clients.get(&provider_cached_key).is_some(),
+            "expected cache key for provider proxy URL"
+        );
+    }
+
+    #[test]
+    fn atomic_proxy_snapshot_updates_runtime_and_clients_together() {
+        let (state, _member) = state_with_one_account();
+        assert_eq!(state.proxy.load().runtime.global_proxy_url, "");
+
+        // Mutate proxy-url via SettingsStore
+        state
+            .settings
+            .mutate(|s| s.proxy_url = "http://127.0.0.1:18842".to_string())
+            .expect("mutate proxy-url");
+
+        let snapshot = state.proxy.load();
+        assert_eq!(snapshot.runtime.global_proxy_url, "http://127.0.0.1:18842");
+
+        // Pre-validation protects the snapshot: invalid URL leaves runtime and disk untouched
+        let before_url = state.proxy.load().runtime.global_proxy_url.clone();
+        let mutate_err = state
+            .settings
+            .mutate(|s| s.proxy_url = "ftp://bad-url".to_string());
+        assert!(mutate_err.is_err());
+        assert_eq!(state.proxy.load().runtime.global_proxy_url, before_url);
+    }
+
+    #[tokio::test]
+    async fn credential_proxy_precedence_actual_wire_including_devin() {
+        let (state, member) = state_with_one_account();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock bind");
+        let credential_proxy = format!(
+            "http://127.0.0.1:{}",
+            listener.local_addr().expect("mock addr").port()
+        );
+        let (seen_tx, mut seen_rx) = tokio::sync::mpsc::channel(4);
+        let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+            let tx = seen_tx.clone();
+            async move {
+                tx.send(uri.to_string()).await.expect("capture");
+                "credential-proxy-sentinel"
+            }
+        });
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    stop_rx.await.expect("stop");
+                })
+                .await
+                .expect("serve");
+        });
+        let mut settings = crate::management::settings::Settings {
+            proxy_url: "http://127.0.0.1:18846".into(),
+            ..Default::default()
+        };
+        for provider in ["cline", "devin"] {
+            settings.proxy_providers.insert(
+                provider.into(),
+                ProviderProxyPolicy {
+                    enabled: true,
+                    sticky: false,
+                    ttl_secs: 0,
+                    url: "http://127.0.0.1:18847".into(),
+                },
+            );
+        }
+        state.proxy.store(Arc::new(
+            crate::proxy_policy::ProxySnapshot::from_settings(&settings).expect("snapshot"),
+        ));
+        for provider in ["cline", "devin"] {
+            let client = if provider == "devin" {
+                state
+                    .devin_client_for_target_at_with_override(
+                        &member.id,
+                        Some(credential_proxy.as_str()),
+                        1,
+                    )
+                    .expect("devin credential client")
+            } else {
+                state
+                    .try_client_for_target_at_with_override(
+                        provider,
+                        &member.id,
+                        Some(credential_proxy.as_str()),
+                        1,
+                    )
+                    .expect("credential client")
+            };
+            let response = client
+                .get(format!(
+                    "http://127.0.0.1:18848/{provider}-credential-proof"
+                ))
+                .timeout(std::time::Duration::from_secs(3))
+                .send()
+                .await
+                .expect("wire");
+            assert_eq!(
+                response.text().await.expect("body"),
+                "credential-proxy-sentinel"
+            );
+            let captured = tokio::time::timeout(std::time::Duration::from_secs(3), seen_rx.recv())
+                .await
+                .expect("capture deadline")
+                .expect("capture");
+            assert!(captured.contains(&format!("/{provider}-credential-proof")));
+        }
+        assert!(state
+            .try_client_for_target_at_with_override("cline", &member.id, Some("invalid-proxy"), 1)
+            .is_err());
+        assert!(state
+            .devin_client_for_target_at_with_override(&member.id, Some("invalid-proxy"), 1)
+            .is_err());
+        stop_tx.send(()).expect("shutdown");
+        server.await.expect("join");
+        std::fs::remove_dir_all(state.settings.path().parent().expect("auth directory"))
+            .expect("fixture cleanup");
     }
 }

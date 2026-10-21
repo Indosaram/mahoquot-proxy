@@ -178,7 +178,7 @@ async fn exchange_antigravity_code(
         .unwrap_or(ANTIGRAVITY_DEFAULT_LOAD_URL);
 
     let response = state
-        .http_client
+        .http_client()
         .post(&session.token_url)
         .header("accept", "application/json")
         .form(&[
@@ -244,7 +244,7 @@ async fn exchange_antigravity_code(
     }
     if email.is_empty() {
         let userinfo_resp = state
-            .http_client
+            .http_client()
             .get(userinfo_url)
             .header("authorization", format!("Bearer {access_token}"))
             .header("accept", "application/json")
@@ -266,7 +266,7 @@ async fn exchange_antigravity_code(
 
     let mut project_id = String::new();
     let load_resp = state
-        .http_client
+        .http_client()
         .post(load_url)
         .header("authorization", format!("Bearer {access_token}"))
         .header("accept", "*/*")
@@ -299,7 +299,7 @@ async fn exchange_antigravity_code(
     if project_id.is_empty() {
         let daily_url = ANTIGRAVITY_DEFAULT_DAILY_URL;
         let onboard_resp = state
-            .http_client
+            .http_client()
             .post(daily_url)
             .header("authorization", format!("Bearer {access_token}"))
             .header("accept", "*/*")
@@ -359,17 +359,27 @@ async fn exchange_antigravity_code(
             return Err("Invalid reauthentication credential name".to_string());
         }
         target = auth_dir.join(name);
-        let raw = tokio::fs::read(&target).await.map_err(|e| format!("Cannot read reauthentication target: {e}"))?;
+        let raw = tokio::fs::read(&target)
+            .await
+            .map_err(|e| format!("Cannot read reauthentication target: {e}"))?;
         existing = Some(serde_json::from_slice::<Value>(&raw).map_err(|e| e.to_string())?);
     } else {
-        let mut entries = tokio::fs::read_dir(&auth_dir).await.map_err(|e| e.to_string())?;
+        let mut entries = tokio::fs::read_dir(&auth_dir)
+            .await
+            .map_err(|e| e.to_string())?;
         while let Some(entry) = entries.next_entry().await.map_err(|e| e.to_string())? {
             if entry.path().extension().and_then(|ext| ext.to_str()) != Some("json") {
                 continue;
             }
-            let raw = tokio::fs::read(entry.path()).await.map_err(|e| e.to_string())?;
+            let raw = tokio::fs::read(entry.path())
+                .await
+                .map_err(|e| e.to_string())?;
             if let Ok(value) = serde_json::from_slice::<Value>(&raw) {
-                if value["type"] == "antigravity" && value["email"].as_str().is_some_and(|old| old.eq_ignore_ascii_case(&email)) {
+                if value["type"] == "antigravity"
+                    && value["email"]
+                        .as_str()
+                        .is_some_and(|old| old.eq_ignore_ascii_case(&email))
+                {
                     if existing.is_some() {
                         return Err("Multiple credentials match this Google account; reauthenticate from its account card".to_string());
                     }
@@ -380,7 +390,11 @@ async fn exchange_antigravity_code(
         }
     }
     if let Some(mut old) = existing {
-        if old["type"] != "antigravity" || !old["email"].as_str().is_some_and(|value| value.eq_ignore_ascii_case(&email)) {
+        if old["type"] != "antigravity"
+            || !old["email"]
+                .as_str()
+                .is_some_and(|value| value.eq_ignore_ascii_case(&email))
+        {
             return Err("Reauthentication used a different Google account; sign in with the original account".to_string());
         }
         if refresh_token.is_empty() {
@@ -488,7 +502,7 @@ async fn exchange_xai_code(
     code: &str,
 ) -> Result<(), String> {
     let response = state
-        .http_client
+        .http_client()
         .post(&session.token_url)
         .form(&[
             ("grant_type", "authorization_code"),
@@ -514,7 +528,8 @@ async fn exchange_xai_code(
         .and_then(Value::as_str)
         .unwrap_or("xai-account");
     let models =
-        fetch_credential_models(&state.http_client, &session.poll_url, access_token, "xai").await?;
+        fetch_credential_models(&state.http_client(), &session.poll_url, access_token, "xai")
+            .await?;
     let credential = json!({
         "type":"generic", "provider":"xai", "label":email, "adapter":"openai-chat",
         "base_url":session.poll_url, "api_key":access_token, "auth_mode":"oauth",
@@ -818,7 +833,7 @@ fn sha256(data: &[u8]) -> [u8; 32] {
     }
     msg.extend_from_slice(&bit_len.to_be_bytes());
 
-    for chunk in msg.chunks_exact(64) {
+    for chunk in msg.as_chunks::<64>().0 {
         let mut w = [0u32; 64];
         for i in 0..16 {
             w[i] = u32::from_be_bytes([
@@ -1102,13 +1117,9 @@ fn publish_session(session: OAuthSession, listener: Option<ListenerHandle>) {
 }
 
 fn session_is_active(state: &str) -> bool {
-    SESSIONS
-        .read()
-        .unwrap()
-        .get(state)
-        .is_some_and(|session| {
-            Instant::now().saturating_duration_since(session.created_at) < OAUTH_SESSION_TTL
-        })
+    SESSIONS.read().unwrap().get(state).is_some_and(|session| {
+        Instant::now().saturating_duration_since(session.created_at) < OAUTH_SESSION_TTL
+    })
 }
 
 fn write_session_credential(
@@ -1145,7 +1156,7 @@ async fn start_device_session(
         start_form.push(("scope", scope));
     }
     let response = state
-        .http_client
+        .http_client()
         .post(device_url)
         .header("accept", "application/json")
         .form(&start_form)
@@ -1175,48 +1186,51 @@ async fn start_device_session(
         .and_then(Value::as_str)
         .ok_or_else(|| "device authorization missing verification URI".to_string())?;
     let state_token = format!("{}-{}", &provider[..3.min(provider.len())], new_state());
-    publish_session(OAuthSession {
-        state: state_token.clone(),
-        provider: provider.to_string(),
-        verifier: device_code.to_string(),
-        challenge: spec.client_id.to_string(),
-        redirect_uri: params
-            .get("exchange_url")
-            .cloned()
-            .unwrap_or_else(|| spec.base_url.to_string()),
-        token_url,
-        poll_url: if spec.camel_case_poll {
-            "camel"
-        } else {
-            "snake"
-        }
-        .to_string(),
-        uuid: {
-            let catalog_models: Vec<String> =
-                if let Ok(pid) = mahoquot_registry::ProviderId::new(provider) {
-                    let contrib =
-                        mahoquot_registry::embedded_snapshot().contribution_for_provider(&pid);
-                    contrib
-                        .models
-                        .iter()
-                        .map(|m| match m {
-                            mahoquot_registry::ContributionItem::Descriptor(d) => {
-                                d.id.as_str().to_string()
-                            }
-                            mahoquot_registry::ContributionItem::Discovered(d) => {
-                                d.id.as_str().to_string()
-                            }
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-            catalog_models.join(",")
+    publish_session(
+        OAuthSession {
+            state: state_token.clone(),
+            provider: provider.to_string(),
+            verifier: device_code.to_string(),
+            challenge: spec.client_id.to_string(),
+            redirect_uri: params
+                .get("exchange_url")
+                .cloned()
+                .unwrap_or_else(|| spec.base_url.to_string()),
+            token_url,
+            poll_url: if spec.camel_case_poll {
+                "camel"
+            } else {
+                "snake"
+            }
+            .to_string(),
+            uuid: {
+                let catalog_models: Vec<String> =
+                    if let Ok(pid) = mahoquot_registry::ProviderId::new(provider) {
+                        let contrib =
+                            mahoquot_registry::embedded_snapshot().contribution_for_provider(&pid);
+                        contrib
+                            .models
+                            .iter()
+                            .map(|m| match m {
+                                mahoquot_registry::ContributionItem::Descriptor(d) => {
+                                    d.id.as_str().to_string()
+                                }
+                                mahoquot_registry::ContributionItem::Discovered(d) => {
+                                    d.id.as_str().to_string()
+                                }
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                catalog_models.join(",")
+            },
+            status: SessionStatus::Pending,
+            created_at: Instant::now(),
+            saved_account_email: None,
         },
-        status: SessionStatus::Pending,
-        created_at: Instant::now(),
-        saved_account_email: None,
-    }, None);
+        None,
+    );
     Ok(json!({
         "url": url,
         "state": state_token,
@@ -1234,14 +1248,14 @@ async fn poll_device_session(
 ) -> Result<Option<Value>, String> {
     let response = if session.poll_url == "camel" {
         state
-            .http_client
+            .http_client()
             .post(&session.token_url)
             .form(&[("deviceCode", session.verifier.as_str())])
             .send()
             .await
     } else {
         state
-            .http_client
+            .http_client()
             .post(&session.token_url)
             .form(&[
                 ("client_id", session.challenge.as_str()),
@@ -1273,7 +1287,7 @@ async fn poll_device_session(
     let mut upstream_base = session.redirect_uri.clone();
     if session.provider == "github-copilot" {
         let exchange = state
-            .http_client
+            .http_client()
             .get(&session.redirect_uri)
             .header("authorization", format!("token {access_token}"))
             .header("accept", "application/json")
@@ -1303,7 +1317,7 @@ async fn poll_device_session(
             .to_string();
     }
     let models = fetch_credential_models(
-        &state.http_client,
+        &state.http_client(),
         &upstream_base,
         &access_token,
         &session.provider,
@@ -1463,7 +1477,7 @@ async fn exchange_codex_code(
     code: &str,
 ) -> Result<(), String> {
     let response = state
-        .http_client
+        .http_client()
         .post(&session.token_url)
         .header("accept", "application/json")
         .form(&[
@@ -1692,7 +1706,7 @@ pub async fn cancel_session(Query(params): Query<HashMap<String, String>>) -> Re
     json_status(StatusCode::OK, json!({ "status": "ok" }))
 }
 
-async fn auth_status(
+pub(crate) async fn auth_status(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
@@ -1706,7 +1720,7 @@ async fn auth_status(
             sessions.get(session_state).cloned()
         };
 
-            if let Some(mut session) = session_opt {
+        if let Some(mut session) = session_opt {
             if Instant::now().saturating_duration_since(session.created_at) >= OAUTH_SESSION_TTL {
                 let handle = {
                     let mut sessions = SESSIONS.write().unwrap();
@@ -1723,14 +1737,21 @@ async fn auth_status(
             }
             if session.provider == "zcode" && session.status == SessionStatus::Pending {
                 let auth_dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
-                let poll_result = poll_zcode_session(&state.http_client, &auth_dir, &mut session).await;
+                let poll_result =
+                    poll_zcode_session(&state.http_client(), &auth_dir, &mut session).await;
                 if !session_is_active(session_state) {
-                    return json_status(StatusCode::NOT_FOUND, json!({ "status": "error", "error": "OAuth session expired or cancelled" }));
+                    return json_status(
+                        StatusCode::NOT_FOUND,
+                        json!({ "status": "error", "error": "OAuth session expired or cancelled" }),
+                    );
                 }
                 match poll_result {
                     Ok(Some(_cred)) => {
                         if !session_is_active(session_state) {
-                            return json_status(StatusCode::NOT_FOUND, json!({ "status": "error", "error": "OAuth session expired or cancelled" }));
+                            return json_status(
+                                StatusCode::NOT_FOUND,
+                                json!({ "status": "error", "error": "OAuth session expired or cancelled" }),
+                            );
                         }
                         if let Err(error) = state.rescan_pool() {
                             eprintln!("pool rescan failed after zcode onboarding: {error}");
@@ -1746,7 +1767,10 @@ async fn auth_status(
                     }
                     Err(err) => {
                         if !session_is_active(session_state) {
-                            return json_status(StatusCode::NOT_FOUND, json!({ "status": "error", "error": "OAuth session expired or cancelled" }));
+                            return json_status(
+                                StatusCode::NOT_FOUND,
+                                json!({ "status": "error", "error": "OAuth session expired or cancelled" }),
+                            );
                         }
                         session.status = SessionStatus::Failed(err.clone());
                         update_session_in(&mut SESSIONS.write().unwrap(), session);
@@ -1759,14 +1783,21 @@ async fn auth_status(
             }
             if session.provider == "cursor" && session.status == SessionStatus::Pending {
                 let auth_dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
-                let poll_result = poll_cursor_session(&state.http_client, &auth_dir, &mut session).await;
+                let poll_result =
+                    poll_cursor_session(&state.http_client(), &auth_dir, &mut session).await;
                 if !session_is_active(session_state) {
-                    return json_status(StatusCode::NOT_FOUND, json!({ "status": "error", "error": "OAuth session expired or cancelled" }));
+                    return json_status(
+                        StatusCode::NOT_FOUND,
+                        json!({ "status": "error", "error": "OAuth session expired or cancelled" }),
+                    );
                 }
                 match poll_result {
                     Ok(Some(_cred)) => {
                         if !session_is_active(session_state) {
-                            return json_status(StatusCode::NOT_FOUND, json!({ "status": "error", "error": "OAuth session expired or cancelled" }));
+                            return json_status(
+                                StatusCode::NOT_FOUND,
+                                json!({ "status": "error", "error": "OAuth session expired or cancelled" }),
+                            );
                         }
                         if let Err(error) = state.rescan_pool() {
                             eprintln!("pool rescan failed after cursor onboarding: {error}");
@@ -1782,7 +1813,10 @@ async fn auth_status(
                     }
                     Err(err) => {
                         if !session_is_active(session_state) {
-                            return json_status(StatusCode::NOT_FOUND, json!({ "status": "error", "error": "OAuth session expired or cancelled" }));
+                            return json_status(
+                                StatusCode::NOT_FOUND,
+                                json!({ "status": "error", "error": "OAuth session expired or cancelled" }),
+                            );
                         }
                         session.status = SessionStatus::Failed(err.clone());
                         update_session_in(&mut SESSIONS.write().unwrap(), session);
@@ -1798,12 +1832,18 @@ async fn auth_status(
             {
                 let poll_result = poll_device_session(&state, &mut session).await;
                 if !session_is_active(session_state) {
-                    return json_status(StatusCode::NOT_FOUND, json!({ "status": "error", "error": "OAuth session expired or cancelled" }));
+                    return json_status(
+                        StatusCode::NOT_FOUND,
+                        json!({ "status": "error", "error": "OAuth session expired or cancelled" }),
+                    );
                 }
                 match poll_result {
                     Ok(Some(_)) => {
                         if !session_is_active(session_state) {
-                            return json_status(StatusCode::NOT_FOUND, json!({ "status": "error", "error": "OAuth session expired or cancelled" }));
+                            return json_status(
+                                StatusCode::NOT_FOUND,
+                                json!({ "status": "error", "error": "OAuth session expired or cancelled" }),
+                            );
                         }
                         if let Err(error) = state.rescan_pool() {
                             eprintln!("pool rescan failed after device onboarding: {error}");
@@ -1817,7 +1857,10 @@ async fn auth_status(
                     Ok(None) => return json_status(StatusCode::OK, json!({ "status": "pending" })),
                     Err(error) => {
                         if !session_is_active(session_state) {
-                            return json_status(StatusCode::NOT_FOUND, json!({ "status": "error", "error": "OAuth session expired or cancelled" }));
+                            return json_status(
+                                StatusCode::NOT_FOUND,
+                                json!({ "status": "error", "error": "OAuth session expired or cancelled" }),
+                            );
                         }
                         session.status = SessionStatus::Failed(error.clone());
                         update_session_in(&mut SESSIONS.write().unwrap(), session);
@@ -1930,7 +1973,7 @@ async fn exchange_command_code_callback(
     };
 
     let response = state
-        .http_client
+        .http_client()
         .get(whoami_url)
         .header("authorization", format!("Bearer {api_key}"))
         .header("accept", "application/json")
@@ -1972,7 +2015,7 @@ async fn exchange_command_code_callback(
     };
 
     let models =
-        fetch_credential_models(&state.http_client, base_url, api_key, "command-code").await?;
+        fetch_credential_models(&state.http_client(), base_url, api_key, "command-code").await?;
 
     let credential = json!({
         "type": "generic",
@@ -2083,11 +2126,15 @@ pub async fn oauth_callback(
             );
         }
 
-                let exchange_result = exchange_command_code_callback(&state, &mut session, api_key, user_name).await;
-                if !session_is_active(state_val) {
-                    return json_status(StatusCode::NOT_FOUND, json!({ "status": "error", "error": "OAuth session expired or cancelled" }));
-                }
-                match exchange_result {
+        let exchange_result =
+            exchange_command_code_callback(&state, &mut session, api_key, user_name).await;
+        if !session_is_active(state_val) {
+            return json_status(
+                StatusCode::NOT_FOUND,
+                json!({ "status": "error", "error": "OAuth session expired or cancelled" }),
+            );
+        }
+        match exchange_result {
             Ok(()) => {
                 update_session_in(&mut SESSIONS.write().unwrap(), session);
                 return json_status(
@@ -2115,7 +2162,10 @@ pub async fn oauth_callback(
             if session.provider == "codex" && session.status == SessionStatus::Pending {
                 let exchange_result = exchange_codex_code(&state, &mut session, code).await;
                 if !session_is_active(state_param) {
-                    return json_status(StatusCode::NOT_FOUND, json!({ "status": "error", "error": "OAuth session expired or cancelled" }));
+                    return json_status(
+                        StatusCode::NOT_FOUND,
+                        json!({ "status": "error", "error": "OAuth session expired or cancelled" }),
+                    );
                 }
                 match exchange_result {
                     Ok(()) => {
@@ -2134,7 +2184,7 @@ pub async fn oauth_callback(
             {
                 let auth_dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
                 let exchange_res = exchange_anthropic_code(
-                    &state.http_client,
+                    &state.http_client(),
                     &auth_dir,
                     &mut session,
                     code,
@@ -2142,7 +2192,10 @@ pub async fn oauth_callback(
                 )
                 .await;
                 if !session_is_active(state_param) {
-                    return json_status(StatusCode::NOT_FOUND, json!({ "status": "error", "error": "OAuth session expired or cancelled" }));
+                    return json_status(
+                        StatusCode::NOT_FOUND,
+                        json!({ "status": "error", "error": "OAuth session expired or cancelled" }),
+                    );
                 }
 
                 match exchange_res {
@@ -2165,7 +2218,10 @@ pub async fn oauth_callback(
             } else if session.provider == "xai" && session.status == SessionStatus::Pending {
                 let exchange_result = exchange_xai_code(&state, &mut session, code).await;
                 if !session_is_active(state_param) {
-                    return json_status(StatusCode::NOT_FOUND, json!({ "status": "error", "error": "OAuth session expired or cancelled" }));
+                    return json_status(
+                        StatusCode::NOT_FOUND,
+                        json!({ "status": "error", "error": "OAuth session expired or cancelled" }),
+                    );
                 }
                 match exchange_result {
                     Ok(()) => {
@@ -2180,7 +2236,10 @@ pub async fn oauth_callback(
             {
                 let exchange_result = exchange_antigravity_code(&state, &mut session, code).await;
                 if !session_is_active(state_param) {
-                    return json_status(StatusCode::NOT_FOUND, json!({ "status": "error", "error": "OAuth session expired or cancelled" }));
+                    return json_status(
+                        StatusCode::NOT_FOUND,
+                        json!({ "status": "error", "error": "OAuth session expired or cancelled" }),
+                    );
                 }
                 match exchange_result {
                     Ok(()) => {
@@ -2531,8 +2590,17 @@ async fn command_code_auth_url_handler(
     publish_session(session, listener);
     json_status(
         StatusCode::OK,
-        json!({ "url": url, "state": state, "provider": "command-code", "status": "ok" }),
+        json!({ "url": url, "state": state, "provider": params.get("provider").map(String::as_str).unwrap_or("command-code"), "status": "ok" }),
     )
+}
+
+pub async fn devin_auth_url_handler(
+    State(app_state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let mut params = params;
+    params.insert("provider".into(), "devin".into());
+    command_code_auth_url_handler(State(app_state), Query(params)).await
 }
 
 async fn start_zcode_plan_session(
@@ -2548,7 +2616,7 @@ async fn start_zcode_plan_session(
         .ok()
         .unwrap_or_else(|| mahoquot_providers::zcode::ZCODE_OAUTH_CLI_INIT_URL.to_string());
     let init_response: Value = state
-        .http_client
+        .http_client()
         .post(&init_url)
         .bearer_auth(&poll_token)
         .header("content-type", "application/json")
@@ -2705,6 +2773,7 @@ pub fn oauth_routes() -> Router<Arc<AppState>> {
         .route("/xai-auth-url", get(xai_auth_url_handler))
         .route("/command-code-auth-url", get(command_code_auth_url_handler))
         .route("/zcode-auth-url", get(zcode_auth_url_handler))
+        .route("/devin-auth-url", get(devin_auth_url_handler))
         .route(
             "/kimi-auth-url",
             get(|state, params| device_auth_url(state, params, "kimi")),
@@ -2733,6 +2802,35 @@ pub fn oauth_routes() -> Router<Arc<AppState>> {
         );
     }
     router
+}
+
+pub async fn start_oauth_by_provider(
+    State(state): State<Arc<crate::state::AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let provider = params.get("provider").map(String::as_str).unwrap_or("");
+    match provider {
+        "devin" => {
+            let mut routed = params;
+            routed.insert("provider".into(), "command-code".into());
+            command_code_auth_url_handler(State(state), Query(routed)).await
+        }
+        "claude" | "anthropic" => anthropic_auth_url_handler(State(state), Query(params)).await,
+        "codex" => codex_auth_url_handler(State(state), Query(params)).await,
+        "cursor" => cursor_auth_url_handler(Query(params)).await,
+        "antigravity" => antigravity_auth_url_handler(State(state), Query(params)).await,
+        "xai" => xai_auth_url_handler(Query(params)).await,
+        "command-code" => command_code_auth_url_handler(State(state), Query(params)).await,
+        "zcode" => zcode_auth_url_handler(State(state), Query(params)).await,
+        "kimi" => device_auth_url(State(state), Query(params), "kimi").await,
+        "qwen" => device_auth_url(State(state), Query(params), "qwen").await,
+        "nous" => device_auth_url(State(state), Query(params), "nous").await,
+        _ => (
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({"error":"provider not found"})),
+        )
+            .into_response(),
+    }
 }
 
 #[cfg(test)]
@@ -2899,16 +2997,68 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn token_exchange_uses_published_default_proxy_and_explicit_direct_client() {
+        use crate::state::task2_proxy_consumers::{bounded, Fixture, Peer};
+        let mut a = Peer::start("a").await;
+        let mut b = Peer::start("b").await;
+        let mut target = Peer::start("target").await;
+        let fixture = Fixture::new(&target.url);
+        let session_id = format!("task2-{}", new_state());
+        let mut session = test_session(&session_id, Instant::now());
+        session.provider = "codex".into();
+        session.token_url = format!("{}/token", target.url);
+        SESSIONS
+            .write()
+            .expect("sessions")
+            .insert(session_id.clone(), session.clone());
+        struct SessionGuard(String);
+        impl Drop for SessionGuard {
+            fn drop(&mut self) {
+                SESSIONS.write().expect("sessions cleanup").remove(&self.0);
+            }
+        }
+        let _session = SessionGuard(session_id);
+        for (proxy, peer, token) in [
+            (a.url.clone(), &mut a, "token-a"),
+            (b.url.clone(), &mut b, "token-b"),
+            ("direct".into(), &mut target, "token-target"),
+        ] {
+            fixture.proxy(&proxy);
+            bounded(exchange_codex_code(
+                &fixture.state,
+                &mut session,
+                "dummy-code",
+            ))
+            .await
+            .expect("token exchange");
+            peer.captured("/token").await;
+            let saved: Value = serde_json::from_slice(
+                &std::fs::read(fixture.dir.join("codex-task2_example.invalid.json"))
+                    .expect("saved credential"),
+            )
+            .expect("saved JSON");
+            assert_eq!(saved["access_token"], token);
+            assert_eq!(session.status, SessionStatus::Completed);
+        }
+        a.close().await;
+        b.close().await;
+        target.close().await;
+    }
+
     #[test]
     fn removed_session_cannot_commit_a_credential() {
         let state = format!("removed-{}", new_state());
         let session = test_session(&state, Instant::now());
         let path = std::env::temp_dir().join(format!("oauth-{state}.json"));
-        SESSIONS.write().unwrap().insert(state.clone(), session.clone());
+        SESSIONS
+            .write()
+            .unwrap()
+            .insert(state.clone(), session.clone());
         assert!(session_is_active(&state));
 
         SESSIONS.write().unwrap().remove(&state);
-        let result = write_session_credential(&session, &path, b"{}" );
+        let result = write_session_credential(&session, &path, b"{}");
 
         assert_eq!(result.unwrap_err(), "OAuth session expired or cancelled");
         assert!(!path.exists());
@@ -3023,7 +3173,9 @@ mod tests {
         // A client that opened a connection but never finishes its request is
         // still in flight; the TTL deadline must drop it and the listener.
         use tokio::io::AsyncWriteExt;
-        let mut hung = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut hung = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
         hung.write_all(b"GET /callback HTTP/1.1\r\nHost: localhost\r\n")
             .await
             .unwrap();

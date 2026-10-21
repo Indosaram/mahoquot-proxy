@@ -11,7 +11,21 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::prelude::*;
-use common::unique_temp_dir;
+use common::{unique_temp_dir, with_loopback_peer};
+
+fn persist_management_secret(config_path: &std::path::Path, auth_dir: &std::path::Path) {
+    mahoquot_gateway::management::settings::Settings {
+        api_keys: vec![API_KEY.to_string()],
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: MANAGEMENT_KEY.to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(config_path)
+    .expect("persist management secret");
+}
 use mahoquot_gateway::account::ProviderAccount;
 use mahoquot_gateway::config::GatewayConfig;
 use mahoquot_gateway::routes::create_app;
@@ -25,6 +39,7 @@ use serde_json::{json, Value};
 use tower::ServiceExt;
 
 const API_KEY: &str = "test-api-key-42";
+const MANAGEMENT_KEY: &str = "test-management-key-42";
 
 async fn body_json(response: axum::response::Response) -> Value {
     use http_body_util::BodyExt;
@@ -116,22 +131,24 @@ async fn test_codex_oauth_flow_persists_a_routable_account() {
     let config = GatewayConfig {
         auth_dir: auth_dir.clone(),
         api_keys: mahoquot_gateway::inbound::ApiKeys::new(vec![API_KEY.to_string()]),
+        config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
+    persist_management_secret(&config.config_path, &auth_dir);
     let app = create_app(Arc::new(AppState::new(&config).unwrap()));
     let start = app
         .clone()
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .uri(format!(
                     "/v0/management/codex-auth-url?token_url={}&redirect_uri={}",
                     url_encode(&token_url),
                     url_encode("http://localhost:1455/auth/callback")
                 ))
-                .header(header::AUTHORIZATION, format!("Bearer {API_KEY}"))
+                .header("X-Management-Key", MANAGEMENT_KEY)
                 .body(Body::empty())
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(start.status(), StatusCode::OK);
@@ -144,14 +161,14 @@ async fn test_codex_oauth_flow_persists_a_routable_account() {
 
     let callback = app
         .clone()
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .uri(format!(
                     "/v0/management/oauth-callback?code=codex-test-code&state={state}"
                 ))
                 .body(Body::empty())
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(callback.status(), StatusCode::OK);
@@ -167,13 +184,13 @@ async fn test_codex_oauth_flow_persists_a_routable_account() {
     assert_eq!(account.email(), "codex.user@example.com");
 
     let status = app
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .uri(format!("/v0/management/get-auth-status?state={state}"))
-                .header(header::AUTHORIZATION, format!("Bearer {API_KEY}"))
+                .header("X-Management-Key", MANAGEMENT_KEY)
                 .body(Body::empty())
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(body_json(status).await["status"], "ok");
@@ -231,8 +248,20 @@ async fn test_anthropic_oauth_flow_end_to_end() {
     let config = GatewayConfig {
         auth_dir: auth_dir.clone(),
         api_keys: mahoquot_gateway::inbound::ApiKeys::new(vec![API_KEY.to_string()]),
+        config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
+    mahoquot_gateway::management::settings::Settings {
+        api_keys: vec![API_KEY.to_string()],
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: MANAGEMENT_KEY.to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(&config.config_path)
+    .expect("persist management settings");
     let app_state = Arc::new(AppState::new(&config).unwrap());
     let gateway_app = create_app(app_state);
 
@@ -256,7 +285,7 @@ async fn test_anthropic_oauth_flow_end_to_end() {
     );
     let start_resp = client
         .get(&start_url)
-        .bearer_auth(API_KEY)
+        .header("X-Management-Key", MANAGEMENT_KEY)
         .send()
         .await
         .unwrap();
@@ -310,7 +339,7 @@ async fn test_anthropic_oauth_flow_end_to_end() {
     );
     let status_resp = client
         .get(&status_url)
-        .bearer_auth(API_KEY)
+        .header("X-Management-Key", MANAGEMENT_KEY)
         .send()
         .await
         .unwrap();
@@ -377,8 +406,20 @@ async fn test_cursor_oauth_flow_end_to_end() {
     let config = GatewayConfig {
         auth_dir: auth_dir.clone(),
         api_keys: mahoquot_gateway::inbound::ApiKeys::new(vec![API_KEY.to_string()]),
+        config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
+    mahoquot_gateway::management::settings::Settings {
+        api_keys: vec![API_KEY.to_string()],
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: MANAGEMENT_KEY.to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(&config.config_path)
+    .expect("persist management settings");
     let app_state = Arc::new(AppState::new(&config).unwrap());
     let gateway_app = create_app(app_state);
 
@@ -402,7 +443,7 @@ async fn test_cursor_oauth_flow_end_to_end() {
     );
     let start_resp = client
         .get(&start_url)
-        .bearer_auth(API_KEY)
+        .header("X-Management-Key", MANAGEMENT_KEY)
         .send()
         .await
         .unwrap();
@@ -425,7 +466,7 @@ async fn test_cursor_oauth_flow_end_to_end() {
     );
     let poll1_resp = client
         .get(&status_url)
-        .bearer_auth(API_KEY)
+        .header("X-Management-Key", MANAGEMENT_KEY)
         .send()
         .await
         .unwrap();
@@ -436,7 +477,7 @@ async fn test_cursor_oauth_flow_end_to_end() {
     // 5. Second poll: gateway polls mock server, gets 200, writes credential, reports "ok"
     let poll2_resp = client
         .get(&status_url)
-        .bearer_auth(API_KEY)
+        .header("X-Management-Key", MANAGEMENT_KEY)
         .send()
         .await
         .unwrap();
@@ -470,8 +511,20 @@ async fn test_oauth_session_cancellation() {
     let config = GatewayConfig {
         auth_dir: auth_dir.clone(),
         api_keys: mahoquot_gateway::inbound::ApiKeys::new(vec![API_KEY.to_string()]),
+        config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
+    mahoquot_gateway::management::settings::Settings {
+        api_keys: vec![API_KEY.to_string()],
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: MANAGEMENT_KEY.to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(&config.config_path)
+    .expect("persist management settings");
     let app_state = Arc::new(AppState::new(&config).unwrap());
     let gateway_app = create_app(app_state);
 
@@ -493,7 +546,7 @@ async fn test_oauth_session_cancellation() {
     );
     let start_resp = client
         .get(&start_url)
-        .bearer_auth(API_KEY)
+        .header("X-Management-Key", MANAGEMENT_KEY)
         .send()
         .await
         .unwrap();
@@ -505,7 +558,7 @@ async fn test_oauth_session_cancellation() {
         format!("http://127.0.0.1:{gateway_port}/v0/management/oauth-session?state={state_token}");
     let cancel_resp = client
         .delete(&cancel_url)
-        .bearer_auth(API_KEY)
+        .header("X-Management-Key", MANAGEMENT_KEY)
         .send()
         .await
         .unwrap();
@@ -608,6 +661,18 @@ async fn device_oauth_starts_polls_and_writes_generic_provider_credentials() {
         config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
+    mahoquot_gateway::management::settings::Settings {
+        api_keys: vec![API_KEY.to_string()],
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: MANAGEMENT_KEY.to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(&config.config_path)
+    .expect("persist management settings");
+    persist_management_secret(&config.config_path, &auth_dir);
     let app = create_app(Arc::new(AppState::new(&config).unwrap()));
 
     for provider in ["kimi", "qwen", "nous", "github-copilot"] {
@@ -621,14 +686,14 @@ async fn device_oauth_starts_polls_and_writes_generic_provider_credentials() {
         let start = app
             .clone()
             .oneshot(
-                Request::builder()
+                with_loopback_peer(Request::builder()
                     .uri(format!(
                         "/v0/management/{provider}-auth-url?device_url={}%2Fdevice%2Fstart&token_url={}%2Fdevice%2Fpoll&interval=0{exchange}",
                         mock_base, mock_base
                     ))
-                    .header(header::AUTHORIZATION, format!("Bearer {API_KEY}"))
+                    .header("X-Management-Key", MANAGEMENT_KEY)
                     .body(Body::empty())
-                    .unwrap(),
+                    .unwrap()),
             )
             .await
             .unwrap();
@@ -639,13 +704,13 @@ async fn device_oauth_starts_polls_and_writes_generic_provider_credentials() {
         let state = start_json["state"].as_str().unwrap();
         let poll = app
             .clone()
-            .oneshot(
+            .oneshot(with_loopback_peer(
                 Request::builder()
                     .uri(format!("/v0/management/get-auth-status?state={state}"))
-                    .header(header::AUTHORIZATION, format!("Bearer {API_KEY}"))
+                    .header("X-Management-Key", MANAGEMENT_KEY)
                     .body(Body::empty())
                     .unwrap(),
-            )
+            ))
             .await
             .unwrap();
         let status = poll.status();
@@ -707,11 +772,30 @@ async fn xai_pkce_callback_writes_a_live_generic_account() {
         config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
+    mahoquot_gateway::management::settings::Settings {
+        api_keys: vec![API_KEY.to_string()],
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: MANAGEMENT_KEY.to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(&config.config_path)
+    .expect("persist management settings");
+    persist_management_secret(&config.config_path, &auth_dir);
     let app = create_app(Arc::new(AppState::new(&config).unwrap()));
-    let start = app.clone().oneshot(Request::builder()
-        .uri(format!("/v0/management/xai-auth-url?auth_url=https%3A%2F%2Fauth.example.test%2Fauthorize&token_url={}&base_url={}", url_encode(&token_url), url_encode(&catalog_base)))
-        .header(header::AUTHORIZATION, format!("Bearer {API_KEY}"))
-        .body(Body::empty()).unwrap()).await.unwrap();
+    let start = app
+        .clone()
+        .oneshot(with_loopback_peer(
+            Request::builder()
+                .uri(format!("/v0/management/xai-auth-url?auth_url=https%3A%2F%2Fauth.example.test%2Fauthorize&token_url={}&base_url={}", url_encode(&token_url), url_encode(&catalog_base)))
+                .header("X-Management-Key", MANAGEMENT_KEY)
+                .body(Body::empty())
+                .unwrap(),
+        ))
+        .await
+        .unwrap();
     assert_eq!(start.status(), StatusCode::OK);
     let start_json = body_json(start).await;
     assert!(start_json["url"]
@@ -721,25 +805,25 @@ async fn xai_pkce_callback_writes_a_live_generic_account() {
     let state = start_json["state"].as_str().unwrap();
     let callback = app
         .clone()
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .uri(format!(
                     "/v0/management/oauth-callback?code=xai-code&state={state}"
                 ))
                 .body(Body::empty())
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(callback.status(), StatusCode::OK);
     let status = app
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .uri(format!("/v0/management/get-auth-status?state={state}"))
-                .header(header::AUTHORIZATION, format!("Bearer {API_KEY}"))
+                .header("X-Management-Key", MANAGEMENT_KEY)
                 .body(Body::empty())
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(body_json(status).await["status"], "ok");
@@ -783,7 +867,11 @@ async fn antigravity_eligibility_denial_preserves_existing_credentials() {
     antigravity_oauth_flow(Some(true), false, true).await;
 }
 
-async fn antigravity_oauth_flow(reauth: Option<bool>, different_account: bool, eligibility_denied: bool) {
+async fn antigravity_oauth_flow(
+    reauth: Option<bool>,
+    different_account: bool,
+    eligibility_denied: bool,
+) {
     let auth_dir = unique_temp_dir("qg-t13-antigravity");
     std::fs::remove_dir_all(&auth_dir).ok();
     std::fs::create_dir_all(&auth_dir).unwrap();
@@ -858,14 +946,20 @@ async fn antigravity_oauth_flow(reauth: Option<bool>, different_account: bool, e
                     let body_json: Value = serde_json::from_str(&body).unwrap();
                     assert_eq!(body_json["metadata"]["ideType"], "ANTIGRAVITY");
                     if eligibility_denied {
-                        return (StatusCode::FORBIDDEN, Json(json!({"error": {
-                            "code": 403, "message": "Verify your account to continue.",
-                            "details": [{"reason": "VALIDATION_REQUIRED"}]
-                        }})));
+                        return (
+                            StatusCode::FORBIDDEN,
+                            Json(json!({"error": {
+                                "code": 403, "message": "Verify your account to continue.",
+                                "details": [{"reason": "VALIDATION_REQUIRED"}]
+                            }})),
+                        );
                     }
-                    (StatusCode::OK, Json(json!({
-                        "cloudaicompanionProject": "mock-cca-project-456"
-                    })))
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "cloudaicompanionProject": "mock-cca-project-456"
+                        })),
+                    )
                 },
             ),
         )
@@ -886,6 +980,18 @@ async fn antigravity_oauth_flow(reauth: Option<bool>, different_account: bool, e
         config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
+    mahoquot_gateway::management::settings::Settings {
+        api_keys: vec![API_KEY.to_string()],
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: MANAGEMENT_KEY.to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(&config.config_path)
+    .expect("persist management settings");
+    persist_management_secret(&config.config_path, &auth_dir);
     let app_state = Arc::new(AppState::new(&config).unwrap());
     let app = create_app(app_state.clone());
 
@@ -904,17 +1010,19 @@ async fn antigravity_oauth_flow(reauth: Option<bool>, different_account: bool, e
     if reauth.is_some() {
         let member = app_state.pool.load().members[0].clone();
         app_state.force_health(&member.id, mahoquot_types::Health::AuthFailed);
-        app_state.monitor.record_error(&member.id, 403, "VALIDATION_REQUIRED");
+        app_state
+            .monitor
+            .record_error(&member.id, 403, "VALIDATION_REQUIRED");
     }
     let start = app
         .clone()
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .uri(start_uri)
-                .header(header::AUTHORIZATION, format!("Bearer {API_KEY}"))
+                .header("X-Management-Key", MANAGEMENT_KEY)
                 .body(Body::empty())
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(start.status(), StatusCode::OK);
@@ -941,28 +1049,37 @@ async fn antigravity_oauth_flow(reauth: Option<bool>, different_account: bool, e
     // 2. Invoke public callback
     let callback = app
         .clone()
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .uri(format!(
                     "/v0/management/oauth-callback?code=antigravity-code-777&state={state}"
                 ))
                 .body(Body::empty())
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(callback.status(), StatusCode::OK);
 
     if different_account || eligibility_denied {
-        let status = app.oneshot(Request::builder()
-            .uri(format!("/v0/management/get-auth-status?state={state}"))
-            .header(header::AUTHORIZATION, format!("Bearer {API_KEY}"))
-            .body(Body::empty()).unwrap()).await.unwrap();
+        let status = app
+            .oneshot(with_loopback_peer(
+                Request::builder()
+                    .uri(format!("/v0/management/get-auth-status?state={state}"))
+                    .header("X-Management-Key", MANAGEMENT_KEY)
+                    .body(Body::empty())
+                    .unwrap(),
+            ))
+            .await
+            .unwrap();
         assert_eq!(body_json(status).await["status"], "error");
-        let saved: Value = serde_json::from_slice(&std::fs::read(auth_dir.join(original_name)).unwrap()).unwrap();
+        let saved: Value =
+            serde_json::from_slice(&std::fs::read(auth_dir.join(original_name)).unwrap()).unwrap();
         assert_eq!(saved["access_token"], "old-access");
         assert_eq!(app_state.pool.load().members.len(), 1);
-        assert!(!auth_dir.join("antigravity-antigravity.user_studio.dev.json").exists());
+        assert!(!auth_dir
+            .join("antigravity-antigravity.user_studio.dev.json")
+            .exists());
         mock_task.abort();
         std::fs::remove_dir_all(auth_dir).unwrap();
         return;
@@ -988,7 +1105,11 @@ async fn antigravity_oauth_flow(reauth: Option<bool>, different_account: bool, e
     assert!(raw_token_body.contains("code_verifier="));
 
     // 4. Assert antigravity-<email>.json credential file exists and has correct fields
-    let cred_file = auth_dir.join(if reauth.is_some() { original_name } else { "antigravity-antigravity.user_studio.dev.json" });
+    let cred_file = auth_dir.join(if reauth.is_some() {
+        original_name
+    } else {
+        "antigravity-antigravity.user_studio.dev.json"
+    });
     assert!(
         cred_file.exists(),
         "antigravity credential file must exist: {cred_file:?}"
@@ -1009,9 +1130,14 @@ async fn antigravity_oauth_flow(reauth: Option<bool>, different_account: bool, e
         let saved: Value = serde_json::from_str(&cred_raw).unwrap();
         assert_eq!(saved["identity_slug"], "original-import");
         assert_eq!(saved["label"], "Preserved label");
-        assert!(!auth_dir.join("antigravity-antigravity.user_studio.dev.json").exists());
+        assert!(!auth_dir
+            .join("antigravity-antigravity.user_studio.dev.json")
+            .exists());
         assert_eq!(app_state.pool.load().members.len(), 1);
-        assert!(app_state.monitor.last_error(&app_state.pool.load().members[0].id).is_none());
+        assert!(app_state
+            .monitor
+            .last_error(&app_state.pool.load().members[0].id)
+            .is_none());
     }
 
     // 5. Assert it joins the runtime pool
@@ -1041,13 +1167,13 @@ async fn antigravity_oauth_flow(reauth: Option<bool>, different_account: bool, e
 
     // 6. Assert get-auth-status returns ok
     let status_resp = app
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .uri(format!("/v0/management/get-auth-status?state={state}"))
-                .header(header::AUTHORIZATION, format!("Bearer {API_KEY}"))
+                .header("X-Management-Key", MANAGEMENT_KEY)
                 .body(Body::empty())
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(status_resp.status(), StatusCode::OK);
@@ -1082,21 +1208,33 @@ async fn test_antigravity_oauth_malformed_token_response_fails_cleanly() {
         config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
+    mahoquot_gateway::management::settings::Settings {
+        api_keys: vec![API_KEY.to_string()],
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: MANAGEMENT_KEY.to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(&config.config_path)
+    .expect("persist management settings");
+    persist_management_secret(&config.config_path, &auth_dir);
     let app = create_app(Arc::new(AppState::new(&config).unwrap()));
 
     let start = app
         .clone()
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .uri(format!(
                     "/v0/management/antigravity-auth-url?token_url={}&redirect_uri={}",
                     url_encode(&token_url),
                     url_encode("http://localhost:51121/oauth-callback")
                 ))
-                .header(header::AUTHORIZATION, format!("Bearer {API_KEY}"))
+                .header("X-Management-Key", MANAGEMENT_KEY)
                 .body(Body::empty())
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(start.status(), StatusCode::OK);
@@ -1105,26 +1243,26 @@ async fn test_antigravity_oauth_malformed_token_response_fails_cleanly() {
 
     let callback = app
         .clone()
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .uri(format!(
                     "/v0/management/oauth-callback?code=bad-code&state={state}"
                 ))
                 .body(Body::empty())
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(callback.status(), StatusCode::OK);
 
     let status = app
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .uri(format!("/v0/management/get-auth-status?state={state}"))
-                .header(header::AUTHORIZATION, format!("Bearer {API_KEY}"))
+                .header("X-Management-Key", MANAGEMENT_KEY)
                 .body(Body::empty())
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(status.status(), StatusCode::BAD_REQUEST);
@@ -1148,15 +1286,27 @@ async fn test_antigravity_oauth_reports_unavailable_default_callback_port() {
         config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
+    mahoquot_gateway::management::settings::Settings {
+        api_keys: vec![API_KEY.to_string()],
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: MANAGEMENT_KEY.to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(&config.config_path)
+    .expect("persist management settings");
+    persist_management_secret(&config.config_path, &auth_dir);
     let app = create_app(Arc::new(AppState::new(&config).unwrap()));
     let response = app
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .uri("/v0/management/antigravity-auth-url")
-                .header(header::AUTHORIZATION, format!("Bearer {API_KEY}"))
+                .header("X-Management-Key", MANAGEMENT_KEY)
                 .body(Body::empty())
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
 
@@ -1177,17 +1327,29 @@ async fn test_antigravity_oauth_callback_state_edge() {
         config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
+    mahoquot_gateway::management::settings::Settings {
+        api_keys: vec![API_KEY.to_string()],
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: MANAGEMENT_KEY.to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(&config.config_path)
+    .expect("persist management settings");
+    persist_management_secret(&config.config_path, &auth_dir);
     let app = create_app(Arc::new(AppState::new(&config).unwrap()));
 
     // Callback with unknown state
     let callback = app
         .clone()
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .uri("/v0/management/oauth-callback?code=any-code&state=nonexistent-state-123")
                 .body(Body::empty())
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(callback.status(), StatusCode::OK);
@@ -1202,13 +1364,13 @@ async fn test_antigravity_oauth_callback_state_edge() {
 
     // Status check on unknown state returns stats (default) or pending/error
     let status = app
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .uri("/v0/management/get-auth-status?state=nonexistent-state-123")
-                .header(header::AUTHORIZATION, format!("Bearer {API_KEY}"))
+                .header("X-Management-Key", MANAGEMENT_KEY)
                 .body(Body::empty())
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(status.status(), StatusCode::OK);
@@ -1290,6 +1452,18 @@ async fn test_command_code_oauth_flow_end_to_end() {
         config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
+    mahoquot_gateway::management::settings::Settings {
+        api_keys: vec![API_KEY.to_string()],
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: MANAGEMENT_KEY.to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(&config.config_path)
+    .expect("persist management settings");
+    persist_management_secret(&config.config_path, &auth_dir);
     let app_state = Arc::new(AppState::new(&config).unwrap());
     let app = create_app(app_state.clone());
 
@@ -1302,13 +1476,13 @@ async fn test_command_code_oauth_flow_end_to_end() {
     );
     let start = app
         .clone()
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .uri(start_uri)
-                .header(header::AUTHORIZATION, format!("Bearer {API_KEY}"))
+                .header("X-Management-Key", MANAGEMENT_KEY)
                 .body(Body::empty())
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
 
@@ -1335,14 +1509,14 @@ async fn test_command_code_oauth_flow_end_to_end() {
     });
     let callback = app
         .clone()
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .method("POST")
                 .uri("/v0/management/oauth-callback")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(callback_payload.to_string()))
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
 
@@ -1392,13 +1566,13 @@ async fn test_command_code_oauth_flow_end_to_end() {
 
     // Then: get-auth-status returns ok
     let status_resp = app
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .uri(format!("/v0/management/get-auth-status?state={state}"))
-                .header(header::AUTHORIZATION, format!("Bearer {API_KEY}"))
+                .header("X-Management-Key", MANAGEMENT_KEY)
                 .body(Body::empty())
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(status_resp.status(), StatusCode::OK);
@@ -1423,17 +1597,29 @@ async fn test_command_code_oauth_mismatched_state_fails_without_persistence() {
         config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
+    mahoquot_gateway::management::settings::Settings {
+        api_keys: vec![API_KEY.to_string()],
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: MANAGEMENT_KEY.to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(&config.config_path)
+    .expect("persist management settings");
+    persist_management_secret(&config.config_path, &auth_dir);
     let app_state = Arc::new(AppState::new(&config).unwrap());
     let app = create_app(app_state);
 
     let start = app
         .clone()
         .oneshot(
-            Request::builder()
+            with_loopback_peer(Request::builder()
                 .uri("/v0/management/command-code-auth-url?callback=http%3A%2F%2F127.0.0.1%3A35959%2Fcallback")
-                .header(header::AUTHORIZATION, format!("Bearer {API_KEY}"))
+                .header("X-Management-Key", MANAGEMENT_KEY)
                 .body(Body::empty())
-                .unwrap(),
+                .unwrap()),
         )
         .await
         .unwrap();
@@ -1451,14 +1637,14 @@ async fn test_command_code_oauth_mismatched_state_fails_without_persistence() {
     });
     let callback = app
         .clone()
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .method("POST")
                 .uri("/v0/management/oauth-callback")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(callback_payload.to_string()))
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
 
@@ -1478,13 +1664,13 @@ async fn test_command_code_oauth_mismatched_state_fails_without_persistence() {
 
     // Real session remains pending
     let status_resp = app
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .uri(format!("/v0/management/get-auth-status?state={real_state}"))
-                .header(header::AUTHORIZATION, format!("Bearer {API_KEY}"))
+                .header("X-Management-Key", MANAGEMENT_KEY)
                 .body(Body::empty())
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(status_resp.status(), StatusCode::OK);
@@ -1507,16 +1693,28 @@ async fn test_command_code_oauth_malformed_callback_fails_without_persistence() 
         config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
+    mahoquot_gateway::management::settings::Settings {
+        api_keys: vec![API_KEY.to_string()],
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: MANAGEMENT_KEY.to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(&config.config_path)
+    .expect("persist management settings");
+    persist_management_secret(&config.config_path, &auth_dir);
     let app = create_app(Arc::new(AppState::new(&config).unwrap()));
 
     let start = app
         .clone()
         .oneshot(
-            Request::builder()
+            with_loopback_peer(Request::builder()
                 .uri("/v0/management/command-code-auth-url?callback=http%3A%2F%2F127.0.0.1%3A35959%2Fcallback")
-                .header(header::AUTHORIZATION, format!("Bearer {API_KEY}"))
+                .header("X-Management-Key", MANAGEMENT_KEY)
                 .body(Body::empty())
-                .unwrap(),
+                .unwrap()),
         )
         .await
         .unwrap();
@@ -1533,14 +1731,14 @@ async fn test_command_code_oauth_malformed_callback_fails_without_persistence() 
     ] {
         let callback = app
             .clone()
-            .oneshot(
+            .oneshot(with_loopback_peer(
                 Request::builder()
                     .method("POST")
                     .uri("/v0/management/oauth-callback")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(bad_payload.to_string()))
                     .unwrap(),
-            )
+            ))
             .await
             .unwrap();
 
@@ -1583,19 +1781,31 @@ async fn test_command_code_oauth_whoami_failure_fails_without_persistence() {
         config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
+    mahoquot_gateway::management::settings::Settings {
+        api_keys: vec![API_KEY.to_string()],
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: MANAGEMENT_KEY.to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(&config.config_path)
+    .expect("persist management settings");
+    persist_management_secret(&config.config_path, &auth_dir);
     let app = create_app(Arc::new(AppState::new(&config).unwrap()));
 
     let start = app
         .clone()
         .oneshot(
-            Request::builder()
+            with_loopback_peer(Request::builder()
                 .uri(format!(
                     "/v0/management/command-code-auth-url?whoami_url={}&callback=http%3A%2F%2F127.0.0.1%3A35959%2Fcallback",
                     url_encode(&whoami_url)
                 ))
-                .header(header::AUTHORIZATION, format!("Bearer {API_KEY}"))
+                .header("X-Management-Key", MANAGEMENT_KEY)
                 .body(Body::empty())
-                .unwrap(),
+                .unwrap()),
         )
         .await
         .unwrap();
@@ -1613,14 +1823,14 @@ async fn test_command_code_oauth_whoami_failure_fails_without_persistence() {
     });
     let callback = app
         .clone()
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .method("POST")
                 .uri("/v0/management/oauth-callback")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(callback_payload.to_string()))
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
 
@@ -1636,13 +1846,13 @@ async fn test_command_code_oauth_whoami_failure_fails_without_persistence() {
     assert_eq!(files, 0, "no credential saved when whoami fails");
 
     let status_resp = app
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .uri(format!("/v0/management/get-auth-status?state={state}"))
-                .header(header::AUTHORIZATION, format!("Bearer {API_KEY}"))
+                .header("X-Management-Key", MANAGEMENT_KEY)
                 .body(Body::empty())
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(status_resp.status(), StatusCode::BAD_REQUEST);
@@ -1673,18 +1883,30 @@ async fn test_command_code_oauth_rejects_whoami_without_identity() {
         config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
+    mahoquot_gateway::management::settings::Settings {
+        api_keys: vec![API_KEY.to_string()],
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: MANAGEMENT_KEY.to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(&config.config_path)
+    .expect("persist management settings");
+    persist_management_secret(&config.config_path, &auth_dir);
     let app = create_app(Arc::new(AppState::new(&config).unwrap()));
     let start = app
         .clone()
         .oneshot(
-            Request::builder()
+            with_loopback_peer(Request::builder()
                 .uri(format!(
                     "/v0/management/command-code-auth-url?whoami_url={}&callback=http%3A%2F%2F127.0.0.1%3A35959%2Fcallback",
                     url_encode(&format!("http://127.0.0.1:{port}/alpha/whoami"))
                 ))
-                .header(header::AUTHORIZATION, format!("Bearer {API_KEY}"))
+                .header("X-Management-Key", MANAGEMENT_KEY)
                 .body(Body::empty())
-                .unwrap(),
+                .unwrap()),
         )
         .await
         .unwrap();
@@ -1693,7 +1915,7 @@ async fn test_command_code_oauth_rejects_whoami_without_identity() {
         .unwrap()
         .to_string();
     let callback = app
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .method("POST")
                 .uri("/v0/management/oauth-callback")
@@ -1709,7 +1931,7 @@ async fn test_command_code_oauth_rejects_whoami_without_identity() {
                     .to_string(),
                 ))
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
 
@@ -1738,15 +1960,27 @@ async fn test_command_code_oauth_reports_unavailable_default_callback_port() {
         config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
+    mahoquot_gateway::management::settings::Settings {
+        api_keys: vec![API_KEY.to_string()],
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: MANAGEMENT_KEY.to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(&config.config_path)
+    .expect("persist management settings");
+    persist_management_secret(&config.config_path, &auth_dir);
     let app = create_app(Arc::new(AppState::new(&config).unwrap()));
     let response = app
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .uri("/v0/management/command-code-auth-url")
-                .header(header::AUTHORIZATION, format!("Bearer {API_KEY}"))
+                .header("X-Management-Key", MANAGEMENT_KEY)
                 .body(Body::empty())
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
 
@@ -1800,8 +2034,20 @@ async fn test_zcode_quota_reads_the_desktop_app_balance_log() {
     let config = GatewayConfig {
         auth_dir: auth_dir.clone(),
         api_keys: mahoquot_gateway::inbound::ApiKeys::new(vec![API_KEY.to_string()]),
+        config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
+    mahoquot_gateway::management::settings::Settings {
+        api_keys: vec![API_KEY.to_string()],
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: MANAGEMENT_KEY.to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(&config.config_path)
+    .expect("persist management settings");
     let state = Arc::new(AppState::new(&config).unwrap());
     let snapshot = state.pool.load();
     let member = snapshot
@@ -1895,8 +2141,20 @@ async fn test_zcode_plan_billing_probe_reads_balance_windows() {
     let config = GatewayConfig {
         auth_dir: auth_dir.clone(),
         api_keys: mahoquot_gateway::inbound::ApiKeys::new(vec![API_KEY.to_string()]),
+        config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
+    mahoquot_gateway::management::settings::Settings {
+        api_keys: vec![API_KEY.to_string()],
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: MANAGEMENT_KEY.to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(&config.config_path)
+    .expect("persist management settings");
     let state = Arc::new(AppState::new(&config).unwrap());
     let snapshot = state.pool.load();
     let member = snapshot
@@ -2014,8 +2272,20 @@ async fn test_zcode_oauth_flow_end_to_end() {
     let config = GatewayConfig {
         auth_dir: auth_dir.clone(),
         api_keys: mahoquot_gateway::inbound::ApiKeys::new(vec![API_KEY.to_string()]),
+        config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
+    mahoquot_gateway::management::settings::Settings {
+        api_keys: vec![API_KEY.to_string()],
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: MANAGEMENT_KEY.to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(&config.config_path)
+    .expect("persist management settings");
     let app_state = Arc::new(AppState::new(&config).unwrap());
     let gateway_app = create_app(app_state);
     let gateway_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2034,7 +2304,7 @@ async fn test_zcode_oauth_flow_end_to_end() {
         .get(format!(
             "http://127.0.0.1:{gateway_port}/v0/management/zcode-auth-url"
         ))
-        .bearer_auth(API_KEY)
+        .header("X-Management-Key", MANAGEMENT_KEY)
         .send()
         .await
         .unwrap();
@@ -2050,7 +2320,7 @@ async fn test_zcode_oauth_flow_end_to_end() {
     };
     let pending_resp = client
         .get(auth_status_url(&state_token))
-        .bearer_auth(API_KEY)
+        .header("X-Management-Key", MANAGEMENT_KEY)
         .send()
         .await
         .unwrap();
@@ -2061,7 +2331,7 @@ async fn test_zcode_oauth_flow_end_to_end() {
 
     let done_resp = client
         .get(auth_status_url(&state_token))
-        .bearer_auth(API_KEY)
+        .header("X-Management-Key", MANAGEMENT_KEY)
         .send()
         .await
         .unwrap();
@@ -2086,7 +2356,7 @@ async fn test_zcode_oauth_flow_end_to_end() {
         .post(format!(
             "http://127.0.0.1:{gateway_port}/v0/management/zcode-callback"
         ))
-        .bearer_auth(API_KEY)
+        .header("X-Management-Key", MANAGEMENT_KEY)
         .json(&json!({ "state": state_token, "callback_url": "zcode://oauth/callback?code=x" }))
         .send()
         .await

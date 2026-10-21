@@ -11,13 +11,23 @@ use serde_json::json;
 fn test_duplicate_alias_across_providers_is_rejected() {
     let (store, path) = temp_store("duplicate-alias");
     let before = std::fs::read(&path).unwrap();
-    let result = store.mutate(|s| s.oauth_model_alias = json!({
-        "codex": {"fast": "gpt-5.4"},
-        "antigravity": {"fast": "gemini-3.7-flash-high"}
-    }));
+    let result = store.mutate(|s| {
+        s.oauth_model_alias = json!({
+            "codex": {"fast": "gpt-5.4"},
+            "antigravity": {"fast": "gemini-3.7-flash-high"}
+        })
+    });
     let after = std::fs::read(&path).unwrap();
     std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
-    assert!(matches!(result, Err(SettingsError::Validation(RegistryError::DuplicateAlias { .. }))), "ambiguous alias must be rejected");
+    assert!(
+        matches!(
+            result,
+            Err(SettingsError::Validation(
+                RegistryError::DuplicateAlias { .. }
+            ))
+        ),
+        "ambiguous alias must be rejected"
+    );
     assert_eq!(store.current().oauth_model_alias, serde_json::Value::Null);
     assert_eq!(before, after);
 }
@@ -32,31 +42,57 @@ fn test_settings_mutation_deletion_unregisters_rules_from_runtime() {
         catalog_cache_path: Some(dir.join("catalog.json")),
         auth_refresh_enabled: false,
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
     let before = state.pool.load().registry.clone();
-    state.settings.mutate(|s| {
-        s.oauth_model_alias = json!({"work": "gemini-3.7-flash-high"});
-        s.oauth_excluded_models.insert("codex".into(), vec!["gpt-5.4".into()]);
-        s.model_catalog = Some(ModelCatalogSettings {
-            custom_models: vec![ModelDescriptor::new(ModelId::new("custom-gemini").unwrap(), "google")
-                .with_binding(ProviderBinding::new(ProviderId::antigravity(), ProviderPolicy::Closed,
-                    mahoquot_registry::CatalogSource::LocalOverride))],
-            ..Default::default()
-        });
-    }).unwrap();
+    state
+        .settings
+        .mutate(|s| {
+            s.oauth_model_alias = json!({"work": "gemini-3.7-flash-high"});
+            s.oauth_excluded_models
+                .insert("codex".into(), vec!["gpt-5.4".into()]);
+            s.model_catalog = Some(ModelCatalogSettings {
+                custom_models: vec![ModelDescriptor::new(
+                    ModelId::new("custom-gemini").unwrap(),
+                    "google",
+                )
+                .with_binding(ProviderBinding::new(
+                    ProviderId::antigravity(),
+                    ProviderPolicy::Closed,
+                    mahoquot_registry::CatalogSource::LocalOverride,
+                ))],
+                ..Default::default()
+            });
+        })
+        .unwrap();
     assert!(state.pool.load().registry.resolve("work").is_ok());
     assert!(state.pool.load().registry.resolve("custom-gemini").is_ok());
-    state.settings.mutate(|s| {
-        s.oauth_model_alias = serde_json::Value::Null;
-        s.oauth_excluded_models.clear();
-        s.model_catalog = None;
-    }).unwrap();
+    state
+        .settings
+        .mutate(|s| {
+            s.oauth_model_alias = serde_json::Value::Null;
+            s.oauth_excluded_models.clear();
+            s.model_catalog = None;
+        })
+        .unwrap();
     let after = state.pool.load().registry.clone();
     drop(state);
     std::fs::remove_dir_all(dir).unwrap();
-    assert_eq!(after.resolve("work").unwrap().canonical_id.as_str(), "work", "deleted alias must disappear");
-    assert!(after.get_model(&ModelId::new("custom-gemini").unwrap()).is_none(), "deleted custom model must disappear");
-    assert_eq!(serde_json::to_value(&*after).unwrap(), serde_json::to_value(&*before).unwrap());
+    assert_eq!(
+        after.resolve("work").unwrap().canonical_id.as_str(),
+        "work",
+        "deleted alias must disappear"
+    );
+    assert!(
+        after
+            .get_model(&ModelId::new("custom-gemini").unwrap())
+            .is_none(),
+        "deleted custom model must disappear"
+    );
+    assert_eq!(
+        serde_json::to_value(&*after).unwrap(),
+        serde_json::to_value(&*before).unwrap()
+    );
 }
 
 fn temp_store(tag: &str) -> (SettingsStore, PathBuf) {

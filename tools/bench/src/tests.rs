@@ -172,9 +172,15 @@ async fn test_50req_10conc_zero_error_run() {
     };
     let state = Arc::new(MockState::new(&cfg));
     let app = create_mock_router(state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind ephemeral");
+    // run_benchmark only targets the leased loopback range 18840-18899.
+    let mut bound = None;
+    for candidate in 18840..=18899u16 {
+        if let Ok(listener) = tokio::net::TcpListener::bind(("127.0.0.1", candidate)).await {
+            bound = Some(listener);
+            break;
+        }
+    }
+    let listener = bound.expect("free port in 18840-18899");
     let port = listener.local_addr().expect("local addr").port();
     tokio::spawn(async move {
         axum::serve(listener, app).await.expect("serve mock");
@@ -275,10 +281,11 @@ async fn test_headers_and_body_json_literal_pinning() {
         headers: hdrs,
         body: body_literal,
         timeout: Duration::from_millis(5000),
+        expected: None,
     })
     .await;
     match res {
-        crate::runner::SampleResult::Success { ttft_ms } => {
+        crate::runner::SampleResult::Success { ttft_ms, .. } => {
             assert!(ttft_ms > 0.0);
         }
         crate::runner::SampleResult::Error { kind } => {

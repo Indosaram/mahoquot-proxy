@@ -181,6 +181,7 @@ impl GatewayConfig {
                     Strategy::FillFirst => "fill-first".to_string(),
                     Strategy::StrictRoundRobin => "round-robin".to_string(),
                 },
+                ..RoutingSettings::default()
             },
             remote_management: RemoteManagement {
                 secret_key: String::new(),

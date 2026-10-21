@@ -51,6 +51,7 @@ impl AuthIdentity {
 pub struct ApiKeys {
     overrides: Vec<String>,
     settings: Option<Arc<SettingsStore>>,
+    management_attempts: Arc<std::sync::Mutex<crate::management::gate::ManagementAttempts>>,
 }
 
 impl ApiKeys {
@@ -58,6 +59,7 @@ impl ApiKeys {
         Self {
             overrides: keys,
             settings: None,
+            management_attempts: Arc::new(std::sync::Mutex::new(Default::default())),
         }
     }
 
@@ -75,7 +77,14 @@ impl ApiKeys {
         Self {
             overrides: overrides.overrides,
             settings: Some(settings),
+            management_attempts: overrides.management_attempts,
         }
+    }
+
+    pub fn management_attempts(
+        &self,
+    ) -> Arc<std::sync::Mutex<crate::management::gate::ManagementAttempts>> {
+        Arc::clone(&self.management_attempts)
     }
 
     pub fn values(&self) -> &[String] {
@@ -177,7 +186,7 @@ fn request_targets_management(req: &Request) -> bool {
 
 /// Control-plane prefixes a scoped key may never reach.
 fn is_management_path(path: &str) -> bool {
-    const PREFIXES: [&str; 2] = ["/v0/management", "/admin"];
+    const PREFIXES: [&str; 3] = ["/v0/management", "/v8/management", "/admin"];
     PREFIXES.iter().any(|prefix| {
         path.strip_prefix(prefix)
             .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
@@ -189,7 +198,57 @@ pub async fn require_api_key(
     mut req: Request,
     next: Next,
 ) -> Response {
+    if request_targets_management(&req) {
+        let scoped_key = matches!(
+            keys.authorizes(extract_presented_key(&req)),
+            Some(AuthIdentity::Scoped(_))
+        );
+        let attempts = keys.management_attempts();
+        let identity = AuthIdentity::Master;
+        req.extensions_mut().insert(ResolvedAuth {
+            identity: identity.clone(),
+            key_identifier: None,
+        });
+        req.extensions_mut().insert(identity);
+        let response = crate::management::gate::require_management_key(
+            keys.settings.as_deref(),
+            &attempts,
+            req,
+            next,
+        )
+        .await;
+        if scoped_key && response.status() != StatusCode::UNAUTHORIZED {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+        return response;
+    }
     let Some(identity) = keys.authorizes(extract_presented_key(&req)) else {
+        if let Some(value) = presented_api_key(req.headers()) {
+            if let Some(store) = req
+                .extensions()
+                .get::<Arc<crate::realtime::RealtimeStore>>()
+            {
+                if let Some(secret) = store.lookup(value).await {
+                    let requested = req.uri().path();
+                    let allowed = requested == "/v1/realtime/calls"
+                        || requested.starts_with("/v1/realtime/calls/")
+                        || requested.starts_with("/v1/live/");
+                    if !allowed {
+                        return StatusCode::UNAUTHORIZED.into_response();
+                    }
+                    req.extensions_mut().insert(ResolvedAuth {
+                        identity: secret
+                            .scope
+                            .clone()
+                            .map(AuthIdentity::Scoped)
+                            .unwrap_or(AuthIdentity::Master),
+                        key_identifier: Some(secret.issuer.clone()),
+                    });
+                    req.extensions_mut().insert(secret);
+                    return next.run(req).await;
+                }
+            }
+        }
         return (
             StatusCode::UNAUTHORIZED,
             [(header::CONTENT_TYPE, "application/json")],
@@ -209,8 +268,8 @@ pub async fn require_api_key(
 
     // Downstream handlers read the identity instead of re-deriving it from the
     // header, so scope enforcement and auth share one decision.
-    let key_identifier = extract_presented_key(&req)
-        .map(crate::request_history::stable_key_identifier);
+    let key_identifier =
+        extract_presented_key(&req).map(crate::request_history::stable_key_identifier);
     req.extensions_mut().insert(ResolvedAuth {
         identity: identity.clone(),
         key_identifier,

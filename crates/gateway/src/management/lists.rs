@@ -5,14 +5,17 @@ use super::scalar_table::Refusal;
 /// Replace a list wholesale. Upstream accepts either a bare JSON array or the
 /// same array wrapped as `{"items": [...]}`, and treats an empty `items` as a
 /// bad body rather than a request to clear.
-pub fn replace(target: &mut Vec<String>, body: &Value) -> Result<(), Refusal> {
-    if let Ok(array) = serde_json::from_value::<Vec<String>>(body.clone()) {
+pub fn replace<T: serde::de::DeserializeOwned>(
+    target: &mut Vec<T>,
+    body: &Value,
+) -> Result<(), Refusal> {
+    if let Ok(array) = serde_json::from_value::<Vec<T>>(body.clone()) {
         *target = array;
         return Ok(());
     }
     match body
         .get("items")
-        .and_then(|i| serde_json::from_value::<Vec<String>>(i.clone()).ok())
+        .and_then(|i| serde_json::from_value::<Vec<T>>(i.clone()).ok())
     {
         Some(items) if !items.is_empty() => {
             *target = items;
@@ -25,23 +28,30 @@ pub fn replace(target: &mut Vec<String>, body: &Value) -> Result<(), Refusal> {
 /// Edit one entry. `{"index","value"}` overwrites in place; `{"old","new"}`
 /// replaces the first match and otherwise appends. Anything else is
 /// "missing fields", which upstream distinguishes from "invalid body".
-pub fn edit(target: &mut Vec<String>, body: &Value) -> Result<(), Refusal> {
+pub fn edit<T: serde::de::DeserializeOwned + AsRef<str>>(
+    target: &mut Vec<T>,
+    body: &Value,
+) -> Result<(), Refusal> {
     let index = body.get("index").and_then(Value::as_i64);
-    let value = body.get("value").and_then(Value::as_str);
+    let value = body
+        .get("value")
+        .and_then(|value| serde_json::from_value::<T>(value.clone()).ok());
     if let (Some(index), Some(value)) = (index, value) {
         if index >= 0 && (index as usize) < target.len() {
-            target[index as usize] = value.to_string();
+            target[index as usize] = value;
             return Ok(());
         }
     }
 
     let old = body.get("old").and_then(Value::as_str);
-    let new = body.get("new").and_then(Value::as_str);
+    let new = body
+        .get("new")
+        .and_then(|value| serde_json::from_value::<T>(value.clone()).ok());
     if let (Some(old), Some(new)) = (old, new) {
-        if let Some(slot) = target.iter_mut().find(|entry| entry.as_str() == old) {
-            *slot = new.to_string();
+        if let Some(slot) = target.iter_mut().find(|entry| entry.as_ref() == old) {
+            *slot = new;
         } else {
-            target.push(new.to_string());
+            target.push(new);
         }
         return Ok(());
     }
@@ -50,8 +60,8 @@ pub fn edit(target: &mut Vec<String>, body: &Value) -> Result<(), Refusal> {
 }
 
 /// Remove by `?index=` or `?value=`; upstream refuses when neither is usable.
-pub fn remove(
-    target: &mut Vec<String>,
+pub fn remove<T: AsRef<str>>(
+    target: &mut Vec<T>,
     index: Option<&str>,
     value: Option<&str>,
 ) -> Result<(), Refusal> {
@@ -63,7 +73,7 @@ pub fn remove(
     }
     match value.map(str::trim).filter(|v| !v.is_empty()) {
         Some(wanted) => {
-            target.retain(|entry| entry.trim() != wanted);
+            target.retain(|entry| entry.as_ref().trim() != wanted);
             Ok(())
         }
         None => Err(Refusal::Message("missing index or value")),

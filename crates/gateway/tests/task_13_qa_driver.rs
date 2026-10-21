@@ -160,7 +160,9 @@ async fn task_13_http_qa_scenario() {
     });
 
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5)).build().expect("bounded HTTP client");
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("bounded HTTP client");
     let images_url = format!("http://127.0.0.1:{QA_PORT}/v1/images/generations");
 
     let mut http_evidence = String::new();
@@ -295,9 +297,14 @@ async fn task_13_http_qa_scenario() {
     // Graceful shutdown
     let _ = shutdown_tx.send(());
     tokio::time::timeout(Duration::from_secs(5), server_handle)
-        .await.expect("server shutdown deadline").expect("server stopped");
+        .await
+        .expect("server shutdown deadline")
+        .expect("server stopped");
     upstream_task.abort();
-    assert!(upstream_task.await.expect_err("upstream cancelled").is_cancelled());
+    assert!(upstream_task
+        .await
+        .expect_err("upstream cancelled")
+        .is_cancelled());
     drop(client);
     drop(state);
     std::fs::remove_dir_all(auth_dir).expect("remove fixture directory");
@@ -311,5 +318,4 @@ async fn task_13_http_qa_scenario() {
         &http_evidence,
     )
     .expect("wrote proxy evidence");
-
 }

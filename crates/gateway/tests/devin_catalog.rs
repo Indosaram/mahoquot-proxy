@@ -27,7 +27,7 @@ use tower::ServiceExt;
 
 #[path = "common/mod.rs"]
 mod common;
-use common::unique_temp_dir;
+use common::{unique_temp_dir, with_loopback_peer};
 
 struct ChildGuard {
     child: Option<std::process::Child>,
@@ -114,6 +114,8 @@ impl MockServerHandle {
 }
 
 fn test_gateway_config(auth_dir: &Path) -> GatewayConfig {
+    // Task 26: the management routes need a configured dedicated secret.
+    common::configure_management_secret(&auth_dir.join("config.yaml"), "test-mgmt-key");
     GatewayConfig {
         port: 0,
         auth_dir: auth_dir.to_path_buf(),
@@ -545,6 +547,17 @@ async fn test_devin_management_refresh_endpoint_flow() {
     .unwrap();
 
     let config = test_gateway_config(&auth_dir);
+    mahoquot_gateway::management::settings::Settings {
+        api_keys: vec!["test-mgmt-key".to_string()],
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: "test-mgmt-key".to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(&config.config_path)
+    .expect("persist management test settings");
     let state = Arc::new(AppState::new(&config).expect("create state"));
     let app = create_app(Arc::clone(&state));
 
@@ -557,34 +570,42 @@ async fn test_devin_management_refresh_endpoint_flow() {
             serde_json::to_string(&json!({"identity_slug": "devin-a"})).unwrap(),
         ))
         .unwrap();
-    let resp = app.clone().oneshot(missing_auth_req).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(with_loopback_peer(missing_auth_req))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
     // 2. Wrong Authorization key rejected with 401
     let wrong_auth_req = Request::builder()
         .method("POST")
         .uri("/v0/management/devin/models/refresh")
-        .header("authorization", "Bearer wrong-key")
+        .header("x-management-key", "wrong-key")
         .header("content-type", "application/json")
         .body(Body::from(
             serde_json::to_string(&json!({"identity_slug": "devin-a"})).unwrap(),
         ))
         .unwrap();
-    let resp = app.clone().oneshot(wrong_auth_req).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(with_loopback_peer(wrong_auth_req))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
     // 3. Valid Authorization key succeeds with 200 OK
     let req = Request::builder()
         .method("POST")
         .uri("/v0/management/devin/models/refresh")
-        .header("authorization", "Bearer test-mgmt-key")
+        .header("x-management-key", "test-mgmt-key")
         .header("content-type", "application/json")
         .body(Body::from(
             serde_json::to_string(&json!({"identity_slug": "devin-a"})).unwrap(),
         ))
         .unwrap();
 
-    let resp = app.clone().oneshot(req).await.unwrap();
+    let resp = app.clone().oneshot(with_loopback_peer(req)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
     let body = resp.into_body().collect().await.unwrap().to_bytes();
@@ -1644,14 +1665,14 @@ async fn test_devin_initial_refresh_failure_publishes_catalog_and_subsequent_get
     let req = Request::builder()
         .method("POST")
         .uri("/v0/management/devin/models/refresh")
-        .header("authorization", "Bearer test-mgmt-key")
+        .header("X-Management-Key", "test-mgmt-key")
         .header("content-type", "application/json")
         .body(Body::from(
             serde_json::to_string(&json!({"identity_slug": "devin-fail"})).unwrap(),
         ))
         .unwrap();
 
-    let resp = app.clone().oneshot(req).await.unwrap();
+    let resp = app.clone().oneshot(with_loopback_peer(req)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     let res: Value = serde_json::from_slice(&body).unwrap();
@@ -1661,11 +1682,15 @@ async fn test_devin_initial_refresh_failure_publishes_catalog_and_subsequent_get
     let status_req = Request::builder()
         .method("GET")
         .uri("/v0/management/devin/models/status")
-        .header("authorization", "Bearer test-mgmt-key")
+        .header("X-Management-Key", "test-mgmt-key")
         .body(Body::empty())
         .unwrap();
 
-    let status_resp = app.clone().oneshot(status_req).await.unwrap();
+    let status_resp = app
+        .clone()
+        .oneshot(with_loopback_peer(status_req))
+        .await
+        .unwrap();
     assert_eq!(status_resp.status(), StatusCode::OK);
     let status_body = status_resp.into_body().collect().await.unwrap().to_bytes();
     let status_json: Value = serde_json::from_slice(&status_body).unwrap();
@@ -1719,14 +1744,14 @@ async fn test_devin_cached_transient_failure_refresh_returns_outcome_error_when_
     let req1 = Request::builder()
         .method("POST")
         .uri("/v0/management/devin/models/refresh")
-        .header("authorization", "Bearer test-mgmt-key")
+        .header("X-Management-Key", "test-mgmt-key")
         .header("content-type", "application/json")
         .body(Body::from(
             serde_json::to_string(&json!({"identity_slug": "devin-transient"})).unwrap(),
         ))
         .unwrap();
 
-    let resp1 = app.clone().oneshot(req1).await.unwrap();
+    let resp1 = app.clone().oneshot(with_loopback_peer(req1)).await.unwrap();
     assert_eq!(resp1.status(), StatusCode::OK);
     let body1 = resp1.into_body().collect().await.unwrap().to_bytes();
     let res1: Value = serde_json::from_slice(&body1).unwrap();
@@ -1739,14 +1764,14 @@ async fn test_devin_cached_transient_failure_refresh_returns_outcome_error_when_
     let req2 = Request::builder()
         .method("POST")
         .uri("/v0/management/devin/models/refresh")
-        .header("authorization", "Bearer test-mgmt-key")
+        .header("X-Management-Key", "test-mgmt-key")
         .header("content-type", "application/json")
         .body(Body::from(
             serde_json::to_string(&json!({"identity_slug": "devin-transient"})).unwrap(),
         ))
         .unwrap();
 
-    let resp2 = app.clone().oneshot(req2).await.unwrap();
+    let resp2 = app.clone().oneshot(with_loopback_peer(req2)).await.unwrap();
     assert_eq!(resp2.status(), StatusCode::OK);
     let body2 = resp2.into_body().collect().await.unwrap().to_bytes();
     let res2: Value = serde_json::from_slice(&body2).unwrap();
@@ -1791,11 +1816,15 @@ async fn test_devin_stale_get_schedules_async_refresh() {
     let status_req = Request::builder()
         .method("GET")
         .uri("/v0/management/devin/models/status")
-        .header("authorization", "Bearer test-mgmt-key")
+        .header("X-Management-Key", "test-mgmt-key")
         .body(Body::empty())
         .unwrap();
 
-    let status_resp = app.clone().oneshot(status_req).await.unwrap();
+    let status_resp = app
+        .clone()
+        .oneshot(with_loopback_peer(status_req))
+        .await
+        .unwrap();
     assert_eq!(status_resp.status(), StatusCode::OK);
 
     // Bounded wait on the exact event subscription

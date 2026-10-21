@@ -24,7 +24,13 @@ fn translate(messages: Value) -> Value {
 #[test]
 fn astra_user_images_preserve_urls_and_optional_detail() {
     for url in [PNG, REMOTE] {
-        for detail in [None, Some("low"), Some("high"), Some("auto"), Some("original")] {
+        for detail in [
+            None,
+            Some("low"),
+            Some("high"),
+            Some("auto"),
+            Some("original"),
+        ] {
             let mut image = json!({"type": "image_url", "image_url": {"url": url}});
             let mut expected = json!({"type": "input_image", "image_url": url});
             if let Some(detail) = detail {
@@ -168,9 +174,7 @@ async fn assert_chat_relay(messages: Value, expected_input: Value, stream: bool)
             }
         }),
     );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_url = format!("http://{}", listener.local_addr().unwrap());
     fixture.servers.push(tokio::spawn(async move {
         axum::serve(listener, upstream).await.unwrap()
@@ -195,9 +199,7 @@ async fn assert_chat_relay(messages: Value, expected_input: Value, stream: bool)
         .unwrap(),
     );
     let app = create_app(state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let gateway_url = format!("http://{}", listener.local_addr().unwrap());
     fixture.servers.push(tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap()

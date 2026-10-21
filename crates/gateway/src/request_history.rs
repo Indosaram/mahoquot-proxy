@@ -488,8 +488,7 @@ impl HistoryService {
                     worker_health
                         .queue_depth
                         .fetch_sub(batch.len() as u64, Ordering::Relaxed);
-                    let (accepted, rejected) =
-                        worker_store.insert_batch_skipping_invalid(&batch);
+                    let (accepted, rejected) = worker_store.insert_batch_skipping_invalid(&batch);
                     if rejected > 0 {
                         worker_health
                             .dropped_events
@@ -538,6 +537,12 @@ impl HistoryService {
     }
 
     pub fn enqueue(&self, event: UsageEvent) -> bool {
+        let hub = crate::resp::global_redis_hub();
+        if hub.enabled() && hub.usage_statistics_enabled() {
+            if let Ok(payload) = serde_json::to_vec(&event) {
+                hub.enqueue_usage(bytes::Bytes::from(payload));
+            }
+        }
         let Some(sender) = &self.sender else {
             self.drop_event("request history is unavailable");
             return false;
@@ -575,7 +580,9 @@ impl HistoryService {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-        self.health.last_degraded_unix_ms.store(now_ms, Ordering::Relaxed);
+        self.health
+            .last_degraded_unix_ms
+            .store(now_ms, Ordering::Relaxed);
         self.health.degraded.store(true, Ordering::Relaxed);
         self.health.dropped_events.fetch_add(1, Ordering::Relaxed);
         self.metrics.history_dropped.fetch_add(1, Ordering::Relaxed);
@@ -975,7 +982,8 @@ fn migrate(connection: &mut Connection) -> Result<(), HistoryError> {
         // Nullable on purpose: rows written before this column existed, or by a
         // caller that sent no session identity, must stay distinguishable from
         // a session whose digest happens to look empty.
-        transaction.execute_batch("ALTER TABLE usage_events ADD COLUMN session_identifier TEXT;")?;
+        transaction
+            .execute_batch("ALTER TABLE usage_events ADD COLUMN session_identifier TEXT;")?;
         transaction.execute(
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at_ms) VALUES (4, ?1)",
             [unix_time_ms()],
@@ -1130,7 +1138,10 @@ fn worker_loop(
         if now_ms >= next_maintenance {
             match prune_events(&mut connection, path, now_ms, PrunePolicy::from(&config)) {
                 Ok(result) if !result.size_cap_satisfied => {
-                    tracing::warn!(size_bytes = result.logical_size_bytes, "request history size cap cannot be satisfied");
+                    tracing::warn!(
+                        size_bytes = result.logical_size_bytes,
+                        "request history size cap cannot be satisfied"
+                    );
                 }
                 Ok(_) => {}
                 Err(error) => tracing::warn!(%error, "request history runtime maintenance failed"),
@@ -1220,7 +1231,8 @@ fn worker_loop(
                     let filtered: Vec<ClineCapEvent> = rows
                         .into_iter()
                         .filter(|event| {
-                            accounts.is_empty() || accounts.iter().any(|a| a == &event.account_identifier)
+                            accounts.is_empty()
+                                || accounts.iter().any(|a| a == &event.account_identifier)
                         })
                         .collect();
                     Ok(filtered)
@@ -1403,9 +1415,8 @@ fn export_events(
     query: &HistoryQuery,
 ) -> Result<Vec<HistoryEventRow>, HistoryError> {
     let (where_sql, values) = build_where(query);
-    let sql = format!(
-        "{EVENT_SELECT}{where_sql} ORDER BY e.id DESC LIMIT {HISTORY_EXPORT_MAX_ROWS}"
-    );
+    let sql =
+        format!("{EVENT_SELECT}{where_sql} ORDER BY e.id DESC LIMIT {HISTORY_EXPORT_MAX_ROWS}");
     let mut statement = connection.prepare(&sql)?;
     let rows = statement.query_map(params_from_iter(values.iter()), read_event_row)?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -2008,10 +2019,10 @@ pub fn sha256(input: &[u8]) -> [u8; 32] {
         0x1f83d9ab,
         0x5be0cd19,
     ];
-    for chunk in message.chunks_exact(64) {
+    for chunk in message.as_chunks::<64>().0 {
         let mut words = [0_u32; 64];
-        for (index, bytes) in chunk.chunks_exact(4).enumerate() {
-            words[index] = u32::from_be_bytes(bytes.try_into().expect("four-byte chunk"));
+        for (word, bytes) in words.iter_mut().zip(chunk.as_chunks::<4>().0) {
+            *word = u32::from_be_bytes(*bytes);
         }
         for index in 16..64 {
             let s0 = words[index - 15].rotate_right(7)
@@ -2046,12 +2057,12 @@ pub fn sha256(input: &[u8]) -> [u8; 32] {
             b = a;
             a = temp1.wrapping_add(temp2);
         }
-        for (slot, value) in state.iter_mut().zip([a, b, c, d, e, f, g, h].into_iter()) {
+        for (slot, value) in state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
             *slot = slot.wrapping_add(value);
         }
     }
     let mut digest = [0_u8; 32];
-    for (chunk, value) in digest.chunks_exact_mut(4).zip(state) {
+    for (chunk, value) in digest.as_chunks_mut::<4>().0.iter_mut().zip(state) {
         chunk.copy_from_slice(&value.to_be_bytes());
     }
     digest
@@ -2284,11 +2295,22 @@ pub mod tests {
         // Given missing, reported-zero, and reported-positive usage.
         let path = TestPath::new("cache-presence");
         let history = ready(&path.0);
-        for (id, count, known) in [("missing", 0, false), ("zero", 0, true), ("positive", 17, true)] {
+        for (id, count, known) in [
+            ("missing", 0, false),
+            ("zero", 0, true),
+            ("positive", 17, true),
+        ] {
             let mut usage = event(EventFixture {
-                event_id: id, occurred_at_ms: 1, account: "a", provider: "p",
-                model: "m", key: "k", status_code: 200,
-                input_tokens: 30, output_tokens: 2, cached_input_tokens: count,
+                event_id: id,
+                occurred_at_ms: 1,
+                account: "a",
+                provider: "p",
+                model: "m",
+                key: "k",
+                status_code: 200,
+                input_tokens: 30,
+                output_tokens: 2,
+                cached_input_tokens: count,
             });
             usage.cached_input_tokens_known = known;
             usage.cache_write_tokens = count;
@@ -2296,15 +2318,28 @@ pub mod tests {
             history.insert(&usage).unwrap();
         }
         // When persisted rows and aggregates are read.
-        for (id, count, known) in [("missing", 0, false), ("zero", 0, true), ("positive", 17, true)] {
+        for (id, count, known) in [
+            ("missing", 0, false),
+            ("zero", 0, true),
+            ("positive", 17, true),
+        ] {
             let row = history.detail(id).unwrap().unwrap();
             // Then both cache dimensions preserve presence, including explicit zero.
-            assert_eq!((row.cached_input_tokens, row.cached_input_tokens_known), (count, known));
-            assert_eq!((row.cache_write_tokens, row.cache_write_tokens_known), (count, known));
+            assert_eq!(
+                (row.cached_input_tokens, row.cached_input_tokens_known),
+                (count, known)
+            );
+            assert_eq!(
+                (row.cache_write_tokens, row.cache_write_tokens_known),
+                (count, known)
+            );
         }
-        let result = history.query(&HistoryQuery {
-            group_by: vec![GroupDimension::Provider], ..HistoryQuery::default()
-        }).unwrap();
+        let result = history
+            .query(&HistoryQuery {
+                group_by: vec![GroupDimension::Provider],
+                ..HistoryQuery::default()
+            })
+            .unwrap();
         for totals in [&result.totals, &result.groups[0].totals] {
             assert_eq!(totals.cached_input_tokens, 17);
             assert_eq!(totals.cache_write_tokens, 17);
@@ -2885,9 +2920,13 @@ mod extended_tests {
         assert_eq!(all.len(), 1, "only the future-reset cap is listed");
         assert_eq!(all[0], live);
 
-        let scoped = history.cline_caps(&["cline-user-b@example".to_string()]).unwrap();
+        let scoped = history
+            .cline_caps(&["cline-user-b@example".to_string()])
+            .unwrap();
         assert_eq!(scoped.len(), 1);
-        let empty = history.cline_caps(&["cline-user-z@example".to_string()]).unwrap();
+        let empty = history
+            .cline_caps(&["cline-user-z@example".to_string()])
+            .unwrap();
         assert!(empty.is_empty());
     }
 

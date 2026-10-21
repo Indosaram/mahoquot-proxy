@@ -68,50 +68,48 @@ pub async fn apply_edit(
 ) -> Response {
     let state = Arc::clone(state);
     match tokio::task::spawn_blocking(move || {
-    let mut refusal = None;
-    let outcome = state.settings.mutate(|settings| {
-        let mut candidate = settings.clone();
-        if let Err(reason) = edit(&mut candidate) {
-            refusal = Some(reason);
-            return;
-        }
-        *settings = candidate;
-    });
-
-    if let Some(reason) = refusal {
-        return refusal_response(reason);
-    }
-    match outcome {
-        Ok(_) => {
-            match state.settings.current().routing.strategy.as_str() {
-                "fill-first" => {
-                    state.set_routing_strategy(mahoquot_types::Strategy::FillFirst);
-                }
-                "round-robin" => {
-                    state.set_routing_strategy(mahoquot_types::Strategy::StrictRoundRobin);
-                }
-                other => {
-                    if let Some(strat) = super::scalar_table::parse_routing_strategy(other) {
-                        state.set_routing_strategy(strat);
+        let outcome = match state.settings.try_mutate(edit) {
+            Ok(outcome) => outcome,
+            Err(reason) => return refusal_response(reason),
+        };
+        match outcome {
+            Ok(_) => {
+                match state.settings.current().routing.strategy.as_str() {
+                    "fill-first" => {
+                        state.set_routing_strategy(mahoquot_types::Strategy::FillFirst);
+                    }
+                    "round-robin" => {
+                        state.set_routing_strategy(mahoquot_types::Strategy::StrictRoundRobin);
+                    }
+                    other => {
+                        if let Some(strat) = super::scalar_table::parse_routing_strategy(other) {
+                            state.set_routing_strategy(strat);
+                        }
                     }
                 }
+                note_edit(&state, "config updated");
+                saved()
             }
-            note_edit(&state, "config updated");
-            saved()
+            Err(super::settings::SettingsError::Validation(err)) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": err.to_string() })),
+            )
+                .into_response(),
+            Err(super::settings::SettingsError::InvalidCatalogConfig(err)) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": err })),
+            )
+                .into_response(),
+            Err(super::settings::SettingsError::InvalidProxyUrl(err)) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": err })),
+            )
+                .into_response(),
+            Err(err) => persist_failed(err),
         }
-        Err(super::settings::SettingsError::Validation(err)) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": err.to_string() })),
-        )
-            .into_response(),
-        Err(super::settings::SettingsError::InvalidCatalogConfig(err)) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": err })),
-        )
-            .into_response(),
-        Err(err) => persist_failed(err),
-    }
-    }).await {
+    })
+    .await
+    {
         Ok(response) => response,
         Err(err) => persist_failed(err),
     }
@@ -147,7 +145,10 @@ async fn clear_scalar(
             "channel not found"
         }));
     }
-    apply_edit(&state, move |settings| clear(settings, params.get("provider").map(String::as_str))).await
+    apply_edit(&state, move |settings| {
+        clear(settings, params.get("provider").map(String::as_str))
+    })
+    .await
 }
 
 fn patch_channel(raw: bytes::Bytes) -> Response {
@@ -218,12 +219,14 @@ mod tests {
 
     #[test]
     fn codex_fast_mode_persists_under_its_config_key_and_defaults_off() {
-        let restored: Settings =
-            serde_yaml::from_str("port: 18801\n").expect("a config written before the switch existed");
+        let restored: Settings = serde_yaml::from_str("port: 18801\n")
+            .expect("a config written before the switch existed");
         assert!(!restored.codex_fast_mode);
 
-        let mut settings = Settings::default();
-        settings.codex_fast_mode = true;
+        let settings = Settings {
+            codex_fast_mode: true,
+            ..Settings::default()
+        };
         let yaml = serde_yaml::to_string(&settings).expect("serialize");
         assert!(yaml.contains("codex-fast-mode: true"), "{yaml}");
         assert!(
@@ -328,12 +331,27 @@ mod tests {
         use super::super::scalar_table::parse_routing_strategy;
         use mahoquot_types::Strategy;
 
-        assert_eq!(parse_routing_strategy("fill-first"), Some(Strategy::FillFirst));
-        assert_eq!(parse_routing_strategy("Fill-First"), Some(Strategy::FillFirst));
+        assert_eq!(
+            parse_routing_strategy("fill-first"),
+            Some(Strategy::FillFirst)
+        );
+        assert_eq!(
+            parse_routing_strategy("Fill-First"),
+            Some(Strategy::FillFirst)
+        );
         assert_eq!(parse_routing_strategy("ff"), Some(Strategy::FillFirst));
-        assert_eq!(parse_routing_strategy("round-robin"), Some(Strategy::StrictRoundRobin));
-        assert_eq!(parse_routing_strategy("rr"), Some(Strategy::StrictRoundRobin));
-        assert_eq!(parse_routing_strategy("RoundRobin"), Some(Strategy::StrictRoundRobin));
+        assert_eq!(
+            parse_routing_strategy("round-robin"),
+            Some(Strategy::StrictRoundRobin)
+        );
+        assert_eq!(
+            parse_routing_strategy("rr"),
+            Some(Strategy::StrictRoundRobin)
+        );
+        assert_eq!(
+            parse_routing_strategy("RoundRobin"),
+            Some(Strategy::StrictRoundRobin)
+        );
         assert_eq!(parse_routing_strategy(""), None);
         assert_eq!(parse_routing_strategy("   "), None);
         assert_eq!(parse_routing_strategy("nonsense"), None);
@@ -343,7 +361,8 @@ mod tests {
     fn app_state_initializes_strategy_from_settings() {
         use mahoquot_types::Strategy;
 
-        let dir = std::env::temp_dir().join(format!("test-state-init-routing-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("test-state-init-routing-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let config_path = dir.join("config.yaml");
 
@@ -367,7 +386,8 @@ mod tests {
     async fn write_scalar_updates_router_strategy() {
         use mahoquot_types::Strategy;
 
-        let dir = std::env::temp_dir().join(format!("test-scalar-routing-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("test-scalar-routing-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let config = crate::config::GatewayConfig {
             auth_dir: dir.clone(),
@@ -401,5 +421,27 @@ mod tests {
         assert_eq!(state.router.strategy(), Strategy::StrictRoundRobin);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn proxy_url_scalar_validates_and_refuses_invalid() {
+        let scalar = find("/proxy-url").expect("registered");
+        let mut settings = Settings::default();
+
+        // Valid loopback URL is accepted
+        assert!(
+            (scalar.write)(&mut settings, &json!({ "value": "http://127.0.0.1:8080" })).is_ok()
+        );
+        assert_eq!(settings.proxy_url, "http://127.0.0.1:8080");
+
+        // direct / none is accepted
+        assert!((scalar.write)(&mut settings, &json!({ "value": "direct" })).is_ok());
+        assert_eq!(settings.proxy_url, "direct");
+
+        // invalid URL is refused with Refusal::Message("invalid proxy url")
+        let err = (scalar.write)(&mut settings, &json!({ "value": "not-a-valid-url" }));
+        assert!(matches!(err, Err(Refusal::Message("invalid proxy url"))));
+        // Settings unchanged
+        assert_eq!(settings.proxy_url, "direct");
     }
 }

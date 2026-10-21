@@ -92,13 +92,9 @@ impl LruStore {
     }
 
     pub(crate) fn get(&mut self, key: &str, arguments: &str, now: Instant) -> Option<String> {
-        let (expired, matches) = match self.entries.get(key) {
-            Some(entry) => (
-                now.saturating_duration_since(entry.stored_at) > TTL,
-                entry.arguments == arguments,
-            ),
-            None => return None,
-        };
+        let entry = self.entries.get(key)?;
+        let expired = now.saturating_duration_since(entry.stored_at) > TTL;
+        let matches = entry.arguments == arguments;
         if expired {
             self.remove(key);
             return None;

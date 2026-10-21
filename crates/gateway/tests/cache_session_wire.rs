@@ -19,51 +19,99 @@ async fn gemini_session_survives_history_changes_without_forwarding_ingress_head
         headers: axum::http::HeaderMap,
         body: Bytes,
     ) -> impl axum::response::IntoResponse {
-        seen.lock().unwrap().push((headers, serde_json::from_slice(&body).unwrap()));
+        seen.lock()
+            .unwrap()
+            .push((headers, serde_json::from_slice(&body).unwrap()));
         let response = json!({"response": {
             "candidates": [{"content": {"role": "model", "parts": [{"text": "ok"}]}, "finishReason": "STOP"}],
             "usageMetadata": {"promptTokenCount": 12, "candidatesTokenCount": 1, "cachedContentTokenCount": 0}
         }});
-        ([("content-type", "text/event-stream")], format!("data: {response}\n\n"))
+        (
+            [("content-type", "text/event-stream")],
+            format!("data: {response}\n\n"),
+        )
     }
     let mut listener = None;
     for port in 18880..=18899 {
-        if let Ok(bound) = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await {
+        if let Ok(bound) =
+            tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await
+        {
             listener = Some(bound);
             break;
         }
     }
     let listener = listener.expect("an isolated test port in 18880-18899");
     let upstream = format!("http://{}", listener.local_addr().unwrap());
-    let server = tokio::spawn(axum::serve(listener, Router::new().fallback(post(capture)).with_state(seen.clone())).into_future());
+    let server = tokio::spawn(
+        axum::serve(
+            listener,
+            Router::new()
+                .fallback(post(capture))
+                .with_state(seen.clone()),
+        )
+        .into_future(),
+    );
     let auth = common::unique_temp_dir("cache-session-wire");
-    std::fs::write(auth.join("antigravity-fixture.json"), json!({
-        "type": "antigravity", "identity_slug": "cache-fixture", "email": "cache@example.test",
-        "access_token": "fixture", "refresh_token": "fixture", "project_id": "fixture-project",
-        "expired": "2099-01-01T00:00:00Z", "upstream_override": upstream
-    }).to_string()).unwrap();
+    std::fs::write(
+        auth.join("antigravity-fixture.json"),
+        json!({
+            "type": "antigravity", "identity_slug": "cache-fixture", "email": "cache@example.test",
+            "access_token": "fixture", "refresh_token": "fixture", "project_id": "fixture-project",
+            "expired": "2099-01-01T00:00:00Z", "upstream_override": upstream
+        })
+        .to_string(),
+    )
+    .unwrap();
     let config = GatewayConfig {
-        auth_dir: auth.clone(), config_path: auth.join("config.yaml"), auth_refresh_enabled: false,
+        auth_dir: auth.clone(),
+        config_path: auth.join("config.yaml"),
+        auth_refresh_enabled: false,
         api_keys: mahoquot_gateway::inbound::ApiKeys::from_env_value("fixture-key"),
         ..GatewayConfig::default()
     };
+    mahoquot_gateway::management::settings::Settings {
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: "fixture-key".to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(&config.config_path)
+    .expect("persist management settings");
     let state = Arc::new(AppState::new(&config).unwrap());
     let app = create_app(Arc::clone(&state));
 
     // When: history changes in one session, and another session uses the same history.
-    for (session, content) in [("session-a", "first"), ("session-a", "compacted"), ("session-b", "compacted")] {
-        let response = tokio::time::timeout(std::time::Duration::from_secs(5), app.clone().oneshot(
-            axum::http::Request::post("/v1/chat/completions")
-                .header("authorization", "Bearer fixture-key")
-                .header("content-type", "application/json")
-                .header("x-session-id", session)
-                .body(axum::body::Body::from(json!({
-                    "model": "gemini-3.8-flash-high", "stream": false,
-                    "messages": [{"role": "user", "content": content}]
-                }).to_string())).unwrap()
-        )).await.unwrap().unwrap();
+    for (session, content) in [
+        ("session-a", "first"),
+        ("session-a", "compacted"),
+        ("session-b", "compacted"),
+    ] {
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            app.clone().oneshot(
+                axum::http::Request::post("/v1/chat/completions")
+                    .header("authorization", "Bearer fixture-key")
+                    .header("content-type", "application/json")
+                    .header("x-session-id", session)
+                    .body(axum::body::Body::from(
+                        json!({
+                            "model": "gemini-3.8-flash-high", "stream": false,
+                            "messages": [{"role": "user", "content": content}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let status = response.status();
-        let body = axum::body::to_bytes(response.into_body(), 1_000_000).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 1_000_000)
+            .await
+            .unwrap();
         assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
     }
     server.abort();
@@ -72,11 +120,22 @@ async fn gemini_session_survives_history_changes_without_forwarding_ingress_head
     // Then: stable upstream identity is explicit; client routing headers stay local.
     let seen = seen.lock().unwrap();
     assert_eq!(seen.len(), 3);
-    let ids: Vec<_> = seen.iter().map(|(_, body)| body["request"]["sessionId"].as_str().expect("upstream session id")).collect();
+    let ids: Vec<_> = seen
+        .iter()
+        .map(|(_, body)| {
+            body["request"]["sessionId"]
+                .as_str()
+                .expect("upstream session id")
+        })
+        .collect();
     assert_eq!(ids[0], ids[1]);
     assert_ne!(ids[1], ids[2]);
-    assert!(ids.iter().all(|id| id.starts_with('-') && id[1..].parse::<u64>().is_ok()));
-    assert!(seen.iter().all(|(headers, _)| !headers.contains_key("x-session-id")));
+    assert!(ids
+        .iter()
+        .all(|id| id.starts_with('-') && id[1..].parse::<u64>().is_ok()));
+    assert!(seen
+        .iter()
+        .all(|(headers, _)| !headers.contains_key("x-session-id")));
 
     // And: every relayed row carries the same session label the upstream saw,
     // so history rows can be joined to signature-ledger entries on session.
@@ -128,7 +187,9 @@ async fn antigravity_replays_the_thought_signature_its_own_upstream_emitted() {
         State(seen): State<Arc<Mutex<Vec<Value>>>>,
         body: Bytes,
     ) -> impl axum::response::IntoResponse {
-        seen.lock().unwrap().push(serde_json::from_slice(&body).unwrap());
+        seen.lock()
+            .unwrap()
+            .push(serde_json::from_slice(&body).unwrap());
         let response = json!({"response": {
             "candidates": [{"content": {"role": "model", "parts": [{
                 "functionCall": {"id": "call_todo_1", "name": "todo", "args": {"x": 1}},
@@ -137,12 +198,17 @@ async fn antigravity_replays_the_thought_signature_its_own_upstream_emitted() {
             "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 1,
                               "cachedContentTokenCount": 0}
         }});
-        ([("content-type", "text/event-stream")], format!("data: {response}\n\n"))
+        (
+            [("content-type", "text/event-stream")],
+            format!("data: {response}\n\n"),
+        )
     }
 
     let mut listener = None;
     for port in 18880..=18899 {
-        if let Ok(bound) = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await {
+        if let Ok(bound) =
+            tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await
+        {
             listener = Some(bound);
             break;
         }
@@ -150,8 +216,13 @@ async fn antigravity_replays_the_thought_signature_its_own_upstream_emitted() {
     let listener = listener.expect("an isolated test port in 18880-18899");
     let upstream = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(
-        axum::serve(listener, Router::new().fallback(post(capture)).with_state(seen.clone()))
-            .into_future(),
+        axum::serve(
+            listener,
+            Router::new()
+                .fallback(post(capture))
+                .with_state(seen.clone()),
+        )
+        .into_future(),
     );
     let auth = common::unique_temp_dir("cache-signature-wire");
     std::fs::write(auth.join("antigravity-fixture.json"), json!({
@@ -160,10 +231,22 @@ async fn antigravity_replays_the_thought_signature_its_own_upstream_emitted() {
         "expired": "2099-01-01T00:00:00Z", "upstream_override": upstream
     }).to_string()).unwrap();
     let config = GatewayConfig {
-        auth_dir: auth.clone(), config_path: auth.join("config.yaml"), auth_refresh_enabled: false,
+        auth_dir: auth.clone(),
+        config_path: auth.join("config.yaml"),
+        auth_refresh_enabled: false,
         api_keys: mahoquot_gateway::inbound::ApiKeys::from_env_value("fixture-key"),
         ..GatewayConfig::default()
     };
+    mahoquot_gateway::management::settings::Settings {
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: "fixture-key".to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(&config.config_path)
+    .expect("persist management settings");
     let state = Arc::new(AppState::new(&config).unwrap());
     let app = create_app(Arc::clone(&state));
 
@@ -177,18 +260,24 @@ async fn antigravity_replays_the_thought_signature_its_own_upstream_emitted() {
                         .header("authorization", "Bearer fixture-key")
                         .header("content-type", "application/json")
                         .header("x-session-id", "session-a")
-                        .body(axum::body::Body::from(json!({
-                            "model": "gemini-3.8-flash-high",
-                            "stream": true,
-                            "messages": messages
-                        }).to_string())).unwrap(),
+                        .body(axum::body::Body::from(
+                            json!({
+                                "model": "gemini-3.8-flash-high",
+                                "stream": true,
+                                "messages": messages
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
                 ),
             )
             .await
             .unwrap()
             .unwrap();
             let status = response.status();
-            let body = axum::body::to_bytes(response.into_body(), 1_000_000).await.unwrap();
+            let body = axum::body::to_bytes(response.into_body(), 1_000_000)
+                .await
+                .unwrap();
             (status, String::from_utf8_lossy(&body).into_owned())
         }
     };
@@ -197,7 +286,10 @@ async fn antigravity_replays_the_thought_signature_its_own_upstream_emitted() {
     // then the client replays that call under the id it was handed.
     let (status, first) = send(json!([{"role": "user", "content": "todo please"}])).await;
     assert_eq!(status, 200, "{first}");
-    assert!(!first.contains(SIGNATURE), "the signature must not leak to the client: {first}");
+    assert!(
+        !first.contains(SIGNATURE),
+        "the signature must not leak to the client: {first}"
+    );
     let (status, second) = send(json!([
         {"role": "user", "content": "todo please"},
         {"role": "assistant", "content": null, "tool_calls": [{
@@ -205,7 +297,8 @@ async fn antigravity_replays_the_thought_signature_its_own_upstream_emitted() {
             "function": {"name": "todo", "arguments": "{\"x\":1}"}
         }]},
         {"role": "tool", "tool_call_id": "call_todo_1", "content": "{\"ok\":true}"}
-    ])).await;
+    ]))
+    .await;
     assert_eq!(status, 200, "{second}");
     server.abort();
     let _ = server.await;
@@ -235,21 +328,18 @@ async fn antigravity_replays_the_thought_signature_its_own_upstream_emitted() {
     };
     assert_eq!(captured_len, 2);
     assert_eq!(replayed_id, "call_todo_1");
-    assert_eq!(
-        replayed_signature, SIGNATURE,
-        "parts: {parts_debug:?}"
-    );
+    assert_eq!(replayed_signature, SIGNATURE, "parts: {parts_debug:?}");
 
     // And: the counters behind /admin/stats saw the replayed call as a ledger
     // hit and never needed the unsigned-sentinel fallback.
     let stats_response = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        app.clone().oneshot(
+        app.clone().oneshot(common::with_loopback_peer(
             axum::http::Request::get("/admin/stats")
-                .header("authorization", "Bearer fixture-key")
+                .header("X-Management-Key", "fixture-key")
                 .body(axum::body::Body::empty())
                 .unwrap(),
-        ),
+        )),
     )
     .await
     .unwrap()
@@ -281,18 +371,25 @@ async fn a_caller_without_a_session_header_keeps_one_stable_replay_scope() {
         State(seen): State<Arc<Mutex<Vec<Value>>>>,
         body: Bytes,
     ) -> impl axum::response::IntoResponse {
-        seen.lock().unwrap().push(serde_json::from_slice(&body).unwrap());
+        seen.lock()
+            .unwrap()
+            .push(serde_json::from_slice(&body).unwrap());
         let response = json!({"response": {
             "candidates": [{"content": {"role": "model", "parts": [{"text": "ok"}]},
                             "finishReason": "STOP"}],
             "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 1}
         }});
-        ([( "content-type", "text/event-stream")], format!("data: {response}\n\n"))
+        (
+            [("content-type", "text/event-stream")],
+            format!("data: {response}\n\n"),
+        )
     }
 
     let mut listener = None;
     for port in 18880..=18899 {
-        if let Ok(bound) = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await {
+        if let Ok(bound) =
+            tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await
+        {
             listener = Some(bound);
             break;
         }
@@ -300,8 +397,13 @@ async fn a_caller_without_a_session_header_keeps_one_stable_replay_scope() {
     let listener = listener.expect("an isolated test port in 18880-18899");
     let upstream = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(
-        axum::serve(listener, Router::new().fallback(post(capture)).with_state(seen.clone()))
-            .into_future(),
+        axum::serve(
+            listener,
+            Router::new()
+                .fallback(post(capture))
+                .with_state(seen.clone()),
+        )
+        .into_future(),
     );
     let auth = common::unique_temp_dir("cache-anchor-wire");
     std::fs::write(auth.join("antigravity-fixture.json"), json!({
@@ -310,7 +412,9 @@ async fn a_caller_without_a_session_header_keeps_one_stable_replay_scope() {
         "expired": "2099-01-01T00:00:00Z", "upstream_override": upstream
     }).to_string()).unwrap();
     let config = GatewayConfig {
-        auth_dir: auth.clone(), config_path: auth.join("config.yaml"), auth_refresh_enabled: false,
+        auth_dir: auth.clone(),
+        config_path: auth.join("config.yaml"),
+        auth_refresh_enabled: false,
         api_keys: mahoquot_gateway::inbound::ApiKeys::from_env_value("fixture-key"),
         ..GatewayConfig::default()
     };
@@ -324,21 +428,27 @@ async fn a_caller_without_a_session_header_keeps_one_stable_replay_scope() {
                 axum::http::Request::post("/v1/chat/completions")
                     .header("authorization", "Bearer fixture-key")
                     .header("content-type", "application/json")
-                    .body(axum::body::Body::from(json!({
-                        "model": "gemini-3.8-flash-high",
-                        "stream": false,
-                        "messages": [
-                            {"role": "user", "content": "anchor this conversation"},
-                            {"role": "assistant", "content": follow_up}
-                        ]
-                    }).to_string())).unwrap(),
+                    .body(axum::body::Body::from(
+                        json!({
+                            "model": "gemini-3.8-flash-high",
+                            "stream": false,
+                            "messages": [
+                                {"role": "user", "content": "anchor this conversation"},
+                                {"role": "assistant", "content": follow_up}
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
             ),
         )
         .await
         .unwrap()
         .unwrap();
         assert_eq!(response.status(), 200);
-        axum::body::to_bytes(response.into_body(), 1_000_000).await.unwrap();
+        axum::body::to_bytes(response.into_body(), 1_000_000)
+            .await
+            .unwrap();
     }
     server.abort();
     let _ = server.await;
@@ -351,12 +461,17 @@ async fn a_caller_without_a_session_header_keeps_one_stable_replay_scope() {
     assert_eq!(seen.len(), 2);
     let ids: Vec<_> = seen
         .iter()
-        .map(|body| body["request"]["sessionId"].as_str().expect("anchored session id"))
+        .map(|body| {
+            body["request"]["sessionId"]
+                .as_str()
+                .expect("anchored session id")
+        })
         .collect();
     assert_eq!(ids[0], ids[1], "the anchor must not move between turns");
     // The anchor text itself is never sent: the id is `-` + a numeric digest.
     assert!(
-        ids.iter().all(|id| id.starts_with('-') && id[1..].parse::<u64>().is_ok()),
+        ids.iter()
+            .all(|id| id.starts_with('-') && id[1..].parse::<u64>().is_ok()),
         "session ids must be digests: {ids:?}"
     );
 }

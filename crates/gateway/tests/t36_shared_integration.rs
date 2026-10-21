@@ -3,6 +3,8 @@
 //! (no sleeps, no polling) and makes no external network call — an empty pool
 //! answers inference requests without a single upstream attempt.
 
+mod common;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -86,7 +88,7 @@ fn state_with_two_credentials(dir: &TestDir) -> Arc<AppState> {
         claude_credential().to_string(),
     )
     .expect("seed claude");
-    Arc::new(AppState::new(&config_for(dir)).expect("state"))
+    Arc::new(AppState::new(&common::managed_ref(&config_for(dir))).expect("state"))
 }
 
 fn member_id_for_provider(state: &AppState, provider: &str) -> String {
@@ -126,7 +128,11 @@ fn seed_store_state(state: &AppState, id: &str) {
         .lock()
         .unwrap()
         .insert(id.to_string(), 4_200_000_000);
-    let key = mahoquot_gateway::devin_catalog::DevinCacheKey::new(id, "fixture-token", "http://127.0.0.1:18849");
+    let key = mahoquot_gateway::devin_catalog::DevinCacheKey::new(
+        id,
+        "fixture-token",
+        "http://127.0.0.1:18849",
+    );
     let catalog = mahoquot_gateway::devin_catalog::DevinAccountCatalogState::new_success(
         key.clone(),
         Vec::new(),
@@ -136,14 +142,14 @@ fn seed_store_state(state: &AppState, id: &str) {
 }
 
 async fn delete_credential(app: axum::Router, file_name: &str) -> StatusCode {
-    app.oneshot(
+    app.oneshot(common::with_loopback_peer(
         Request::builder()
             .method(Method::DELETE)
             .uri(format!("/v0/management/auth-files?name={file_name}"))
             .header(header::AUTHORIZATION, format!("Bearer {TEST_API_KEY}"))
             .body(Body::empty())
             .unwrap(),
-    )
+    ))
     .await
     .expect("delete request")
     .status()
@@ -234,7 +240,7 @@ async fn a_rescan_without_removal_keeps_every_store_intact() {
 #[tokio::test]
 async fn router_admission_rejects_unpolled_body_past_ceiling_and_releases_exactly_one_slot() {
     let dir = TestDir::new("gate");
-    let state = Arc::new(AppState::new(&config_for(&dir)).expect("state"));
+    let state = Arc::new(AppState::new(&common::managed_ref(&config_for(&dir))).expect("state"));
     let app = create_app(Arc::clone(&state));
     let gate = state.inference_gate();
     let ceiling = gate.available_permits();
@@ -249,7 +255,9 @@ async fn router_admission_rejects_unpolled_body_past_ceiling_and_releases_exactl
             .header(header::CONTENT_TYPE, "application/json")
             .body(body)
             .unwrap();
-        held.push(tokio::spawn(app.clone().oneshot(request)));
+        held.push(tokio::spawn(
+            app.clone().oneshot(common::with_loopback_peer(request)),
+        ));
     }
     for _ in 0..ceiling {
         tokio::time::timeout(Duration::from_secs(5), polled.acquire())
@@ -268,26 +276,42 @@ async fn router_admission_rejects_unpolled_body_past_ceiling_and_releases_exactl
         .header(header::CONTENT_TYPE, "application/json")
         .body(overflow_body)
         .unwrap();
-    let busy = app.clone().oneshot(overflow).await.expect("oneshot");
+    let busy = app
+        .clone()
+        .oneshot(common::with_loopback_peer(overflow))
+        .await
+        .expect("oneshot");
     assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
     let busy_body = body_json(busy).await;
     assert_eq!(busy_body["error"]["code"], "gateway_busy");
     assert_eq!(busy_body["error"]["retryable"], true);
-    assert_eq!(overflow_signal.available_permits(), 0, "rejected body was polled");
+    assert_eq!(
+        overflow_signal.available_permits(),
+        0,
+        "rejected body was polled"
+    );
 
-    let management = app.clone().oneshot(
-        Request::builder()
-            .method(Method::GET)
-            .uri("/v0/management/config")
-            .header(header::AUTHORIZATION, format!("Bearer {TEST_API_KEY}"))
-            .body(Body::empty())
-            .unwrap(),
-    ).await.expect("management request");
+    let management = app
+        .clone()
+        .oneshot(common::with_loopback_peer(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/v0/management/config")
+                .header(header::AUTHORIZATION, format!("Bearer {TEST_API_KEY}"))
+                .body(Body::empty())
+                .unwrap(),
+        ))
+        .await
+        .expect("management request");
     assert_eq!(management.status(), StatusCode::OK);
 
     held[0].abort();
     let _ = (&mut held[0]).await;
-    assert_eq!(gate.available_permits(), 1, "aborting one request releases one slot");
+    assert_eq!(
+        gate.available_permits(),
+        1,
+        "aborting one request releases one slot"
+    );
 
     let replacement_signal = Arc::new(tokio::sync::Semaphore::new(0));
     let body = pending_body(Arc::clone(&replacement_signal));
@@ -298,7 +322,7 @@ async fn router_admission_rejects_unpolled_body_past_ceiling_and_releases_exactl
         .header(header::CONTENT_TYPE, "application/json")
         .body(body)
         .unwrap();
-    let replacement = tokio::spawn(app.oneshot(request));
+    let replacement = tokio::spawn(app.oneshot(common::with_loopback_peer(request)));
     tokio::time::timeout(Duration::from_secs(5), replacement_signal.acquire())
         .await
         .expect("released slot admits replacement body")
@@ -320,10 +344,10 @@ async fn router_admission_rejects_unpolled_body_past_ceiling_and_releases_exactl
 async fn default_ceiling_admits_a_hundred_concurrent_inference_requests() {
     let dir = TestDir::new("burst");
     let state = Arc::new(
-        AppState::new(&GatewayConfig {
+        AppState::new(&common::managed_ref(&GatewayConfig {
             max_concurrent_inference: mahoquot_gateway::state::MAX_CONCURRENT_INFERENCE_REQUESTS,
             ..config_for(&dir)
-        })
+        }))
         .expect("state"),
     );
     let app = create_app(Arc::clone(&state));
@@ -345,16 +369,18 @@ async fn default_ceiling_admits_a_hundred_concurrent_inference_requests() {
             .header(header::CONTENT_TYPE, "application/json")
             .body(pending_body(Arc::clone(&polled)))
             .unwrap();
-        held.push(tokio::spawn(app.clone().oneshot(request)));
+        held.push(tokio::spawn(
+            app.clone().oneshot(common::with_loopback_peer(request)),
+        ));
     }
-    for admitted in 0..BURST {
+    for (admitted, held_task) in held.iter().enumerate() {
         tokio::time::timeout(Duration::from_secs(5), polled.acquire())
             .await
             .expect("every request inside the ceiling must reach body extraction")
             .unwrap()
             .forget();
         assert!(
-            !held[admitted].is_finished(),
+            !held_task.is_finished(),
             "request {admitted} answered early instead of being admitted"
         );
     }
@@ -368,11 +394,11 @@ async fn default_ceiling_admits_a_hundred_concurrent_inference_requests() {
 #[tokio::test]
 async fn declared_oversized_request_is_rejected_without_polling_body() {
     let dir = TestDir::new("oversized");
-    let state = Arc::new(AppState::new(&config_for(&dir)).expect("state"));
+    let state = Arc::new(AppState::new(&common::managed_ref(&config_for(&dir))).expect("state"));
     let polled = Arc::new(tokio::sync::Semaphore::new(0));
     let response = tokio::time::timeout(
         Duration::from_secs(5),
-        create_app(state).oneshot(
+        create_app(state).oneshot(common::with_loopback_peer(
             Request::builder()
                 .method(Method::POST)
                 .uri("/v1/chat/completions")
@@ -381,7 +407,7 @@ async fn declared_oversized_request_is_rejected_without_polling_body() {
                 .header(header::CONTENT_LENGTH, "536870913")
                 .body(pending_body(Arc::clone(&polled)))
                 .expect("request"),
-        ),
+        )),
     )
     .await
     .expect("declared size rejects before body extraction")
@@ -404,13 +430,11 @@ fn pending_body(polled: Arc<tokio::sync::Semaphore>) -> Body {
 #[tokio::test]
 async fn worker_shutdowns_join_instead_of_detaching() {
     let dir = TestDir::new("workers");
-    let state = Arc::new(AppState::new(&config_for(&dir)).expect("state"));
+    let state = Arc::new(AppState::new(&common::managed_ref(&config_for(&dir))).expect("state"));
     assert!(state.pool.load().members.is_empty());
 
-    let poller = mahoquot_gateway::quota::spawn_usage_poller(
-        Arc::clone(&state),
-        Duration::from_secs(3600),
-    );
+    let poller =
+        mahoquot_gateway::quota::spawn_usage_poller(Arc::clone(&state), Duration::from_secs(3600));
     let flush = state
         .telemetry
         .spawn_flush_worker(Duration::from_secs(3600));

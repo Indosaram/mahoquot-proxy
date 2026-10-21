@@ -326,7 +326,8 @@ impl KiroDecoder {
                 }
                 let name = &frame[cursor..cursor + name_len];
                 cursor += name_len + 1;
-                let len = u16::from_be_bytes(frame[cursor..cursor + 2].try_into().unwrap()) as usize;
+                let len =
+                    u16::from_be_bytes(frame[cursor..cursor + 2].try_into().unwrap()) as usize;
                 cursor += 2;
                 if cursor + len > header_end {
                     self.fail("Invalid Kiro event-stream headers".to_string(), out);
@@ -390,7 +391,10 @@ impl KiroDecoder {
                 return;
             };
             if value.get("__type").is_some() || value.get("error").is_some() {
-                self.fail(kiro_error_message(&value).unwrap_or_else(|| "Kiro upstream error".to_string()), out);
+                self.fail(
+                    kiro_error_message(&value).unwrap_or_else(|| "Kiro upstream error".to_string()),
+                    out,
+                );
                 return;
             } else if let Some(content) = value.get("content").and_then(Value::as_str) {
                 out.push(CodexEvent::TextDelta(content.to_string()));
@@ -452,12 +456,17 @@ impl KiroDecoder {
 }
 
 fn kiro_error_message(value: &Value) -> Option<String> {
-    [value.get("message"), value.get("Message"), value.pointer("/error/message"),
-        value.get("__type"), value.get("error")]
-        .into_iter()
-        .flatten()
-        .find_map(Value::as_str)
-        .map(str::to_string)
+    [
+        value.get("message"),
+        value.get("Message"),
+        value.pointer("/error/message"),
+        value.get("__type"),
+        value.get("error"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(Value::as_str)
+    .map(str::to_string)
 }
 
 fn next_json_object(input: &str) -> Option<(usize, usize)> {
@@ -511,7 +520,9 @@ mod tests {
         headers.push(7);
         headers.extend_from_slice(&(message_type.len() as u16).to_be_bytes());
         headers.extend_from_slice(message_type.as_bytes());
-        let mut frame = ((16 + headers.len() + payload.len()) as u32).to_be_bytes().to_vec();
+        let mut frame = ((16 + headers.len() + payload.len()) as u32)
+            .to_be_bytes()
+            .to_vec();
         frame.extend_from_slice(&(headers.len() as u32).to_be_bytes());
         frame.extend_from_slice(&crc(&frame).to_be_bytes());
         frame.extend(headers);
@@ -540,7 +551,7 @@ mod tests {
     #[test]
     fn kiro_decoder_fails_when_the_json_buffer_exceeds_the_cap() {
         let mut payload = br#"{"content":""#.to_vec();
-        payload.extend(std::iter::repeat(b'a').take(MAX_KIRO_JSON_BUFFER_BYTES + 1));
+        payload.extend(std::iter::repeat_n(b'a', MAX_KIRO_JSON_BUFFER_BYTES + 1));
         assert!(payload.len() > MAX_KIRO_JSON_BUFFER_BYTES);
 
         let mut decoder = KiroDecoder::new();
@@ -575,7 +586,10 @@ mod tests {
     #[test]
     fn clean_aws_eof_completes_without_stop_reason_at_every_split() {
         let mut wire = aws_frame("event", br#"{"content":"hello"}"#);
-        wire.extend(aws_frame("event", br#"{"name":"lookup","toolUseId":"clean-eof","input":"{}"}"#));
+        wire.extend(aws_frame(
+            "event",
+            br#"{"name":"lookup","toolUseId":"clean-eof","input":"{}"}"#,
+        ));
         for split in 0..=wire.len() {
             let mut decoder = KiroDecoder::new();
             let mut events = Vec::new();
@@ -585,26 +599,49 @@ mod tests {
             decoder.finish(&mut events);
             assert_eq!(events.first(), Some(&CodexEvent::TextDelta("hello".into())));
             assert_eq!(events.last(), Some(&CodexEvent::Completed { usage: None }));
-            assert_eq!(events.iter().filter(|event| matches!(event, CodexEvent::Completed { .. })).count(), 1);
-            assert!(!events.iter().any(|event| matches!(event, CodexEvent::Failed { .. })));
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, CodexEvent::Completed { .. }))
+                    .count(),
+                1
+            );
+            assert!(!events
+                .iter()
+                .any(|event| matches!(event, CodexEvent::Failed { .. })));
         }
     }
 
     #[test]
     fn error_payload_emits_failed_event_and_prevents_completed() {
         for (payload, expected) in [
-            (r#"{"__type":"ValidationException","message":"Token limit exceeded"}"#, "Token limit exceeded"),
-            (r#"{"error":"AccessDeniedException","Message":"Denied"}"#, "Denied"),
+            (
+                r#"{"__type":"ValidationException","message":"Token limit exceeded"}"#,
+                "Token limit exceeded",
+            ),
+            (
+                r#"{"error":"AccessDeniedException","Message":"Denied"}"#,
+                "Denied",
+            ),
             (r#"{"error":{"message":"Nested denial"}}"#, "Nested denial"),
             (r#"{"__type":"ValidationException"}"#, "ValidationException"),
-            (r#"{"error":"AccessDeniedException"}"#, "AccessDeniedException"),
+            (
+                r#"{"error":"AccessDeniedException"}"#,
+                "AccessDeniedException",
+            ),
         ] {
             let mut decoder = KiroDecoder::new();
             let mut events = Vec::new();
             decoder.decode(payload.as_bytes(), &mut events);
-            decoder.decode(br#"{"stopReason":"end_turn"}{"content":"late"}"#, &mut events);
+            decoder.decode(
+                br#"{"stopReason":"end_turn"}{"content":"late"}"#,
+                &mut events,
+            );
             decoder.finish(&mut events);
-            assert!(matches!(events.as_slice(), [CodexEvent::Failed { message }] if message == expected), "{payload}: {events:?}");
+            assert!(
+                matches!(events.as_slice(), [CodexEvent::Failed { message }] if message == expected),
+                "{payload}: {events:?}"
+            );
         }
     }
 
@@ -621,15 +658,25 @@ mod tests {
                 decoder.decode(&wire[..split], &mut events);
                 decoder.decode(&wire[split..], &mut events);
                 decoder.finish(&mut events);
-                assert!(matches!(events.as_slice(), [CodexEvent::TextDelta(text), CodexEvent::Failed { message }] if text == "committed" && message == "Denied"), "{message_type} split {split}: {events:?}");
-                let mut renderer = super::super::render::ChunkRenderer::new("kiro/test".to_string(), 0, false);
-                let frames: Vec<_> = events.into_iter().flat_map(|event| renderer.render(event)).collect();
-                let payloads: Vec<Value> = frames.iter()
+                assert!(
+                    matches!(events.as_slice(), [CodexEvent::TextDelta(text), CodexEvent::Failed { message }] if text == "committed" && message == "Denied"),
+                    "{message_type} split {split}: {events:?}"
+                );
+                let mut renderer =
+                    super::super::render::ChunkRenderer::new("kiro/test".to_string(), 0, false);
+                let frames: Vec<_> = events
+                    .into_iter()
+                    .flat_map(|event| renderer.render(event))
+                    .collect();
+                let payloads: Vec<Value> = frames
+                    .iter()
                     .filter(|frame| frame.as_ref() != super::super::render::DONE_FRAME)
                     .map(|frame| serde_json::from_slice(&frame[6..frame.len() - 2]).unwrap())
                     .collect();
                 assert_eq!(payloads.last().unwrap()["error"]["message"], "Denied");
-                assert!(payloads.iter().all(|payload| payload["choices"][0]["finish_reason"].is_null()));
+                assert!(payloads
+                    .iter()
+                    .all(|payload| payload["choices"][0]["finish_reason"].is_null()));
                 assert!(renderer.terminated());
                 assert!(renderer.close_unterminated().is_empty());
             }
@@ -641,14 +688,18 @@ mod tests {
         let wire = [
             aws_frame("event", br#"{"message":"metadata"}"#),
             aws_frame("event", br#"{"content":"hello {world}"}"#),
-        ].concat();
+        ]
+        .concat();
         for split in 0..=wire.len() {
             let mut decoder = KiroDecoder::new();
             let mut events = Vec::new();
             decoder.decode(&wire[..split], &mut events);
             decoder.decode(&wire[split..], &mut events);
             decoder.finish(&mut events);
-            assert!(matches!(events.as_slice(), [CodexEvent::TextDelta(text), CodexEvent::Completed { .. }] if text == "hello {world}"), "split {split}: {events:?}");
+            assert!(
+                matches!(events.as_slice(), [CodexEvent::TextDelta(text), CodexEvent::Completed { .. }] if text == "hello {world}"),
+                "split {split}: {events:?}"
+            );
         }
     }
 
@@ -659,7 +710,10 @@ mod tests {
         let mut events = Vec::new();
         decoder.decode(&wire[..wire.len() - 1], &mut events);
         decoder.finish(&mut events);
-        assert!(matches!(events.as_slice(), [CodexEvent::Failed { .. }]), "{events:?}");
+        assert!(
+            matches!(events.as_slice(), [CodexEvent::Failed { .. }]),
+            "{events:?}"
+        );
     }
 
     #[test]
@@ -675,7 +729,11 @@ mod tests {
             .chain(br#""}"#.iter().copied())
             .collect();
         // Split inside the first multi-byte character.
-        let split = full.iter().position(|b| *b == 0xe3).expect("multibyte start") + 1;
+        let split = full
+            .iter()
+            .position(|b| *b == 0xe3)
+            .expect("multibyte start")
+            + 1;
         let mut decoder = KiroDecoder::new();
         let mut out = Vec::new();
         decoder.decode(&full[..split], &mut out);

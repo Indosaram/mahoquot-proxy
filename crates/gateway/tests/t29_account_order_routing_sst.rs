@@ -7,6 +7,8 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
 use axum::Router;
 use common::{create_auth_file_json, unique_temp_dir};
+
+const MGMT_SECRET: &str = "t29-management-secret";
 use mahoquot_gateway::config::GatewayConfig;
 use mahoquot_gateway::inbound::ApiKeys;
 use mahoquot_gateway::routes::create_app;
@@ -36,7 +38,12 @@ async fn test_fill_first_routing_follows_accounts_view_order_sst() {
         }),
     );
     tokio::spawn(async move {
-        axum::serve(listener_a, app_a).await.unwrap();
+        axum::serve(
+            listener_a,
+            (app_a).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
 
     let count_b_clone = call_count_b.clone();
@@ -57,7 +64,12 @@ async fn test_fill_first_routing_follows_accounts_view_order_sst() {
         }),
     );
     tokio::spawn(async move {
-        axum::serve(listener_b, app_b).await.unwrap();
+        axum::serve(
+            listener_b,
+            (app_b).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
 
     let temp_dir = unique_temp_dir("qgw-test-t29-sst");
@@ -100,12 +112,19 @@ async fn test_fill_first_routing_follows_accounts_view_order_sst() {
         ..Default::default()
     };
 
+    // Task 26: management routes need a configured dedicated secret.
+    common::configure_management_secret(&config.config_path, MGMT_SECRET);
     let state = Arc::new(AppState::new(&config).unwrap());
     let app = create_app(state.clone());
     let gw_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let gw_port = gw_listener.local_addr().unwrap().port();
     tokio::spawn(async move {
-        axum::serve(gw_listener, app).await.unwrap();
+        axum::serve(
+            gw_listener,
+            (app).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
 
     let client = reqwest::Client::new();
@@ -125,6 +144,7 @@ async fn test_fill_first_routing_follows_accounts_view_order_sst() {
 
     let reorder_res = client
         .put(&management_order_url)
+        .header("X-Management-Key", MGMT_SECRET)
         .header("Content-Type", "application/json")
         .json(&serde_json::json!({
             "names": [file_b, file_a]
@@ -201,7 +221,12 @@ async fn test_fill_first_cross_provider_account_order_sst() {
             }
         }));
     tokio::spawn(async move {
-        axum::serve(listener_cline, app_cline).await.unwrap();
+        axum::serve(
+            listener_cline,
+            (app_cline).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
 
     let count_ag_clone = call_count_antigravity.clone();
@@ -237,7 +262,12 @@ async fn test_fill_first_cross_provider_account_order_sst() {
             }
         }));
     tokio::spawn(async move {
-        axum::serve(listener_ag, app_ag).await.unwrap();
+        axum::serve(
+            listener_ag,
+            (app_ag).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
 
     let temp_dir = unique_temp_dir("qgw-test-t29-cross-provider");
@@ -285,12 +315,19 @@ async fn test_fill_first_cross_provider_account_order_sst() {
         ..Default::default()
     };
 
+    // Task 26: management routes need a configured dedicated secret.
+    common::configure_management_secret(&config.config_path, MGMT_SECRET);
     let state = Arc::new(AppState::new(&config).unwrap());
     let app = create_app(state.clone());
     let gw_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let gw_port = gw_listener.local_addr().unwrap().port();
     tokio::spawn(async move {
-        axum::serve(gw_listener, app).await.unwrap();
+        axum::serve(
+            gw_listener,
+            (app).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
 
     let client = reqwest::Client::new();
@@ -299,6 +336,7 @@ async fn test_fill_first_cross_provider_account_order_sst() {
 
     let reorder_res = client
         .put(&management_order_url)
+        .header("X-Management-Key", MGMT_SECRET)
         .header("Content-Type", "application/json")
         .json(&serde_json::json!({
             "names": [file_cline, file_antigravity]
@@ -330,6 +368,7 @@ async fn test_fill_first_cross_provider_account_order_sst() {
 
     let reorder_res2 = client
         .put(&management_order_url)
+        .header("X-Management-Key", MGMT_SECRET)
         .header("Content-Type", "application/json")
         .json(&serde_json::json!({
             "names": [file_antigravity, file_cline]
@@ -391,7 +430,12 @@ async fn test_runtime_strategy_switch_sst() {
             }
         }));
     tokio::spawn(async move {
-        axum::serve(listener_a, app_a).await.unwrap();
+        axum::serve(
+            listener_a,
+            (app_a).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
 
     let count_b_clone = call_count_b.clone();
@@ -427,7 +471,12 @@ async fn test_runtime_strategy_switch_sst() {
             }
         }));
     tokio::spawn(async move {
-        axum::serve(listener_b, app_b).await.unwrap();
+        axum::serve(
+            listener_b,
+            (app_b).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
 
     let temp_dir = unique_temp_dir("qgw-test-t29-switch");
@@ -475,12 +524,19 @@ async fn test_runtime_strategy_switch_sst() {
         ..Default::default()
     };
 
+    // Task 26: management routes need a configured dedicated secret.
+    common::configure_management_secret(&config.config_path, MGMT_SECRET);
     let state = Arc::new(AppState::new(&config).unwrap());
     let app = create_app(state.clone());
     let gw_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let gw_port = gw_listener.local_addr().unwrap().port();
     tokio::spawn(async move {
-        axum::serve(gw_listener, app).await.unwrap();
+        axum::serve(
+            gw_listener,
+            (app).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
 
     let client = reqwest::Client::new();
@@ -491,6 +547,7 @@ async fn test_runtime_strategy_switch_sst() {
 
     let order_res = client
         .put(&management_order_url)
+        .header("X-Management-Key", MGMT_SECRET)
         .header("Content-Type", "application/json")
         .json(&serde_json::json!({
             "names": [file_a, file_b]
@@ -531,6 +588,7 @@ async fn test_runtime_strategy_switch_sst() {
 
     let switch_res = client
         .put(&management_strategy_url)
+        .header("X-Management-Key", MGMT_SECRET)
         .header("Content-Type", "application/json")
         .json(&serde_json::json!({
             "value": "fill-first"

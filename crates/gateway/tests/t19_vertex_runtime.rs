@@ -126,7 +126,12 @@ async fn test_vertex_runtime_lifecycle_wire_and_refresh() {
     let token_addr = token_listener.local_addr().unwrap();
     let token_uri = format!("http://{token_addr}/token");
     let token_task = tokio::spawn(async move {
-        axum::serve(token_listener, token_app).await.unwrap();
+        axum::serve(
+            token_listener,
+            (token_app).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
 
     // 2. Start mock Vertex Upstream server
@@ -141,7 +146,12 @@ async fn test_vertex_runtime_lifecycle_wire_and_refresh() {
     let vertex_addr = vertex_listener.local_addr().unwrap();
     let vertex_upstream_url = format!("http://{vertex_addr}");
     let vertex_task = tokio::spawn(async move {
-        axum::serve(vertex_listener, vertex_app).await.unwrap();
+        axum::serve(
+            vertex_listener,
+            (vertex_app).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
 
     // 3. Create Gateway App
@@ -156,13 +166,18 @@ async fn test_vertex_runtime_lifecycle_wire_and_refresh() {
         config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
-    let state = Arc::new(AppState::new(&config).unwrap());
+    let state = Arc::new(AppState::new(&common::managed_ref(&config)).unwrap());
     let gateway_app = create_app(state.clone());
     let gw_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let gw_addr = gw_listener.local_addr().unwrap();
     let gw_url = format!("http://{gw_addr}");
     let gw_task = tokio::spawn(async move {
-        axum::serve(gw_listener, gateway_app).await.unwrap();
+        axum::serve(
+            gw_listener,
+            (gateway_app).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
 
     let client = reqwest::Client::new();

@@ -1,5 +1,5 @@
 {
-  "version": 5,
+  "version": 6,
   "source": "embedded_fallback",
   "models": {
     "claude-3-5-sonnet-20241022": {
@@ -61,7 +61,8 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "200000"
+        "context_limit": "200000",
+        "thinking.claude": "{\"min\":1024,\"max\":128000}"
       }
     },
     "claude-fable-5": {
@@ -92,7 +93,8 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "1000000"
+        "context_limit": "1000000",
+        "thinking.claude": "{\"min\":1024,\"max\":128000,\"zero_allowed\":true,\"levels\":[\"low\",\"medium\",\"high\",\"xhigh\",\"max\"]}"
       }
     },
     "claude-fable-5-1": {
@@ -123,7 +125,8 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "1000000"
+        "context_limit": "1000000",
+        "thinking.claude": "{\"min\":1024,\"max\":128000,\"zero_allowed\":true,\"levels\":[\"low\",\"medium\",\"high\",\"xhigh\",\"max\"]}"
       }
     },
     "claude-haiku-4-5": {
@@ -185,7 +188,8 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "200000"
+        "context_limit": "200000",
+        "thinking.claude": "{\"min\":1024,\"max\":128000,\"zero_allowed\":true}"
       }
     },
     "claude-haiku-5-5": {
@@ -278,7 +282,8 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "200000"
+        "context_limit": "200000",
+        "thinking.claude": "{\"min\":1024,\"max\":128000,\"zero_allowed\":true}"
       }
     },
     "claude-opus-4-5-20251101-thinking": {
@@ -340,7 +345,8 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "1000000"
+        "context_limit": "1000000",
+        "thinking.claude": "{\"min\":1024,\"max\":128000,\"zero_allowed\":true,\"levels\":[\"low\",\"medium\",\"high\",\"max\"]}"
       }
     },
     "claude-opus-4-6-thinking": {
@@ -371,7 +377,8 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "250000"
+        "context_limit": "250000",
+        "thinking.antigravity": "{\"min\":1024,\"max\":64000,\"zero_allowed\":true,\"dynamic_allowed\":true}"
       }
     },
     "claude-opus-4-7": {
@@ -402,7 +409,8 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "1000000"
+        "context_limit": "1000000",
+        "thinking.claude": "{\"min\":1024,\"max\":128000,\"zero_allowed\":true,\"levels\":[\"low\",\"medium\",\"high\",\"xhigh\",\"max\"]}"
       }
     },
     "claude-opus-4-8": {
@@ -433,7 +441,8 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "1000000"
+        "context_limit": "1000000",
+        "thinking.claude": "{\"min\":1024,\"max\":128000,\"zero_allowed\":true,\"levels\":[\"low\",\"medium\",\"high\",\"xhigh\",\"max\"]}"
       }
     },
     "claude-opus-5": {
@@ -464,7 +473,8 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "1000000"
+        "context_limit": "1000000",
+        "thinking.claude": "{\"zero_allowed\":true,\"dynamic_allowed\":true,\"levels\":[\"low\",\"medium\",\"high\",\"xhigh\",\"max\"]}"
       }
     },
     "claude-opus-5-5": {
@@ -495,7 +505,8 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "1000000"
+        "context_limit": "1000000",
+        "thinking.claude": "{\"zero_allowed\":true,\"dynamic_allowed\":true,\"levels\":[\"low\",\"medium\",\"high\",\"xhigh\",\"max\"]}"
       }
     },
     "claude-sonnet-4-5": {
@@ -557,7 +568,8 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "1000000"
+        "context_limit": "1000000",
+        "thinking.claude": "{\"min\":1024,\"max\":128000,\"zero_allowed\":true}"
       }
     },
     "claude-sonnet-4-5-20250929-thinking": {
@@ -636,7 +648,9 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "1000000"
+        "context_limit": "1000000",
+        "thinking.antigravity": "{\"min\":1024,\"max\":64000,\"zero_allowed\":true,\"dynamic_allowed\":true}",
+        "thinking.claude": "{\"min\":1024,\"max\":128000,\"zero_allowed\":true,\"levels\":[\"low\",\"medium\",\"high\",\"max\"]}"
       }
     },
     "claude-sonnet-5": {
@@ -667,7 +681,8 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "1000000"
+        "context_limit": "1000000",
+        "thinking.claude": "{\"zero_allowed\":true,\"dynamic_allowed\":true,\"levels\":[\"low\",\"medium\",\"high\",\"xhigh\",\"max\"]}"
       }
     },
     "claude-sonnet-5-5": {
@@ -698,7 +713,8 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "1000000"
+        "context_limit": "1000000",
+        "thinking.claude": "{\"zero_allowed\":true,\"dynamic_allowed\":true,\"levels\":[\"low\",\"medium\",\"high\",\"xhigh\",\"max\"]}"
       }
     },
     "cline-free/gemini-3.8-flash": {
@@ -1317,7 +1333,8 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "1048576"
+        "context_limit": "1048576",
+        "thinking.vertex": "{\"max\":24576,\"zero_allowed\":true,\"dynamic_allowed\":true}"
       }
     },
     "gemini-2.5-pro": {
@@ -1348,7 +1365,8 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "1048576"
+        "context_limit": "1048576",
+        "thinking.vertex": "{\"min\":128,\"max\":32768,\"dynamic_allowed\":true}"
       }
     },
     "gemini-3-flash": {
@@ -1396,7 +1414,9 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "1048576"
+        "context_limit": "1048576",
+        "thinking.antigravity": "{\"min\":128,\"max\":32768,\"dynamic_allowed\":true,\"levels\":[\"minimal\",\"low\",\"medium\",\"high\"]}",
+        "thinking.vertex": "{\"min\":128,\"max\":32768,\"dynamic_allowed\":true,\"levels\":[\"minimal\",\"low\",\"medium\",\"high\"]}"
       }
     },
     "gemini-3-flash-agent": {
@@ -1489,7 +1509,8 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "1048576"
+        "context_limit": "1048576",
+        "thinking.vertex": "{\"min\":128,\"max\":32768,\"dynamic_allowed\":true,\"levels\":[\"low\",\"high\"]}"
       }
     },
     "gemini-3.1-flash-image": {
@@ -1522,7 +1543,8 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "1048576"
+        "context_limit": "1048576",
+        "thinking.antigravity": "{\"min\":128,\"max\":32768,\"dynamic_allowed\":true,\"levels\":[\"minimal\",\"high\"]}"
       }
     },
     "gemini-3.1-flash-lite": {
@@ -1570,7 +1592,9 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "1048576"
+        "context_limit": "1048576",
+        "thinking.antigravity": "{\"min\":1,\"max\":65535,\"zero_allowed\":true,\"dynamic_allowed\":true,\"levels\":[\"minimal\",\"low\",\"medium\",\"high\"]}",
+        "thinking.vertex": "{\"min\":128,\"max\":32768,\"dynamic_allowed\":true,\"levels\":[\"minimal\",\"low\",\"medium\",\"high\"]}"
       }
     },
     "gemini-3.1-pro-low": {
@@ -1601,7 +1625,8 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "1048576"
+        "context_limit": "1048576",
+        "thinking.antigravity": "{\"min\":1,\"max\":65535,\"dynamic_allowed\":true,\"levels\":[\"low\",\"medium\",\"high\"]}"
       }
     },
     "gemini-3.1-pro-preview": {
@@ -1632,7 +1657,8 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "1048576"
+        "context_limit": "1048576",
+        "thinking.vertex": "{\"min\":128,\"max\":32768,\"dynamic_allowed\":true,\"levels\":[\"low\",\"medium\",\"high\"]}"
       }
     },
     "gemini-3.5-flash": {
@@ -1663,7 +1689,8 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "1048576"
+        "context_limit": "1048576",
+        "thinking.vertex": "{\"min\":128,\"max\":32768,\"dynamic_allowed\":true,\"levels\":[\"minimal\",\"low\",\"medium\",\"high\"]}"
       }
     },
     "gemini-3.5-flash-extra-low": {
@@ -1756,7 +1783,8 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "1048576"
+        "context_limit": "1048576",
+        "thinking.vertex": "{\"min\":128,\"max\":32768,\"dynamic_allowed\":true,\"levels\":[\"minimal\",\"low\",\"medium\",\"high\"]}"
       }
     },
     "gemini-3.6-flash-high": {
@@ -1787,7 +1815,8 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "1048576"
+        "context_limit": "1048576",
+        "thinking.antigravity": "{\"min\":1,\"max\":65535,\"dynamic_allowed\":true,\"levels\":[\"minimal\",\"low\",\"medium\",\"high\"]}"
       }
     },
     "gemini-3.7-flash": {
@@ -1818,7 +1847,8 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "1048576"
+        "context_limit": "1048576",
+        "thinking.vertex": "{\"min\":128,\"max\":65535,\"dynamic_allowed\":true,\"levels\":[\"low\",\"medium\",\"high\"]}"
       }
     },
     "gemini-3.7-flash-high": {
@@ -1849,7 +1879,8 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "1048576"
+        "context_limit": "1048576",
+        "thinking.antigravity": "{\"min\":1,\"max\":65535,\"dynamic_allowed\":true,\"levels\":[\"low\",\"medium\",\"high\"]}"
       }
     },
     "gemini-3.7-flash-thinking": {
@@ -1911,7 +1942,8 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "1048576"
+        "context_limit": "1048576",
+        "thinking.antigravity": "{\"min\":1,\"max\":65535,\"dynamic_allowed\":true,\"levels\":[\"low\",\"medium\",\"high\"]}"
       }
     },
     "gemini-pro-agent": {
@@ -1942,7 +1974,8 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "1048576"
+        "context_limit": "1048576",
+        "thinking.antigravity": "{\"min\":1,\"max\":65535,\"dynamic_allowed\":true,\"levels\":[\"low\",\"medium\",\"high\"]}"
       }
     },
     "glm-4.6": {
@@ -2726,7 +2759,8 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "131072"
+        "context_limit": "131072",
+        "thinking.antigravity": "null"
       }
     },
     "grok-4.5": {
@@ -2898,7 +2932,8 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "262144"
+        "context_limit": "262144",
+        "thinking.kimi": "{\"zero_allowed\":true,\"levels\":[\"low\",\"high\"]}"
       }
     },
     "kimi-k2.6": {
@@ -2946,7 +2981,8 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "262144"
+        "context_limit": "262144",
+        "thinking.kimi": "{\"zero_allowed\":true,\"levels\":[\"low\",\"high\"]}"
       }
     },
     "kimi-k2.7-code": {
@@ -2994,7 +3030,8 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "262144"
+        "context_limit": "262144",
+        "thinking.kimi": "{\"zero_allowed\":false,\"levels\":[\"low\",\"high\"]}"
       }
     },
     "kiro/auto": {

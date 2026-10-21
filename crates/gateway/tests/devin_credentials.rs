@@ -2,7 +2,7 @@ mod common;
 
 use axum::body::Body;
 use axum::http::{header, Method, Request, StatusCode};
-use common::unique_temp_dir;
+use common::{unique_temp_dir, with_loopback_peer};
 use http_body_util::BodyExt;
 use mahoquot_gateway::account::{AccountMember, ProviderAccount, ProviderKind};
 use mahoquot_gateway::config::GatewayConfig;
@@ -26,6 +26,8 @@ async fn body_json(response: axum::response::Response) -> Value {
 }
 
 fn test_gateway_config(auth_dir: &std::path::Path) -> GatewayConfig {
+    // Task 26: the management routes need a configured dedicated secret.
+    common::configure_management_secret(&auth_dir.join("config.yaml"), MASTER_KEY);
     GatewayConfig {
         port: 0,
         auth_dir: auth_dir.to_path_buf(),
@@ -56,6 +58,17 @@ struct TestContext {
 async fn create_test_context(label: &str) -> TestContext {
     let auth_dir = unique_temp_dir(label);
     let config = test_gateway_config(&auth_dir);
+    mahoquot_gateway::management::settings::Settings {
+        api_keys: vec![MASTER_KEY.to_string()],
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: MASTER_KEY.to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(&config.config_path)
+    .expect("persist management test settings");
     let state = Arc::new(AppState::new(&config).expect("create app state"));
     let app = create_app(Arc::clone(&state));
     TestContext {
@@ -85,7 +98,12 @@ async fn send_management_request(
     };
 
     app.clone()
-        .oneshot(req_builder.body(req_body).unwrap())
+        .oneshot(with_loopback_peer(
+            req_builder
+                .header("X-Management-Key", MASTER_KEY)
+                .body(req_body)
+                .unwrap(),
+        ))
         .await
         .unwrap()
 }

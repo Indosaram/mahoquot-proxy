@@ -769,7 +769,7 @@ pub fn pick_desktop_api_key(config: &Value) -> Option<String> {
             is_provisioned_api_key(key).then(|| (name.contains("coding"), key.to_string()))
         })
         .collect();
-    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.0));
     candidates.into_iter().next().map(|(_, key)| key)
 }
 

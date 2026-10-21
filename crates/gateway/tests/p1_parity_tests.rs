@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
-use common::unique_temp_dir;
+use common::{unique_temp_dir, with_loopback_peer};
 use mahoquot_gateway::config::GatewayConfig;
 use mahoquot_gateway::inbound::ApiKeys;
 use mahoquot_gateway::routes::create_app;
@@ -21,6 +21,17 @@ fn setup_app(auth_dir: &std::path::Path) -> axum::Router {
         config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
+    mahoquot_gateway::management::settings::Settings {
+        api_keys: vec![TEST_KEY.to_string()],
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: TEST_KEY.to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(&config.config_path)
+    .expect("persist management test settings");
     create_app(Arc::new(AppState::new(&config).expect("state")))
 }
 
@@ -60,12 +71,13 @@ async fn test_realtime_sip_and_live_subpaths() {
             .body(Body::empty())
             .expect("request");
         let resp = app.clone().oneshot(req).await.expect("response");
-        assert_eq!(resp.status(), StatusCode::UPGRADE_REQUIRED);
+        // Task 21 failure QA specifies 404 for a missing call.
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .expect("body");
         let body: Value = serde_json::from_slice(&bytes).expect("json");
-        assert_eq!(body["error"], "WebSocket upgrade required");
+        assert_eq!(body["error"]["code"], "realtime_call_not_found");
     }
 
     // 2. Realtime SIP actions: accept, reject, refer
@@ -169,11 +181,15 @@ async fn test_auth_files_fields_selective_patch() {
     let req = Request::builder()
         .method("PATCH")
         .uri("/v0/management/auth-files/fields")
-        .header(header::AUTHORIZATION, format!("Bearer {TEST_KEY}"))
+        .header("X-Management-Key", TEST_KEY)
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(serde_json::to_vec(&patch_payload).unwrap()))
         .expect("request");
-    let resp = app.clone().oneshot(req).await.expect("response");
+    let resp = app
+        .clone()
+        .oneshot(with_loopback_peer(req))
+        .await
+        .expect("response");
     assert_eq!(resp.status(), StatusCode::OK);
 
     // Read file from disk and assert changes
@@ -256,7 +272,7 @@ async fn test_mount_difference_aliases() {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
-    // 5. /videos/:id and /openai/v1/videos/:video_id/content
+    // Task 23 video failure QA requires unknown video lookups to return 404.
     for uri in &[
         "/videos/v_123",
         "/v1/videos/v_123",
@@ -270,7 +286,7 @@ async fn test_mount_difference_aliases() {
             .body(Body::empty())
             .expect("request");
         let resp = app.clone().oneshot(req).await.expect("response");
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     // 6. /oauth-callback and /v0/management/oauth-callback
@@ -278,8 +294,14 @@ async fn test_mount_difference_aliases() {
         let req = Request::builder()
             .method("GET")
             .uri(*uri)
+            .header("X-Management-Key", TEST_KEY)
             .body(Body::empty())
             .expect("request");
+        let req = if uri.starts_with("/v0/management") {
+            with_loopback_peer(req)
+        } else {
+            req
+        };
         let resp = app.clone().oneshot(req).await.expect("response");
         assert!(resp.status() == StatusCode::BAD_REQUEST || resp.status() == StatusCode::OK);
     }
@@ -368,10 +390,14 @@ async fn test_auth_urls_endpoint_family() {
             .uri(format!(
                 "{provider_endpoint}?redirect_uri={base}/callback&device_url={base}/device/start&token_url={base}/token"
             ))
-            .header(header::AUTHORIZATION, format!("Bearer {TEST_KEY}"))
+            .header("X-Management-Key", TEST_KEY)
             .body(Body::empty())
             .expect("request");
-        let resp = app.clone().oneshot(req).await.expect("response");
+        let resp = app
+            .clone()
+            .oneshot(with_loopback_peer(req))
+            .await
+            .expect("response");
         assert_eq!(
             resp.status(),
             StatusCode::OK,
@@ -418,10 +444,14 @@ async fn test_auth_files_crud_and_status() {
     let req = Request::builder()
         .method("GET")
         .uri("/v0/management/auth-files")
-        .header(header::AUTHORIZATION, format!("Bearer {TEST_KEY}"))
+        .header("X-Management-Key", TEST_KEY)
         .body(Body::empty())
         .expect("request");
-    let resp = app.clone().oneshot(req).await.expect("response");
+    let resp = app
+        .clone()
+        .oneshot(with_loopback_peer(req))
+        .await
+        .expect("response");
     assert_eq!(resp.status(), StatusCode::OK);
     let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
@@ -441,11 +471,15 @@ async fn test_auth_files_crud_and_status() {
     let req = Request::builder()
         .method("PATCH")
         .uri("/v0/management/auth-files/status")
-        .header(header::AUTHORIZATION, format!("Bearer {TEST_KEY}"))
+        .header("X-Management-Key", TEST_KEY)
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(serde_json::to_vec(&patch_payload).unwrap()))
         .expect("request");
-    let resp = app.clone().oneshot(req).await.expect("response");
+    let resp = app
+        .clone()
+        .oneshot(with_loopback_peer(req))
+        .await
+        .expect("response");
     assert_eq!(resp.status(), StatusCode::OK);
 
     let updated_content: Value =
@@ -470,17 +504,7 @@ async fn test_existing_live_and_realtime_calls_regression() {
         .body(Body::from(r#"{"session": {"model": "gpt-realtime"}}"#))
         .expect("request");
     let resp = app.clone().oneshot(req).await.expect("response");
-    assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .expect("body");
-    let secret_body: Value = serde_json::from_slice(&bytes).expect("json");
-    assert!(
-        secret_body.get("value").is_some()
-            || secret_body.get("client_secret").is_some()
-            || secret_body.get("key").is_some()
-            || secret_body.get("secret").is_some()
-    );
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 
     // 2. /v1/realtime/sessions
     let req = Request::builder()
@@ -491,9 +515,11 @@ async fn test_existing_live_and_realtime_calls_regression() {
         .body(Body::from(r#"{"model": "gpt-realtime"}"#))
         .expect("request");
     let resp = app.clone().oneshot(req).await.expect("response");
-    assert_eq!(resp.status(), StatusCode::OK);
+    // Task 21 receipt line 7 requires a selectable Codex transport for minting.
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 
     // 3. /v1/realtime/calls POST offer
+    // Task 21: only explicit invalid secrets fail 401; valid local keys require a selectable Codex transport.
     let req = Request::builder()
         .method("POST")
         .uri("/v1/realtime/calls")
@@ -504,9 +530,10 @@ async fn test_existing_live_and_realtime_calls_regression() {
         ))
         .expect("request");
     let resp = app.clone().oneshot(req).await.expect("response");
-    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 
     // 4. /v1/live POST offer
+    // Task 21: the same local-key account-selection contract applies to this alias.
     let req = Request::builder()
         .method("POST")
         .uri("/v1/live")
@@ -517,7 +544,7 @@ async fn test_existing_live_and_realtime_calls_regression() {
         ))
         .expect("request");
     let resp = app.clone().oneshot(req).await.expect("response");
-    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 
     std::fs::remove_dir_all(temp_dir).ok();
 }

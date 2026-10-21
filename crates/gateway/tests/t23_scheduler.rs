@@ -8,6 +8,7 @@ use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use axum::routing::post;
 use axum::Router;
+use common::with_loopback_peer;
 use common::{codex_sse, create_auth_file_json, session_request, unique_temp_dir, CODEX_PATH};
 use http_body_util::BodyExt;
 use mahoquot_gateway::config::GatewayConfig;
@@ -162,7 +163,7 @@ fn write_account(auth_dir: &std::path::Path, id: &str, upstream: &str) {
 }
 
 fn config(auth_dir: std::path::PathBuf, strategy: Strategy) -> GatewayConfig {
-    GatewayConfig {
+    let config = GatewayConfig {
         auth_dir: auth_dir.clone(),
         config_path: auth_dir.join("config.yaml"),
         api_keys: ApiKeys::new(vec![KEY.to_string()]),
@@ -170,7 +171,19 @@ fn config(auth_dir: std::path::PathBuf, strategy: Strategy) -> GatewayConfig {
         max_failover: 3,
         auth_refresh_enabled: false,
         ..GatewayConfig::default()
+    };
+    mahoquot_gateway::management::settings::Settings {
+        api_keys: vec![KEY.to_string()],
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: KEY.to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
     }
+    .persist(&config.config_path)
+    .expect("persist management settings");
+    config
 }
 
 async fn response_json(response: axum::response::Response) -> serde_json::Value {
@@ -187,7 +200,7 @@ async fn management(
     let mut builder = Request::builder()
         .method(method)
         .uri(format!("/v0/management{path}"))
-        .header(header::AUTHORIZATION, format!("Bearer {KEY}"));
+        .header("X-Management-Key", KEY);
     let body = match body {
         Some(value) => {
             builder = builder.header(header::CONTENT_TYPE, "application/json");
@@ -196,7 +209,7 @@ async fn management(
         None => Body::empty(),
     };
     app.clone()
-        .oneshot(builder.body(body).unwrap())
+        .oneshot(with_loopback_peer(builder.body(body).unwrap()))
         .await
         .unwrap()
 }

@@ -45,6 +45,21 @@ impl std::str::FromStr for MockProtocol {
     }
 }
 
+pub fn fixture_frames(protocol: MockProtocol, chunks: usize) -> Vec<Bytes> {
+    match protocol {
+        MockProtocol::OpenAi => std::iter::repeat_n(CHUNK_PAYLOAD, chunks)
+            .chain(std::iter::once(DONE_PAYLOAD))
+            .map(Bytes::from_static)
+            .collect(),
+        MockProtocol::Codex => [CODEX_CREATED, CODEX_ITEM_ADDED, CODEX_PART_ADDED]
+            .into_iter()
+            .chain(std::iter::repeat_n(CODEX_DELTA, chunks))
+            .chain([CODEX_ITEM_DONE, CODEX_COMPLETED])
+            .map(Bytes::from_static)
+            .collect(),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MockConfig {
     pub port: u16,
@@ -112,18 +127,10 @@ async fn handle_mock_request(State(state): State<Arc<MockState>>) -> Response {
         tokio::time::sleep(Duration::from_millis(state.ttft_ms)).await;
     }
 
-    let chunks: Vec<Result<Bytes, Infallible>> = match state.protocol {
-        MockProtocol::OpenAi => std::iter::repeat_n(CHUNK_PAYLOAD, state.chunks)
-            .chain(std::iter::once(DONE_PAYLOAD))
-            .map(|frame| Ok(Bytes::from_static(frame)))
-            .collect(),
-        MockProtocol::Codex => [CODEX_CREATED, CODEX_ITEM_ADDED, CODEX_PART_ADDED]
-            .into_iter()
-            .chain(std::iter::repeat_n(CODEX_DELTA, state.chunks))
-            .chain([CODEX_ITEM_DONE, CODEX_COMPLETED])
-            .map(|frame| Ok(Bytes::from_static(frame)))
-            .collect(),
-    };
+    let chunks: Vec<Result<Bytes, Infallible>> = fixture_frames(state.protocol, state.chunks)
+        .into_iter()
+        .map(Ok)
+        .collect();
 
     let body = Body::from_stream(stream::iter(chunks));
     Response::builder()

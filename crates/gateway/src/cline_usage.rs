@@ -151,8 +151,10 @@ impl ClineDailyTracker {
         }
         self.reset_override_unix
             .store(reset_at_unix, Ordering::Relaxed);
-        self.used_tokens
-            .fetch_max(self.budget_tokens.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.used_tokens.fetch_max(
+            self.budget_tokens.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
         if self.window_start_unix.load(Ordering::Relaxed) == 0 {
             self.window_start_unix
                 .store(reset_at_unix - DAY_SECS, Ordering::Relaxed);
@@ -368,7 +370,8 @@ async fn restore_cap_buckets(
         if cap.credit_driven {
             member.set_group_credit_bench(&cap.model, cap.reset_at_unix * 1000);
         }
-        member.cline_trackers()
+        member
+            .cline_trackers()
             .for_model(&cap.model)
             .on_cap_429(cap.reset_at_unix);
         crate::relay::record_cline_quota_bucket(
@@ -570,7 +573,11 @@ mod tests {
         t.anchor_window(now);
         assert_eq!(t.estimated_reset_unix(), now + DAY_SECS);
         t.anchor_window(now + 100);
-        assert_eq!(t.estimated_reset_unix(), now + DAY_SECS, "first anchor wins");
+        assert_eq!(
+            t.estimated_reset_unix(),
+            now + DAY_SECS,
+            "first anchor wins"
+        );
     }
 
     #[test]
@@ -584,7 +591,11 @@ mod tests {
             Some(90.0),
             "gemini tracker absorbs only gemini tokens"
         );
-        assert_eq!(ds.used_percent(), Some(0.0), "deepseek tracker stays untouched");
+        assert_eq!(
+            ds.used_percent(),
+            Some(0.0),
+            "deepseek tracker stays untouched"
+        );
         let capped = set.for_model("deepseek/deepseek-v4.1-flash");
         assert!(
             Arc::ptr_eq(&capped, &ds),

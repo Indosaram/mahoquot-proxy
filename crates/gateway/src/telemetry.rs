@@ -474,6 +474,7 @@ mod tests {
         assert_eq!(store.snapshot()[0].providers[0].provider, "claude");
     }
 
+    #[allow(clippy::await_holding_lock)] // see the held-lock comment below
     #[tokio::test]
     async fn flush_worker_shutdown_waits_for_a_blocked_flush_to_finish() {
         let dir = std::env::temp_dir().join(format!(
@@ -485,13 +486,17 @@ mod tests {
         let store = std::sync::Arc::new(TelemetryStore::load(path.clone()));
         store.record_with_account(1_800, "codex", Some("codex-1"), true);
         let flush_started = std::sync::Arc::new(tokio::sync::Notify::new());
-        *store.flush_started.lock().unwrap_or_else(|p| p.into_inner()) =
-            Some(std::sync::Arc::clone(&flush_started));
+        *store
+            .flush_started
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(std::sync::Arc::clone(&flush_started));
         let handle = store.spawn_flush_worker(std::time::Duration::from_secs(3600));
 
         // Hold the store lock so the worker's final `spawn_blocking(flush)`
         // blocks inside `snapshot()`. This is exactly the case a
         // timeout-then-drop shutdown would silently abandon.
+        // Holding this std mutex across the awaits below is the point of the
+        // test: it keeps the worker's flush blocked while shutdown is awaited.
         let guard = store.buckets.lock().unwrap_or_else(|p| p.into_inner());
         let worker = tokio::spawn(async move { handle.shutdown().await });
         tokio::time::timeout(std::time::Duration::from_secs(5), flush_started.notified())

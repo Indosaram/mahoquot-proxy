@@ -1,3 +1,161 @@
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum ProviderKeyEntry {
+    Key(String),
+    Config(ProviderKeyConfig),
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ProviderKeyConfig {
+    #[serde(rename = "api-key", default, skip_serializing_if = "String::is_empty")]
+    pub api_key: String,
+    #[serde(
+        rename = "api-key-entries",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub api_key_entries: Vec<ProviderKeyEntry>,
+    #[serde(flatten)]
+    pub metadata: serde_json::Map<String, serde_json::Value>,
+}
+
+impl ProviderKeyEntry {
+    pub fn matches_key(&self, key: &str) -> bool {
+        match self {
+            Self::Key(k) => k == key,
+            Self::Config(c) => {
+                c.api_key == key || c.api_key_entries.iter().any(|e| e.matches_key(key))
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PayloadContext<'a> {
+    pub model: &'a str,
+    pub requested_model: &'a str,
+    pub protocol: &'a str,
+    pub from_protocol: &'a str,
+    pub headers: &'a axum::http::HeaderMap,
+    pub original: &'a serde_json::Value,
+}
+
+impl PassthroughSettings {
+    pub fn validate(&self) -> Result<(), String> {
+        for kind in [
+            "default",
+            "default-raw",
+            "override",
+            "override-raw",
+            "filter",
+        ] {
+            let Some(rules) = self.extra.get(kind) else {
+                continue;
+            };
+            let rules = rules
+                .as_array()
+                .ok_or_else(|| format!("payload.{kind} must be an array"))?;
+            for (index, rule) in rules.iter().enumerate() {
+                let object = rule
+                    .as_object()
+                    .ok_or_else(|| format!("payload.{kind}[{index}] must be an object"))?;
+                if let Some(params) = object.get("params") {
+                    if params.is_array() {
+                        if kind != "filter" {
+                            return Err(format!(
+                                "payload.{kind}[{index}].params must be an object"
+                            ));
+                        }
+                        for fragment in params.as_array().unwrap() {
+                            if !fragment.is_string() {
+                                return Err(format!(
+                                    "payload.{kind}[{index}].params entries must be strings"
+                                ));
+                            }
+                        }
+                    } else if kind == "filter" || !params.is_object() {
+                        return Err(format!("payload.{kind}[{index}].params has invalid type"));
+                    }
+                }
+                for field in ["models", "match", "not-match", "exist", "not-exist"] {
+                    if let Some(value) = object.get(field) {
+                        if !value.is_array() {
+                            return Err(format!(
+                                "payload.{kind}[{index}].{field} must be an array"
+                            ));
+                        }
+                    }
+                }
+                if let Some(params) = object.get("params") {
+                    let valid_params = if kind == "filter" {
+                        params
+                            .as_array()
+                            .is_some_and(|values| values.iter().all(serde_json::Value::is_string))
+                    } else {
+                        params.is_object()
+                    };
+                    if !valid_params {
+                        return Err(format!("payload.{kind}[{index}].params has invalid type"));
+                    }
+                    // `-raw` rules carry raw JSON text per value (upstream
+                    // applies them with SetRawBytes): anything that is not a
+                    // string holding valid JSON is invalid configuration.
+                    if kind.ends_with("-raw") {
+                        for (path, value) in params.as_object().into_iter().flatten() {
+                            let parses = value.as_str().is_some_and(|raw| {
+                                serde_json::from_str::<serde_json::Value>(raw).is_ok()
+                            });
+                            if !parses {
+                                return Err(format!(
+                                    "payload.{kind}[{index}].params.{path} must be a raw JSON string"
+                                ));
+                            }
+                        }
+                    }
+                }
+                if let Some(models) = object.get("models").and_then(serde_json::Value::as_array) {
+                    for model in models {
+                        if !model.is_object()
+                            || model.get("name").is_some_and(|name| !name.is_string())
+                        {
+                            return Err(format!(
+                                "payload.{kind}[{index}].models entries must be model-rule objects"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Applies the configured `payload` rules (default/override/filter) through the
+    /// same engine the HTTP relay uses, so WebSocket, media and Interactions
+    /// requests honour identical rules.
+    pub fn apply(
+        &self,
+        payload: &mut serde_json::Value,
+        ctx: &PayloadContext<'_>,
+    ) -> Result<(), String> {
+        if self.extra.is_empty() {
+            return Ok(());
+        }
+        if !payload.is_object() {
+            return Err("payload rules require a JSON object body".into());
+        }
+        let rule_ctx = crate::relay_payload::PayloadRuleContext {
+            model: ctx.model,
+            requested_model: ctx.requested_model,
+            protocol: ctx.protocol,
+            from_protocol: ctx.from_protocol,
+            headers: ctx.headers,
+            original_body: ctx.original,
+        };
+        crate::relay_payload::apply_payload_rules(&self.extra, payload, &rule_ctx);
+        Ok(())
+    }
+}
+
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -92,6 +250,114 @@ pub struct PluginsSettings {
 pub struct RoutingSettings {
     #[serde(default)]
     pub strategy: String,
+    /// Local effective session affinity stays on unless explicitly disabled.
+    #[serde(
+        rename = "session-affinity",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub session_affinity: Option<bool>,
+    /// Opt-in bounded prefix (LCP) matcher for session-less conversations.
+    #[serde(
+        rename = "session-affinity-lcp",
+        default,
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub session_affinity_lcp: bool,
+    /// Binding TTL (Go duration); non-positive or invalid falls back to 1h.
+    #[serde(
+        rename = "session-affinity-ttl",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub session_affinity_ttl: String,
+    #[serde(
+        rename = "lcp-max-turns",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub lcp_max_turns: Option<usize>,
+    #[serde(
+        rename = "lcp-max-groups",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub lcp_max_groups: Option<usize>,
+    #[serde(
+        rename = "lcp-max-prefixes",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub lcp_max_prefixes: Option<usize>,
+}
+
+impl RoutingSettings {
+    /// Binding TTL in milliseconds; canonical 1h for non-positive/invalid.
+    pub fn affinity_ttl_ms(&self) -> i64 {
+        parse_go_duration_ms(&self.session_affinity_ttl)
+            .filter(|ms| *ms > 0)
+            .unwrap_or(3_600_000)
+    }
+
+    pub fn lcp_bounds(&self) -> mahoquot_router::lcp::Bounds {
+        let defaults = mahoquot_router::lcp::Bounds::default();
+        mahoquot_router::lcp::Bounds {
+            max_turns: self
+                .lcp_max_turns
+                .filter(|v| *v > 0)
+                .unwrap_or(defaults.max_turns),
+            max_groups: self
+                .lcp_max_groups
+                .filter(|v| *v > 0)
+                .unwrap_or(defaults.max_groups),
+            max_prefixes: self
+                .lcp_max_prefixes
+                .filter(|v| *v > 0)
+                .unwrap_or(defaults.max_prefixes),
+            ttl_ms: self.affinity_ttl_ms(),
+        }
+    }
+}
+
+/// Go `time.ParseDuration` subset (ns/us/ms/s/m/h, decimals, sign) in ms.
+/// Sub-millisecond positive durations round up to 1ms so "1ns" still expires.
+fn parse_go_duration_ms(raw: &str) -> Option<i64> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let (negative, mut rest) = match raw.as_bytes()[0] {
+        b'-' => (true, &raw[1..]),
+        b'+' => (false, &raw[1..]),
+        _ => (false, raw),
+    };
+    if rest == "0" {
+        return Some(0);
+    }
+    let mut total_ns = 0f64;
+    while !rest.is_empty() {
+        let end = rest
+            .find(|c: char| !c.is_ascii_digit() && c != '.')
+            .unwrap_or(rest.len());
+        let value: f64 = rest[..end].parse().ok()?;
+        rest = &rest[end..];
+        let (unit, scale) = [
+            ("ns", 1.0),
+            ("us", 1e3),
+            ("µs", 1e3),
+            ("μs", 1e3),
+            ("ms", 1e6),
+            ("s", 1e9),
+            ("m", 60e9),
+            ("h", 3600e9),
+        ]
+        .into_iter()
+        .find(|(unit, _)| rest.starts_with(unit))?;
+        rest = &rest[unit.len()..];
+        total_ns += value * scale;
+    }
+    let ms = (total_ns / 1e6).ceil() as i64;
+    Some(if negative { -ms } else { ms })
 }
 
 /// An inbound key route stores only the key's stable one-way identifier. Raw
@@ -380,9 +646,19 @@ impl WarmupSettings {
 /// mahoquot never silently drops settings this build does not implement.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Settings {
+    /// Runtime-only Home coordination marker set by the Home coordinator.
+    /// Never persisted and never part of the v8 document (Home owns it).
+    #[serde(default, skip_serializing)]
+    pub home: crate::home::HomeConfig,
+    #[serde(
+        rename = "github-token",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub github_token: String,
     #[serde(default = "default_port")]
     pub port: u16,
-    #[serde(rename = "auth-dir", default)]
+    #[serde(rename = "auth-dir", default, skip_serializing_if = "String::is_empty")]
     pub auth_dir: String,
     #[serde(default)]
     pub debug: bool,
@@ -482,19 +758,19 @@ pub struct Settings {
     #[serde(rename = "oauth-excluded-models", default)]
     pub oauth_excluded_models: std::collections::BTreeMap<String, Vec<String>>,
     #[serde(rename = "gemini-api-key", default)]
-    pub gemini_api_key: Vec<String>,
+    pub gemini_api_key: Vec<ProviderKeyEntry>,
     #[serde(rename = "claude-api-key", default)]
-    pub claude_api_key: Vec<String>,
+    pub claude_api_key: Vec<ProviderKeyEntry>,
     #[serde(rename = "codex-api-key", default)]
-    pub codex_api_key: Vec<String>,
+    pub codex_api_key: Vec<ProviderKeyEntry>,
     #[serde(rename = "xai-api-key", default)]
-    pub xai_api_key: Vec<String>,
+    pub xai_api_key: Vec<ProviderKeyEntry>,
     #[serde(rename = "vertex-api-key", default)]
-    pub vertex_api_key: Vec<String>,
+    pub vertex_api_key: Vec<ProviderKeyEntry>,
     #[serde(rename = "interactions-api-key", default)]
-    pub interactions_api_key: Vec<String>,
+    pub interactions_api_key: Vec<ProviderKeyEntry>,
     #[serde(rename = "openai-compatibility", default)]
-    pub openai_compatibility: Vec<String>,
+    pub openai_compatibility: Vec<ProviderKeyEntry>,
     #[serde(rename = "oauth-model-alias", default)]
     pub oauth_model_alias: serde_json::Value,
     #[serde(rename = "oauth-request-scoped-errors", default)]
@@ -522,6 +798,8 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            home: Default::default(),
+            github_token: String::new(),
             port: default_port(),
             auth_dir: String::new(),
             debug: false,
@@ -587,6 +865,8 @@ impl Default for Settings {
 
 #[derive(Debug, thiserror::Error)]
 pub enum SettingsError {
+    #[error("store error: {0}")]
+    Store(mahoquot_registry::store::StoreError),
     #[error("failed to read {path}: {source}")]
     Read {
         path: PathBuf,
@@ -613,14 +893,48 @@ pub enum SettingsError {
     InvalidCatalogConfig(String),
     #[error("invalid warmup policy: {0}")]
     InvalidWarmupPolicy(String),
+    #[error("invalid proxy url: {0}")]
+    InvalidProxyUrl(String),
 }
 
 impl Settings {
+    pub fn validate_proxy_settings(&self) -> Result<(), SettingsError> {
+        // An unrecognised routing strategy is invalid configuration: it is
+        // rejected before anything is persisted or published (Task 7).
+        if crate::management::scalar_table::normalize_routing_strategy(&self.routing.strategy)
+            .is_none()
+        {
+            return Err(SettingsError::Validation(
+                mahoquot_registry::RegistryError::DeserializationError(format!(
+                    "unsupported routing strategy {:?}",
+                    self.routing.strategy
+                )),
+            ));
+        }
+        if !self.proxy_url.trim().is_empty() {
+            crate::proxy_policy::validate_proxy_url_candidate(&self.proxy_url)
+                .map_err(|e| SettingsError::InvalidProxyUrl(e.to_string()))?;
+        }
+        for (provider, policy) in &self.proxy_providers {
+            if policy.enabled && !policy.url.trim().is_empty() {
+                crate::proxy_policy::validate_proxy_url_candidate(&policy.url)
+                    .map_err(|e| SettingsError::InvalidProxyUrl(format!("{provider}: {e}")))?;
+            }
+        }
+        Ok(())
+    }
     pub fn load(path: &Path) -> Result<Self, SettingsError> {
         let raw = std::fs::read_to_string(path).map_err(|source| SettingsError::Read {
             path: path.to_path_buf(),
             source,
         })?;
+        // A document written by a v8 management write is read back through
+        // the v8 schema so restart serves exactly what was persisted.
+        if let Ok(Some(settings)) =
+            crate::management::store::v8_config::runtime_of_v8_document(&raw)
+        {
+            return Ok(settings);
+        }
         Self::from_yaml(&raw).map_err(|source| SettingsError::Parse {
             path: path.to_path_buf(),
             source,
@@ -639,7 +953,9 @@ impl Settings {
     }
 
     pub fn is_codex_account_credit_enabled(&self, account_id: &str) -> bool {
-        self.credit_codex_account_ids.iter().any(|id| id == account_id)
+        self.credit_codex_account_ids
+            .iter()
+            .any(|id| id == account_id)
     }
 
     pub fn set_codex_account_credit_use(&mut self, account_id: String, enabled: bool) {
@@ -951,6 +1267,31 @@ fn validate_catalog_url(url_str: &str, field_name: &str) -> Result<(), SettingsE
     }
 
     Ok(())
+}
+
+impl AsRef<str> for ProviderKeyEntry {
+    fn as_ref(&self) -> &str {
+        match self {
+            Self::Key(value) => value,
+            Self::Config(config) => &config.api_key,
+        }
+    }
+}
+
+impl ProviderKeyEntry {
+    pub fn retry_for_key(&self, key: &str) -> Option<Option<i64>> {
+        match self {
+            Self::Key(_) => None,
+            Self::Config(config) => {
+                let matches = self.matches_key(key);
+                matches.then(|| {
+                    crate::account::request_retry_override(&serde_json::Value::Object(
+                        config.metadata.clone(),
+                    ))
+                })
+            }
+        }
+    }
 }
 
 #[cfg(test)]

@@ -17,6 +17,68 @@ pub fn unique_temp_dir(prefix: &str) -> PathBuf {
     dir
 }
 
+/// Supply the transport peer metadata normally installed by `axum::serve` to
+/// oneshot requests that exercise the dedicated management gate.
+pub fn with_loopback_peer<B>(mut request: axum::http::Request<B>) -> axum::http::Request<B> {
+    request
+        .extensions_mut()
+        .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            0,
+        ))));
+    request
+}
+
+/// Configure the dedicated management secret (Task 26) in the gateway config
+/// file at `config_path` before the gateway state is built, preserving any
+/// YAML the test already wrote there. Management and /admin routes answer 404
+/// until a secret is configured.
+pub fn configure_management_secret(config_path: &std::path::Path, secret: &str) {
+    let raw = std::fs::read_to_string(config_path).unwrap_or_default();
+    let mut doc: serde_yaml::Value = if raw.trim().is_empty() {
+        serde_yaml::Value::Mapping(Default::default())
+    } else {
+        serde_yaml::from_str(&raw).expect("test config yaml")
+    };
+    let root = doc.as_mapping_mut().expect("config root mapping");
+    let key = serde_yaml::Value::from("remote-management");
+    if !root.contains_key(&key) {
+        root.insert(key.clone(), serde_yaml::Value::Mapping(Default::default()));
+    }
+    root.get_mut(&key)
+        .and_then(serde_yaml::Value::as_mapping_mut)
+        .expect("remote-management mapping")
+        .insert("secret-key".into(), secret.into());
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent).expect("config dir");
+    }
+    std::fs::write(config_path, serde_yaml::to_string(&doc).unwrap()).expect("write config");
+}
+
+/// Task 26 fixture: the operator's dedicated management secret is the first
+/// inbound key the test already presents, written into the gateway config
+/// file before the state is built (management/admin answer 404 until a
+/// secret is configured). Tests that assert the master/management split
+/// itself (t6, t26, t27) configure distinct keys explicitly instead.
+pub fn managed(
+    mut config: mahoquot_gateway::config::GatewayConfig,
+) -> mahoquot_gateway::config::GatewayConfig {
+    if config.config_path.as_os_str().is_empty() {
+        config.config_path = config.auth_dir.join("config.yaml");
+    }
+    if let Some(secret) = config.api_keys.values().first().cloned() {
+        configure_management_secret(&config.config_path, &secret);
+    }
+    config
+}
+
+/// Borrowing form of [`managed`] for `AppState::new(&...)` call sites.
+pub fn managed_ref(
+    config: &mahoquot_gateway::config::GatewayConfig,
+) -> mahoquot_gateway::config::GatewayConfig {
+    managed(config.clone())
+}
+
 pub fn create_auth_file_json(
     id: &str,
     account_id: &str,

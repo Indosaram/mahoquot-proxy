@@ -203,7 +203,9 @@ impl SseParser {
         };
         if value.get("type").and_then(Value::as_str) == Some("response.incomplete")
             && value.pointer("/response/error").is_none_or(Value::is_null)
-            && value.pointer("/response/incomplete_details/reason").and_then(Value::as_str)
+            && value
+                .pointer("/response/incomplete_details/reason")
+                .and_then(Value::as_str)
                 == Some("max_output_tokens")
         {
             out.push(CodexEvent::OutputLimitReached);
@@ -275,17 +277,19 @@ fn classify(value: &Value) -> Option<CodexEvent> {
                 .and_then(|r| r.get("usage"))
                 .map(parse_usage),
         }),
-        "response.failed" | "response.incomplete" | "response.cancelled" => Some(CodexEvent::Failed {
-            message: value
-                .get("response")
-                .and_then(|r| r.get("error"))
-                .and_then(|e| e.get("message"))
-                .or_else(|| value.pointer("/response/incomplete_details/reason"))
-                .or_else(|| value.pointer("/response/status"))
-                .and_then(Value::as_str)
-                .unwrap_or("upstream response failed")
-                .to_string(),
-        }),
+        "response.failed" | "response.incomplete" | "response.cancelled" => {
+            Some(CodexEvent::Failed {
+                message: value
+                    .get("response")
+                    .and_then(|r| r.get("error"))
+                    .and_then(|e| e.get("message"))
+                    .or_else(|| value.pointer("/response/incomplete_details/reason"))
+                    .or_else(|| value.pointer("/response/status"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("upstream response failed")
+                    .to_string(),
+            })
+        }
         "error" => Some(CodexEvent::Failed {
             message: value
                 .get("message")
@@ -301,32 +305,56 @@ fn classify(value: &Value) -> Option<CodexEvent> {
 fn parse_usage(usage: &Value) -> Usage {
     let prompt_tokens = usage
         .get("input_tokens")
+        .or_else(|| usage.get("prompt_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
     let completion_tokens = usage
         .get("output_tokens")
+        .or_else(|| usage.get("completion_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    let total_tokens = usage
+        .get("total_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| prompt_tokens + completion_tokens);
+    let cached_tokens = usage
+        .pointer("/input_tokens_details/cached_tokens")
+        .or_else(|| usage.pointer("/prompt_tokens_details/cached_tokens"))
+        .or_else(|| usage.get("cache_read_input_tokens"))
+        .or_else(|| usage.get("cache_read_tokens"))
+        .and_then(Value::as_u64);
+    let cache_write_tokens = usage
+        .pointer("/input_tokens_details/cache_creation_tokens")
+        .or_else(|| usage.pointer("/input_tokens_details/cache_write_tokens"))
+        .or_else(|| usage.pointer("/prompt_tokens_details/cache_creation_tokens"))
+        .or_else(|| usage.pointer("/prompt_tokens_details/cache_write_tokens"))
+        .or_else(|| usage.get("cache_creation_input_tokens"))
+        .or_else(|| usage.get("cache_write_tokens"))
+        .or_else(|| usage.get("cache_creation_tokens"))
+        .and_then(Value::as_u64);
+    let reasoning_tokens = usage
+        .pointer("/output_tokens_details/reasoning_tokens")
+        .or_else(|| usage.pointer("/completion_tokens_details/reasoning_tokens"))
+        .or_else(|| usage.get("reasoning_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+
+    let (final_prompt, final_completion) =
+        if prompt_tokens == 0 && completion_tokens == 0 && total_tokens > 0 {
+            (0, total_tokens)
+        } else {
+            (prompt_tokens, completion_tokens)
+        };
+
     Usage {
-        prompt_tokens,
-        completion_tokens,
-        total_tokens: usage
-            .get("total_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(prompt_tokens + completion_tokens),
-        cached_tokens: usage
-            .get("input_tokens_details")
-            .and_then(|d| d.get("cached_tokens"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        reasoning_tokens: usage
-            .get("output_tokens_details")
-            .and_then(|d| d.get("reasoning_tokens"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        cache_write_tokens: 0,
-        cached_tokens_known: usage.pointer("/input_tokens_details/cached_tokens").and_then(Value::as_u64).is_some(),
-        cache_write_tokens_known: false,
+        prompt_tokens: final_prompt,
+        completion_tokens: final_completion,
+        total_tokens,
+        cached_tokens: cached_tokens.unwrap_or(0),
+        reasoning_tokens,
+        cache_write_tokens: cache_write_tokens.unwrap_or(0),
+        cached_tokens_known: cached_tokens.is_some(),
+        cache_write_tokens_known: cache_write_tokens.is_some(),
     }
 }
 
@@ -357,7 +385,7 @@ mod bounded_accumulation_tests {
         // One `data:` line at a time stays under the per-line cap; the joined
         // frame is what exceeds the frame cap.
         let mut line = b"data: ".to_vec();
-        line.extend(std::iter::repeat(b'a').take(1024 * 1024));
+        line.extend(std::iter::repeat_n(b'a', 1024 * 1024));
         line.push(b'\n');
 
         let mut parser = SseParser::default();
@@ -379,10 +407,8 @@ mod bounded_accumulation_tests {
         // own size (the retracted revision-1 bug capped the incoming chunk).
         let frames_in: Vec<Vec<u8>> = (0..4096)
             .map(|i| {
-                format!(
-                    "data: {{\"type\":\"response.output_text.delta\",\"delta\":\"{i}\"}}\n\n"
-                )
-                .into_bytes()
+                format!("data: {{\"type\":\"response.output_text.delta\",\"delta\":\"{i}\"}}\n\n")
+                    .into_bytes()
             })
             .collect();
         let chunk: Vec<u8> = frames_in.concat();

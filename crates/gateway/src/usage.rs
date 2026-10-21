@@ -139,7 +139,7 @@ fn matches_codex_model(
             return true;
         }
         if models
-            .split(|c| c == ',' || c == ' ')
+            .split([',', ' '])
             .any(|m| m.trim() == requested_model)
         {
             return true;
@@ -1710,17 +1710,38 @@ pub fn extract_response_token_usage(head: &[u8], tail: &[u8]) -> Option<Response
                 .unwrap_or(0),
             });
         }
-        // OpenAI Responses API usage: `input_tokens` plus
-        // `input_tokens_details.cached_tokens` instead of the chat-completions
-        // `prompt_tokens` family. Gated on the details object because Anthropic
-        // message_delta usage objects also carry input/output tokens, and this
-        // branch must never swallow Claude's head-side `cache_read_input_tokens`.
-        if let Some(cached) = nested_object_number(&usage, "input_tokens_details", "cached_tokens")
-        {
+        // OpenAI Responses API usage: `input_tokens` / `output_tokens` / `total_tokens`
+        // without requiring cache details. Gated on any of input_tokens, output_tokens,
+        // or total_tokens being present in the usage object.
+        let input = object_number(&usage, &["input_tokens"]);
+        let output = object_number(&usage, &["output_tokens"]);
+        let total = object_number(&usage, &["total_tokens"]);
+        if input.is_some() || output.is_some() || total.is_some() {
+            let cached_in_tail =
+                nested_object_number(&usage, "input_tokens_details", "cached_tokens")
+                    .or_else(|| {
+                        nested_object_number(&usage, "prompt_tokens_details", "cached_tokens")
+                    })
+                    .or_else(|| {
+                        object_number(&usage, &["cache_read_input_tokens", "cache_read_tokens"])
+                    });
+            let cached =
+                cached_in_tail.or_else(|| last_number_after(head, b"\"cache_read_input_tokens\""));
+
             let cache_write_tokens =
                 nested_object_number(&usage, "input_tokens_details", "cache_creation_tokens")
                     .or_else(|| {
                         nested_object_number(&usage, "input_tokens_details", "cache_write_tokens")
+                    })
+                    .or_else(|| {
+                        nested_object_number(
+                            &usage,
+                            "prompt_tokens_details",
+                            "cache_creation_tokens",
+                        )
+                    })
+                    .or_else(|| {
+                        nested_object_number(&usage, "prompt_tokens_details", "cache_write_tokens")
                     })
                     .or_else(|| {
                         object_number(
@@ -1731,20 +1752,43 @@ pub fn extract_response_token_usage(head: &[u8], tail: &[u8]) -> Option<Response
                                 "cache_creation_tokens",
                             ],
                         )
-                    });
+                    })
+                    .or_else(|| last_number_after(head, b"\"cache_creation_input_tokens\""));
+
+            let reasoning_tokens =
+                nested_object_number(&usage, "output_tokens_details", "reasoning_tokens")
+                    .or_else(|| {
+                        nested_object_number(
+                            &usage,
+                            "completion_tokens_details",
+                            "reasoning_tokens",
+                        )
+                    })
+                    .or_else(|| object_number(&usage, &["reasoning_tokens"]))
+                    .unwrap_or(0);
+
+            // In Claude streaming, input_tokens is in head message_start while output_tokens is in tail message_delta
+            let effective_input = input.or_else(|| last_number_after(head, b"\"input_tokens\""));
+            let effective_output = output;
+
+            let (final_input, final_output) = match (effective_input, effective_output, total) {
+                (Some(i), Some(o), _) => (i, o),
+                (Some(i), None, Some(t)) => (i, t.saturating_sub(i)),
+                (Some(i), None, None) => (i, 0),
+                (None, Some(o), Some(t)) => (t.saturating_sub(o), o),
+                (None, Some(o), None) => (0, o),
+                (None, None, Some(t)) => (0, t),
+                (None, None, None) => (0, 0),
+            };
+
             return Some(ResponseTokenUsage {
-                input_tokens: object_number(&usage, &["input_tokens"]).unwrap_or(0),
-                output_tokens: object_number(&usage, &["output_tokens"]).unwrap_or(0),
-                cached_input_tokens: cached,
-                cached_input_tokens_known: true,
+                input_tokens: final_input,
+                output_tokens: final_output,
+                cached_input_tokens: cached.unwrap_or(0),
+                cached_input_tokens_known: cached.is_some(),
                 cache_write_tokens: cache_write_tokens.unwrap_or(0),
                 cache_write_tokens_known: cache_write_tokens.is_some(),
-                reasoning_tokens: nested_object_number(
-                    &usage,
-                    "output_tokens_details",
-                    "reasoning_tokens",
-                )
-                .unwrap_or(0),
+                reasoning_tokens,
             });
         }
     }
@@ -1765,21 +1809,36 @@ pub fn extract_response_token_usage(head: &[u8], tail: &[u8]) -> Option<Response
             });
         }
     }
-    let input = last_number_after(head, b"\"input_tokens\"");
+    let input = last_number_after(head, b"\"input_tokens\"")
+        .or_else(|| last_number_after(tail, b"\"input_tokens\""));
     let output = last_number_after(tail, b"\"output_tokens\"");
-    if input.is_some() || output.is_some() {
+    let total = last_number_after(tail, b"\"total_tokens\"")
+        .or_else(|| last_number_after(head, b"\"total_tokens\""));
+    if input.is_some() || output.is_some() || total.is_some() {
+        let cached = last_number_after(head, b"\"cache_read_input_tokens\"")
+            .or_else(|| last_number_after(tail, b"\"cache_read_input_tokens\""));
+        let cache_write = last_number_after(head, b"\"cache_creation_input_tokens\"")
+            .or_else(|| last_number_after(tail, b"\"cache_creation_input_tokens\""));
+        let reasoning = last_number_after(tail, b"\"reasoning_tokens\"").unwrap_or(0);
+
+        let (final_input, final_output) = match (input, output, total) {
+            (Some(i), Some(o), _) => (i, o),
+            (Some(i), None, Some(t)) => (i, t.saturating_sub(i)),
+            (Some(i), None, None) => (i, 0),
+            (None, Some(o), Some(t)) => (t.saturating_sub(o), o),
+            (None, Some(o), None) => (0, o),
+            (None, None, Some(t)) => (0, t),
+            (None, None, None) => (0, 0),
+        };
+
         return Some(ResponseTokenUsage {
-            input_tokens: input.unwrap_or(0),
-            output_tokens: output.unwrap_or(0),
-            cached_input_tokens: last_number_after(head, b"\"cache_read_input_tokens\"")
-                .unwrap_or(0),
-            cached_input_tokens_known: last_number_after(head, b"\"cache_read_input_tokens\"")
-                .is_some(),
-            cache_write_tokens: last_number_after(head, b"\"cache_creation_input_tokens\"")
-                .unwrap_or(0),
-            cache_write_tokens_known: last_number_after(head, b"\"cache_creation_input_tokens\"")
-                .is_some(),
-            reasoning_tokens: 0,
+            input_tokens: final_input,
+            output_tokens: final_output,
+            cached_input_tokens: cached.unwrap_or(0),
+            cached_input_tokens_known: cached.is_some(),
+            cache_write_tokens: cache_write.unwrap_or(0),
+            cache_write_tokens_known: cache_write.is_some(),
+            reasoning_tokens: reasoning,
         });
     }
     None
@@ -1794,11 +1853,11 @@ fn last_balanced_object(haystack: &[u8], key: &[u8]) -> Option<String> {
     let mut found = None;
     while let Some(pos) = find_sub(&haystack[start..], key) {
         let after = &haystack[start + pos + key.len()..];
-        let colon = after.iter().position(|b| *b != b' ').map_or(0, |p| p);
+        let colon = after.iter().position(|b| *b != b' ').unwrap_or(0);
         let after = &after[colon..];
         if after.first() == Some(&b':') {
             let after = &after[1..];
-            let brace = after.iter().position(|b| *b != b' ').map_or(0, |p| p);
+            let brace = after.iter().position(|b| *b != b' ').unwrap_or(0);
             let after = &after[brace..];
             if after.first() == Some(&b'{') {
                 if let Some(end) = balanced_end(after) {
@@ -2599,6 +2658,45 @@ mod tests {
         assert_eq!(usage.output_tokens, 10);
         assert_eq!(usage.cached_input_tokens, 20);
         assert_eq!(usage.cache_write_tokens, 50);
+    }
+
+    #[test]
+    fn extract_reads_responses_api_usage_without_cache_details_across_head_tail_rollover() {
+        let created = b"event: response.created\ndata: {\"type\":\"response.created\"}\n\n";
+        let completed = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":700,\"output_tokens\":60,\"total_tokens\":760,\"output_tokens_details\":{\"reasoning_tokens\":16}}}}\n\n";
+        let mut capture = HeadTailCapture::new();
+        capture.push(created);
+        for _ in 0..20 {
+            capture.push(&vec![b'x'; 4096]);
+        }
+        capture.push(completed);
+        let (head, tail) = capture.parts();
+        let actual = extract_response_token_usage(head, tail).expect("terminal usage exists");
+        assert_eq!(actual.input_tokens, 700);
+        assert_eq!(actual.output_tokens, 60);
+        assert_eq!(actual.reasoning_tokens, 16);
+        assert!(!actual.cached_input_tokens_known);
+        assert_eq!(actual.cached_input_tokens, 0);
+        assert_eq!(actual.total_tokens(), 760);
+    }
+
+    #[test]
+    fn extract_reads_total_only_usage() {
+        let total_only = br#"{"usage":{"total_tokens":760}}"#;
+        let actual =
+            extract_response_token_usage(total_only, total_only).expect("total-only usage exists");
+        assert_eq!(actual.total_tokens(), 760);
+    }
+
+    #[test]
+    fn extract_reads_buffered_responses_usage_preserving_reasoning() {
+        let buffered = br#"{"usage":{"input_tokens":700,"output_tokens":60,"total_tokens":760,"output_tokens_details":{"reasoning_tokens":16}}}"#;
+        let actual =
+            extract_response_token_usage(buffered, buffered).expect("buffered usage exists");
+        assert_eq!(actual.input_tokens, 700);
+        assert_eq!(actual.output_tokens, 60);
+        assert_eq!(actual.reasoning_tokens, 16);
+        assert!(!actual.cached_input_tokens_known);
     }
 
     #[test]
@@ -3589,7 +3687,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn conversation_ids_never_become_model_availability() {
         let raw = r#"{"model_usage":{"gemini-3-flash":{"available":true},"chat_20706":{"available":true},"tab_flash_lite_preview":{"available":true}}}"#;
         let wham: WhamUsage = serde_json::from_str(raw).expect("deserializes");
@@ -3601,6 +3698,7 @@ mod tests {
         assert!(avail.contains_key("tab_flash_lite_preview"));
         assert!(!avail.contains_key("chat_20706"));
     }
+    #[test]
     fn parses_live_pro_wham_payload_with_chatpass_and_model_availability() {
         let raw = r#"{
           "rate_limit": {
@@ -3823,15 +3921,16 @@ mod tests {
     #[test]
     fn codex_exhaustion_handles_burst_and_overage() {
         let now = 1_000_000;
-        let mut u = AccountUsage::default();
-
         // Fresh burst window reading (<= 300s)
-        u.primary = QuotaWindow {
-            used_percent: Some(100.0),
-            reset_at_unix: None,
-            ..Default::default()
+        let mut u = AccountUsage {
+            primary: QuotaWindow {
+                used_percent: Some(100.0),
+                reset_at_unix: None,
+                ..Default::default()
+            },
+            observed_at_unix: Some(now - 100),
+            ..AccountUsage::default()
         };
-        u.observed_at_unix = Some(now - 100);
         assert!(
             u.is_codex_included_quota_exhausted(None, now),
             "fresh burst 100% is exhausted"
@@ -3845,8 +3944,10 @@ mod tests {
         );
 
         // Explicit overage limit reached
-        let mut u_overage = AccountUsage::default();
-        u_overage.overage_limit_reached = Some(true);
+        let u_overage = AccountUsage {
+            overage_limit_reached: Some(true),
+            ..AccountUsage::default()
+        };
         assert!(
             u_overage.is_codex_hard_limit_reached(),
             "overage_limit_reached is hard limit"

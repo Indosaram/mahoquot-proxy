@@ -18,14 +18,17 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
+rustls-pemfile = "2.1"
+tokio-rustls = "0.26"
 mahoquot-types = { path = "crates/types" }
 mahoquot-registry = { path = "crates/registry" }
 mahoquot-router = { path = "crates/router" }
 mahoquot-providers = { path = "crates/providers" }
 tokio = { version = "1", features = ["full"] }
-axum = { version = "0.8", features = ["ws"] }
+axum = { version = "0.8", features = ["ws", "http2"] }
 rand = "0.8"
 base64 = "0.22"
+hex = "0.4"
 jsonwebtoken = { version = "9", default-features = false, features = ["use_pem"] }
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
@@ -44,7 +47,7 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures = "0.3"
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v5"] }
 url = "2"
 chrono = { version = "0.4", features = ["serde"] }
 async-trait = "0.1"

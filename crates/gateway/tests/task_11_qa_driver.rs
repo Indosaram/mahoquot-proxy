@@ -246,9 +246,14 @@ async fn task_11_http_qa_scenario() {
     // Shutdown and clean up
     let _ = shutdown_tx.send(());
     tokio::time::timeout(Duration::from_secs(5), server_handle)
-        .await.expect("server shutdown deadline").expect("server gracefully stopped");
+        .await
+        .expect("server shutdown deadline")
+        .expect("server gracefully stopped");
     upstream_task.abort();
-    assert!(upstream_task.await.expect_err("upstream cancelled").is_cancelled());
+    assert!(upstream_task
+        .await
+        .expect_err("upstream cancelled")
+        .is_cancelled());
     drop(state);
     std::fs::remove_dir_all(auth_dir).expect("remove fixture directory");
 
@@ -261,5 +266,4 @@ async fn task_11_http_qa_scenario() {
         &http_evidence,
     )
     .expect("wrote proxy task-11-routing.http");
-
 }

@@ -1,6 +1,7 @@
-use std::collections::BTreeMap;
-use reqwest::Url;
 use crate::management::settings::{ProviderProxyPolicy, Settings};
+use reqwest::Url;
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProxyRuntime {
@@ -57,6 +58,10 @@ impl ProxyRuntime {
             return None;
         };
 
+        if is_direct_or_none(raw_url) {
+            return Some("direct".to_string());
+        }
+
         Some(format_session_proxy_url(
             raw_url,
             member_id,
@@ -76,11 +81,15 @@ impl ProxyRuntime {
 /// through the same proxy. With no provider opted in the URL keeps its
 /// process-wide meaning.
 pub fn base_proxy_url(settings: &Settings) -> Option<&str> {
-    if settings.proxy_providers.values().any(|policy| policy.enabled) {
+    if settings
+        .proxy_providers
+        .values()
+        .any(|policy| policy.enabled)
+    {
         return None;
     }
     let url = settings.proxy_url.trim();
-    if url.is_empty() {
+    if url.is_empty() || is_direct_or_none(url) {
         None
     } else {
         Some(url)
@@ -101,8 +110,9 @@ pub fn format_session_proxy_url(
 
     let username = if sticky {
         let sanitized = sanitize_session_id(member_id);
-        if ttl_secs > 0 {
-            let bucket = (now_unix + session_phase_offset(&sanitized, ttl_secs)) / ttl_secs;
+        if let Some(ttl_secs) = std::num::NonZeroU64::new(ttl_secs) {
+            let bucket =
+                (now_unix + session_phase_offset(&sanitized, ttl_secs.get())) / ttl_secs.get();
             format!("sess={sanitized}-b{bucket};any=1")
         } else {
             format!("sess={sanitized};any=1")
@@ -165,19 +175,105 @@ pub fn sanitize_session_id(raw: &str) -> String {
     }
 }
 
+pub fn is_direct_or_none(url: &str) -> bool {
+    let trimmed = url.trim();
+    trimmed.eq_ignore_ascii_case("direct")
+        || trimmed.eq_ignore_ascii_case("none")
+        || trimmed.eq_ignore_ascii_case("no_proxy")
+}
+
+pub fn validate_proxy_url_candidate(url: &str) -> anyhow::Result<()> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() || is_direct_or_none(trimmed) {
+        return Ok(());
+    }
+    let parsed = reqwest::Url::parse(trimmed)
+        .map_err(|e| anyhow::anyhow!("invalid proxy URL '{trimmed}': {e}"))?;
+    match parsed.scheme() {
+        "http" | "https" | "socks5" | "socks5h" => {}
+        other => {
+            return Err(anyhow::anyhow!(
+                "unsupported proxy scheme '{other}' in '{trimmed}'"
+            ))
+        }
+    }
+    if parsed.host_str().is_none() {
+        return Err(anyhow::anyhow!("proxy URL '{trimmed}' is missing host"));
+    }
+    if crate::loopback_guard::is_qa_loopback_only()
+        && !crate::loopback_guard::is_literal_loopback_url(&parsed)
+    {
+        return Err(anyhow::anyhow!(
+            "MAHOQUOT_QA_LOOPBACK_ONLY: proxy URL '{trimmed}' is not literal loopback"
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ProxyClientBuildError {
+    #[error("failed to configure outbound proxy: {0}")]
+    ProxyConfig(String),
+    #[error("failed to build HTTP client: {0}")]
+    BuildFailed(String),
+}
+
+#[derive(Clone)]
+pub struct ProxySnapshot {
+    pub runtime: Arc<ProxyRuntime>,
+    pub default_client: reqwest::Client,
+    pub direct_client: reqwest::Client,
+    pub devin_default_client: reqwest::Client,
+    pub devin_direct_client: reqwest::Client,
+}
+
+impl ProxySnapshot {
+    pub fn from_settings(settings: &Settings) -> anyhow::Result<Self> {
+        settings
+            .validate_proxy_settings()
+            .map_err(|e| anyhow::anyhow!("invalid proxy settings: {e}"))?;
+
+        let base_proxy = base_proxy_url(settings);
+        let default_client = build_http_client(base_proxy)
+            .map_err(|e| anyhow::anyhow!("failed to build default client: {e}"))?;
+        let direct_client = build_http_client(None)
+            .map_err(|e| anyhow::anyhow!("failed to build direct client: {e}"))?;
+        let devin_default_client = build_devin_http_client(base_proxy)
+            .map_err(|e| anyhow::anyhow!("failed to build devin default client: {e}"))?;
+        let devin_direct_client = build_devin_http_client(None)
+            .map_err(|e| anyhow::anyhow!("failed to build devin direct client: {e}"))?;
+
+        Ok(Self {
+            runtime: Arc::new(ProxyRuntime::from_settings(settings)),
+            default_client,
+            direct_client,
+            devin_default_client,
+            devin_direct_client,
+        })
+    }
+}
+
 pub fn build_http_client(proxy_url: Option<&str>) -> anyhow::Result<reqwest::Client> {
+    if let Some(url) = proxy_url {
+        validate_proxy_url_candidate(url)?;
+    }
     let mut builder = reqwest::Client::builder()
         .tcp_nodelay(true)
         .pool_idle_timeout(std::time::Duration::from_secs(90))
         .pool_max_idle_per_host(32)
         .tcp_keepalive(Some(std::time::Duration::from_secs(60)));
-    if let Some(url) = proxy_url {
-        if !url.trim().is_empty() {
-            let proxy = reqwest::Proxy::all(url.trim())
-                .map_err(|e| anyhow::anyhow!("failed to build proxy for '{url}': {e}"))?;
+    match proxy_url {
+        Some(url) if !url.trim().is_empty() && !is_direct_or_none(url) => {
+            let trimmed = url.trim();
+            let proxy = reqwest::Proxy::all(trimmed)
+                .map_err(|e| anyhow::anyhow!("failed to build proxy for '{trimmed}': {e}"))?;
             builder = builder.proxy(proxy);
         }
+        _ => {
+            builder = builder.no_proxy();
+        }
     }
+    builder = crate::loopback_guard::apply_qa_loopback_guard(builder);
     builder
         .build()
         .map_err(|e| anyhow::anyhow!("failed to build reqwest client: {e}"))
@@ -191,29 +287,36 @@ pub enum DevinClientBuildError {
     BuildFailed,
 }
 
-pub fn build_devin_http_client(proxy_url: Option<&str>) -> Result<reqwest::Client, DevinClientBuildError> {
+pub fn build_devin_http_client(
+    proxy_url: Option<&str>,
+) -> Result<reqwest::Client, DevinClientBuildError> {
+    if let Some(url) = proxy_url {
+        validate_proxy_url_candidate(url).map_err(|_| DevinClientBuildError::ProxyConfig)?;
+    }
     let mut builder = reqwest::Client::builder()
         .http1_only()
         .redirect(reqwest::redirect::Policy::none())
         .tcp_nodelay(true);
-    if let Some(url) = proxy_url {
-        let trimmed = url.trim();
-        if !trimmed.is_empty() {
-            let proxy = reqwest::Proxy::all(trimmed)
-                .map_err(|_| DevinClientBuildError::ProxyConfig)?;
+    match proxy_url {
+        Some(url) if !url.trim().is_empty() && !is_direct_or_none(url) => {
+            let trimmed = url.trim();
+            let proxy =
+                reqwest::Proxy::all(trimmed).map_err(|_| DevinClientBuildError::ProxyConfig)?;
             builder = builder.proxy(proxy);
-        } else {
+        }
+        _ => {
             builder = builder.no_proxy();
         }
-    } else {
-        builder = builder.no_proxy();
     }
+    builder = crate::loopback_guard::apply_qa_loopback_guard(builder);
     builder
         .build()
         .map_err(|_| DevinClientBuildError::BuildFailed)
 }
 
-pub fn build_devin_discovery_client(proxy_url: Option<&str>) -> Result<reqwest::Client, DevinClientBuildError> {
+pub fn build_devin_discovery_client(
+    proxy_url: Option<&str>,
+) -> Result<reqwest::Client, DevinClientBuildError> {
     build_devin_http_client(proxy_url)
 }
 
@@ -222,7 +325,10 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
-    fn settings_with(proxy_url: &str, providers: BTreeMap<String, ProviderProxyPolicy>) -> Settings {
+    fn settings_with(
+        proxy_url: &str,
+        providers: BTreeMap<String, ProviderProxyPolicy>,
+    ) -> Settings {
         Settings {
             proxy_url: proxy_url.to_string(),
             proxy_providers: providers,
@@ -363,7 +469,9 @@ mod tests {
         let accounts: Vec<String> = (0..60).map(|i| format!("cline-user-{i:04}")).collect();
         let mut rotations_per_second = BTreeMap::new();
         for account in &accounts {
-            let mut previous = runtime.session_proxy_url("cline", account, 100_000).unwrap();
+            let mut previous = runtime
+                .session_proxy_url("cline", account, 100_000)
+                .unwrap();
             for second in 100_001..100_601u64 {
                 let current = runtime.session_proxy_url("cline", account, second).unwrap();
                 if current != previous {
@@ -389,7 +497,11 @@ mod tests {
     fn session_phase_offset_is_stable_and_bounded() {
         for id in ["acc1", "cline-user-ofz76h06-superwiki-net", ""] {
             let offset = session_phase_offset(id, 600);
-            assert_eq!(offset, session_phase_offset(id, 600), "offset must be stable");
+            assert_eq!(
+                offset,
+                session_phase_offset(id, 600),
+                "offset must be stable"
+            );
             assert!(offset < 600, "offset must stay inside the TTL window");
         }
         assert_ne!(
@@ -440,7 +552,8 @@ mod tests {
 
     #[test]
     fn sanitize_session_id_hashes_long_strings() {
-        let long_id = "generic-cline-oauth-a3f834a97167decdd49292fefceccfca0e044cbcfe24c6d886b3bb64b1bf18a6";
+        let long_id =
+            "generic-cline-oauth-a3f834a97167decdd49292fefceccfca0e044cbcfe24c6d886b3bb64b1bf18a6";
         let sanitized = sanitize_session_id(long_id);
         assert!(sanitized.len() <= 48);
         assert!(sanitized.starts_with("generic-cline-oauth-a3f834a97167"));
@@ -481,7 +594,89 @@ mod tests {
                 .await
                 .expect("second request");
             let ip2 = resp2.text().await.unwrap_or_default();
-            assert_eq!(ip1, ip2, "sticky session should preserve exit IP across requests");
+            assert_eq!(
+                ip1, ip2,
+                "sticky session should preserve exit IP across requests"
+            );
         }
+    }
+
+    #[test]
+    fn test_direct_or_none_directive() {
+        assert!(is_direct_or_none("direct"));
+        assert!(is_direct_or_none("DIRECT"));
+        assert!(is_direct_or_none("none"));
+        assert!(is_direct_or_none("NONE"));
+        assert!(is_direct_or_none("no_proxy"));
+        assert!(is_direct_or_none("NO_PROXY"));
+        assert!(!is_direct_or_none("http://127.0.0.1:3128"));
+        assert!(!is_direct_or_none(""));
+    }
+
+    #[test]
+    fn test_base_proxy_url_direct() {
+        let settings = settings_with("direct", BTreeMap::new());
+        assert_eq!(base_proxy_url(&settings), None);
+        let settings_none = settings_with("none", BTreeMap::new());
+        assert_eq!(base_proxy_url(&settings_none), None);
+    }
+
+    #[test]
+    fn test_session_proxy_url_direct_directive() {
+        let mut providers = BTreeMap::new();
+        providers.insert(
+            "cline".to_string(),
+            ProviderProxyPolicy {
+                enabled: true,
+                sticky: false,
+                ttl_secs: 0,
+                url: "direct".to_string(),
+            },
+        );
+        let runtime = ProxyRuntime {
+            global_proxy_url: "http://127.0.0.1:3128".to_string(),
+            providers,
+        };
+        assert_eq!(
+            runtime.session_proxy_url("cline", "acc1", 1000),
+            Some("direct".to_string())
+        );
+    }
+
+    #[test]
+    fn test_validate_proxy_url_candidate() {
+        assert!(validate_proxy_url_candidate("").is_ok());
+        assert!(validate_proxy_url_candidate("direct").is_ok());
+        assert!(validate_proxy_url_candidate("none").is_ok());
+        assert!(validate_proxy_url_candidate("http://127.0.0.1:8080").is_ok());
+        assert!(validate_proxy_url_candidate("socks5://127.0.0.1:1080").is_ok());
+        assert!(validate_proxy_url_candidate("ftp://127.0.0.1:21").is_err());
+        assert!(validate_proxy_url_candidate("invalid-url-without-scheme").is_err());
+    }
+
+    #[test]
+    fn test_proxy_snapshot_single_generation_and_validation() {
+        let mut providers = BTreeMap::new();
+        providers.insert(
+            "cline".to_string(),
+            ProviderProxyPolicy {
+                enabled: true,
+                sticky: false,
+                ttl_secs: 0,
+                url: "http://127.0.0.1:18840".to_string(),
+            },
+        );
+        let settings = settings_with("http://127.0.0.1:3128", providers);
+        let snapshot = ProxySnapshot::from_settings(&settings).expect("snapshot build");
+        assert_eq!(snapshot.runtime.global_proxy_url, "http://127.0.0.1:3128");
+        assert!(snapshot.runtime.scoped_routing_active());
+        assert_eq!(
+            snapshot.runtime.session_proxy_url("cline", "acc1", 1000),
+            Some("http://any=1:x@127.0.0.1:18840/".to_string())
+        );
+
+        // Pre-validation: invalid proxy URL causes build failure
+        let bad_settings = settings_with("ftp://invalid-host", BTreeMap::new());
+        assert!(ProxySnapshot::from_settings(&bad_settings).is_err());
     }
 }

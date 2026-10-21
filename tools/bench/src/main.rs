@@ -1,6 +1,7 @@
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
+pub mod locality;
 mod mock;
 mod runner;
 mod stats;
@@ -21,6 +22,19 @@ enum Commands {
     Mock(MockArgs),
     /// Run concurrent TTFT sampling benchmark
     Run(RunArgs),
+    Locality(LocalityArgs),
+}
+
+#[derive(Args, Debug)]
+struct LocalityArgs {
+    #[arg(short, long)]
+    url: String,
+    #[arg(long)]
+    out: PathBuf,
+    #[arg(long, default_value_t = 5)]
+    turns: usize,
+    #[arg(long)]
+    session: String,
 }
 
 #[derive(Args, Debug)]
@@ -94,6 +108,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 timeout_ms: args.timeout_ms,
             };
             runner::run_benchmark(cfg).await?;
+        }
+        Commands::Locality(args) => {
+            let report =
+                locality::run_locality_benchmarks(&args.url, &args.session, args.turns).await?;
+            tokio::fs::write(&args.out, serde_json::to_vec_pretty(&report)?).await?;
         }
     }
     Ok(())

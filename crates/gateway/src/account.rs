@@ -151,7 +151,7 @@ pub enum ProviderAccount {
     Generic(GenericAccount),
 }
 
-#[derive(Clone, Debug, Default, serde::Deserialize)]
+#[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
 pub struct GenericAccount {
     #[serde(default)]
     pub identity_slug: String,
@@ -280,6 +280,7 @@ impl ProviderKind {
 
     pub fn from_type_str(value: &str) -> Option<Self> {
         match value {
+            "kimi" | "kimi-ai" | "kimi.com" | "kimi.ai" => Some(Self::Generic),
             "codex" => Some(Self::Codex),
             "antigravity" => Some(Self::Antigravity),
             "claude" | "anthropic" => Some(Self::Claude),
@@ -288,6 +289,7 @@ impl ProviderKind {
             "zcode" => Some(Self::Zcode),
             "vertex" | "google-vertex" => Some(Self::Vertex),
             "devin" => Some(Self::Devin),
+            "meta" => Some(Self::Generic),
             "generic" => Some(Self::Generic),
             _ => None,
         }
@@ -873,6 +875,7 @@ impl ProviderAccount {
             // Cline CLI login (WorkOS OAuth) carries a short-lived JWT and a
             // server-side refresh; expiry gates re-auth like other OAuth.
             Self::Generic(a) if a.provider == "cline" => expired_at_is_past(&a.expired, now_unix),
+            Self::Generic(a) if a.provider == "meta" => a.api_key.is_empty(),
             Self::Vertex(a) => a.is_expired(now_unix),
             Self::Devin(_) => false,
             // A MiMo Free account holds a bootstrap JWT rather than a pasted
@@ -1029,7 +1032,27 @@ impl ProviderAccount {
                 ),
                 ("connect-protocol-version".to_string(), "1".to_string()),
             ],
+            Self::Generic(a) if a.provider == "xai" => {
+                let native = mahoquot_providers::xai::XaiAccount {
+                    auth_mode: a.auth_mode.clone(),
+                    api_key: a.api_key.clone(),
+                    base_url: a.base_url.clone(),
+                    static_headers: a.static_headers.clone(),
+                    ..Default::default()
+                };
+                let base = native.base_url_for(mahoquot_providers::xai::Transport::Chat, None);
+                native.headers(
+                    mahoquot_providers::xai::Transport::Chat,
+                    base,
+                    false,
+                    mahoquot_providers::xai::CLIENT_VERSION,
+                )
+            }
             Self::Generic(a) => {
+                if a.provider == "meta" {
+                    return mahoquot_providers::meta::api_headers(&a.api_key, true)
+                        .unwrap_or_default();
+                }
                 let mut headers =
                     vec![("content-type".to_string(), "application/json".to_string())];
                 if a.adapter == "anthropic" {
@@ -1113,18 +1136,19 @@ impl ProviderAccount {
             Self::Generic(a) if a.provider == "cline" => {
                 mahoquot_providers::build_cline_refresh_request(&a.refresh_token)
             }
-            Self::Generic(a) if matches!(a.provider.as_str(), "xai" | "kimi") => {
-                mahoquot_providers::RefreshRequest {
-                    url: a.token_url.clone(),
-                    form_fields: vec![
-                        ("grant_type".to_string(), "refresh_token".to_string()),
-                        ("refresh_token".to_string(), a.refresh_token.clone()),
-                        ("client_id".to_string(), a.client_id.clone()),
-                    ],
-                    json_body: None,
-                    headers: Vec::new(),
-                }
+            Self::Generic(a) if a.provider == "xai" => {
+                mahoquot_providers::xai::refresh_request(&a.refresh_token, &a.token_url)
             }
+            Self::Generic(a) if a.provider == "kimi" => mahoquot_providers::RefreshRequest {
+                url: a.token_url.clone(),
+                form_fields: vec![
+                    ("grant_type".to_string(), "refresh_token".to_string()),
+                    ("refresh_token".to_string(), a.refresh_token.clone()),
+                    ("client_id".to_string(), a.client_id.clone()),
+                ],
+                json_body: None,
+                headers: Vec::new(),
+            },
             Self::Generic(_) => mahoquot_providers::build_refresh_request(""),
             Self::Vertex(_) => mahoquot_providers::build_refresh_request(""),
             other => mahoquot_providers::build_refresh_request(&other.refresh_token()),
@@ -1186,6 +1210,12 @@ pub fn model_quota_group<'a>(provider: &str, model: &'a str) -> Option<&'a str> 
 /// name, which always comes from provider display text.
 const ACCOUNT_BENCH_SCOPE: &str = "\u{0}account";
 
+/// Bench-scope key for a single-model cooldown. The NUL prefix keeps it apart
+/// from provider quota-group names.
+fn model_bench_key(model: &str) -> String {
+    format!("\u{0}model:{model}")
+}
+
 /// Why an account, or one of its quota groups, is benched.
 ///
 /// A deadline alone cannot describe a bench: a plan cap and a transient rate
@@ -1214,8 +1244,11 @@ pub(crate) fn split_date_suffix(model: &str) -> Option<&str> {
 }
 
 pub struct AccountMember {
+    pub home_lease: Option<Arc<crate::home::HomeLease>>,
     pub id: String,
     pub file_path: PathBuf,
+    request_retry_override: Option<i64>,
+    config_retry_override: Option<Option<i64>>,
     pub inner: RwLock<ProviderAccount>,
     pub health: Arc<RwLock<Health>>,
     /// Per-quota-group cooldown deadlines (unix ms) for providers that meter
@@ -1238,6 +1271,7 @@ pub struct AccountMember {
     pub upstream_override: Option<String>,
     /// Usage-polling-only base; falls back to `upstream_override` when unset.
     pub usage_override: Option<String>,
+    pub proxy_url: Option<String>,
     pub ok_count: Arc<AtomicU64>,
     pub fail_count: Arc<AtomicU64>,
     pub refresh_lock: Arc<tokio::sync::Mutex<()>>,
@@ -1281,8 +1315,11 @@ impl AccountMember {
 
     pub fn for_test_with_id(id: impl Into<String>, inner: ProviderAccount) -> Self {
         Self {
+            home_lease: None,
             id: id.into(),
             file_path: PathBuf::from("/dev/null"),
+            request_retry_override: None,
+            config_retry_override: None,
             inner: RwLock::new(inner),
             health: Arc::new(RwLock::new(Health::Available)),
             group_cooldowns: Arc::new(RwLock::new(BTreeMap::new())),
@@ -1292,6 +1329,7 @@ impl AccountMember {
             last_activity: Arc::new(std::sync::Mutex::new(tokio::time::Instant::now())),
             upstream_override: None,
             usage_override: None,
+            proxy_url: None,
             ok_count: Arc::new(AtomicU64::new(0)),
             fail_count: Arc::new(AtomicU64::new(0)),
             refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -1627,8 +1665,11 @@ impl AccountMember {
         new_catalog: Option<Arc<crate::devin_catalog::DevinAccountCatalogState>>,
     ) -> Self {
         Self {
+            home_lease: self.home_lease.clone(),
             id: self.id.clone(),
             file_path: self.file_path.clone(),
+            request_retry_override: self.request_retry_override,
+            config_retry_override: self.config_retry_override,
             inner: RwLock::new(self.inner.read().unwrap_or_else(|p| p.into_inner()).clone()),
             health: Arc::clone(&self.health),
             group_cooldowns: Arc::clone(&self.group_cooldowns),
@@ -1638,6 +1679,7 @@ impl AccountMember {
             last_activity: Arc::clone(&self.last_activity),
             upstream_override: self.upstream_override.clone(),
             usage_override: self.usage_override.clone(),
+            proxy_url: self.proxy_url.clone(),
             ok_count: Arc::clone(&self.ok_count),
             fail_count: Arc::clone(&self.fail_count),
             refresh_lock: Arc::clone(&self.refresh_lock),
@@ -1837,6 +1879,20 @@ impl AccountMember {
         }
     }
 
+    pub fn xai_account(&self) -> Option<mahoquot_providers::xai::XaiAccount> {
+        let guard = self
+            .inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match &*guard {
+            ProviderAccount::Generic(account) if account.provider == "xai" => {
+                let json = serde_json::to_value(account).ok()?;
+                mahoquot_providers::xai::XaiAccount::from_record(&json).ok()
+            }
+            _ => None,
+        }
+    }
+
     pub fn is_manually_disabled(&self) -> bool {
         if self.health() == mahoquot_types::Health::Disabled {
             return true;
@@ -1879,6 +1935,9 @@ impl AccountMember {
                 .read()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             match &*guard {
+                ProviderAccount::Generic(account) if account.provider == "xai" => {
+                    account.models.iter().any(|candidate| candidate == model)
+                }
                 ProviderAccount::Generic(account) => {
                     account.models.is_empty()
                         || account.models.iter().any(|candidate| candidate == model)
@@ -1980,14 +2039,32 @@ impl AccountMember {
     /// Whether this account may currently serve `model`, considering only the
     /// per-group cooldowns. Account-wide health is checked separately.
     pub fn group_available(&self, model: &str, now_unix_ms: i64) -> bool {
-        let Some(group) = self.quota_group_for(model) else {
-            return true;
-        };
         let guard = self
             .group_cooldowns
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // A documented model/overage-scoped rejection benches only that model.
+        if guard
+            .get(&model_bench_key(model))
+            .is_some_and(|until| *until > now_unix_ms)
+        {
+            return false;
+        }
+        let Some(group) = self.quota_group_for(model) else {
+            return true;
+        };
         guard.get(group).is_none_or(|until| *until <= now_unix_ms)
+    }
+
+    /// Bench exactly one model on this account (Claude overage/model-scoped
+    /// rejection), leaving the account and its other models routable.
+    pub fn set_model_cooldown(&self, model: &str, until_unix_ms: i64) {
+        let mut guard = self
+            .group_cooldowns
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let slot = guard.entry(model_bench_key(model)).or_insert(until_unix_ms);
+        *slot = (*slot).max(until_unix_ms);
     }
 
     /// The benched-group reset (unix secs) for `model`, when this account's
@@ -2240,6 +2317,9 @@ impl AccountMember {
         if self.relay_api_key().is_some() || self.kind() == ProviderKind::Devin {
             return Ok(false);
         }
+        if presented_token.is_some() {
+            tracing::debug!(name: "reactive_refresh_entered", account = self.id());
+        }
         let _guard = self.refresh_lock.lock().await;
 
         let now_unix = SystemTime::now()
@@ -2253,6 +2333,64 @@ impl AccountMember {
             }
         } else if !self.is_expired(now_unix) {
             return Ok(false);
+        }
+
+        if self.provider_name() == "meta" {
+            return crate::compat::meta::refresh_member(self, client, presented_token)
+                .await
+                .map_err(RefreshError::Parse);
+        }
+
+        if mahoquot_providers::kimi::is_provider(&self.provider_name()) {
+            'kimi: {
+                let raw = tokio::fs::read(&self.file_path).await?;
+                let mut credential: serde_json::Value = serde_json::from_slice(&raw)
+                    .map_err(|error| RefreshError::Parse(error.to_string()))?;
+                let domain = mahoquot_providers::kimi::credential_domain(&credential);
+                let token_url = credential
+                    .get("token_url")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("{}/api/oauth/token", domain.oauth_host()));
+                // A credential whose token endpoint is not Kimi's own OAuth path is a
+                // generic OAuth contract; refresh it through the shared path below.
+                let Some(oauth_host) = token_url.strip_suffix("/api/oauth/token") else {
+                    break 'kimi;
+                };
+                let api_base = self
+                    .upstream_override
+                    .clone()
+                    .or_else(|| self.generic_base_url())
+                    .unwrap_or_else(|| domain.api_base().to_string());
+                let native = mahoquot_providers::kimi::KimiClient::with_endpoints(
+                    client.clone(),
+                    oauth_host,
+                    &api_base,
+                    mahoquot_providers::kimi::device_identity(&credential),
+                );
+                let update = native
+                    .refresh(&self.refresh_token())
+                    .await
+                    .map_err(|error| match error {
+                        mahoquot_providers::kimi::Error::Http(code) => RefreshError::Status {
+                            code,
+                            body: "Kimi refresh or catalog rejected".into(),
+                        },
+                        other => RefreshError::Parse(other.to_string()),
+                    })?;
+                update
+                    .apply(&mut credential, now_unix)
+                    .map_err(|error| RefreshError::Parse(error.to_string()))?;
+                let path = self.file_path.clone();
+                let rendered = serde_json::to_vec_pretty(&credential)
+                    .map_err(|error| RefreshError::Parse(error.to_string()))?;
+                tokio::task::spawn_blocking(move || write_credential_atomically(&path, &rendered))
+                    .await
+                    .map_err(|error| RefreshError::Parse(error.to_string()))??;
+                self.reload_from_file()
+                    .map_err(|error| RefreshError::Parse(error.to_string()))?;
+                return Ok(true);
+            }
         }
 
         let spec = self
@@ -2365,8 +2503,11 @@ fn normalize_cline_generic(account: &mut GenericAccount) {
 
 fn provider_account_from_value(
     kind: ProviderKind,
-    value: serde_json::Value,
+    mut value: serde_json::Value,
 ) -> Result<ProviderAccount, serde_json::Error> {
+    mahoquot_providers::kimi::normalize_credential(&mut value)
+        .map_err(|error| <serde_json::Error as serde::de::Error>::custom(error.to_string()))?;
+    mahoquot_providers::xai::normalize_record(&mut value);
     Ok(match kind {
         ProviderKind::Codex => ProviderAccount::Codex(serde_json::from_value(value)?),
         ProviderKind::Antigravity => ProviderAccount::Antigravity(serde_json::from_value(value)?),
@@ -2377,6 +2518,14 @@ fn provider_account_from_value(
         ProviderKind::Vertex => ProviderAccount::Vertex(serde_json::from_value(value)?),
         ProviderKind::Devin => ProviderAccount::Devin(serde_json::from_value(value)?),
         ProviderKind::Generic => {
+            let value = if value.get("type").and_then(serde_json::Value::as_str) == Some("meta") {
+                let native: mahoquot_providers::meta::MetaAccount = serde_json::from_value(value)?;
+                mahoquot_providers::meta::routing_record(&native).map_err(|error| {
+                    serde_json::Error::io(std::io::Error::other(error.to_string()))
+                })?
+            } else {
+                value
+            };
             let mut account: GenericAccount = serde_json::from_value(value)?;
             normalize_cline_generic(&mut account);
             ProviderAccount::Generic(account)
@@ -2415,6 +2564,51 @@ fn identity_slug_of(account: &ProviderAccount) -> &str {
 #[cfg(test)]
 mod identity_tests {
     use super::*;
+
+    #[test]
+    fn retry_override_survives_credential_load_and_snapshot() {
+        let dir = std::env::temp_dir().join(format!(
+            "mahoquot-retry-override-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp auth dir");
+        let path = dir.join("codex-retry.json");
+        std::fs::write(
+            &path,
+            r#"{"type":"codex","access_token":"t","account_id":"a","email":"u@example.com","expired":"2099-01-01T00:00:00Z","id_token":"i","last_refresh":"","refresh_token":"r","unknown-retained-test-field":true,"request_retry":2,"request-retry":4}"#,
+        )
+        .expect("write credential");
+
+        let members = load_account_members(&dir).expect("load accounts");
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].request_retry_override(), Some(2));
+        let snapshot = members[0].clone_for_snapshot(None);
+        assert_eq!(snapshot.request_retry_override(), Some(2));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn retry_override_alias_and_invalid_values_follow_canonical_precedence() {
+        for (raw, expected) in [
+            (r#"{"request-retry":3}"#, Some(3)),
+            (r#"{"request_retry":0,"request-retry":3}"#, Some(0)),
+            (r#"{"request_retry":-1,"request-retry":3}"#, None),
+            (r#"{"request_retry":"bad","request-retry":3}"#, Some(3)),
+            (r#"{"request_retry":" 0 "}"#, Some(0)),
+            (r#"{"request_retry":2.9}"#, Some(2)),
+            (r#"{"request_retry":-0.5}"#, Some(0)),
+            (r#"{"request_retry":2.9,"request-retry":3}"#, Some(2)),
+            (r#"{"request_retry":" -1 ","request-retry":3}"#, None),
+            (r#"{"request_retry":true,"request-retry":" 3 "}"#, Some(3)),
+            (r#"{"request_retry":-1}"#, None),
+            (r#"{"request_retry":"bad"}"#, None),
+            (r#"{}"#, None),
+        ] {
+            let value: serde_json::Value = serde_json::from_str(raw).expect("metadata JSON");
+            assert_eq!(request_retry_override(&value), expected, "{raw}");
+        }
+    }
 
     #[test]
     fn pool_order_respects_the_account_order_manifest() {
@@ -2531,6 +2725,10 @@ fn classify_credential(file_path: &Path, declared_type: &str) -> Option<Provider
         .and_then(|n| n.to_str())
         .unwrap_or_default();
 
+    if name.starts_with("kimi-") || name.starts_with("kimi-ai-") || name.starts_with("meta-") {
+        return Some(ProviderKind::Generic);
+    }
+
     for kind in [
         ProviderKind::Codex,
         ProviderKind::Antigravity,
@@ -2550,6 +2748,24 @@ fn classify_credential(file_path: &Path, declared_type: &str) -> Option<Provider
     }
 
     ProviderKind::from_type_str(declared_type)
+}
+
+pub(crate) fn request_retry_override(value: &serde_json::Value) -> Option<i64> {
+    let parsed = value
+        .get("request_retry")
+        .and_then(parse_retry_integer)
+        .or_else(|| value.get("request-retry").and_then(parse_retry_integer));
+    parsed.filter(|retry| *retry >= 0)
+}
+
+fn parse_retry_integer(value: &serde_json::Value) -> Option<i64> {
+    match value {
+        serde_json::Value::Number(number) => number
+            .as_i64()
+            .or_else(|| number.as_f64().map(|value| value as i64)),
+        serde_json::Value::String(value) => value.trim().parse().ok(),
+        _ => None,
+    }
 }
 
 pub const ACCOUNT_ORDER_FILE: &str = ".mahoquot-account-order.json";
@@ -2633,6 +2849,8 @@ pub fn load_account_members(auth_dir: &Path) -> anyhow::Result<Vec<Arc<AccountMe
             continue;
         };
 
+        let request_retry_override = request_retry_override(&value);
+
         let upstream_override = value
             .get("upstream_override")
             .and_then(|v| v.as_str())
@@ -2651,6 +2869,12 @@ pub fn load_account_members(auth_dir: &Path) -> anyhow::Result<Vec<Arc<AccountMe
 
         let usage_override = value
             .get("usage_override")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+
+        let proxy_url = value
+            .get("proxy_url")
+            .or_else(|| value.get("proxy"))
             .and_then(|v| v.as_str())
             .map(str::to_string);
 
@@ -2745,8 +2969,11 @@ pub fn load_account_members(auth_dir: &Path) -> anyhow::Result<Vec<Arc<AccountMe
         };
 
         members.push(Arc::new(AccountMember {
+            home_lease: None,
+            config_retry_override: None,
             id,
             file_path,
+            request_retry_override,
             inner: RwLock::new(inner),
             health: Arc::new(RwLock::new(if is_disabled {
                 Health::Disabled
@@ -2760,6 +2987,7 @@ pub fn load_account_members(auth_dir: &Path) -> anyhow::Result<Vec<Arc<AccountMe
             last_activity: Arc::new(std::sync::Mutex::new(tokio::time::Instant::now())),
             upstream_override,
             usage_override,
+            proxy_url,
             ok_count: Arc::new(AtomicU64::new(0)),
             fail_count: Arc::new(AtomicU64::new(0)),
             refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -2772,4 +3000,130 @@ pub fn load_account_members(auth_dir: &Path) -> anyhow::Result<Vec<Arc<AccountMe
     }
 
     Ok(members)
+}
+
+impl AccountMember {
+    pub fn request_retry_override(&self) -> Option<i64> {
+        self.config_retry_override
+            .unwrap_or(self.request_retry_override)
+    }
+
+    pub(crate) fn apply_config_retry(&mut self, settings: &crate::management::settings::Settings) {
+        let entries = match self.provider_name().as_str() {
+            "gemini" | "antigravity" => &settings.gemini_api_key,
+            "claude" => &settings.claude_api_key,
+            "codex" => &settings.codex_api_key,
+            "xai" => &settings.xai_api_key,
+            "vertex" => &settings.vertex_api_key,
+            "interactions" => &settings.interactions_api_key,
+            _ => &settings.openai_compatibility,
+        };
+        let key = self.access_token();
+        self.config_retry_override = entries.iter().find_map(|entry| entry.retry_for_key(&key));
+    }
+
+    /// Builds a routable member from a credential Home dispatched. The
+    /// credential goes through the exact same parser as an on-disk auth file
+    /// (written to a private, process-owned scratch directory), so a Home
+    /// account behaves identically to a local one; the Home id is kept.
+    pub fn from_home(
+        id: String,
+        provider: &str,
+        credential: serde_json::Value,
+    ) -> Result<Self, String> {
+        if id.trim().is_empty() {
+            return Err("Home credential id is empty".into());
+        }
+        let mut credential = credential;
+        let object = credential
+            .as_object_mut()
+            .ok_or_else(|| "Home credential must be a JSON object".to_string())?;
+        object
+            .entry("identity_slug")
+            .or_insert_with(|| serde_json::Value::String(id.clone()));
+        let kind = ProviderKind::from_type_str(provider)
+            .or_else(|| {
+                object
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(ProviderKind::from_type_str)
+            })
+            .ok_or_else(|| format!("unknown Home provider {provider}"))?;
+        let scratch = std::env::temp_dir().join(format!(
+            "mahoquot-home-auth-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
+        let safe_id: String = id
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let file = scratch.join(format!("{}-{safe_id}.json", kind.as_str()));
+        let loaded = (|| {
+            std::fs::write(
+                &file,
+                serde_json::to_vec(&credential).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+            load_account_members(&scratch).map_err(|e| e.to_string())
+        })();
+        let _ = std::fs::remove_dir_all(&scratch);
+        let member = loaded?
+            .into_iter()
+            .next()
+            .ok_or_else(|| "Home credential does not match its provider schema".to_string())?;
+        let mut member = Arc::try_unwrap(member)
+            .map_err(|_| "Home credential member unexpectedly shared".to_string())?;
+        member.id = id;
+        Ok(member)
+    }
+}
+
+static ACTIVE_STORAGE_MANAGER: std::sync::RwLock<
+    Option<Arc<mahoquot_registry::store::StorageManager>>,
+> = std::sync::RwLock::new(None);
+
+pub fn set_active_storage_manager(store: Option<Arc<mahoquot_registry::store::StorageManager>>) {
+    *ACTIVE_STORAGE_MANAGER.write().unwrap() = store;
+}
+
+pub fn active_storage_manager() -> Option<Arc<mahoquot_registry::store::StorageManager>> {
+    ACTIVE_STORAGE_MANAGER.read().unwrap().clone()
+}
+
+pub fn save_account_to_store(
+    store: &mahoquot_registry::store::StorageManager,
+    filename: &str,
+    content: &[u8],
+) -> anyhow::Result<()> {
+    let key = format!("auths/{}", filename.trim_start_matches('/'));
+    store
+        .put(&key, content)
+        .map_err(|e| anyhow::Error::new(e).context("failed to persist account to store"))
+}
+
+pub fn delete_account_from_store(
+    store: &mahoquot_registry::store::StorageManager,
+    filename: &str,
+) -> anyhow::Result<()> {
+    let key = format!("auths/{}", filename.trim_start_matches('/'));
+    store
+        .delete(&key)
+        .map_err(|e| anyhow::Error::new(e).context("failed to delete account from store"))
+}
+
+pub fn load_account_members_from_store(
+    store: &mahoquot_registry::store::StorageManager,
+) -> anyhow::Result<Vec<Arc<AccountMember>>> {
+    store
+        .sync_all_to_spool()
+        .map_err(|e| anyhow::Error::new(e).context("failed to sync store to spool"))?;
+    load_account_members(&store.auth_dir())
 }

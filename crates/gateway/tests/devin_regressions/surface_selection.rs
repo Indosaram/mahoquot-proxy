@@ -38,7 +38,11 @@ impl Fixture {
         };
         let state = Arc::new(AppState::new(&config).unwrap());
         register_devin_models(&state, &["devin/glm-5-2", "devin/swe-1-7"]);
-        Self { state, mock, auth_dir }
+        Self {
+            state,
+            mock,
+            auth_dir,
+        }
     }
 
     async fn request(&self, path: &str, body: serde_json::Value) -> StatusCode {
@@ -47,7 +51,11 @@ impl Fixture {
         let member = &pool.members[0];
         let chat_path = "/exa.api_server_pb.ApiServerService/GetChatMessage";
         assert_eq!(
-            build_provider_url(member.kind(), member.upstream_override.as_deref(), chat_path),
+            build_provider_url(
+                member.kind(),
+                member.upstream_override.as_deref(),
+                chat_path
+            ),
             format!("{}{chat_path}", self.mock.url),
         );
         let response = tokio::time::timeout(
@@ -56,14 +64,21 @@ impl Fixture {
                 Request::post(path)
                     .header(header::AUTHORIZATION, "Bearer test-inbound-key")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(body.to_string())).unwrap(),
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
             ),
-        ).await.unwrap().unwrap();
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let status = response.status();
         tokio::time::timeout(
             Duration::from_secs(5),
             axum::body::to_bytes(response.into_body(), 1024 * 1024),
-        ).await.unwrap().unwrap();
+        )
+        .await
+        .unwrap()
+        .unwrap();
         status
     }
 
@@ -100,7 +115,12 @@ async fn gemini_selects_discovered_account_when_only_native_endpoint_is_set() {
     // Given a healthy snapshot declaring the discovered public model IDs.
     let fixture = Fixture::new(false);
     // When Gemini resolves and selects its account through the real route.
-    let status = fixture.request("/v1beta/models/devin/glm-5-2:generateContent", gemini_body()).await;
+    let status = fixture
+        .request(
+            "/v1beta/models/devin/glm-5-2:generateContent",
+            gemini_body(),
+        )
+        .await;
     // Then the selected account sends the canonical model's UID to the mock.
     assert_eq!(status, StatusCode::OK);
     fixture.assert_selected().await;
@@ -122,7 +142,12 @@ async fn gemini_selects_discovered_account_when_endpoint_is_explicit() {
     // Given endpoint resolution independent of the native-endpoint regression.
     let fixture = Fixture::new(true);
     // When the healthy account is selected through Gemini.
-    let status = fixture.request("/v1beta/models/devin/glm-5-2:generateContent", gemini_body()).await;
+    let status = fixture
+        .request(
+            "/v1beta/models/devin/glm-5-2:generateContent",
+            gemini_body(),
+        )
+        .await;
     // Then the existing model normalization already selects the account.
     assert_eq!(status, StatusCode::OK);
     fixture.assert_selected().await;
@@ -146,7 +171,12 @@ async fn gemini_returns_unavailable_when_discovered_account_is_auth_failed() {
     let fixture = Fixture::new(true);
     fixture.state.pool.load().members[0].set_health(Health::AuthFailed);
     // When Gemini tries to select the account.
-    let status = fixture.request("/v1beta/models/devin/glm-5-2:generateContent", gemini_body()).await;
+    let status = fixture
+        .request(
+            "/v1beta/models/devin/glm-5-2:generateContent",
+            gemini_body(),
+        )
+        .await;
     // Then health, not model normalization, blocks selection before upstream I/O.
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(fixture.mock.get_state().await["captures"], json!([]));

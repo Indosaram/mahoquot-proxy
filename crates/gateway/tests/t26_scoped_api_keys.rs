@@ -1,8 +1,10 @@
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::http::{header, Request, StatusCode};
+use axum::extract::ConnectInfo;
+use axum::http::{Request, StatusCode};
 use mahoquot_gateway::config::GatewayConfig;
+use mahoquot_gateway::management::management_router;
 use mahoquot_gateway::management::settings::{ScopedApiKey, Settings};
 use mahoquot_gateway::routes::create_app;
 use mahoquot_gateway::state::AppState;
@@ -11,6 +13,7 @@ use tower::ServiceExt;
 mod common;
 
 const MASTER: &str = "master-key";
+const MANAGEMENT: &str = "secret-key";
 const SCOPED_RAW: &str = "scoped-raw-key";
 
 fn scoped_key(is_active: bool, expires_at_ms: Option<i64>) -> ScopedApiKey {
@@ -36,6 +39,10 @@ fn state_with(scoped: Vec<ScopedApiKey>) -> Arc<AppState> {
     let config_path = dir.join("config.yaml");
     let settings = Settings {
         api_keys: vec![MASTER.to_string()],
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: MANAGEMENT.to_string(),
+            ..Default::default()
+        },
         scoped_api_keys: scoped,
         auth_dir: dir.to_string_lossy().to_string(),
         ..Settings::default()
@@ -49,16 +56,24 @@ fn state_with(scoped: Vec<ScopedApiKey>) -> Arc<AppState> {
     Arc::new(AppState::new(&config).expect("state"))
 }
 
+fn management_test_router(state: Arc<AppState>) -> axum::Router {
+    // Mounted exactly as the gateway mounts it; management_router installs
+    // the dedicated management gate itself.
+    axum::Router::new()
+        .nest("/v0/management", management_router(state.clone()))
+        .with_state(state)
+}
+
 async fn status_for(state: Arc<AppState>, path: &str, key: &str) -> StatusCode {
     let app = create_app(state);
+    let mut builder = Request::builder().uri(path).extension(ConnectInfo(
+        "127.0.0.1:18840"
+            .parse::<std::net::SocketAddr>()
+            .expect("loopback peer"),
+    ));
+    builder = builder.header("Authorization", format!("Bearer {key}"));
     let response = app
-        .oneshot(
-            Request::builder()
-                .uri(path)
-                .header(header::AUTHORIZATION, format!("Bearer {key}"))
-                .body(Body::empty())
-                .expect("request"),
-        )
+        .oneshot(builder.body(Body::empty()).expect("request"))
         .await
         .expect("response");
     response.status()
@@ -77,25 +92,75 @@ async fn a_scoped_key_authenticates_on_the_relay_surface() {
 #[tokio::test]
 async fn a_scoped_key_is_forbidden_on_management_and_admin_routes() {
     // given a gateway with one active scoped key
-    let state = state_with(vec![scoped_key(true, None)]);
     // when it reaches for the control plane
-    for path in ["/v0/management/api-keys", "/admin/stats"] {
-        let status = status_for(Arc::clone(&state), path, SCOPED_RAW).await;
-        // then it is refused with 403 rather than served
-        assert_eq!(status, StatusCode::FORBIDDEN, "path: {path}");
-    }
+    let management_state = state_with(vec![scoped_key(true, None)]);
+    let management_status = management_test_router(management_state)
+        .oneshot(
+            Request::get("/v0/management/api-keys")
+                .header("Authorization", format!("Bearer {SCOPED_RAW}"))
+                .extension(ConnectInfo(std::net::SocketAddr::from((
+                    [127, 0, 0, 1],
+                    18840,
+                ))))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status();
+    // Task 26: a scoped key is never a management credential, so the
+    // dedicated gate refuses it as unauthenticated (401) on every
+    // control-plane surface (inbound.rs keeps 401 rather than masking it 403).
+    assert_eq!(management_status, StatusCode::UNAUTHORIZED);
+    let status = status_for(
+        state_with(vec![scoped_key(true, None)]),
+        "/admin/stats",
+        SCOPED_RAW,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "path: /admin/stats");
 }
 
 #[tokio::test]
 async fn a_master_key_retains_control_plane_access() {
     // given the same gateway
-    let state = state_with(vec![scoped_key(true, None)]);
     // when the master key calls the control plane
-    for path in ["/v0/management/api-keys", "/admin/stats"] {
-        let status = status_for(Arc::clone(&state), path, MASTER).await;
-        // then it is served
-        assert_eq!(status, StatusCode::OK, "path: {path}");
-    }
+    let management_state = state_with(vec![scoped_key(true, None)]);
+    let management_status = management_test_router(management_state)
+        .oneshot(
+            Request::get("/v0/management/api-keys")
+                .header("Authorization", format!("Bearer {MANAGEMENT}"))
+                .extension(ConnectInfo(std::net::SocketAddr::from((
+                    [127, 0, 0, 1],
+                    18840,
+                ))))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(management_status, StatusCode::OK);
+    // Task 26: /admin is control plane too, so it takes the dedicated
+    // management key; the inference master key is never a management key.
+    let status = status_for(
+        state_with(vec![scoped_key(true, None)]),
+        "/admin/stats",
+        MANAGEMENT,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "path: /admin/stats");
+    let status = status_for(
+        state_with(vec![scoped_key(true, None)]),
+        "/admin/stats",
+        MASTER,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "master key on /admin/stats"
+    );
 }
 
 #[tokio::test]
@@ -182,7 +247,11 @@ fn rotation_shares_stable_id_counter_with_in_flight_request() {
     assert_eq!(current.token_used(), 450, "rotation retains live usage");
     assert!(tracker.lookup_raw(SCOPED_RAW).is_none());
     in_flight.consume(600);
-    assert_eq!(current.token_used(), 1050, "in-flight completion charges the same counter");
+    assert_eq!(
+        current.token_used(),
+        1050,
+        "in-flight completion charges the same counter"
+    );
     assert!(current.is_exhausted());
     rotated.token_used = 1100;
     tracker.reconcile(&[rotated]);
@@ -194,7 +263,10 @@ fn rotation_shares_stable_id_counter_with_in_flight_request() {
 fn rotation_persists_in_flight_stream_usage_across_restart() {
     use http_body_util::BodyExt;
     let dir = common::unique_temp_dir("review-rotation");
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     runtime.block_on(async {
     let mut bound = None;
     for port in 18840..=18899 {
@@ -212,7 +284,7 @@ fn rotation_persists_in_flight_stream_usage_across_restart() {
     let mut key = scoped_key(true, None);
     key.allowed_providers.clear();
     let config = GatewayConfig { auth_dir: dir.clone(), config_path: dir.join("config.yaml"), auth_refresh_enabled: false, ..GatewayConfig::default() };
-    Settings { api_keys: vec![MASTER.into()], scoped_api_keys: vec![key], auth_dir: dir.to_string_lossy().into_owned(), ..Settings::default() }.persist(&config.config_path).unwrap();
+    Settings { api_keys: vec![MASTER.into()], remote_management: mahoquot_gateway::management::settings::RemoteManagement { secret_key: MANAGEMENT.into(), ..Default::default() }, scoped_api_keys: vec![key], auth_dir: dir.to_string_lossy().into_owned(), ..Settings::default() }.persist(&config.config_path).unwrap();
     let state = Arc::new(AppState::new(&config).unwrap());
     state.scoped_keys.lookup_raw(SCOPED_RAW).unwrap().consume(450);
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(2);
@@ -232,7 +304,8 @@ fn rotation_persists_in_flight_stream_usage_across_restart() {
     assert_eq!(response.status(), StatusCode::OK);
     let mut body = response.into_body();
     tokio::time::timeout(std::time::Duration::from_secs(5), body.frame()).await.unwrap().unwrap().unwrap();
-    let response = app.clone().oneshot(Request::patch("/v0/management/scoped-keys/sk-1").header("Authorization", format!("Bearer {MASTER}")).header("content-type", "application/json").body(Body::from(r#"{"raw_key":"rotated-secret"}"#)).unwrap()).await.unwrap();
+    let app = create_app(state.clone());
+    let response = app.clone().oneshot(Request::patch("/v0/management/scoped-keys/sk-1").header("Authorization", format!("Bearer {MANAGEMENT}")).extension(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 18840)))).header("content-type", "application/json").body(Body::from(r#"{"raw_key":"rotated-secret"}"#)).unwrap()).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let view: serde_json::Value = serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(view["key"]["token_used"], 450);

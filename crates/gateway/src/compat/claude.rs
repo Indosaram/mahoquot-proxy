@@ -38,9 +38,11 @@ impl AnthropicDecoder {
                 let usage = &value["message"]["usage"];
                 self.input_tokens = usage["input_tokens"].as_u64().unwrap_or(0);
                 self.cache_read_tokens = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
-                self.cache_write_tokens = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+                self.cache_write_tokens =
+                    usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
                 self.cache_read_tokens_known = usage["cache_read_input_tokens"].as_u64().is_some();
-                self.cache_write_tokens_known = usage["cache_creation_input_tokens"].as_u64().is_some();
+                self.cache_write_tokens_known =
+                    usage["cache_creation_input_tokens"].as_u64().is_some();
                 out.push(CodexEvent::Created {
                     response_id: value["message"]["id"]
                         .as_str()
@@ -93,7 +95,8 @@ impl AnthropicDecoder {
                 _ => {}
             },
             Some("message_delta") => {
-                if value.pointer("/delta/stop_reason").and_then(Value::as_str) == Some("max_tokens") {
+                if value.pointer("/delta/stop_reason").and_then(Value::as_str) == Some("max_tokens")
+                {
                     out.push(CodexEvent::OutputLimitReached);
                 }
                 self.output_tokens = value["usage"]["output_tokens"].as_u64().unwrap_or(0);
@@ -157,6 +160,7 @@ pub fn anthropic_to_openai(body: &Value) -> Result<Value, String> {
         let content = msg.get("content");
 
         let mut text_parts: Vec<String> = Vec::new();
+        let mut image_parts: Vec<Value> = Vec::new();
         let mut tool_calls: Vec<Value> = Vec::new();
         let mut tool_results: Vec<Value> = Vec::new();
         let mut thinking_parts: Vec<String> = Vec::new();
@@ -171,6 +175,21 @@ pub fn anthropic_to_openai(body: &Value) -> Result<Value, String> {
                         Some("text") => {
                             if let Some(t) = block.get("text").and_then(Value::as_str) {
                                 text_parts.push(t.to_string());
+                            }
+                        }
+                        Some("image") => {
+                            let source = &block["source"];
+                            if source["type"] == "base64" {
+                                image_parts.push(json!({
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": format!(
+                                            "data:{};base64,{}",
+                                            source["media_type"].as_str().unwrap_or("application/octet-stream"),
+                                            source["data"].as_str().unwrap_or("")
+                                        )
+                                    }
+                                }));
                             }
                         }
                         Some("thinking") => {
@@ -202,26 +221,49 @@ pub fn anthropic_to_openai(body: &Value) -> Result<Value, String> {
                                 .get("tool_use_id")
                                 .and_then(Value::as_str)
                                 .unwrap_or("");
-                            let text = block
+                            let content = block
                                 .get("content")
-                                .and_then(|c| match c {
-                                    Value::String(s) => Some(s.clone()),
-                                    Value::Array(items) => Some(
-                                        items
-                                            .iter()
-                                            .filter_map(|i| i.get("text").and_then(Value::as_str))
-                                            .collect::<Vec<_>>()
-                                            .join(""),
-                                    ),
-                                    _ => None,
-                                })
-                                .unwrap_or_default();
+                                .cloned()
+                                .unwrap_or(Value::String(String::new()));
+                            let output_text = match &content {
+                                Value::String(text) => Value::String(text.clone()),
+                                Value::Array(items) => Value::Array(
+                                    items
+                                        .iter()
+                                        .map(|item| match item["type"].as_str() {
+                                            Some("image") => {
+                                                let source = &item["source"];
+                                                if source["type"] == "base64" {
+                                                    json!({
+                                                        "type": "image_url",
+                                                        "image_url": {
+                                                            "url": format!(
+                                                                "data:{};base64,{}",
+                                                                source["media_type"].as_str().unwrap_or("application/octet-stream"),
+                                                                source["data"].as_str().unwrap_or("")
+                                                            )
+                                                        }
+                                                    })
+                                                } else {
+                                                    item.clone()
+                                                }
+                                            }
+                                            _ => item.clone(),
+                                        })
+                                        .collect(),
+                                ),
+                                other => other.clone(),
+                            };
                             let is_error = block.get("is_error").and_then(Value::as_bool);
                             let mut tr = json!({
                                 "role": "tool",
                                 "tool_call_id": id,
-                                "content": text
+                                "content": output_text,
+                                "x_anthropic_tool_result": true
                             });
+                            if let Some(cache_control) = block.get("cache_control") {
+                                tr["cache_control"] = cache_control.clone();
+                            }
                             if let Some(err) = is_error {
                                 tr["is_error"] = json!(err);
                             }
@@ -265,11 +307,23 @@ pub fn anthropic_to_openai(body: &Value) -> Result<Value, String> {
             m.insert("content".to_string(), json!(text_parts.join("")));
             m.insert("tool_calls".to_string(), Value::Array(tool_calls));
             out_messages.push(Value::Object(m));
-        } else if !text_parts.is_empty() {
-            out_messages.push(json!({ "role": role, "content": text_parts.join("") }));
+        } else if !text_parts.is_empty() || !image_parts.is_empty() {
+            let content = if image_parts.is_empty() {
+                json!(text_parts.join(""))
+            } else {
+                let mut parts = Vec::new();
+                if !text_parts.is_empty() {
+                    parts.push(json!({ "type": "text", "text": text_parts.join("") }));
+                }
+                parts.extend(image_parts);
+                Value::Array(parts)
+            };
+            out_messages.push(json!({ "role": role, "content": content }));
         }
 
+        let has_tool_results = !tool_results.is_empty();
         out_messages.extend(tool_results);
+        let _ = has_tool_results;
     }
 
     let mut out = Map::new();
@@ -314,7 +368,9 @@ pub fn anthropic_to_openai(body: &Value) -> Result<Value, String> {
             Some("none") => json!("none"),
             Some("any") => json!("required"),
             Some("tool") => {
-                let name = choice["name"].as_str().filter(|name| !name.is_empty())
+                let name = choice["name"]
+                    .as_str()
+                    .filter(|name| !name.is_empty())
                     .ok_or_else(|| "tool_choice tool requires a name".to_string())?;
                 json!({"type":"function","function":{"name":name}})
             }
@@ -322,7 +378,8 @@ pub fn anthropic_to_openai(body: &Value) -> Result<Value, String> {
         };
         out.insert("tool_choice".to_string(), mapped);
         if let Some(disabled) = choice.get("disable_parallel_tool_use") {
-            let disabled = disabled.as_bool()
+            let disabled = disabled
+                .as_bool()
                 .ok_or_else(|| "disable_parallel_tool_use must be boolean".to_string())?;
             out.insert("parallel_tool_calls".to_string(), json!(!disabled));
         }
@@ -331,11 +388,125 @@ pub fn anthropic_to_openai(body: &Value) -> Result<Value, String> {
     Ok(Value::Object(out))
 }
 
+/// Applies a requested thinking mode (model suffix or reasoning effort) to an
+/// Anthropic request `result` per the catalog capability. Shared by the
+/// OpenAI->Anthropic translation and native `/v1/messages` passthrough, so a
+/// `claude-*(2048)` suffix behaves the same on both wires. Returns whether
+/// thinking ended up enabled.
+pub fn apply_thinking_mode(
+    raw_model: &str,
+    body: &Value,
+    capability: &mahoquot_registry::ThinkingCapability,
+    result: &mut Value,
+) -> Result<bool, String> {
+    let mut thinking_enabled = false;
+    if let Some(mode) =
+        super::request::thinking_mode(raw_model, body).map_err(|error| error.to_string())?
+    {
+        use super::request::ThinkingMode;
+        use mahoquot_registry::ThinkingCapability;
+        let adaptive = matches!(capability, ThinkingCapability::Supported(support) if !support.levels.is_empty());
+        let mode = super::request::target_thinking_mode(mode, capability, true)?;
+        let budget = match mode {
+            ThinkingMode::None => {
+                result["thinking"] = json!({"type":"disabled"});
+                None
+            }
+            ThinkingMode::Auto => {
+                result["thinking"] = json!({"type":if adaptive { "adaptive" } else { "enabled" }});
+                thinking_enabled = true;
+                None
+            }
+            ThinkingMode::Level(level) if adaptive => {
+                result["thinking"] = json!({"type":"adaptive"});
+                result["output_config"] = json!({"effort":level});
+                thinking_enabled = true;
+                None
+            }
+            ThinkingMode::Level(level) => Some(super::request::level_budget(&level)),
+            ThinkingMode::Budget(budget) => Some(budget),
+        };
+        if let Some(budget) = budget {
+            let (minimum, maximum) = match capability {
+                ThinkingCapability::Supported(support) => (support.min, support.max),
+                ThinkingCapability::Unknown => (1024, 128000),
+                ThinkingCapability::Unsupported => (0, 0),
+            };
+            let budget =
+                u64::try_from(budget.clamp(minimum, maximum)).map_err(|error| error.to_string())?;
+            let max_tokens = result["max_tokens"].as_u64().unwrap_or(32_768);
+            if max_tokens <= u64::try_from(minimum).map_err(|error| error.to_string())? {
+                return Err("max_tokens cannot accommodate Claude minimum thinking budget: unsupported option conflict".to_string());
+            }
+            result["thinking"] =
+                json!({"type":"enabled", "budget_tokens":budget.min(max_tokens - 1)});
+            thinking_enabled = true;
+        }
+    }
+    Ok(thinking_enabled)
+}
+
+/// Native Anthropic body: resolve a thinking suffix on the requested model into
+/// `thinking`/`output_config`, then send the bare upstream model.
+pub fn apply_native_thinking_suffix(
+    requested_model: &str,
+    upstream_model: &str,
+    body: &mut Value,
+) -> Result<(), String> {
+    let (_, suffix) =
+        super::request::parse_model_suffix(requested_model).map_err(|e| e.to_string())?;
+    if suffix.is_none() {
+        return Ok(());
+    }
+    let capability = super::request::embedded_thinking_capability(requested_model, "claude")?;
+    let original = body.clone();
+    if let Some(object) = body.as_object_mut() {
+        object.remove("thinking");
+        object.remove("output_config");
+    }
+    let enabled = apply_thinking_mode(requested_model, &original, &capability, body)?;
+    if enabled && body.get("temperature").is_some() {
+        body["temperature"] = json!(1.0);
+    }
+    let (bare, _) =
+        super::request::parse_model_suffix(upstream_model).map_err(|e| e.to_string())?;
+    body["model"] = json!(bare);
+    Ok(())
+}
+
 pub fn openai_to_anthropic(body: &Value) -> Result<Value, String> {
     let model = body
         .get("model")
         .and_then(Value::as_str)
         .ok_or_else(|| "missing model".to_string())?;
+    let capability = super::request::embedded_thinking_capability(model, "claude")?;
+    openai_to_anthropic_with_capability(body, &capability)
+}
+
+pub fn openai_to_anthropic_with_capability(
+    body: &Value,
+    capability: &mahoquot_registry::ThinkingCapability,
+) -> Result<Value, String> {
+    let raw_model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "missing model".to_string())?;
+    let (model, _) = super::request::parse_model_suffix(raw_model).map_err(|e| e.to_string())?;
+
+    // The pinned canonical Claude catalog advertises thinking levels, but no
+    // native structured-output capability. Its translator uses system prompt
+    // instructions instead; that substitute is not part of our contract.
+    if let Some(rf) = body.get("response_format") {
+        if !rf.is_null() {
+            match rf.get("type").and_then(Value::as_str) {
+                Some("text") => {}
+                Some("json_schema") | Some("json_object") => return Err(format!(
+                    "Claude model '{model}' has no catalog-advertised native structured-output capability: unsupported option conflict"
+                )),
+                _ => return Err("unsupported response_format type or shape".to_string()),
+            }
+        }
+    }
     let messages = body
         .get("messages")
         .and_then(Value::as_array)
@@ -349,16 +520,35 @@ pub fn openai_to_anthropic(body: &Value) -> Result<Value, String> {
             .unwrap_or("user");
         if role == "system" || role == "developer" {
             if let Some(text) = message.get("content").and_then(content_text) {
-                system.push(text.to_string());
+                let mut block = json!({"type": "text", "text": text});
+                if let Some(cache_control) = message.get("cache_control").filter(|c| c.is_object())
+                {
+                    block["cache_control"] = cache_control.clone();
+                }
+                system.push(block);
             }
             continue;
         }
         if role == "tool" {
+            let content = match message.get("content") {
+                Some(Value::Array(parts)) => Value::Array(
+                    parts
+                        .iter()
+                        .map(openai_content_to_anthropic)
+                        .collect::<Result<Vec<_>, _>>()?,
+                ),
+                Some(content) => content.clone(),
+                None => Value::String(String::new()),
+            };
             let block = json!({
                 "type": "tool_result",
                 "tool_use_id": message.get("tool_call_id").and_then(Value::as_str).unwrap_or(""),
-                "content": message.get("content").cloned().unwrap_or(Value::String(String::new())),
+                "content": content,
             });
+            let mut block = block;
+            if let Some(cache_control) = message.get("cache_control") {
+                block["cache_control"] = cache_control.clone();
+            }
             if let Some(last) = out.last_mut().filter(|last| last["role"] == "user") {
                 if let Some(content) = last.get_mut("content").and_then(Value::as_array_mut) {
                     content.push(block);
@@ -368,11 +558,15 @@ pub fn openai_to_anthropic(body: &Value) -> Result<Value, String> {
             out.push(json!({"role": "user", "content": [block]}));
             continue;
         }
-        let mut content = match message.get("content") {
+        let content = match message.get("content") {
             Some(Value::String(text)) => vec![json!({"type":"text","text":text})],
-            Some(Value::Array(blocks)) => blocks.iter().map(openai_content_to_anthropic).collect(),
+            Some(Value::Array(blocks)) => blocks
+                .iter()
+                .map(openai_content_to_anthropic)
+                .collect::<Result<Vec<_>, _>>()?,
             _ => Vec::new(),
         };
+        let mut content = content;
         if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
             for call in calls {
                 let input = call["function"]["arguments"]
@@ -411,14 +605,26 @@ pub fn openai_to_anthropic(body: &Value) -> Result<Value, String> {
         .enumerate()
         .filter_map(|(index, tool)| tool.get("function").map(|function| (index, function)))
         .map(|(index, function)| {
+            // Built-in search maps to Claude's native server tool, not an
+            // ordinary function replacement (Task 25).
+            if function["name"].as_str() == Some("web_search") {
+                return Ok(json!({"type": "web_search_20250305", "name": "web_search"}));
+            }
             let name = anthropic_tool_name(function["name"].as_str().unwrap_or("tool"));
             let schema = super::tool_schema::anthropic_schema(function.get("parameters"))
                 .map_err(|error| format!("tools[{index}].function.parameters: {error}"))?;
-            Ok(json!({
+            let mut tool = json!({
                 "name": name,
                 "description": function["description"],
                 "input_schema": schema,
-            }))
+            });
+            if let Some(cache_control) = body["tools"][index]
+                .get("cache_control")
+                .filter(|c| c.is_object())
+            {
+                tool["cache_control"] = cache_control.clone();
+            }
+            Ok(tool)
         })
         .collect::<Result<Vec<_>, String>>()?;
     // Anthropic-style upstreams require max_tokens, but OpenAI-agent clients
@@ -433,7 +639,20 @@ pub fn openai_to_anthropic(body: &Value) -> Result<Value, String> {
         "stream": body.get("stream").and_then(Value::as_bool).unwrap_or(false),
     });
     if !system.is_empty() {
-        result["system"] = Value::String(system.join("\n\n"));
+        result["system"] = if system
+            .iter()
+            .any(|block| block.get("cache_control").is_some())
+        {
+            Value::Array(system)
+        } else {
+            Value::String(
+                system
+                    .iter()
+                    .filter_map(|block| block["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n\n"),
+            )
+        };
     }
     if !tools.is_empty() {
         result["tools"] = Value::Array(tools);
@@ -447,49 +666,34 @@ pub fn openai_to_anthropic(body: &Value) -> Result<Value, String> {
             _ => return Err("unsupported OpenAI tool_choice".to_string()),
         }),
         Some(choice) if choice["type"] == "function" => {
-            let name = choice["function"]["name"].as_str().filter(|name| !name.is_empty())
+            let name = choice["function"]["name"]
+                .as_str()
+                .filter(|name| !name.is_empty())
                 .ok_or_else(|| "tool_choice function requires a name".to_string())?;
             Some(json!({"type":"tool","name":anthropic_tool_name(name)}))
         }
         Some(_) => return Err("unsupported OpenAI tool_choice".to_string()),
     };
     if let Some(parallel) = body.get("parallel_tool_calls") {
-        let parallel = parallel.as_bool()
+        let parallel = parallel
+            .as_bool()
             .ok_or_else(|| "parallel_tool_calls must be boolean".to_string())?;
-        choice.get_or_insert_with(|| json!({"type":"auto"}))["disable_parallel_tool_use"] = json!(!parallel);
+        choice.get_or_insert_with(|| json!({"type":"auto"}))["disable_parallel_tool_use"] =
+            json!(!parallel);
     }
     if let Some(choice) = choice {
         result["tool_choice"] = choice;
     }
+    let thinking_enabled = apply_thinking_mode(raw_model, body, capability, &mut result)?;
+
     for key in ["temperature", "top_p", "stop_sequences"] {
         if let Some(value) = body.get(key) {
-            result[key] = value.clone();
-        }
-    }
-    // Reasoning effort maps to the Anthropic thinking budget both upstreams
-    // (api.anthropic.com and z.ai's /api/anthropic) accept. The thinking block
-    // must fit inside max_tokens (budget < max_tokens, plus room for the
-    // answer), so a too-small client max_tokens is raised to make room.
-    if let Some(effort) = body.get("reasoning_effort").and_then(Value::as_str) {
-        let budget: u64 = match effort {
-            "minimal" => 1024,
-            "low" => 1024,
-            "medium" => 2048,
-            "high" => 4096,
-            "xhigh" => 8192,
-            "max" => 16384,
-            _ => 0,
-        };
-        if budget > 0 {
-            let max_tokens = body
-                .get("max_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(32_768);
-            let needed = budget + 4096;
-            if max_tokens <= budget {
-                result["max_tokens"] = json!(needed);
+            if key == "temperature" && thinking_enabled {
+                // Anthropic requires temperature to be 1.0 or omitted when thinking is enabled
+                result[key] = json!(1.0);
+            } else {
+                result[key] = value.clone();
             }
-            result["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
         }
     }
     Ok(result)
@@ -510,20 +714,79 @@ fn content_text(content: &Value) -> Option<String> {
     }
 }
 
-fn openai_content_to_anthropic(part: &Value) -> Value {
-    if part["type"] != "image_url" {
-        return part.clone();
+const CLAUDE_IMAGE_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+
+/// One OpenAI content part as an Anthropic block (Task 4): image bytes/MIME,
+/// http(s) image URLs, PDF/text documents and ephemeral cache markers survive;
+/// any media Claude cannot take is an explicit error before dispatch, never a
+/// silent text-only downgrade.
+fn openai_content_to_anthropic(part: &Value) -> Result<Value, String> {
+    let mut block = match part["type"].as_str() {
+        Some("text") => json!({"type": "text", "text": part["text"].as_str().unwrap_or_default()}),
+        Some("image_url") => {
+            let url = part["image_url"]["url"]
+                .as_str()
+                .or_else(|| part["image_url"].as_str())
+                .ok_or("image_url.url must be a string: unsupported media")?;
+            if let Some((media_type, data)) = super::split_data_url(url) {
+                if !CLAUDE_IMAGE_TYPES.contains(&media_type) {
+                    return Err(format!(
+                        "unsupported image media type {media_type}: unsupported media"
+                    ));
+                }
+                json!({"type": "image", "source": {"type": "base64", "media_type": media_type, "data": data}})
+            } else if url.starts_with("https://") || url.starts_with("http://") {
+                json!({"type": "image", "source": {"type": "url", "url": url}})
+            } else {
+                return Err(
+                    "image_url must be a data URL or http(s) URL: unsupported media".into(),
+                );
+            }
+        }
+        Some("file") => {
+            let file = &part["file"];
+            let data_url = file["file_data"]
+                .as_str()
+                .ok_or("file.file_data must be a data URL string: unsupported media")?;
+            let (media_type, data) = super::split_data_url(data_url)
+                .ok_or("file.file_data must be a base64 data URL: unsupported media")?;
+            let source = match media_type {
+                "application/pdf" => {
+                    json!({"type": "base64", "media_type": media_type, "data": data})
+                }
+                "text/plain" => {
+                    use base64::Engine as _;
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(data)
+                        .map_err(|_| "file.file_data is not valid base64: unsupported media")?;
+                    let text = String::from_utf8(bytes)
+                        .map_err(|_| "text document is not UTF-8: unsupported media")?;
+                    json!({"type": "text", "media_type": media_type, "data": text})
+                }
+                other => {
+                    return Err(format!(
+                        "unsupported document media type {other}: unsupported media"
+                    ))
+                }
+            };
+            let mut document = json!({"type": "document", "source": source});
+            if let Some(name) = file["filename"].as_str() {
+                document["title"] = json!(name);
+            }
+            document
+        }
+        Some("image" | "document" | "tool_result" | "tool_use") => part.clone(),
+        Some(other) => {
+            return Err(format!(
+                "unsupported content part type {other}: unsupported media"
+            ))
+        }
+        None => return Err("content part missing type: unsupported media".into()),
+    };
+    if let Some(cache_control) = part.get("cache_control").filter(|c| c.is_object()) {
+        block["cache_control"] = cache_control.clone();
     }
-    let Some(url) = part["image_url"]["url"].as_str() else {
-        return part.clone();
-    };
-    let Some((media_type, data)) = super::split_data_url(url) else {
-        return part.clone();
-    };
-    json!({
-        "type": "image",
-        "source": {"type":"base64", "media_type":media_type, "data":data},
-    })
+    Ok(block)
 }
 
 pub const CLAUDE_CODE_SYSTEM_INSTRUCTION: &str =
@@ -832,11 +1095,12 @@ pub fn render_anthropic_stream(
                 usage = u.clone();
             }
             CodexEvent::OutputLimitReached => finish = "length".to_string(),
-            CodexEvent::ToolCallBegin { .. } | CodexEvent::ToolArgsDelta { .. } => {
-                if finish != "length" {
-                    finish = "tool_calls".to_string();
-                }
+            CodexEvent::ToolCallBegin { .. } | CodexEvent::ToolArgsDelta { .. }
+                if finish != "length" =>
+            {
+                finish = "tool_calls".to_string();
             }
+            CodexEvent::ToolCallBegin { .. } | CodexEvent::ToolArgsDelta { .. } => {}
             _ => {}
         }
     }
@@ -993,7 +1257,11 @@ impl AnthropicStreamRenderer {
             // Redacted reasoning has no Anthropic wire representation without
             // upstream redacted data; the marker only keeps the state explicit.
             CodexEvent::ReasoningRedacted => {}
-            CodexEvent::ToolCallBegin { call_id, name, output_index } => {
+            CodexEvent::ToolCallBegin {
+                call_id,
+                name,
+                output_index,
+            } => {
                 self.close_thinking(&mut out);
                 self.close_text(&mut out);
                 let index = self.next_content_index;
@@ -1005,7 +1273,10 @@ impl AnthropicStreamRenderer {
                     json!({"type":"content_block_start","index":index,"content_block":{"type":"tool_use","id":call_id,"name":name,"input":{}}}),
                 ));
             }
-            CodexEvent::ToolArgsDelta { delta, output_index } => {
+            CodexEvent::ToolArgsDelta {
+                delta,
+                output_index,
+            } => {
                 let index = self.tool_indices.get(&output_index).copied().unwrap_or(1);
                 out.push(Self::frame(
                     "content_block_delta",
@@ -1026,7 +1297,10 @@ impl AnthropicStreamRenderer {
                 };
                 out.push(Self::frame(
                     "message_delta",
-                    json!({"type":"message_delta","delta":{"stop_reason":stop,"stop_sequence":Value::Null},"usage":{"output_tokens":usage.map(|u|u.completion_tokens).unwrap_or(0)}}),
+                    // message_start went out before the provider reported usage, so the
+                    // final input count is carried here (Anthropic clients merge
+                    // message_delta usage into the message).
+                    json!({"type":"message_delta","delta":{"stop_reason":stop,"stop_sequence":Value::Null},"usage":{"input_tokens":usage.as_ref().map(|u|u.prompt_tokens).unwrap_or(0),"output_tokens":usage.as_ref().map(|u|u.completion_tokens).unwrap_or(0)}}),
                 ));
                 out.push(Self::frame("message_stop", json!({"type":"message_stop"})));
                 self.terminated = true;
@@ -1077,9 +1351,31 @@ mod contract_tests {
     #[test]
     fn r23_blocks_allocate_from_zero_and_never_reuse_indices() {
         for events in [
-            vec![CodexEvent::ReasoningDelta("think".into()), CodexEvent::TextDelta("answer".into()), CodexEvent::ToolCallBegin { output_index: 0, call_id: "a".into(), name: "lookup".into() }],
-            vec![CodexEvent::ToolCallBegin { output_index: 0, call_id: "a".into(), name: "lookup".into() }],
-            vec![CodexEvent::TextDelta("before".into()), CodexEvent::ToolCallBegin { output_index: 0, call_id: "a".into(), name: "lookup".into() }, CodexEvent::TextDelta("after".into()), CodexEvent::ReasoningSignature("sig".into()), CodexEvent::TextDelta("end".into())],
+            vec![
+                CodexEvent::ReasoningDelta("think".into()),
+                CodexEvent::TextDelta("answer".into()),
+                CodexEvent::ToolCallBegin {
+                    output_index: 0,
+                    call_id: "a".into(),
+                    name: "lookup".into(),
+                },
+            ],
+            vec![CodexEvent::ToolCallBegin {
+                output_index: 0,
+                call_id: "a".into(),
+                name: "lookup".into(),
+            }],
+            vec![
+                CodexEvent::TextDelta("before".into()),
+                CodexEvent::ToolCallBegin {
+                    output_index: 0,
+                    call_id: "a".into(),
+                    name: "lookup".into(),
+                },
+                CodexEvent::TextDelta("after".into()),
+                CodexEvent::ReasoningSignature("sig".into()),
+                CodexEvent::TextDelta("end".into()),
+            ],
         ] {
             let expected_blocks = events.len();
             let mut renderer = AnthropicStreamRenderer::new("fixture".into(), 1);
@@ -1088,7 +1384,10 @@ mod contract_tests {
                 let tool = matches!(&event, CodexEvent::ToolCallBegin { .. });
                 frames.extend(renderer.render(event));
                 if tool {
-                    frames.extend(renderer.render(CodexEvent::ToolArgsDelta { output_index: 0, delta: "{}".into() }));
+                    frames.extend(renderer.render(CodexEvent::ToolArgsDelta {
+                        output_index: 0,
+                        delta: "{}".into(),
+                    }));
                 }
             }
             frames.extend(renderer.close_unterminated());
@@ -1098,7 +1397,8 @@ mod contract_tests {
             let mut stops = 0;
             for frame in frames {
                 let raw = std::str::from_utf8(&frame).unwrap();
-                let payload: Value = serde_json::from_str(raw.split_once("data: ").unwrap().1.trim()).unwrap();
+                let payload: Value =
+                    serde_json::from_str(raw.split_once("data: ").unwrap().1.trim()).unwrap();
                 match payload["type"].as_str().unwrap() {
                     "content_block_start" => {
                         assert_eq!(open, None);
@@ -1123,7 +1423,11 @@ mod contract_tests {
 
     #[test]
     fn r24_history_names_match_definitions_without_double_prefix() {
-        for (name, expected) in [("lookup", "custom_lookup"), ("custom_lookup", "custom_lookup"), ("web_search", "web_search")] {
+        for (name, expected) in [
+            ("lookup", "custom_lookup"),
+            ("custom_lookup", "custom_lookup"),
+            ("web_search", "web_search"),
+        ] {
             let out = openai_to_anthropic(&json!({
                 "model":"fixture", "tools":[{"type":"function","function":{"name":name}}],
                 "messages":[{"role":"assistant","tool_calls":[{"id":"a","function":{"name":name,"arguments":"{}"}}]},
@@ -1141,8 +1445,16 @@ mod contract_tests {
             (json!("auto"), json!({"type":"auto"}), json!("auto")),
             (json!("none"), json!({"type":"none"}), json!("none")),
             (json!("required"), json!({"type":"any"}), json!("required")),
-            (json!({"type":"function","function":{"name":"lookup"}}), json!({"type":"tool","name":"custom_lookup"}), json!({"type":"function","function":{"name":"custom_lookup"}})),
-            (json!({"type":"function","function":{"name":"web_search"}}), json!({"type":"tool","name":"web_search"}), json!({"type":"function","function":{"name":"web_search"}})),
+            (
+                json!({"type":"function","function":{"name":"lookup"}}),
+                json!({"type":"tool","name":"custom_lookup"}),
+                json!({"type":"function","function":{"name":"custom_lookup"}}),
+            ),
+            (
+                json!({"type":"function","function":{"name":"web_search"}}),
+                json!({"type":"tool","name":"web_search"}),
+                json!({"type":"function","function":{"name":"web_search"}}),
+            ),
         ] {
             for parallel in [None, Some(false), Some(true)] {
                 let mut input = json!({"model":"fixture","messages":[],"tool_choice":openai});
@@ -1155,15 +1467,30 @@ mod contract_tests {
                 assert_eq!(out["tool_choice"], expected);
                 let back = anthropic_to_openai(&out).unwrap();
                 assert_eq!(back["tool_choice"], native_choice);
-                assert_eq!(back.get("parallel_tool_calls"), input.get("parallel_tool_calls"));
+                assert_eq!(
+                    back.get("parallel_tool_calls"),
+                    input.get("parallel_tool_calls")
+                );
             }
         }
-        let out = openai_to_anthropic(&json!({"model":"fixture","messages":[],"parallel_tool_calls":false})).unwrap();
-        assert_eq!(out["tool_choice"], json!({"type":"auto","disable_parallel_tool_use":true}));
+        let out = openai_to_anthropic(
+            &json!({"model":"fixture","messages":[],"parallel_tool_calls":false}),
+        )
+        .unwrap();
+        assert_eq!(
+            out["tool_choice"],
+            json!({"type":"auto","disable_parallel_tool_use":true})
+        );
         let out = openai_to_anthropic(&json!({"model":"fixture","messages":[],"tool_choice":{"type":"function","function":{"name":"custom_lookup"}}})).unwrap();
         assert_eq!(out["tool_choice"]["name"], "custom_lookup");
-        assert!(openai_to_anthropic(&json!({"model":"fixture","messages":[],"tool_choice":"invalid"})).is_err());
-        assert!(anthropic_to_openai(&json!({"model":"fixture","messages":[],"tool_choice":{"type":"invalid"}})).is_err());
+        assert!(openai_to_anthropic(
+            &json!({"model":"fixture","messages":[],"tool_choice":"invalid"})
+        )
+        .is_err());
+        assert!(anthropic_to_openai(
+            &json!({"model":"fixture","messages":[],"tool_choice":{"type":"invalid"}})
+        )
+        .is_err());
     }
 
     #[test]
@@ -1236,6 +1563,49 @@ mod contract_tests {
         assert_eq!(image["source"]["type"], "base64");
         assert_eq!(image["source"]["media_type"], "image/png");
         assert_eq!(image["source"]["data"], "iVBORw0KGgo=");
+    }
+
+    #[test]
+    fn anthropic_tool_result_images_survive_codex_request_normalization() {
+        let anthropic = json!({
+            "model":"claude-sonnet-4-6",
+            "messages":[
+                {"role":"user","content":[
+                    {"type":"text","text":"first"},
+                    {"type":"image","source":{"type":"base64","media_type":"image/png","data":"FIRST"}}
+                ]},
+                {"role":"assistant","content":[{"type":"tool_use","id":"toolu_native_1","name":"take_screenshot","input":{}}]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_native_1","content":[
+                    {"type":"text","text":"Native tool result text"},
+                    {"type":"image","source":{"type":"base64","media_type":"image/png","data":"SECOND"}}
+                ]}]}
+            ]
+        });
+        let openai = anthropic_to_openai(&anthropic).expect("Anthropic normalization");
+        let openai_bytes = serde_json::to_vec(&openai).expect("OpenAI JSON");
+        let request =
+            super::super::request::openai_to_codex(&openai_bytes).expect("Codex normalization");
+        let body: Value = serde_json::from_slice(&request.body).expect("Codex JSON");
+        let input = body["input"].as_array().expect("input");
+        assert_eq!(input.len(), 4);
+        assert_eq!(input[0]["content"][1]["type"], "input_image");
+        assert_eq!(
+            input[0]["content"][1]["image_url"],
+            "data:image/png;base64,FIRST"
+        );
+        assert_eq!(input[1]["call_id"], "toolu_native_1");
+        assert_eq!(input[2]["type"], "function_call_output");
+        assert_eq!(input[2]["call_id"], input[1]["call_id"]);
+        assert_eq!(input[2]["output"], "Native tool result text");
+        // The relayed tool image follows as a user turn whose image part sits
+        // after a leading text part (the multimodal wire contract, Task 4).
+        assert_eq!(input[3]["role"], "user");
+        assert_eq!(input[3]["content"][0]["type"], "input_text");
+        assert_eq!(input[3]["content"][1]["type"], "input_image");
+        assert_eq!(
+            input[3]["content"][1]["image_url"],
+            "data:image/png;base64,SECOND"
+        );
     }
 
     #[test]
@@ -1404,25 +1774,20 @@ mod contract_tests {
         let out = openai_to_anthropic(&body).unwrap();
         assert_eq!(
             out["thinking"],
-            json!({"type": "enabled", "budget_tokens": 16384})
+            json!({"type": "enabled", "budget_tokens": 4095})
         );
-        assert_eq!(out["max_tokens"], json!(20480));
+        assert_eq!(out["max_tokens"], json!(4096));
     }
 
     #[test]
-    fn a_tiny_max_tokens_is_raised_to_make_room_for_thinking() {
+    fn a_tiny_max_tokens_rejects_incompatible_thinking() {
         let body = json!({
             "model": "glm-5.3-flash",
             "reasoning_effort": "high",
             "max_tokens": 64,
             "messages": [{"role": "user", "content": "hi"}]
         });
-        let out = openai_to_anthropic(&body).unwrap();
-        assert_eq!(
-            out["thinking"],
-            json!({"type": "enabled", "budget_tokens": 4096})
-        );
-        assert_eq!(out["max_tokens"], json!(8192));
+        assert!(openai_to_anthropic(&body).is_err());
     }
 
     #[test]
@@ -1494,23 +1859,21 @@ mod contract_tests {
     }
 
     #[test]
-    fn unknown_efforts_are_ignored() {
+    fn unknown_efforts_are_rejected() {
         let body = json!({
             "model": "glm-5.3-flash",
             "reasoning_effort": "turbo",
             "max_tokens": 4096,
             "messages": [{"role": "user", "content": "hi"}]
         });
-        let out = openai_to_anthropic(&body).unwrap();
-        assert!(out.get("thinking").is_none());
-        assert_eq!(out["max_tokens"], json!(4096));
+        assert!(openai_to_anthropic(&body).is_err());
     }
 }
 
 #[cfg(test)]
 mod openai_to_anthropic_tests {
     use super::openai_to_anthropic;
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     #[test]
     fn empty_content_is_not_sent_as_a_blank_block() {
@@ -1597,5 +1960,165 @@ mod openai_to_anthropic_tests {
         ensure_claude_code_system_instruction(&mut body);
         let arr2 = body["system"].as_array().unwrap();
         assert_eq!(arr2.len(), 2);
+    }
+
+    #[test]
+    fn suffix_overrides_body_reasoning_and_strips_suffix() {
+        let body = json!({
+            "model": "claude-3-7-sonnet(high)",
+            "reasoning_effort": "low",
+            "messages": [{"role": "user", "content": "solve this"}]
+        });
+        let out = openai_to_anthropic(&body).expect("translates");
+        assert_eq!(out["model"], "claude-3-7-sonnet");
+        assert_eq!(out["thinking"]["type"], "enabled");
+        assert_eq!(out["thinking"]["budget_tokens"], 24576);
+    }
+
+    #[test]
+    fn suffix_none_disables_thinking_even_if_body_sets_high() {
+        let body = json!({
+            "model": "claude-3-7-sonnet(none)",
+            "reasoning_effort": "high",
+            "messages": [{"role": "user", "content": "solve this"}]
+        });
+        let out = openai_to_anthropic(&body).expect("translates");
+        assert_eq!(out["model"], "claude-3-7-sonnet");
+        assert_eq!(out["thinking"]["type"], "disabled");
+    }
+
+    #[test]
+    fn thinking_normalizes_temperature_to_one() {
+        let body = json!({
+            "model": "claude-3-7-sonnet(medium)",
+            "temperature": 0.3,
+            "messages": [{"role": "user", "content": "solve this"}]
+        });
+        let out = openai_to_anthropic(&body).expect("translates");
+        assert_eq!(out["temperature"], 1.0);
+    }
+
+    #[test]
+    fn response_format_rejected_as_unsupported_conflict() {
+        let body = json!({
+            "model": "claude-3-7-sonnet",
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "test", "schema": {}}
+            },
+            "messages": [{"role": "user", "content": "solve this"}]
+        });
+        let err = openai_to_anthropic(&body).expect_err("should reject response_format");
+        assert!(err.contains("unsupported option conflict"));
+    }
+
+    #[test]
+    fn explicit_text_format_is_a_noop_for_claude() {
+        let body = json!({"model":"claude-sonnet-4-6", "messages":[],
+            "response_format":{"type":"text"}});
+        let out = openai_to_anthropic(&body).unwrap();
+        assert!(out.get("system").is_none());
+        assert!(out.get("output_config").is_none());
+    }
+
+    #[test]
+    fn adaptive_effort_uses_canonical_levels_and_auto_omits_effort() {
+        for (raw, expected) in [
+            ("minimal", Some("low")),
+            ("medium", Some("medium")),
+            ("high", Some("high")),
+            ("xhigh", Some("high")),
+            ("max", Some("max")),
+            ("auto", None),
+            ("-1", None),
+        ] {
+            let body = json!({"model":format!("claude-sonnet-4-6({raw})"),
+                "reasoning_effort":"low", "messages":[]});
+            let out = openai_to_anthropic(&body).unwrap();
+            assert_eq!(out["thinking"]["type"], "adaptive");
+            assert_eq!(
+                out.pointer("/output_config/effort").and_then(Value::as_str),
+                expected
+            );
+            assert!(out["thinking"].get("budget_tokens").is_none());
+        }
+    }
+
+    #[test]
+    fn manual_budget_preserves_numeric_input_and_respects_output_limit() {
+        for (raw, max_tokens, expected) in [
+            ("medium", 32768, 8192),
+            ("high", 32768, 24576),
+            ("2048", 32768, 2048),
+            ("max", 4096, 4095),
+        ] {
+            let body = json!({"model":format!("claude-3-7-sonnet({raw})"),
+                "max_tokens":max_tokens, "messages":[]});
+            let out = openai_to_anthropic(&body).unwrap();
+            assert_eq!(out["thinking"]["budget_tokens"], expected);
+            assert_eq!(out["max_tokens"], max_tokens);
+        }
+    }
+
+    #[test]
+    fn adaptive_catalog_numeric_suffix_retains_budget_mode() {
+        let body = json!({"model":"claude-sonnet-4-6(2048)", "messages":[]});
+        let out = openai_to_anthropic(&body).unwrap();
+        assert_eq!(
+            out["thinking"],
+            json!({"type":"enabled","budget_tokens":2048})
+        );
+        assert!(out.get("output_config").is_none());
+    }
+
+    #[test]
+    fn explicitly_supported_xhigh_is_not_rewritten_to_max() {
+        let body = json!({"model":"claude-opus-4-7(xhigh)", "messages":[]});
+        let out = openai_to_anthropic(&body).unwrap();
+        assert_eq!(out["thinking"]["type"], "adaptive");
+        assert_eq!(out["output_config"]["effort"], "xhigh");
+    }
+
+    #[test]
+    fn runtime_profile_not_model_name_selects_adaptive_and_range() {
+        let capability =
+            mahoquot_registry::ThinkingCapability::Supported(mahoquot_registry::ThinkingSupport {
+                min: 128,
+                max: 4096,
+                levels: vec!["low".into(), "high".into()],
+                ..Default::default()
+            });
+        let body = json!({"model":"operator-custom(2048)", "messages":[]});
+        let out = super::openai_to_anthropic_with_capability(&body, &capability).unwrap();
+        assert_eq!(out["thinking"]["budget_tokens"], 2048);
+        let body = json!({"model":"operator-custom(medium)", "messages":[]});
+        let out = super::openai_to_anthropic_with_capability(&body, &capability).unwrap();
+        assert_eq!(out["output_config"]["effort"], "low");
+    }
+
+    #[test]
+    fn unsupported_profile_rejects_thinking_but_unknown_custom_keeps_manual_contract() {
+        let body = json!({"model":"operator-custom(high)", "messages":[]});
+        assert!(super::openai_to_anthropic_with_capability(
+            &body,
+            &mahoquot_registry::ThinkingCapability::Unsupported
+        )
+        .is_err());
+        let out = openai_to_anthropic(&body).unwrap();
+        assert_eq!(out["thinking"]["budget_tokens"], 24576);
+    }
+
+    #[test]
+    fn invalid_effort_and_insufficient_manual_output_budget_are_conflicts() {
+        for extra in [
+            json!({"reasoning_effort":true}),
+            json!({"reasoning_effort":"high", "max_tokens":1024}),
+        ] {
+            let mut body = json!({"model":"claude-3-7-sonnet", "messages":[]});
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            assert!(openai_to_anthropic(&body).is_err());
+        }
     }
 }

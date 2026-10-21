@@ -301,9 +301,7 @@ impl ReplayScope {
     /// A replayed call had no signature to reuse, so the request goes upstream
     /// with the `skip_thought_signature_validator` sentinel.
     pub fn record_unsigned_replay(&self) {
-        self.ledger
-            .unsigned_replays
-            .fetch_add(1, Ordering::Relaxed);
+        self.ledger.unsigned_replays.fetch_add(1, Ordering::Relaxed);
     }
 
     fn key(&self, call_id: &str, name: &str) -> String {

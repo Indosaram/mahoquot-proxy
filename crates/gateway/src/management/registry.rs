@@ -244,19 +244,34 @@ async fn refresh_devin_models(
             Err(err) => {
                 let err_str = err.to_string();
                 last_error_msg = Some(err_str.clone());
-                state.monitor.record_error(&member.id, 502, &format!("model discovery failed: {err_str}"));
+                state.monitor.record_error(
+                    &member.id,
+                    502,
+                    &format!("model discovery failed: {err_str}"),
+                );
                 let now_unix = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
-                let key = crate::devin_catalog::DevinCacheKey::new(&member.id, &member.access_token(), member.effective_base_url());
-                let init_fail = Arc::new(crate::devin_catalog::DevinAccountCatalogState::initial_failure(
-                    key,
-                    "failed to build upstream HTTP client",
-                    now_unix,
-                ));
+                let key = crate::devin_catalog::DevinCacheKey::new(
+                    &member.id,
+                    &member.access_token(),
+                    member.effective_base_url(),
+                );
+                let init_fail = Arc::new(
+                    crate::devin_catalog::DevinAccountCatalogState::initial_failure(
+                        key,
+                        "failed to build upstream HTTP client",
+                        now_unix,
+                    ),
+                );
                 let rev = crate::devin_catalog::compute_credential_revision(&member.access_token());
-                let _ = state.runtime.publish_devin_member_catalog(&member.id, &rev, init_fail, &state.devin_cache);
+                let _ = state.runtime.publish_devin_member_catalog(
+                    &member.id,
+                    &rev,
+                    init_fail,
+                    &state.devin_cache,
+                );
 
                 account_results.push(DevinAccountRefreshResult {
                     identity_slug: member.id.clone(),
@@ -269,7 +284,13 @@ async fn refresh_devin_models(
                 continue;
             }
         };
-        match crate::devin_catalog::refresh_account_models(member, &client, Some(&state.devin_cache)).await {
+        match crate::devin_catalog::refresh_account_models(
+            member,
+            &client,
+            Some(&state.devin_cache),
+        )
+        .await
+        {
             Ok(catalog_state) => {
                 match state.runtime.publish_devin_member_catalog(
                     &member.id,
@@ -281,10 +302,7 @@ async fn refresh_devin_models(
                         if !catalog_state.stale {
                             any_fresh_success = true;
                         }
-                        let accepted_member = new_comp
-                            .members()
-                            .iter()
-                            .find(|m| m.id == member.id);
+                        let accepted_member = new_comp.members().iter().find(|m| m.id == member.id);
                         let public_ids = accepted_member
                             .and_then(|m| m.devin_models())
                             .unwrap_or_else(|| {
@@ -296,7 +314,11 @@ async fn refresh_devin_models(
                             });
                         account_results.push(DevinAccountRefreshResult {
                             identity_slug: member.id.clone(),
-                            status: if catalog_state.stale { "error" } else { "success" },
+                            status: if catalog_state.stale {
+                                "error"
+                            } else {
+                                "success"
+                            },
                             models: public_ids,
                             stale: catalog_state.stale,
                             last_refresh_at: catalog_state.last_refresh_at,
@@ -304,7 +326,11 @@ async fn refresh_devin_models(
                         });
                         if let Some(ref err) = catalog_state.last_error {
                             last_error_msg = Some(err.clone());
-                            state.monitor.record_error(&member.id, 502, &format!("model discovery: {err}"));
+                            state.monitor.record_error(
+                                &member.id,
+                                502,
+                                &format!("model discovery: {err}"),
+                            );
                         } else {
                             state.monitor.clear_error(&member.id);
                         }
@@ -312,7 +338,11 @@ async fn refresh_devin_models(
                     Err(pub_err) => {
                         let err_str = pub_err.safe_message().to_string();
                         last_error_msg = Some(err_str.clone());
-                        state.monitor.record_error(&member.id, 502, &format!("model discovery publication failed: {err_str}"));
+                        state.monitor.record_error(
+                            &member.id,
+                            502,
+                            &format!("model discovery publication failed: {err_str}"),
+                        );
                         account_results.push(DevinAccountRefreshResult {
                             identity_slug: member.id.clone(),
                             status: "error",
@@ -327,19 +357,34 @@ async fn refresh_devin_models(
             Err(err) => {
                 let err_str = err.safe_message().to_string();
                 last_error_msg = Some(err_str.clone());
-                state.monitor.record_error(&member.id, 502, &format!("model discovery failed: {err_str}"));
+                state.monitor.record_error(
+                    &member.id,
+                    502,
+                    &format!("model discovery failed: {err_str}"),
+                );
                 let now_unix = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
-                let key = crate::devin_catalog::DevinCacheKey::new(&member.id, &member.access_token(), member.effective_base_url());
-                let init_fail = Arc::new(crate::devin_catalog::DevinAccountCatalogState::initial_failure(
-                    key,
-                    err.safe_message(),
-                    now_unix,
-                ));
+                let key = crate::devin_catalog::DevinCacheKey::new(
+                    &member.id,
+                    &member.access_token(),
+                    member.effective_base_url(),
+                );
+                let init_fail = Arc::new(
+                    crate::devin_catalog::DevinAccountCatalogState::initial_failure(
+                        key,
+                        err.safe_message(),
+                        now_unix,
+                    ),
+                );
                 let rev = crate::devin_catalog::compute_credential_revision(&member.access_token());
-                let _ = state.runtime.publish_devin_member_catalog(&member.id, &rev, init_fail, &state.devin_cache);
+                let _ = state.runtime.publish_devin_member_catalog(
+                    &member.id,
+                    &rev,
+                    init_fail,
+                    &state.devin_cache,
+                );
 
                 account_results.push(DevinAccountRefreshResult {
                     identity_slug: member.id.clone(),
@@ -458,7 +503,13 @@ async fn get_devin_models_status(
             let _guards = guards;
             for member in claimed {
                 if let Ok(client) = state_clone.devin_client_for_member(&member) {
-                    if let Ok(cat) = crate::devin_catalog::refresh_account_models(&member, &client, Some(&state_clone.devin_cache)).await {
+                    if let Ok(cat) = crate::devin_catalog::refresh_account_models(
+                        &member,
+                        &client,
+                        Some(&state_clone.devin_cache),
+                    )
+                    .await
+                    {
                         let rev = cat.key.credential_revision.clone();
                         let _ = state_clone.runtime.publish_devin_member_catalog(
                             &member.id,
@@ -490,7 +541,10 @@ async fn get_devin_models_status(
 fn claim_stale_devin_refreshes(
     state: &AppState,
     stale: Vec<Arc<AccountMember>>,
-) -> (Vec<Arc<AccountMember>>, Vec<crate::state::DevinRefreshGuard>) {
+) -> (
+    Vec<Arc<AccountMember>>,
+    Vec<crate::state::DevinRefreshGuard>,
+) {
     let mut claimed = Vec::new();
     let mut guards = Vec::new();
     for member in stale {
@@ -516,6 +570,115 @@ mod tests {
     use super::*;
     use crate::config::GatewayConfig;
     use crate::inbound::ApiKeys;
+
+    #[tokio::test]
+    async fn explicit_and_background_devin_discovery_follow_proxy_publication_and_failclosed() {
+        use crate::state::task2_proxy_consumers::{bounded, Fixture, Peer};
+        let mut a = Peer::start("a").await;
+        let mut b = Peer::start("b").await;
+        let mut target = Peer::start("target").await;
+        let fixture = Fixture::new(&target.url);
+        let credential_path = fixture.dir.join("devin-task2-devin.json");
+        let mut credential = serde_json::json!({
+            "type":"devin","identity_slug":"task2-devin","access_token":"dummy-devin",
+            "api_server_url":target.url,"upstream_override":target.url
+        });
+        std::fs::write(&credential_path, credential.to_string()).expect("Devin fixture");
+        fixture.state.rescan_pool().expect("add Devin");
+        let path = "/exa.api_server_pb.ApiServerService/GetCascadeModelConfigs";
+        for (proxy, peer, expected) in [
+            (a.url.clone(), &mut a, "devin/model-a"),
+            (b.url.clone(), &mut b, "devin/model-b"),
+            ("direct".into(), &mut target, "devin/model-target"),
+        ] {
+            fixture.proxy(&proxy);
+            let query = DevinRefreshQuery {
+                identity_slug: Some("task2-devin".into()),
+                identity: None,
+            };
+            let (status, Json(body)) = bounded(refresh_devin_models(
+                State(fixture.state.clone()),
+                Query(query),
+                axum::body::Bytes::new(),
+            ))
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body.outcome, "success");
+            assert!(body.models.iter().any(|model| model == expected));
+            peer.captured(path).await;
+        }
+        fixture.proxy(&b.url);
+        let member = fixture
+            .state
+            .find_member("task2-devin")
+            .expect("Devin member");
+        let mut stale = (*member.devin_catalog_state().expect("published catalog")).clone();
+        stale.stale = true;
+        member.devin_catalog.store(Some(Arc::new(stale)));
+        let mut finalized = fixture.state.subscribe_finalizer("task2-devin");
+        let _ = bounded(get_devin_models_status(State(fixture.state.clone()))).await;
+        b.captured(path).await;
+        bounded(finalized.recv())
+            .await
+            .expect("background finalizer");
+        assert_eq!(
+            member
+                .devin_catalog_state()
+                .expect("held old catalog")
+                .models[0]
+                .public_id,
+            "devin/model-target"
+        );
+        let member = fixture
+            .state
+            .find_member("task2-devin")
+            .expect("current Devin member");
+        assert_eq!(
+            member
+                .devin_catalog_state()
+                .expect("background catalog")
+                .models[0]
+                .public_id,
+            "devin/model-b"
+        );
+
+        credential["proxy_url"] = serde_json::json!("ftp://invalid");
+        std::fs::write(credential_path, credential.to_string()).expect("invalid Devin proxy");
+        fixture
+            .state
+            .rescan_pool()
+            .expect("reload invalid override");
+        let query = DevinRefreshQuery {
+            identity_slug: Some("task2-devin".into()),
+            identity: None,
+        };
+        let (_, Json(body)) = bounded(refresh_devin_models(
+            State(fixture.state.clone()),
+            Query(query),
+            axum::body::Bytes::new(),
+        ))
+        .await;
+        assert_eq!(body.outcome, "error");
+        assert!(body.error.is_some());
+        let mut finalized = fixture.state.subscribe_finalizer("task2-devin");
+        let (status, Json(body)) =
+            bounded(get_devin_models_status(State(fixture.state.clone()))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["accounts"]
+            .as_array()
+            .expect("accounts array")
+            .iter()
+            .any(|account| account["identity_slug"] == "task2-devin"));
+        bounded(finalized.recv())
+            .await
+            .expect("failed background finalizer");
+        assert!(a.seen.try_recv().is_err());
+        assert!(b.seen.try_recv().is_err());
+        assert!(target.seen.try_recv().is_err());
+        a.close().await;
+        b.close().await;
+        target.close().await;
+    }
 
     fn state_with_one_account() -> Arc<AppState> {
         let auth_dir = std::env::temp_dir().join(format!(
@@ -565,8 +728,7 @@ mod tests {
         assert_eq!(state.devin_refresh_in_flight_count(), 1);
 
         drop(first_guards);
-        let (third, _third_guards) =
-            claim_stale_devin_refreshes(&state, vec![Arc::clone(&member)]);
+        let (third, _third_guards) = claim_stale_devin_refreshes(&state, vec![Arc::clone(&member)]);
         assert_eq!(
             third.len(),
             1,

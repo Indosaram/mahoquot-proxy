@@ -473,7 +473,11 @@ fn concurrent_parameterized_mutations_are_never_dropped_by_coalescing() {
     for i in 0..n_updates {
         let rt = Arc::clone(&runtime);
         handles.push(std::thread::spawn(move || {
-            let m = test_member(&format!("acc-{i}"), "claude", vec!["model-base".to_string()]);
+            let m = test_member(
+                &format!("acc-{i}"),
+                "claude",
+                vec!["model-base".to_string()],
+            );
             rt.reload_accounts(vec![m])
                 .expect("reload_accounts must succeed")
         }));

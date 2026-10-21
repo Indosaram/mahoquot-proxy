@@ -1,8 +1,17 @@
 use std::sync::{Arc, Mutex};
 
-use axum::{body::Body, extract::State, http::{Request, StatusCode}, response::IntoResponse, routing::post, Json, Router};
+use axum::{
+    body::Body,
+    extract::State,
+    http::{Request, StatusCode},
+    response::IntoResponse,
+    routing::post,
+    Json, Router,
+};
 use http_body_util::BodyExt;
-use mahoquot_gateway::{config::GatewayConfig, quota::refresh_account_usage, routes::create_app, state::AppState};
+use mahoquot_gateway::{
+    config::GatewayConfig, quota::refresh_account_usage, routes::create_app, state::AppState,
+};
 use mahoquot_types::{Health, PoolMember, Strategy};
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -22,8 +31,14 @@ async fn upstream(
     headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> axum::response::Response {
-    let account = headers.get("authorization").unwrap().to_str().unwrap()
-        .strip_prefix("Bearer ").unwrap().to_owned();
+    let account = headers
+        .get("authorization")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .strip_prefix("Bearer ")
+        .unwrap()
+        .to_owned();
     if uri.path().ends_with(":retrieveUserQuotaSummary") {
         return Json(json!({"groups": []})).into_response();
     }
@@ -32,13 +47,22 @@ async fn upstream(
     }
     if uri.path().ends_with(":fetchAvailableModels") {
         assert_eq!(body["project"], "fixture-project");
-        assert!(headers.get("user-agent").unwrap().to_str().unwrap().starts_with("antigravity/"));
+        assert!(headers
+            .get("user-agent")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("antigravity/"));
         return match state.catalogs.lock().unwrap().get(&account) {
             Some(catalog) => Json(catalog.clone()).into_response(),
             None => StatusCode::SERVICE_UNAVAILABLE.into_response(),
         };
     }
-    state.calls.lock().unwrap().push((account, body["model"].as_str().unwrap().to_owned()));
+    state
+        .calls
+        .lock()
+        .unwrap()
+        .push((account, body["model"].as_str().unwrap().to_owned()));
     (
         [("content-type", "text/event-stream")],
         "data: {\"response\":{\"responseId\":\"fixture\",\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":1,\"candidatesTokenCount\":1,\"totalTokenCount\":2}}}\n\n",
@@ -66,8 +90,18 @@ fn catalog(models: &[&str]) -> Value {
 impl Fixture {
     async fn new() -> Self {
         let upstream_state = Upstream::default();
-        upstream_state.catalogs.lock().unwrap().insert("pro".into(), catalog(&["claude-sonnet-4-6", "gemini-3-flash"]));
-        upstream_state.catalogs.lock().unwrap().insert("ultra".into(), catalog(&["claude-opus-5-5-high", "claude-sonnet-5-5-high", "gemini-3-flash"]));
+        upstream_state.catalogs.lock().unwrap().insert(
+            "pro".into(),
+            catalog(&["claude-sonnet-4-6", "gemini-3-flash"]),
+        );
+        upstream_state.catalogs.lock().unwrap().insert(
+            "ultra".into(),
+            catalog(&[
+                "claude-opus-5-5-high",
+                "claude-sonnet-5-5-high",
+                "gemini-3-flash",
+            ]),
+        );
         let mut listener = None;
         for port in 18840..=18899 {
             if let Ok(bound) = tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
@@ -77,23 +111,40 @@ impl Fixture {
         }
         let listener = listener.expect("free test port");
         let base = format!("http://{}", listener.local_addr().unwrap());
-        let app = Router::new().fallback(post(upstream)).with_state(upstream_state.clone());
+        let app = Router::new()
+            .fallback(post(upstream))
+            .with_state(upstream_state.clone());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let dir = common::unique_temp_dir("agy-entitlements");
         for (file, id) in [("a-pro", "pro"), ("z-ultra", "ultra")] {
-            std::fs::write(dir.join(format!("{file}.json")), json!({
-                "type": "antigravity", "identity_slug": id, "access_token": id,
-                "refresh_token": "fixture", "project_id": "fixture-project",
-                "email": format!("{id}@example.test"), "expired": "2099-01-01T00:00:00Z",
-                "upstream_override": base, "usage_override": base
-            }).to_string()).unwrap();
+            std::fs::write(
+                dir.join(format!("{file}.json")),
+                json!({
+                    "type": "antigravity", "identity_slug": id, "access_token": id,
+                    "refresh_token": "fixture", "project_id": "fixture-project",
+                    "email": format!("{id}@example.test"), "expired": "2099-01-01T00:00:00Z",
+                    "upstream_override": base, "usage_override": base
+                })
+                .to_string(),
+            )
+            .unwrap();
         }
-        let state = Arc::new(AppState::new(&GatewayConfig {
-            auth_dir: dir.clone(), config_path: dir.join("config.yaml"),
-            strategy: Strategy::FillFirst, auth_refresh_enabled: false,
-            ..GatewayConfig::default()
-        }).unwrap());
-        Self { dir, server, state, upstream: upstream_state }
+        let state = Arc::new(
+            AppState::new(&GatewayConfig {
+                auth_dir: dir.clone(),
+                config_path: dir.join("config.yaml"),
+                strategy: Strategy::FillFirst,
+                auth_refresh_enabled: false,
+                ..GatewayConfig::default()
+            })
+            .unwrap(),
+        );
+        Self {
+            dir,
+            server,
+            state,
+            upstream: upstream_state,
+        }
     }
 
     async fn refresh(&self, id: &str) {
@@ -118,18 +169,32 @@ async fn ultra_models_skip_pro_while_existing_models_keep_their_accounts() {
     fixture.refresh("pro").await;
     fixture.refresh("ultra").await;
     // When each model is requested through the real HTTP router.
-    for model in ["claude-opus-5-5-high", "claude-sonnet-5-5-high", "claude-sonnet-4-6", "gemini-3-flash"] {
+    for model in [
+        "claude-opus-5-5-high",
+        "claude-sonnet-5-5-high",
+        "claude-sonnet-4-6",
+        "gemini-3-flash",
+    ] {
         let (status, body) = fixture.request(model).await;
         assert_eq!(status, StatusCode::OK, "{model}: {body}");
     }
     // Then only entitled accounts receive traffic; no account is disabled.
-    assert_eq!(*fixture.upstream.calls.lock().unwrap(), vec![
-        ("ultra".into(), "claude-opus-5-5-high".into()),
-        ("ultra".into(), "claude-sonnet-5-5-high".into()),
-        ("pro".into(), "claude-sonnet-4-6".into()),
-        ("pro".into(), "gemini-3-flash".into()),
-    ]);
-    assert!(fixture.state.pool.load().members.iter().all(|m| m.health() == Health::Available));
+    assert_eq!(
+        *fixture.upstream.calls.lock().unwrap(),
+        vec![
+            ("ultra".into(), "claude-opus-5-5-high".into()),
+            ("ultra".into(), "claude-sonnet-5-5-high".into()),
+            ("pro".into(), "claude-sonnet-4-6".into()),
+            ("pro".into(), "gemini-3-flash".into()),
+        ]
+    );
+    assert!(fixture
+        .state
+        .pool
+        .load()
+        .members
+        .iter()
+        .all(|m| m.health() == Health::Available));
 }
 
 #[tokio::test]
@@ -141,7 +206,10 @@ async fn undiscovered_accounts_do_not_inherit_another_accounts_new_models() {
     let (status, body) = fixture.request("claude-opus-5-5-high").await;
     // Then the uninitialized Pro account is skipped rather than probed.
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(*fixture.upstream.calls.lock().unwrap(), vec![("ultra".into(), "claude-opus-5-5-high".into())]);
+    assert_eq!(
+        *fixture.upstream.calls.lock().unwrap(),
+        vec![("ultra".into(), "claude-opus-5-5-high".into())]
+    );
 }
 
 #[tokio::test]
@@ -150,16 +218,37 @@ async fn downgrade_removes_ultra_models_from_listing_and_routing() {
     let fixture = Fixture::new().await;
     fixture.refresh("pro").await;
     fixture.refresh("ultra").await;
-    assert!(fixture.state.pool.load().models.iter().any(|m| m.id == "claude-opus-5-5-high"));
-    fixture.upstream.catalogs.lock().unwrap().insert("ultra".into(), catalog(&["claude-sonnet-4-6", "gemini-3-flash"]));
+    assert!(fixture
+        .state
+        .pool
+        .load()
+        .models
+        .iter()
+        .any(|m| m.id == "claude-opus-5-5-high"));
+    fixture.upstream.catalogs.lock().unwrap().insert(
+        "ultra".into(),
+        catalog(&["claude-sonnet-4-6", "gemini-3-flash"]),
+    );
     // When the authoritative model set changes on refresh.
     fixture.refresh("ultra").await;
     // Then discovery and routing both revoke the old capability without disabling the account.
-    assert!(!fixture.state.pool.load().models.iter().any(|m| m.id.contains("5-5")));
+    assert!(!fixture
+        .state
+        .pool
+        .load()
+        .models
+        .iter()
+        .any(|m| m.id.contains("5-5")));
     let (status, _) = fixture.request("claude-opus-5-5-high").await;
     assert!(!status.is_success());
     assert!(fixture.upstream.calls.lock().unwrap().is_empty());
-    assert!(fixture.state.pool.load().members.iter().all(|m| m.health() == Health::Available));
+    assert!(fixture
+        .state
+        .pool
+        .load()
+        .members
+        .iter()
+        .all(|m| m.health() == Health::Available));
 }
 
 #[tokio::test]
@@ -172,7 +261,10 @@ async fn transient_catalog_failure_preserves_last_verified_entitlements() {
     let _refresh_result = refresh_account_usage(&fixture.state, &member).await;
     let (status, body) = fixture.request("claude-sonnet-5-5-high").await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(*fixture.upstream.calls.lock().unwrap(), vec![("ultra".into(), "claude-sonnet-5-5-high".into())]);
+    assert_eq!(
+        *fixture.upstream.calls.lock().unwrap(),
+        vec![("ultra".into(), "claude-sonnet-5-5-high".into())]
+    );
 }
 
 #[tokio::test]
@@ -203,5 +295,11 @@ async fn pro_scoped_catalog_does_not_advertise_ultra_models() {
     let models = mahoquot_gateway::models_route::scoped_model_entries(&pool, &scope);
     assert!(models.iter().any(|m| m.id == "claude-sonnet-4-6"));
     assert!(!models.iter().any(|m| m.id.contains("5-5")));
-    assert_eq!(pool.routable_accounts_for_model("claude-opus-5-5-high").iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), vec!["ultra"]);
+    assert_eq!(
+        pool.routable_accounts_for_model("claude-opus-5-5-high")
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["ultra"]
+    );
 }

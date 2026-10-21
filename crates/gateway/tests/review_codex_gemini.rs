@@ -1,9 +1,7 @@
 use mahoquot_gateway::compat::{
     self,
     events::{CodexEvent, SseParser},
-    gemini::{
-        gemini_json_to_openai_with_replay, openai_to_gemini_with_replay, GeminiDecoder,
-    },
+    gemini::{gemini_json_to_openai_with_replay, openai_to_gemini_with_replay, GeminiDecoder},
     signature_ledger::SignatureLedger,
 };
 use serde_json::json;
@@ -422,17 +420,28 @@ async fn http_codex_and_gemini_two_turn_tools_refresh_and_explicit_parity_errors
                 contents[2]["parts"][1]["functionResponse"]["id"],
                 "http-g-b"
             );
-            let refusal = client
+            // Task 9 replaced the buffered Google adapter with a real
+            // Responses stream: `stream: true` is served as SSE now.
+            let streamed = client
                 .post(format!("{gateway_url}/v1/responses"))
                 .json(&json!({"model":model,"input":"go","stream":true}))
                 .send()
                 .await
                 .unwrap();
-            assert_eq!(refusal.status(), StatusCode::BAD_REQUEST);
-            assert_eq!(
-                refusal.json::<Value>().await.unwrap()["error"]["param"],
-                "stream"
-            );
+            assert_eq!(streamed.status(), StatusCode::OK);
+            assert!(streamed
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|ct| ct.starts_with("text/event-stream")));
+            let _ = streamed.text().await.unwrap();
+            // The streamed request is a real upstream dial; consume its capture.
+            let (path, _, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(2), captures.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert!(path.contains("streamGenerateContent"), "{path}");
         } else {
             assert_eq!(requests[1].0, "/token");
             assert!(String::from_utf8_lossy(&requests[1].2).contains("refresh_token"));
@@ -477,8 +486,15 @@ async fn http_codex_and_gemini_two_turn_tools_refresh_and_explicit_parity_errors
             .await
             .unwrap();
         if google {
-            assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
-            assert!(captures.try_recv().is_err());
+            // Task 25: non-Codex compaction is served by a provider summary
+            // sealed into a model-bound cpa-ag-compact-v1 capsule.
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.json::<Value>().await.unwrap();
+            assert!(body["output"][0]["encrypted_content"]
+                .as_str()
+                .is_some_and(|capsule| capsule.starts_with("cpa-ag-compact-v1:")));
+            let (path, _, _) = captures.recv().await.unwrap();
+            assert!(path.contains("GenerateContent"), "{path}");
         } else {
             assert_eq!(response.status(), StatusCode::OK);
             assert_eq!(

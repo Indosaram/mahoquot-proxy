@@ -14,6 +14,7 @@ use crate::models_route::ModelEntry;
 #[derive(Clone)]
 pub struct PoolSnapshot {
     pub generation: u64,
+    pub models_created_unix: i64,
     pub members: Vec<Arc<AccountMember>>,
     pub models: Vec<ModelEntry>,
     pub registry: Arc<RegistrySnapshot>,
@@ -45,7 +46,8 @@ pub struct AccountSnapshotPermissions {
     pub effective_base_url: String,
     pub devin_models: Option<Vec<String>>,
     pub devin_discovered: Option<Vec<crate::devin_catalog::DiscoveredDevinModel>>,
-    pub antigravity_models: Option<std::collections::BTreeMap<String, crate::usage::ModelAvailability>>,
+    pub antigravity_models:
+        Option<std::collections::BTreeMap<String, crate::usage::ModelAvailability>>,
     pub unsupported_models: Vec<String>,
 }
 
@@ -88,7 +90,12 @@ impl AccountSnapshotPermissions {
         }
     }
 
-    pub fn supports_antigravity_model(&self, requested: &str, canonical: &str, upstream: &str) -> bool {
+    pub fn supports_antigravity_model(
+        &self,
+        requested: &str,
+        canonical: &str,
+        upstream: &str,
+    ) -> bool {
         if self.provider_kind != ProviderKind::Antigravity || self.disabled {
             return false;
         }
@@ -100,9 +107,7 @@ impl AccountSnapshotPermissions {
             return false;
         }
         match &self.antigravity_models {
-            Some(discovered) => {
-                discovered.get(upstream).and_then(|m| m.available) == Some(true)
-            }
+            Some(discovered) => discovered.get(upstream).and_then(|m| m.available) == Some(true),
             None => mahoquot_providers::is_antigravity_model(upstream),
         }
     }
@@ -114,9 +119,9 @@ impl AccountSnapshotPermissions {
         let Some(ref discovered) = self.devin_discovered else {
             return false;
         };
-        discovered.iter().any(|m| {
-            (m.public_id == model || m.model_uid == model) && m.supports_images
-        })
+        discovered
+            .iter()
+            .any(|m| (m.public_id == model || m.model_uid == model) && m.supports_images)
     }
 }
 
@@ -128,6 +133,16 @@ impl PoolSnapshot {
         members: Vec<Arc<AccountMember>>,
         models: Vec<ModelEntry>,
         registry: Arc<RegistrySnapshot>,
+    ) -> Self {
+        Self::new_with_created(generation, members, models, registry, 0)
+    }
+
+    pub fn new_with_created(
+        generation: u64,
+        members: Vec<Arc<AccountMember>>,
+        models: Vec<ModelEntry>,
+        registry: Arc<RegistrySnapshot>,
+        models_created_unix: i64,
     ) -> Self {
         let mut permissions = std::collections::HashMap::with_capacity(members.len());
         for m in &members {
@@ -160,6 +175,7 @@ impl PoolSnapshot {
 
         Self {
             generation,
+            models_created_unix,
             members,
             models,
             registry,
@@ -188,7 +204,9 @@ impl PoolSnapshot {
     }
 
     #[inline]
-    pub fn permissions(&self) -> &Arc<std::collections::HashMap<String, AccountSnapshotPermissions>> {
+    pub fn permissions(
+        &self,
+    ) -> &Arc<std::collections::HashMap<String, AccountSnapshotPermissions>> {
         &self.permissions
     }
 
@@ -197,7 +215,9 @@ impl PoolSnapshot {
     }
 
     pub fn devin_account_models(&self, id: &str) -> Option<&[String]> {
-        self.permissions.get(id).and_then(|p| p.devin_models.as_deref())
+        self.permissions
+            .get(id)
+            .and_then(|p| p.devin_models.as_deref())
     }
 
     pub fn is_devin_model_eligible(&self, id: &str, model: &str) -> bool {
@@ -223,7 +243,9 @@ impl PoolSnapshot {
     }
 
     pub fn devin_effective_base_url(&self, id: &str) -> Option<&str> {
-        self.permissions.get(id).map(|p| p.effective_base_url.as_str())
+        self.permissions
+            .get(id)
+            .map(|p| p.effective_base_url.as_str())
     }
 
     pub fn is_antigravity_model_eligible(&self, id: &str, model: &str) -> bool {
@@ -270,8 +292,14 @@ impl PoolSnapshot {
                     let canonical = resolved.canonical_id.as_str();
                     let upstream = binding.effective_upstream_id(&resolved.canonical_id);
 
-                    let unsupported = m.unsupported_models.read().unwrap_or_else(|p| p.into_inner());
-                    if unsupported.iter().any(|id| id == model || id == canonical || id == upstream) {
+                    let unsupported = m
+                        .unsupported_models
+                        .read()
+                        .unwrap_or_else(|p| p.into_inner());
+                    if unsupported
+                        .iter()
+                        .any(|id| id == model || id == canonical || id == upstream)
+                    {
                         return false;
                     }
 
@@ -298,7 +326,9 @@ impl PoolSnapshot {
 
                     m.generic_models().is_none_or(|(_, models)| {
                         models.is_empty()
-                            || models.iter().any(|id| id == model || id == canonical || id == upstream)
+                            || models
+                                .iter()
+                                .any(|id| id == model || id == canonical || id == upstream)
                     })
                 })
             })
@@ -313,7 +343,9 @@ fn registry_with_account_contributions(
 ) -> Result<RegistrySnapshot, RegistryError> {
     let mut effective = registry.clone();
     effective.models.retain(|_, descriptor| {
-        let discovered = descriptor.bindings.get(&ProviderId::antigravity())
+        let discovered = descriptor
+            .bindings
+            .get(&ProviderId::antigravity())
             .is_some_and(|binding| binding.source == CatalogSource::Discovered);
         if discovered {
             descriptor.bindings.remove(&ProviderId::antigravity());
@@ -403,13 +435,13 @@ fn registry_with_account_contributions(
                     }
                     for model in &models {
                         let model_id = ModelId::new(&model.public_id)?;
-                        let descriptor = effective
-                            .models
-                            .entry(model_id.clone())
-                            .or_insert_with(|| {
+                        let descriptor =
+                            effective.models.entry(model_id.clone()).or_insert_with(|| {
                                 let mut desc = ModelDescriptor::new(model_id.clone(), "devin");
-                                desc.capabilities.insert(mahoquot_registry::ModelCapability::Chat);
-                                desc.capabilities.insert(mahoquot_registry::ModelCapability::Tools);
+                                desc.capabilities
+                                    .insert(mahoquot_registry::ModelCapability::Chat);
+                                desc.capabilities
+                                    .insert(mahoquot_registry::ModelCapability::Tools);
                                 desc
                             });
                         descriptor
@@ -458,13 +490,13 @@ fn registry_with_account_contributions(
                                 continue;
                             }
                         };
-                        let descriptor = effective
-                            .models
-                            .entry(model_id.clone())
-                            .or_insert_with(|| {
+                        let descriptor =
+                            effective.models.entry(model_id.clone()).or_insert_with(|| {
                                 let mut desc = ModelDescriptor::new(model_id.clone(), "google");
-                                desc.capabilities.insert(mahoquot_registry::ModelCapability::Chat);
-                                desc.capabilities.insert(mahoquot_registry::ModelCapability::Tools);
+                                desc.capabilities
+                                    .insert(mahoquot_registry::ModelCapability::Chat);
+                                desc.capabilities
+                                    .insert(mahoquot_registry::ModelCapability::Tools);
                                 desc
                             });
                         descriptor
@@ -482,7 +514,6 @@ fn registry_with_account_contributions(
                                 ])
                                 .with_priority(100)
                             });
-
                     }
                 }
             }
@@ -499,6 +530,22 @@ pub fn compute_candidate_composition(
     members: Vec<Arc<AccountMember>>,
     registry: Arc<RegistrySnapshot>,
     models_env: Option<&str>,
+) -> Result<RuntimeComposition, RegistryError> {
+    compute_candidate_composition_with_created(
+        generation,
+        members,
+        registry,
+        models_env,
+        generation as i64,
+    )
+}
+
+pub fn compute_candidate_composition_with_created(
+    generation: u64,
+    members: Vec<Arc<AccountMember>>,
+    registry: Arc<RegistrySnapshot>,
+    models_env: Option<&str>,
+    models_created_unix: i64,
 ) -> Result<RuntimeComposition, RegistryError> {
     let mut effective_registry = registry_with_account_contributions(&members, &registry)?;
 
@@ -528,14 +575,42 @@ pub fn compute_candidate_composition(
         }
     }
 
+    let base_projected = crate::models_route::project_model_entries(&effective_registry, &members);
+    let alias_pairs =
+        crate::models_route::prefixed_model_aliases(&base_projected, &members, &effective_registry);
+    for (prefixed_id_str, canonical_id_str, _) in &alias_pairs {
+        let Ok(alias_id) = ModelId::new(prefixed_id_str) else {
+            continue;
+        };
+        let Ok(target_id) = ModelId::new(canonical_id_str) else {
+            continue;
+        };
+        // Do not add aliases that collide with an existing model id or alias
+        if effective_registry.models().contains_key(&alias_id)
+            || effective_registry.aliases().contains_key(&alias_id)
+        {
+            continue;
+        }
+        let rule = mahoquot_registry::ModelAliasRule {
+            alias: alias_id.clone(),
+            target: target_id,
+            provider_id: None,
+        };
+        effective_registry.aliases.insert(alias_id, rule);
+    }
+
     effective_registry.validate()?;
     let registry = Arc::new(effective_registry);
 
     let models = crate::models_route::project_model_entries(&registry, &members);
     let models = crate::models_route::expand_prefixed_models(models, &members, &registry);
 
-    Ok(RuntimeComposition::new(
-        generation, members, models, registry,
+    Ok(RuntimeComposition::new_with_created(
+        generation,
+        members,
+        models,
+        registry,
+        models_created_unix,
     ))
 }
 
@@ -663,12 +738,14 @@ impl UnifiedRuntimeState {
         &self,
         next_registry: Arc<RegistrySnapshot>,
     ) -> Result<Arc<RuntimeComposition>, anyhow::Error> {
-        self.update_registry_with_commit(next_registry, || Ok(()))
+        let models_created_unix = self.pool.load().models_created_unix;
+        self.update_registry_with_created_and_commit(next_registry, models_created_unix, || Ok(()))
     }
 
-    pub(crate) fn update_registry_with_commit(
+    pub(crate) fn update_registry_with_created_and_commit(
         &self,
         next_registry: Arc<RegistrySnapshot>,
+        models_created_unix: i64,
         commit: impl FnOnce() -> anyhow::Result<()>,
     ) -> Result<Arc<RuntimeComposition>, anyhow::Error> {
         let models_env = self.models_env.clone();
@@ -678,12 +755,14 @@ impl UnifiedRuntimeState {
 
         self.coordinator.exclusive(|| {
             let next_gen = gen_seq.fetch_add(1, Ordering::SeqCst) + 1;
-            let current_members = pool.load().members.clone();
-            let candidate = compute_candidate_composition(
+            let current = pool.load_full();
+            let current_members = current.members.clone();
+            let candidate = compute_candidate_composition_with_created(
                 next_gen,
                 current_members,
                 Arc::clone(&next_registry),
                 models_env.as_deref(),
+                models_created_unix,
             )?;
             commit()?;
             base_reg.store(next_registry);
@@ -705,11 +784,13 @@ impl UnifiedRuntimeState {
         self.coordinator.exclusive(|| {
             let next_gen = gen_seq.fetch_add(1, Ordering::SeqCst) + 1;
             let base = Arc::clone(&base_reg.load());
-            let candidate = compute_candidate_composition(
+            let created_unix = pool.load().models_created_unix;
+            let candidate = compute_candidate_composition_with_created(
                 next_gen,
                 new_members,
                 base,
                 models_env.as_deref(),
+                created_unix,
             )?;
             let arc_candidate = Arc::new(candidate);
             pool.store(Arc::clone(&arc_candidate));
@@ -725,13 +806,15 @@ impl UnifiedRuntimeState {
 
         self.coordinator.coordinate(|| {
             let next_gen = gen_seq.fetch_add(1, Ordering::SeqCst) + 1;
-            let current_members = pool.load().members.clone();
+            let current = pool.load_full();
+            let current_members = current.members.clone();
             let base = Arc::clone(&base_reg.load());
-            let candidate = compute_candidate_composition(
+            let candidate = compute_candidate_composition_with_created(
                 next_gen,
                 current_members,
                 base,
                 models_env.as_deref(),
+                current.models_created_unix,
             )?;
             pool.store(Arc::new(candidate));
             Ok(next_gen)
@@ -750,20 +833,23 @@ impl UnifiedRuntimeState {
         self.coordinator
             .exclusive(|| {
                 let current_snapshot = self.pool.load();
-                let member = current_snapshot
-                    .find_member(target_id)
-                    .ok_or_else(|| anyhow::Error::new(crate::devin_catalog::DevinDiscoveryError::StalePublication))?;
+                let member = current_snapshot.find_member(target_id).ok_or_else(|| {
+                    anyhow::Error::new(crate::devin_catalog::DevinDiscoveryError::StalePublication)
+                })?;
 
                 if member.kind() != ProviderKind::Devin || member.is_manually_disabled() {
-                    return Err(anyhow::Error::new(crate::devin_catalog::DevinDiscoveryError::StalePublication));
+                    return Err(anyhow::Error::new(
+                        crate::devin_catalog::DevinDiscoveryError::StalePublication,
+                    ));
                 }
 
                 let current_token = member.access_token();
                 let current_base_url = member.effective_base_url();
-                let current_rev =
-                    crate::devin_catalog::compute_credential_revision(&current_token);
+                let current_rev = crate::devin_catalog::compute_credential_revision(&current_token);
                 if current_rev != target_revision {
-                    return Err(anyhow::Error::new(crate::devin_catalog::DevinDiscoveryError::StalePublication));
+                    return Err(anyhow::Error::new(
+                        crate::devin_catalog::DevinDiscoveryError::StalePublication,
+                    ));
                 }
 
                 let expected_key = crate::devin_catalog::DevinCacheKey {
@@ -775,7 +861,9 @@ impl UnifiedRuntimeState {
 
                 // Full key validation: token, identity, and effective base URL must match
                 if new_catalog.key != expected_key {
-                    return Err(anyhow::Error::new(crate::devin_catalog::DevinDiscoveryError::StalePublication));
+                    return Err(anyhow::Error::new(
+                        crate::devin_catalog::DevinDiscoveryError::StalePublication,
+                    ));
                 }
 
                 // Monotonicity / out-of-order rejection:
@@ -786,11 +874,17 @@ impl UnifiedRuntimeState {
                     if existing.key == expected_key {
                         if new_catalog.sequence > 0 && existing.sequence > 0 {
                             if new_catalog.sequence <= existing.sequence {
-                                return Err(anyhow::Error::new(crate::devin_catalog::DevinDiscoveryError::StalePublication));
+                                return Err(anyhow::Error::new(
+                                    crate::devin_catalog::DevinDiscoveryError::StalePublication,
+                                ));
                             }
-                        } else if let (Some(existing_ts), Some(new_ts)) = (existing.last_refresh_at, new_catalog.last_refresh_at) {
+                        } else if let (Some(existing_ts), Some(new_ts)) =
+                            (existing.last_refresh_at, new_catalog.last_refresh_at)
+                        {
                             if new_ts < existing_ts {
-                                return Err(anyhow::Error::new(crate::devin_catalog::DevinDiscoveryError::StalePublication));
+                                return Err(anyhow::Error::new(
+                                    crate::devin_catalog::DevinDiscoveryError::StalePublication,
+                                ));
                             }
                         }
                     }
@@ -809,11 +903,12 @@ impl UnifiedRuntimeState {
                     .collect();
 
                 let next_gen = self.generation_seq.fetch_add(1, Ordering::SeqCst) + 1;
-                let candidate = compute_candidate_composition(
+                let candidate = compute_candidate_composition_with_created(
                     next_gen,
                     new_members,
                     Arc::clone(&current_snapshot.registry),
                     self.models_env.as_deref(),
+                    current_snapshot.models_created_unix,
                 )
                 .map_err(|_| {
                     crate::devin_catalog::DevinDiscoveryError::Internal(
@@ -847,31 +942,87 @@ impl UnifiedRuntimeState {
     }
 }
 
-
 #[cfg(test)]
 mod closed_contribution_tests {
     use super::*;
     use crate::account::{AccountMember, GenericAccount, ProviderAccount};
 
     fn generic_member(provider: &str, models: &[&str]) -> Arc<AccountMember> {
-        Arc::new(AccountMember::for_test(ProviderAccount::Generic(GenericAccount {
-            identity_slug: format!("slug-{provider}"),
-            provider: provider.to_string(),
-            label: provider.to_string(),
-            email: String::new(),
-            adapter: "openai-chat".to_string(),
-            base_url: "http://127.0.0.1:9".to_string(),
-            api_key: "fixture".to_string(),
-            auth_mode: "key".to_string(),
-            refresh_token: String::new(),
-            expired: String::new(),
-            token_url: String::new(),
-            client_id: String::new(),
-            project_id: String::new(),
-            models: models.iter().map(|m| m.to_string()).collect(),
-            static_headers: Default::default(),
-            disabled: false,
-        })))
+        Arc::new(AccountMember::for_test(ProviderAccount::Generic(
+            GenericAccount {
+                identity_slug: format!("slug-{provider}"),
+                provider: provider.to_string(),
+                label: provider.to_string(),
+                email: String::new(),
+                adapter: "openai-chat".to_string(),
+                base_url: "http://127.0.0.1:9".to_string(),
+                api_key: "fixture".to_string(),
+                auth_mode: "key".to_string(),
+                refresh_token: String::new(),
+                expired: String::new(),
+                token_url: String::new(),
+                client_id: String::new(),
+                project_id: String::new(),
+                models: models.iter().map(|m| m.to_string()).collect(),
+                static_headers: Default::default(),
+                disabled: false,
+            },
+        )))
+    }
+
+    #[test]
+    fn registry_publication_captures_registry_and_created_time_in_one_pool_snapshot() {
+        let old_registry = Arc::new(mahoquot_registry::embedded_snapshot().clone());
+        let mut next_registry = (*old_registry).clone();
+        next_registry.version = mahoquot_registry::CatalogVersion::new(
+            next_registry.version.as_u64().saturating_add(1),
+        );
+        let registry = Arc::new(next_registry);
+        let initial = compute_candidate_composition_with_created(
+            1,
+            Vec::new(),
+            Arc::clone(&old_registry),
+            None,
+            100,
+        )
+        .expect("initial composition");
+        let runtime = UnifiedRuntimeState::new(initial, None);
+        let timeout = std::time::Duration::from_secs(5);
+        let (committing_tx, committing_rx) = std::sync::mpsc::sync_channel(1);
+        let (observed_tx, observed_rx) = std::sync::mpsc::sync_channel(1);
+        let reader_runtime = runtime.pool();
+        let old_version = old_registry.version();
+        let reader = std::thread::spawn(move || {
+            committing_rx
+                .recv_timeout(timeout)
+                .expect("publication reached commit barrier");
+            let before = reader_runtime.load_full();
+            let old_coherent =
+                before.models_created_unix == 100 && before.registry.version() == old_version;
+            let _ = observed_tx.send(old_coherent);
+        });
+
+        let update_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime
+                .update_registry_with_created_and_commit(Arc::clone(&registry), 200, || {
+                    let _ = committing_tx.send(());
+                    let observed = observed_rx
+                        .recv_timeout(timeout)
+                        .expect("reader observed pre-publication snapshot");
+                    assert!(observed);
+                    Ok(())
+                })
+                .expect("registry publication");
+        }));
+        let reader_res = reader.join();
+        if let Err(panic_payload) = update_res {
+            std::panic::resume_unwind(panic_payload);
+        }
+        reader_res.expect("reader thread completed");
+
+        let published = runtime.composition();
+        assert_eq!(published.models_created_unix, 200);
+        assert_eq!(published.registry.version(), registry.version());
     }
 
     #[test]
@@ -900,10 +1051,8 @@ mod closed_contribution_tests {
             .contains_key(&ModelId::new("brand-new-glm").unwrap()));
 
         // The member still advertises the authorized model for routing.
-        let entries = crate::models_route::project_model_entries(
-            &composition.registry,
-            &composition.members,
-        );
+        let entries =
+            crate::models_route::project_model_entries(&composition.registry, &composition.members);
         assert!(
             entries.iter().any(|entry| entry.id == "glm-5.3"),
             "the authorized model must stay routable after the skip"

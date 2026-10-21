@@ -872,15 +872,24 @@ async fn put_binding(State(state): State<Arc<AppState>>, Json(body): Json<Value>
     };
     let store = Arc::clone(&state.settings);
     let stored = binding.clone();
-    let saved = tokio::task::spawn_blocking(move || store.mutate(|settings| {
-        settings
-            .api_key_bindings
-            .retain(|existing| existing.key_identifier != key_identifier);
-        settings.api_key_bindings.push(stored);
-    })).await;
+    let saved = tokio::task::spawn_blocking(move || {
+        store.mutate(|settings| {
+            settings
+                .api_key_bindings
+                .retain(|existing| existing.key_identifier != key_identifier);
+            settings.api_key_bindings.push(stored);
+        })
+    })
+    .await;
     let saved = match saved {
         Ok(saved) => saved,
-        Err(error) => return typed_error(StatusCode::INTERNAL_SERVER_ERROR, "binding_save_failed", error),
+        Err(error) => {
+            return typed_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "binding_save_failed",
+                error,
+            )
+        }
     };
     if let Err(error) = saved {
         return typed_error(
@@ -984,7 +993,8 @@ pub async fn put_codex_credits_opt_in(
                         let path = entry.path();
                         if let Ok(raw) = std::fs::read_to_string(&path) {
                             if let Ok(val) = serde_json::from_str::<Value>(&raw) {
-                                let is_codex = val.get("type").and_then(Value::as_str) == Some("codex")
+                                let is_codex = val.get("type").and_then(Value::as_str)
+                                    == Some("codex")
                                     || val.get("type").and_then(Value::as_str) == Some("plus")
                                     || val.get("provider").and_then(Value::as_str) == Some("codex");
                                 if is_codex {
@@ -1142,11 +1152,7 @@ pub async fn put_codex_credits_opt_in(
                 }),
             ),
             Ok(Err((status, code, msg))) => typed_error(status, code, msg),
-            Err(err) => typed_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "task_join_failed",
-                err,
-            ),
+            Err(err) => typed_error(StatusCode::INTERNAL_SERVER_ERROR, "task_join_failed", err),
         }
     }
 }

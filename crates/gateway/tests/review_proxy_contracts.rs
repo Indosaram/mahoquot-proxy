@@ -29,8 +29,21 @@ fn relay_identity_uses_endpoint_hosts_not_account_names_or_url_paths() {
     assert!(!classified_as_relay);
     assert!(member.supports_model("anthropic-claude-3-7-sonnet-20250219"));
     assert!(!member.supports_model("nekos-claude-3-7-sonnet-20250219"));
+    // A relay is a known relay host AND a relay API key (commit 1786e62:
+    // OAuth subscription accounts may proxy through ccapi without becoming a
+    // relay). The host alone, without the key, still does not classify.
     member.usage_override = Some("https://claude.nekos.me".to_string());
-    assert!(member.is_nekos_relay());
+    assert!(!member.is_nekos_relay());
+    let relay = mahoquot_gateway::account::AccountMember::for_test_with_id(
+        "nekos-fan-ccapi",
+        mahoquot_gateway::account::ProviderAccount::Claude(mahoquot_providers::ClaudeAccount {
+            api_key: Some("relay-key".to_string()),
+            ..Default::default()
+        }),
+    );
+    let mut relay = relay;
+    relay.usage_override = Some("https://claude.nekos.me".to_string());
+    assert!(relay.is_nekos_relay());
 }
 
 #[tokio::test]
@@ -100,10 +113,12 @@ fn runtime_candidates_obey_exclusions_and_canonical_unsupported_models() {
 
     pool.members[0].unsupported_models.write().unwrap().clear();
     let mut registry = (*pool.registry).clone();
-    registry.exclusions.insert(mahoquot_registry::ModelExclusionRule {
-        model_id: mahoquot_registry::ModelId::new(canonical).unwrap(),
-        provider_id: None,
-    });
+    registry
+        .exclusions
+        .insert(mahoquot_registry::ModelExclusionRule {
+            model_id: mahoquot_registry::ModelId::new(canonical).unwrap(),
+            provider_id: None,
+        });
     pool.registry = Arc::new(registry);
     assert!(pool.routable_accounts_for_model(canonical).is_empty());
     std::fs::remove_dir_all(auth_dir).unwrap();

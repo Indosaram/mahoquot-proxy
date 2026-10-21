@@ -8,6 +8,12 @@
 //! - FillFirst: first AVAILABLE member in list order every time.
 //! - select() MUST NOT mutate member objects; bookkeeping lives inside Router.
 //! - Router is pure selection: health transitions are owned by the caller.
+//! - Session affinity keys are OPAQUE SCOPES composed by the relay (caller,
+//!   route providers, compatible model group, session). The router never
+//!   parses, merges or recombines them, so pinning one scope cannot overwrite
+//!   another and a binding is only ever reused inside its own scope.
+
+pub mod lcp;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -42,9 +48,11 @@ struct RouterState {
     last_served: HashMap<String, u64>,
     /// monotonically increasing global service counter
     seq: u64,
-    /// affinity key -> member id, so a conversation keeps hitting one account
-    /// instead of hopping every turn. Entries carry the sequence number at which
-    /// they were last used so idle sessions can be evicted.
+    /// Scoped affinity key -> member id, so one caller's conversation on one
+    /// route keeps hitting one account instead of hopping every turn. Keys are
+    /// composed by the relay and treated as opaque strings here. Entries carry
+    /// the sequence number at which they were last used so idle scopes can be
+    /// evicted.
     affinity: HashMap<String, (String, u64)>,
 }
 
@@ -59,6 +67,8 @@ impl RouterState {
 /// Sessions idle for this many selections are dropped, bounding the map on a
 /// long-lived proxy without needing a timer.
 const AFFINITY_MAX_IDLE: u64 = 10_000;
+
+const AFFINITY_MAX_ENTRIES: usize = 1024;
 
 #[derive(Default, Debug)]
 pub struct Router {
@@ -75,7 +85,8 @@ impl Router {
     }
 
     pub fn set_strategy(&self, strategy: Strategy) {
-        self.strategy.store(strategy_to_u8(strategy), Ordering::SeqCst);
+        self.strategy
+            .store(strategy_to_u8(strategy), Ordering::SeqCst);
     }
 
     /// Index into `members` of the next member to serve, or None if none available.
@@ -98,9 +109,10 @@ impl Router {
                 // A binding to a member outside the activated pool is stale and
                 // must not be refreshed, so fall through to normal selection.
                 if state.admits(&bound_id) {
-                    if let Some(idx) = members.iter().position(|m| {
-                        m.id() == bound_id && m.health().is_available(now_unix_ms)
-                    }) {
+                    if let Some(idx) = members
+                        .iter()
+                        .position(|m| m.id() == bound_id && m.health().is_available(now_unix_ms))
+                    {
                         let seq = state.seq.wrapping_add(1);
                         state.seq = seq;
                         state.last_served.insert(bound_id.clone(), seq);
@@ -124,10 +136,8 @@ impl Router {
                     state.last_served.insert(chosen_id.clone(), seq);
 
                     if let Some(key) = hint.affinity_key.as_deref() {
-                        state
-                            .affinity
-                            .insert(key.to_string(), (chosen_id, seq));
-                        if state.affinity.len() > 1024 {
+                        state.affinity.insert(key.to_string(), (chosen_id, seq));
+                        if state.affinity.len() > AFFINITY_MAX_ENTRIES {
                             let cutoff = seq.saturating_sub(AFFINITY_MAX_IDLE);
                             state.affinity.retain(|_, (_, s)| *s >= cutoff);
                         }
@@ -169,7 +179,7 @@ impl Router {
                         state
                             .affinity
                             .insert(key.to_string(), (chosen_id, next_seq));
-                        if state.affinity.len() > 1024 {
+                        if state.affinity.len() > AFFINITY_MAX_ENTRIES {
                             let cutoff = next_seq.saturating_sub(AFFINITY_MAX_IDLE);
                             state.affinity.retain(|_, (_, seq)| *seq >= cutoff);
                         }
@@ -468,45 +478,80 @@ mod red_tests {
         assert!(seq2 > last_seq, "sequence must increase monotonically");
         last_seq = seq2;
 
-        assert_ne!(first, second, "must alternate between a and b under RoundRobin");
+        assert_ne!(
+            first, second,
+            "must alternate between a and b under RoundRobin"
+        );
 
         let third = p[r.select(&p, &hint).expect("select 3")].id().to_string();
         let seq3 = r.state.lock().unwrap().seq;
         assert!(seq3 > last_seq, "sequence must increase monotonically");
         last_seq = seq3;
-        assert_eq!(third, first, "must wrap around to the first candidate under RoundRobin");
+        assert_eq!(
+            third, first,
+            "must wrap around to the first candidate under RoundRobin"
+        );
 
         let fourth = p[r.select(&p, &hint).expect("select 4")].id().to_string();
         let seq4 = r.state.lock().unwrap().seq;
         assert!(seq4 > last_seq, "sequence must increase monotonically");
         last_seq = seq4;
-        assert_eq!(fourth, second, "must alternate back to the second candidate under RoundRobin");
+        assert_eq!(
+            fourth, second,
+            "must alternate back to the second candidate under RoundRobin"
+        );
 
         // 2. Call router.set_strategy(Strategy::FillFirst).
         r.set_strategy(Strategy::FillFirst);
 
         // Stale state probe: immediately returns the newly set Strategy without cached delay.
-        assert_eq!(r.strategy(), Strategy::FillFirst, "strategy getter must immediately reflect FillFirst");
+        assert_eq!(
+            r.strategy(),
+            Strategy::FillFirst,
+            "strategy getter must immediately reflect FillFirst"
+        );
 
         // 3. Send subsequent requests: observe immediate switch to pinning to the first candidate (FillFirst behavior).
         for i in 0..6 {
-            let picked = p[r.select(&p, &hint).expect("select under FillFirst")].id().to_string();
+            let picked = p[r.select(&p, &hint).expect("select under FillFirst")]
+                .id()
+                .to_string();
             let curr_seq = r.state.lock().unwrap().seq;
-            assert!(curr_seq > last_seq, "sequence must remain monotonic across strategy switch (iteration {i})");
+            assert!(
+                curr_seq > last_seq,
+                "sequence must remain monotonic across strategy switch (iteration {i})"
+            );
             last_seq = curr_seq;
-            assert_eq!(picked, "a", "FillFirst must always pin to the first available member (iteration {i})");
+            assert_eq!(
+                picked, "a",
+                "FillFirst must always pin to the first available member (iteration {i})"
+            );
         }
 
         // 4. Switch back to StrictRoundRobin: ensure immediate effect and sequence monotonicity.
         r.set_strategy(Strategy::StrictRoundRobin);
-        assert_eq!(r.strategy(), Strategy::StrictRoundRobin, "strategy getter must immediately reflect StrictRoundRobin");
+        assert_eq!(
+            r.strategy(),
+            Strategy::StrictRoundRobin,
+            "strategy getter must immediately reflect StrictRoundRobin"
+        );
 
         // Under StrictRoundRobin, 'b' was served less recently than 'a' (which was picked 6 times),
         // so 'b' must be picked next.
-        let next = p[r.select(&p, &hint).expect("select under resumed RoundRobin")].id().to_string();
+        let next = p[r
+            .select(&p, &hint)
+            .expect("select under resumed RoundRobin")]
+        .id()
+        .to_string();
         let curr_seq = r.state.lock().unwrap().seq;
-        assert!(curr_seq > last_seq, "sequence must remain monotonic when switching back to RoundRobin");
-        assert_eq!(next, "b", "resumed RoundRobin must pick candidate b because candidate a was repeatedly served");
+        assert!(
+            curr_seq > last_seq,
+            "sequence must remain monotonic when switching back to RoundRobin"
+        );
+        assert_eq!(
+            next, "b",
+            "resumed RoundRobin must pick candidate b because candidate a was repeatedly served"
+        );
     }
 
     fn active_set(ids: &[&str]) -> std::collections::BTreeSet<String> {
@@ -523,7 +568,10 @@ mod red_tests {
         assert_eq!(r.bound_affinity_member("conv-b").as_deref(), Some("b"));
 
         let removed = r.retain_members(&active_set(&["a", "c"]));
-        assert_eq!(removed, 1, "only the removed member's bookkeeping is pruned");
+        assert_eq!(
+            removed, 1,
+            "only the removed member's bookkeeping is pruned"
+        );
 
         let mut tracked = r.tracked_members();
         tracked.sort();
@@ -557,7 +605,11 @@ mod red_tests {
 
         let live = pool(&[("b", Health::Available), ("c", Health::Available)]);
         let next = r.select(&live, &hint).expect("rotate after retain");
-        assert_eq!(live[next].id(), "b", "smallest last_served_seq is served first");
+        assert_eq!(
+            live[next].id(),
+            "b",
+            "smallest last_served_seq is served first"
+        );
         assert_eq!(r.state.lock().unwrap().seq, seq_before + 1);
         let next2 = r.select(&live, &hint).expect("rotate after retain");
         assert_eq!(live[next2].id(), "c");
@@ -582,6 +634,104 @@ mod red_tests {
         );
         assert_eq!(r.bound_affinity_member("keep-1").as_deref(), Some("a"));
         assert_eq!(r.bound_affinity_member("keep-3").as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn scoped_keys_keep_one_sessions_route_pins_independent() {
+        // One session id, two route scopes: pinning the provider-A scope must
+        // never clobber the provider-B scope for the same conversation.
+        let r = Router::new(Strategy::FillFirst);
+        let a = pool(&[("a1", Health::Disabled), ("a2", Health::Available)]);
+        let b = pool(&[("b1", Health::Available)]);
+        let scope_a = keyed("caller-1|codex|gpt-5.6-sol|session-S");
+        let scope_b = keyed("caller-1|claude|claude-sonnet-4-6|session-S");
+
+        assert_eq!(r.select(&a, &scope_a).map(|i| a[i].id()), Some("a2"));
+        assert_eq!(r.select(&b, &scope_b).map(|i| b[i].id()), Some("b1"));
+
+        // provider-A comes back: its own scope still points at a2, so the
+        // recovery is A2 rather than the fill-first first member a1.
+        let a_restored = pool(&[("a1", Health::Available), ("a2", Health::Available)]);
+        assert_eq!(
+            r.select(&a_restored, &scope_a).map(|i| a_restored[i].id()),
+            Some("a2")
+        );
+        // and the untouched scope still points at b1.
+        assert_eq!(r.select(&b, &scope_b).map(|i| b[i].id()), Some("b1"));
+        assert_eq!(
+            r.bound_affinity_member("caller-1|codex|gpt-5.6-sol|session-S")
+                .as_deref(),
+            Some("a2")
+        );
+        assert_eq!(
+            r.bound_affinity_member("caller-1|claude|claude-sonnet-4-6|session-S")
+                .as_deref(),
+            Some("b1")
+        );
+    }
+
+    #[test]
+    fn new_scope_still_follows_fill_first_order_then_pins() {
+        let r = Router::new(Strategy::FillFirst);
+        let p = pool(&[("a1", Health::Available), ("a2", Health::Available)]);
+        let scope = keyed("caller-1|codex|gpt-5.6-sol|session-S");
+        // A scope with no binding keeps the configured fill-first order.
+        assert_eq!(r.select(&p, &scope).map(|i| p[i].id()), Some("a1"));
+        assert_eq!(r.select(&p, &scope).map(|i| p[i].id()), Some("a1"));
+
+        // Another scope over the same pool is independent, not a second look.
+        let other = keyed("caller-2|codex|gpt-5.6-sol|session-S");
+        assert_eq!(r.select(&p, &other).map(|i| p[i].id()), Some("a1"));
+        assert_eq!(
+            r.bound_affinity_member("caller-1|codex|gpt-5.6-sol|session-S")
+                .as_deref(),
+            Some("a1")
+        );
+    }
+
+    #[test]
+    fn unavailable_binding_rebinds_only_its_own_scope() {
+        let r = Router::new(Strategy::FillFirst);
+        let p = pool(&[("a1", Health::Available), ("a2", Health::Available)]);
+        let scope = keyed("caller-1|codex|gpt-5.6-sol|session-S");
+        assert_eq!(r.select(&p, &scope).map(|i| p[i].id()), Some("a1"));
+
+        // a1 goes unavailable: the scope falls back to the next eligible
+        // member and is rebound there, leaving every other scope alone.
+        let degraded = pool(&[("a1", Health::Disabled), ("a2", Health::Available)]);
+        assert_eq!(
+            r.select(&degraded, &scope).map(|i| degraded[i].id()),
+            Some("a2")
+        );
+        assert_eq!(
+            r.bound_affinity_member("caller-1|codex|gpt-5.6-sol|session-S")
+                .as_deref(),
+            Some("a2")
+        );
+        assert_eq!(
+            r.bound_affinity_member("caller-9|codex|gpt-5.6-sol|session-S"),
+            None,
+            "a fallback must not invent a binding for another scope"
+        );
+    }
+
+    #[test]
+    fn scoped_affinity_storage_stays_bounded() {
+        // Scope keys multiply per caller/route/model, so prove the idle window
+        // still caps the map instead of letting it grow with every new scope.
+        let r = Router::new(Strategy::FillFirst);
+        let p = pool(&[("a1", Health::Available), ("a2", Health::Available)]);
+        for i in 0..(AFFINITY_MAX_IDLE + 2_000) {
+            let _ = r.select(
+                &p,
+                &keyed(&format!("caller-{i}|codex|gpt-5.6-sol|session-S")),
+            );
+        }
+        let live = r.state.lock().unwrap().affinity.len();
+        assert!(
+            live <= AFFINITY_MAX_IDLE as usize + 2,
+            "affinity map must stay inside the idle window, got {live} entries"
+        );
     }
 
     #[test]

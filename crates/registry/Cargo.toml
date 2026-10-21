@@ -18,6 +18,16 @@ ed25519-dalek = { workspace = true, features = ["rand_core"] }
 clap = { workspace = true }
 anyhow = { workspace = true }
 rand = { workspace = true }
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres"] }
+reqwest = { workspace = true, features = ["blocking"] }
+url.workspace = true
+sha2 = "0.10"
+hmac = "0.12"
+hex = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true }
+tracing.workspace = true
 
 [dev-dependencies]
 rand.workspace = true
+axum.workspace = true

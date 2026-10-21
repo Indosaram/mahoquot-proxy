@@ -47,9 +47,10 @@ async fn harness(label: &str) -> Harness {
         uri: axum::http::Uri,
         body: Bytes,
     ) -> impl axum::response::IntoResponse {
-        seen.lock()
-            .unwrap()
-            .push((uri.path().to_string(), serde_json::from_slice(&body).unwrap()));
+        seen.lock().unwrap().push((
+            uri.path().to_string(),
+            serde_json::from_slice(&body).unwrap(),
+        ));
         (
             [("content-type", "text/event-stream")],
             common::codex_sse("done"),
@@ -58,7 +59,9 @@ async fn harness(label: &str) -> Harness {
 
     let mut listener = None;
     for port in 18880..=18899 {
-        if let Ok(bound) = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await {
+        if let Ok(bound) =
+            tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await
+        {
             listener = Some(bound);
             break;
         }
@@ -102,7 +105,11 @@ async fn harness(label: &str) -> Harness {
         })
         .unwrap(),
     );
-    assert_eq!(state.pool.load().members.len(), 1, "one codex fixture account");
+    assert_eq!(
+        state.pool.load().members.len(),
+        1,
+        "one codex fixture account"
+    );
     let app = create_app(Arc::clone(&state));
     Harness {
         app,
@@ -164,8 +171,14 @@ async fn the_switch_puts_priority_on_every_codex_bound_request() {
         .unwrap();
 
     // When: the caller arrives through both codex-bound entry points
-    assert_eq!(post_json(&h.app, "/v1/chat/completions", chat_request(None)).await, 200);
-    assert_eq!(post_json(&h.app, "/v1/responses", responses_request()).await, 200);
+    assert_eq!(
+        post_json(&h.app, "/v1/chat/completions", chat_request(None)).await,
+        200
+    );
+    assert_eq!(
+        post_json(&h.app, "/v1/responses", responses_request()).await,
+        200
+    );
 
     // Then: each upstream request carries the priority tier on the codex path
     let seen = h.seen();

@@ -3,6 +3,8 @@ pub mod cursor;
 mod cursor_proto;
 pub mod devin;
 pub mod devin_proto;
+pub mod meta;
+pub mod xai;
 pub mod zcode;
 
 #[doc(hidden)]
@@ -71,6 +73,7 @@ pub fn cursor_is_get_blob_reply(frame: &[u8], expected_id: u32) -> bool {
 }
 pub mod events;
 pub mod gemini;
+pub mod kimi;
 pub mod kiro;
 pub mod mimo;
 pub mod render;
@@ -292,6 +295,19 @@ pub enum Protocol {
     Kiro,
     Cursor,
     Devin,
+}
+
+impl Protocol {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Antigravity => "antigravity",
+            Self::Anthropic => "anthropic",
+            Self::Kiro => "kiro",
+            Self::Cursor => "cursor",
+            Self::Devin => "devin",
+        }
+    }
 }
 
 pub struct ProtocolSession {
@@ -518,9 +534,7 @@ pub fn streaming_body(params: StreamingBodyParams) -> Body {
     let parser = ProtocolParser::with_session(&session);
     let renderer = match shape {
         ReplyShape::Gemini => StreamRenderer::Gemini(Box::new(match session.replay {
-            Some(replay) => {
-                GeminiChunkRenderer::with_replay(model, created, replay)
-            }
+            Some(replay) => GeminiChunkRenderer::with_replay(model, created, replay),
             None => GeminiChunkRenderer::new(model, created),
         })),
         ReplyShape::Anthropic => StreamRenderer::Anthropic(Box::new(
@@ -893,10 +907,7 @@ mod bounded_stream_tests {
     impl Stream for CountingSource {
         type Item = reqwest::Result<Bytes>;
 
-        fn poll_next(
-            mut self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<Option<Self::Item>> {
+        fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
             self.polls.fetch_add(1, Ordering::SeqCst);
             match self.chunks.pop_front() {
                 Some(chunk) => Poll::Ready(Some(Ok(chunk))),
@@ -913,7 +924,10 @@ mod bounded_stream_tests {
 
     /// Drives a `streaming_body` that must terminate on its very first chunk,
     /// returning the rendered body text plus the source's poll and drop counts.
-    async fn drain_after_terminal_first(first: Bytes, protocol: Protocol) -> (String, usize, usize) {
+    async fn drain_after_terminal_first(
+        first: Bytes,
+        protocol: Protocol,
+    ) -> (String, usize, usize) {
         let polls = Arc::new(AtomicUsize::new(0));
         let drops = Arc::new(AtomicUsize::new(0));
         let source = CountingSource {
@@ -961,19 +975,33 @@ mod bounded_stream_tests {
             polls, 0,
             "the upstream must not be polled after the limit failure"
         );
-        assert_eq!(drops, 1, "the upstream must be dropped when the stream ends");
+        assert_eq!(
+            drops, 1,
+            "the upstream must be dropped when the stream ends"
+        );
     }
 
     #[tokio::test]
     async fn a_kiro_frame_limit_failure_stops_polling_and_drops_the_upstream() {
-        let mut prelude = (kiro::MAX_KIRO_FRAME_BYTES as u32 + 1).to_be_bytes().to_vec();
+        let mut prelude = (kiro::MAX_KIRO_FRAME_BYTES as u32 + 1)
+            .to_be_bytes()
+            .to_vec();
         prelude.extend_from_slice(&0u32.to_be_bytes());
         prelude.extend_from_slice(&0u32.to_be_bytes());
         let (text, polls, drops) =
             drain_after_terminal_first(Bytes::from(prelude), Protocol::Kiro).await;
-        assert!(text.contains("error"), "expected a terminal error frame: {text}");
-        assert_eq!(polls, 0, "the upstream must not be polled after the frame limit");
-        assert_eq!(drops, 1, "the upstream must be dropped when the stream ends");
+        assert!(
+            text.contains("error"),
+            "expected a terminal error frame: {text}"
+        );
+        assert_eq!(
+            polls, 0,
+            "the upstream must not be polled after the frame limit"
+        );
+        assert_eq!(
+            drops, 1,
+            "the upstream must be dropped when the stream ends"
+        );
     }
 
     #[tokio::test]
@@ -982,18 +1010,30 @@ mod bounded_stream_tests {
         prelude.extend_from_slice(&(cursor::MAX_CURSOR_FRAME_BYTES as u32 + 1).to_be_bytes());
         let (text, polls, drops) =
             drain_after_terminal_first(Bytes::from(prelude), Protocol::Cursor).await;
-        assert!(text.contains("error"), "expected a terminal error frame: {text}");
-        assert_eq!(polls, 0, "the upstream must not be polled after the frame limit");
-        assert_eq!(drops, 1, "the upstream must be dropped when the stream ends");
+        assert!(
+            text.contains("error"),
+            "expected a terminal error frame: {text}"
+        );
+        assert_eq!(
+            polls, 0,
+            "the upstream must not be polled after the frame limit"
+        );
+        assert_eq!(
+            drops, 1,
+            "the upstream must be dropped when the stream ends"
+        );
     }
 
     fn chunks(parts: &[&'static str]) -> UpstreamStream {
-        let items: Vec<reqwest::Result<Bytes>> =
-            parts.iter().map(|p| Ok(Bytes::from_static(p.as_bytes()))).collect();
+        let items: Vec<reqwest::Result<Bytes>> = parts
+            .iter()
+            .map(|p| Ok(Bytes::from_static(p.as_bytes())))
+            .collect();
         Box::pin(futures::stream::iter(items))
     }
 
-    const MESSAGE_START: &str = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\"}}\n\n";
+    const MESSAGE_START: &str =
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\"}}\n\n";
 
     #[tokio::test]
     async fn a_200_stream_that_opens_with_a_rate_limit_error_fails_over() {
@@ -1011,7 +1051,8 @@ mod bounded_stream_tests {
 
     #[tokio::test]
     async fn a_served_stream_releases_every_buffered_byte_in_order() {
-        let block = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0}\n\n";
+        let block =
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0}\n\n";
         let tail = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         let (first, mut rest) = hold_anthropic_preamble(
             Bytes::from_static(MESSAGE_START.as_bytes()),
@@ -1021,7 +1062,10 @@ mod bounded_stream_tests {
         .await
         .expect("served stream");
         assert_eq!(first, Bytes::from(format!("{MESSAGE_START}{block}")));
-        assert_eq!(rest.next().await.unwrap().unwrap(), Bytes::from_static(tail.as_bytes()));
+        assert_eq!(
+            rest.next().await.unwrap().unwrap(),
+            Bytes::from_static(tail.as_bytes())
+        );
         assert!(rest.next().await.is_none());
     }
 

@@ -467,6 +467,183 @@ async fn test_t7_refresh_lifecycle() {
 }
 
 #[tokio::test]
+async fn test_t7_concurrent_reactive_401_single_flight_refresh() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use futures::FutureExt;
+    use http_body_util::BodyExt;
+    use tokio::sync::{mpsc, Semaphore};
+    use tokio::time::{timeout, Duration};
+    use tower::ServiceExt;
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::prelude::*;
+
+    let budget = Duration::from_secs(5);
+    let (stale_tx, mut stale_rx) = mpsc::unbounded_channel();
+    let (oauth_tx, mut oauth_rx) = mpsc::unbounded_channel();
+    let (refresh_tx, mut refresh_rx) = mpsc::unbounded_channel();
+    struct RefreshEntries(mpsc::UnboundedSender<()>);
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RefreshEntries {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().name() == "reactive_refresh_entered" {
+                self.0.send(()).unwrap();
+            }
+        }
+    }
+    let subscriber = tracing_subscriber::registry().with(RefreshEntries(refresh_tx));
+    let dispatch = tracing::Dispatch::new(subscriber);
+    let stale_release = Arc::new(Semaphore::new(0));
+    let token_release = Arc::new(Semaphore::new(0));
+    let oauth_hits = Arc::new(AtomicUsize::new(0));
+    let replay_hits = Arc::new(AtomicUsize::new(0));
+    let oauth_app = Router::new().route("/oauth/token", post({
+        let release = token_release.clone();
+        let hits = oauth_hits.clone();
+        move |body: String| {
+            let release = release.clone();
+            let hits = hits.clone();
+            let entered = oauth_tx.clone();
+            async move {
+                assert!(body.contains("grant_type=refresh_token"));
+                hits.fetch_add(1, Ordering::SeqCst);
+                entered.send(()).unwrap();
+                timeout(budget, release.acquire()).await.unwrap().unwrap().forget();
+                (StatusCode::OK, [("content-type", "application/json")],
+                    r#"{"access_token":"reactive-fresh","refresh_token":"fresh-r","id_token":"fresh-i","expires_in":3600}"#)
+            }
+        }
+    }));
+    let upstream_app = Router::new().route(
+        common::CODEX_PATH,
+        post({
+            let hits = replay_hits.clone();
+            let release = stale_release.clone();
+            move |headers: HeaderMap| {
+                let entered = stale_tx.clone();
+                let hits = hits.clone();
+                let release = release.clone();
+                async move {
+                    match headers.get("authorization").unwrap().to_str().unwrap() {
+                        "Bearer reactive-stale" => {
+                            entered.send(()).unwrap();
+                            timeout(budget, release.acquire())
+                                .await
+                                .unwrap()
+                                .unwrap()
+                                .forget();
+                            (
+                                StatusCode::UNAUTHORIZED,
+                                [("content-type", "text/event-stream")],
+                                "stale".to_string(),
+                            )
+                        }
+                        "Bearer reactive-fresh" => {
+                            hits.fetch_add(1, Ordering::SeqCst);
+                            (
+                                StatusCode::OK,
+                                [("content-type", "text/event-stream")],
+                                common::codex_sse("reactive_ok"),
+                            )
+                        }
+                        other => panic!("unexpected authorization: {other}"),
+                    }
+                }
+            }
+        }),
+    );
+    let oauth_listener = tokio::net::TcpListener::bind("127.0.0.1:18885")
+        .await
+        .unwrap();
+    let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:18886")
+        .await
+        .unwrap();
+    let dir = unique_temp_dir("qgw-reactive-singleflight");
+    std::fs::write(
+        dir.join("codex-reactive.json"),
+        serde_json::json!({
+            "type":"plus", "identity_slug":"reactive", "access_token":"reactive-stale",
+            "refresh_token":"stale-r", "account_id":"reactive", "email":"reactive@example.invalid",
+            "id_token":"stale-i", "last_refresh":"", "expired":"2099-01-01T00:00:00Z",
+            "upstream_override":"http://127.0.0.1:18886"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let config_path = dir.join("config.yaml");
+    std::fs::write(&config_path, "model-catalog:\n  refresh-enabled: false\n").unwrap();
+    let state = Arc::new(
+        AppState::new(&GatewayConfig {
+            auth_dir: dir.clone(),
+            config_path,
+            refresh_url: "http://127.0.0.1:18885/oauth/token".into(),
+            auth_refresh_enabled: true,
+            ..Default::default()
+        })
+        .unwrap(),
+    );
+    let oauth = tokio::spawn(async move {
+        axum::serve(oauth_listener, oauth_app).await.unwrap();
+    });
+    let upstream = tokio::spawn(async move {
+        axum::serve(upstream_listener, upstream_app).await.unwrap();
+    });
+    let outcome = timeout(budget, std::panic::AssertUnwindSafe(async {
+        let request = || Request::post(common::CODEX_PATH)
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"model":"gpt-5.6-sol","stream":false,"input":"hi"}"#)).unwrap();
+        let mut first = Box::pin(create_app(state.clone()).oneshot(request()).with_subscriber(dispatch.clone()));
+        let mut second = Box::pin(create_app(state.clone()).oneshot(request()).with_subscriber(dispatch.clone()));
+        tokio::select! {
+            result = &mut first => panic!("first request completed before 401 release: {result:?}"),
+            result = &mut second => panic!("second request completed before 401 release: {result:?}"),
+            _ = async { stale_rx.recv().await.unwrap(); stale_rx.recv().await.unwrap(); } => {},
+        }
+        stale_release.add_permits(2);
+        tokio::select! {
+            result = &mut first => panic!("first request completed before token release: {result:?}"),
+            result = &mut second => panic!("second request completed before token release: {result:?}"),
+            _ = async {
+                refresh_rx.recv().await.unwrap();
+                refresh_rx.recv().await.unwrap();
+                oauth_rx.recv().await.unwrap();
+            } => {},
+        }
+        assert_eq!(oauth_hits.load(Ordering::SeqCst), 1);
+        token_release.add_permits(2);
+        let (a, b) = tokio::join!(first, second);
+        for response in [a.unwrap(), b.unwrap()] {
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert!(String::from_utf8_lossy(&body).contains("reactive_ok"));
+        }
+        assert_eq!(oauth_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(replay_hits.load(Ordering::SeqCst), 2);
+        println!("reactive401 stale_arrivals=2 refresh_entries_before_release=2 oauth_exchanges=1 fresh_replays=2 outcomes=200,200");
+    }).catch_unwind()).await;
+    oauth.abort();
+    upstream.abort();
+    for task in [oauth, upstream] {
+        let result = timeout(budget, task).await.unwrap();
+        assert!(result.unwrap_err().is_cancelled());
+    }
+    drop(state);
+    // Best-effort temp cleanup: background writers spawned by AppState may
+    // still be flushing into the auth dir after the drop, which made a strict
+    // remove_dir_all fail with DirectoryNotEmpty independent of the behavior
+    // under test.
+    if let Err(error) = std::fs::remove_dir_all(&dir) {
+        eprintln!("t7 temp dir cleanup skipped for {}: {error}", dir.display());
+    }
+    if let Err(panic) = outcome.unwrap() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
 async fn test_t7_concurrent_single_flight_refresh() {
     // Given: Mock OAuth server with slight latency to force concurrency overlap
     let oauth_hit_count = Arc::new(AtomicUsize::new(0));
