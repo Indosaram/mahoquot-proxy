@@ -318,6 +318,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let state = Arc::new(AppState::new(&config)?);
+    let cline_catalog = mahoquot_gateway::cline_catalog::spawn(Arc::clone(&state));
     mahoquot_gateway::warmup::spawn_warmup_loop(state.clone(), std::time::Duration::from_secs(15));
     // Resume each Cline account's 24h token budget from the durable history
     // so a restart does not hand back a partially spent budget.
@@ -364,6 +365,7 @@ async fn main() -> anyhow::Result<()> {
     // server.
     usage_poller.shutdown().await;
     catalog_refresh.shutdown().await;
+    cline_catalog.shutdown().await;
     flush_worker.shutdown().await;
     // Final snapshot before the process exits, so a replay that arrived inside
     // the coalescing window is not lost.

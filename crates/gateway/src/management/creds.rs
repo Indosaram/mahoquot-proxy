@@ -19,8 +19,10 @@ const ACCOUNT_ORDER_FILE: &str = ".mahoquot-account-order.json";
 
 fn is_credential_filename(name: &str) -> bool {
     let lowered = name.to_ascii_lowercase();
-    lowered.ends_with(".json") && lowered != ACCOUNT_ORDER_FILE
-        && lowered != "account-order.json" && lowered != "telemetry.json"
+    lowered.ends_with(".json")
+        && lowered != ACCOUNT_ORDER_FILE
+        && lowered != "account-order.json"
+        && lowered != "telemetry.json"
 }
 
 fn is_credential_document(value: &Value) -> bool {
@@ -279,17 +281,33 @@ async fn create_auth_file(State(state): State<Arc<AppState>>, raw: bytes::Bytes)
         return json_status(StatusCode::BAD_REQUEST, json!({ "error": error }));
     }
     if content.get("type").and_then(Value::as_str) == Some("devin") {
-        let devin_account: mahoquot_providers::DevinAccount = match serde_json::from_value(content.clone()) {
-            Ok(acct) => acct,
-            Err(_) => return json_status(StatusCode::BAD_REQUEST, json!({ "error": "invalid devin credential format" })),
-        };
+        let devin_account: mahoquot_providers::DevinAccount =
+            match serde_json::from_value(content.clone()) {
+                Ok(acct) => acct,
+                Err(_) => {
+                    return json_status(
+                        StatusCode::BAD_REQUEST,
+                        json!({ "error": "invalid devin credential format" }),
+                    )
+                }
+            };
         let validated = match devin_account.validate() {
             Ok(acct) => acct,
-            Err(e) => return json_status(StatusCode::BAD_REQUEST, json!({ "error": format!("invalid devin credential: {e}") })),
+            Err(e) => {
+                return json_status(
+                    StatusCode::BAD_REQUEST,
+                    json!({ "error": format!("invalid devin credential: {e}") }),
+                )
+            }
         };
         content = match serde_json::to_value(&validated) {
             Ok(v) => v,
-            Err(e) => return json_status(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": format!("failed to serialize normalized devin credential: {e}") })),
+            Err(e) => {
+                return json_status(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({ "error": format!("failed to serialize normalized devin credential: {e}") }),
+                )
+            }
         };
     }
     let dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
@@ -564,7 +582,8 @@ async fn patch_auth_file_status(
             json!({ "error": "disabled is required" }),
         );
     };
-    if name.is_empty() || name.contains('/') || name.contains("..") || !is_credential_filename(name) {
+    if name.is_empty() || name.contains('/') || name.contains("..") || !is_credential_filename(name)
+    {
         return json_status(StatusCode::BAD_REQUEST, json!({ "error": "invalid name" }));
     }
     let dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
@@ -591,12 +610,18 @@ async fn patch_auth_file_status(
         }
     };
     if !value.is_object() {
-        return json_status(StatusCode::BAD_REQUEST, json!({ "error": "auth file must be a JSON object" }));
+        return json_status(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "auth file must be a JSON object" }),
+        );
     }
     let legacy_codex = name.starts_with("codex-")
         && serde_json::from_value::<mahoquot_providers::CodexAccount>(value.clone()).is_ok();
     if !is_credential_document(&value) && !legacy_codex {
-        return json_status(StatusCode::BAD_REQUEST, json!({ "error": "invalid credential document" }));
+        return json_status(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "invalid credential document" }),
+        );
     }
     if let Value::Object(fields) = &mut value {
         fields.insert("disabled".into(), json!(disabled));
@@ -982,8 +1007,12 @@ async fn cline_import(State(state): State<Arc<AppState>>) -> Response {
     let settings = cline.get("settings").unwrap_or(&Value::Null);
     let auth = settings.get("auth").unwrap_or(&Value::Null);
     let (Some(access), Some(refresh)) = (
-        auth.get("accessToken").and_then(Value::as_str).filter(|v| !v.is_empty()),
-        auth.get("refreshToken").and_then(Value::as_str).filter(|v| !v.is_empty()),
+        auth.get("accessToken")
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty()),
+        auth.get("refreshToken")
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty()),
     ) else {
         return json_status(
             StatusCode::BAD_REQUEST,
@@ -1014,7 +1043,7 @@ async fn cline_import(State(state): State<Arc<AppState>>) -> Response {
         .header(header::AUTHORIZATION, format!("Bearer {access}"))
         .send()
         .await;
-    let models: Vec<String> = match probe {
+    let mut models: Vec<String> = match probe {
         Ok(response) if response.status().is_success() => {
             match models_from_catalog("cline", response).await {
                 Ok(ids) => ids,
@@ -1034,12 +1063,32 @@ async fn cline_import(State(state): State<Arc<AppState>>) -> Response {
             )
         }
     };
+    let free_models = match crate::cline_catalog::fetch_free_models(
+        &state.http_client,
+        "https://api.cline.bot/api/v1",
+    )
+    .await
+    {
+        Ok(models) => models,
+        Err(error) => {
+            return json_status(
+                StatusCode::BAD_GATEWAY,
+                json!({"error":format!("Cline free catalog unavailable: {error}")}),
+            )
+        }
+    };
+    let free_ids: Vec<_> = free_models
+        .iter()
+        .filter_map(|m| m.get("id").and_then(Value::as_str))
+        .collect();
+    models.retain(|id| !id.starts_with("cline-free/") && !free_ids.contains(&id.as_str()));
+    models.extend(free_ids.iter().map(|id| id.to_string()));
     let credential = json!({"type":"generic","provider":"cline","label":label,"email":email,
         "adapter":"openai-chat","auth_mode":"oauth",
         "base_url":"https://api.cline.bot/api/v1",
         "api_key":access,"refresh_token":refresh,"expired":expired,
         "token_url":"https://api.cline.bot/api/v1/auth/refresh",
-        "account_id":account_id,
+        "account_id":account_id,"cline_free_models":free_ids,
         "models":models,
         "disabled":false});
     let dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
@@ -1111,7 +1160,14 @@ async fn devin_import_cli(State(state): State<Arc<AppState>>, raw: bytes::Bytes)
         };
 
         // Reject arbitrary file path fields strictly with dedicated message
-        for key in ["path", "file_path", "file", "filepath", "credentials_path", "source_path"] {
+        for key in [
+            "path",
+            "file_path",
+            "file",
+            "filepath",
+            "credentials_path",
+            "source_path",
+        ] {
             if obj.contains_key(key) {
                 return json_status(
                     StatusCode::BAD_REQUEST,
@@ -1550,9 +1606,18 @@ async fn discover_provider_models(
 ) -> Response {
     let base_url = match body.get("base_url").and_then(Value::as_str) {
         Some(u) if !u.trim().is_empty() => u.trim().trim_end_matches('/'),
-        _ => return json_status(StatusCode::BAD_REQUEST, json!({"error": "base_url is required"})),
+        _ => {
+            return json_status(
+                StatusCode::BAD_REQUEST,
+                json!({"error": "base_url is required"}),
+            )
+        }
     };
-    let api_key = body.get("api_key").and_then(Value::as_str).unwrap_or("").trim();
+    let api_key = body
+        .get("api_key")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
     let target_url = if base_url.ends_with("/v1") {
         format!("{base_url}/models")
     } else {

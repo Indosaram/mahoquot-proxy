@@ -529,7 +529,7 @@ mod provider_kind_contract_tests {
     }
 
     #[test]
-    fn cline_credential_is_normalized_with_surface_headers_and_free_deepseek() {
+    fn cline_credential_is_normalized_with_surface_headers_without_inventing_models() {
         let value: serde_json::Value = serde_json::from_str(
             r#"{"provider":"cline","adapter":"openai-chat","base_url":"https://api.cline.bot/api/v1","models":["z-ai/glm-5.3-flash"]}"#,
         )
@@ -551,10 +551,7 @@ mod provider_kind_contract_tests {
             Some("cline-cli")
         );
         assert!(account.static_headers.contains_key("X-Task-ID"));
-        assert!(account
-            .models
-            .contains(&"cline-free/deepseek-v4.1-flash".to_string()));
-        assert!(account.models.contains(&"z-ai/glm-5.3-flash".to_string()));
+        assert_eq!(account.models, vec!["z-ai/glm-5.3-flash"]);
     }
 
     #[test]
@@ -2330,10 +2327,8 @@ fn expired_at_is_past(expired: &str, now_unix: i64) -> bool {
 /// `403 ... only available via Cline product surfaces`, so a cline credential
 /// must carry the Cline client surface headers. The account pipeline writes
 /// files without them, which strands every newly enrolled account outside the
-/// free deepseek route (glm is unaffected). Normalize at load time: fill the
-/// canonical surface headers without ever overwriting authored ones, and make
-/// the free deepseek slug eligible for any cline account that declares a
-/// model list at all (an empty list already serves every model).
+/// free routes. Normalize surface headers at load time without inventing model
+/// availability; the official catalog discovery owns the free model list.
 fn normalize_cline_generic(account: &mut GenericAccount) {
     if account.provider != "cline" {
         return;
@@ -2356,10 +2351,6 @@ fn normalize_cline_generic(account: &mut GenericAccount) {
         account
             .static_headers
             .insert("X-Task-ID".to_string(), uuid::Uuid::new_v4().to_string());
-    }
-    const FREE_DEEPSEEK: &str = "cline-free/deepseek-v4.1-flash";
-    if !account.models.is_empty() && !account.models.iter().any(|model| model == FREE_DEEPSEEK) {
-        account.models.push(FREE_DEEPSEEK.to_string());
     }
 }
 

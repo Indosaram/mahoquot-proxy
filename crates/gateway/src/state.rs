@@ -193,7 +193,12 @@ pub struct PollBackoffGuard<'a> {
 
 impl PollBackoffGuard<'_> {
     pub fn set(&mut self, account: &str, until_unix: i64) -> bool {
-        if self.inner.active.as_ref().is_some_and(|active| !active.contains(account)) {
+        if self
+            .inner
+            .active
+            .as_ref()
+            .is_some_and(|active| !active.contains(account))
+        {
             return false;
         }
         self.inner.entries.insert(account.to_string(), until_unix);
@@ -230,7 +235,9 @@ impl PollBackoffGuard<'_> {
     where
         F: FnMut(&String, &mut i64) -> bool,
     {
-        self.inner.entries.retain(|account, until| f(account, until));
+        self.inner
+            .entries
+            .retain(|account, until| f(account, until));
     }
 }
 
@@ -652,10 +659,10 @@ impl AppState {
             usage_state,
             shutdown: Arc::new(tokio::sync::Notify::new()),
             usage_poll_backoff: PollBackoffStore::default(),
-            devin_refresh_in_flight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
-            inference_gate: Arc::new(tokio::sync::Semaphore::new(
-                config.max_concurrent_inference,
+            devin_refresh_in_flight: Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::new(),
             )),
+            inference_gate: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_inference)),
             rescan_gate: std::sync::Mutex::new(()),
             router,
             runtime,
@@ -740,6 +747,7 @@ impl AppState {
                         let fresh = Arc::get_mut(&mut m).expect("freshly loaded account");
                         fresh.last_activity = previous_member.last_activity.clone();
                         fresh.active_requests = previous_member.active_requests.clone();
+                        fresh.refresh_lock = Arc::clone(&previous_member.refresh_lock);
                     }
                     m
                 }
@@ -778,7 +786,11 @@ impl AppState {
     /// Authorization check for management input (scheduler reserve), not a
     /// state-write gate.
     pub fn is_active_account(&self, id: &str) -> bool {
-        self.pool.load().members.iter().any(|member| member.id == id)
+        self.pool
+            .load()
+            .members
+            .iter()
+            .any(|member| member.id == id)
     }
 
     /// Admittance gate for upstream inference requests.
@@ -1092,7 +1104,8 @@ impl AppState {
                         model_candidates
                             .iter()
                             .filter(|(model, _)| {
-                                declared.is_empty() || declared.iter().any(|id| id.as_str() == *model)
+                                declared.is_empty()
+                                    || declared.iter().any(|id| id.as_str() == *model)
                             })
                             .map(|(model, ids)| ((*model).to_string(), ids.contains(&m.id)))
                             .collect()
@@ -1152,7 +1165,11 @@ impl AppState {
                         None
                     },
                     credits_after_limit: if m.kind() == crate::account::ProviderKind::Codex {
-                        Some(self.settings.current().is_codex_account_credit_enabled(&m.id))
+                        Some(
+                            self.settings
+                                .current()
+                                .is_codex_account_credit_enabled(&m.id),
+                        )
                     } else {
                         None
                     },
@@ -1439,7 +1456,11 @@ mod integration_tests {
             "a rotation bucket must replace the member's previous client, not accumulate"
         );
         let again = state.client_for_target_at("cline", &member.id, 1_000_600);
-        assert_eq!(state.proxy_client_count(), 1, "the newest bucket stays cached");
+        assert_eq!(
+            state.proxy_client_count(),
+            1,
+            "the newest bucket stays cached"
+        );
 
         drop((first, second, again));
         assert_eq!(state.proxy_client_count(), 1);
@@ -1469,7 +1490,9 @@ mod integration_tests {
         let (state, _member) = state_with_one_account();
         install_sticky_policy(&state, "cline");
         state.proxy_clients.retain_members(
-            &["member-a".to_string(), "member-b".to_string()].into_iter().collect(),
+            &["member-a".to_string(), "member-b".to_string()]
+                .into_iter()
+                .collect(),
         );
 
         state.client_for_target_at("cline", "member-a", 3_000_000);

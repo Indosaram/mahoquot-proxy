@@ -12,7 +12,30 @@ use mahoquot_gateway::quota::{
     consume_reset_credit, reset_attempt_policy, retain_redeem_request_id, ResetAttemptPolicy,
 };
 use mahoquot_gateway::state::AppState;
-use mahoquot_gateway::usage::{parse_cursor_usage_summary, parse_kiro_usage_summary};
+use mahoquot_gateway::usage::{
+    parse_cursor_usage_summary, parse_kiro_usage_summary, parse_xai_billing_credits,
+};
+
+#[test]
+fn xai_billing_credits_report_weekly_pool_and_products() {
+    let usage = parse_xai_billing_credits(
+        &serde_json::json!({"config": {
+            "currentPeriod": {"type": "USAGE_PERIOD_TYPE_WEEKLY",
+                "start": "2029-12-25T00:00:00.5+00:00", "end": "2030-01-01T00:00:00.693535+00:00"},
+            "creditUsagePercent": 25.0,
+            "productUsage": [{"product": "GrokBuild", "usagePercent": 25.0}, {"product": "GrokChat"}]
+        }}),
+        1_800_000_000,
+    )
+    .expect("pool percent present");
+    let buckets = &usage.groups[0].buckets;
+    assert_eq!(usage.primary.used_percent, Some(25.0));
+    assert_eq!(usage.primary.reset_at_unix, Some(1_893_456_000));
+    assert_eq!(buckets[0].display_name.as_deref(), Some("Weekly"));
+    assert_eq!(buckets[1].display_name.as_deref(), Some("GrokBuild"));
+    assert_eq!(buckets[2].used_percent, Some(0.0));
+    assert!(parse_xai_billing_credits(&serde_json::json!({"config": {}}), 0).is_none());
+}
 
 #[test]
 fn cursor_and_kiro_quota_payloads_normalize_to_account_usage() {
@@ -30,6 +53,7 @@ fn cursor_and_kiro_quota_payloads_normalize_to_account_usage() {
     assert_eq!(cursor.plan_type.as_deref(), Some("pro"));
     assert_eq!(cursor.groups[0].buckets[0].used_percent, Some(75.0));
     assert_eq!(cursor.groups[0].buckets[1].used_percent, Some(20.0));
+    assert_eq!(cursor.groups[0].buckets[0].reset_at_unix, Some(1_893_456_000));
 
     let kiro = parse_kiro_usage_summary(
         &serde_json::json!({
