@@ -117,7 +117,7 @@ fn test_antigravity_typed_contribution_and_capabilities() {
             "is_antigravity_model must return true for legacy model {id}"
         );
     }
-    assert_eq!(contrib.models.len(), 14);
+    assert_eq!(contrib.models.len(), 18);
 
     // Capability profile verification
     let image_caps = contrib
@@ -382,7 +382,7 @@ fn test_dynamic_snapshot_fixture_adds_fictitious_model_without_rust_constants_ch
         antigravity_contrib.supports_model("gemini-next-flash-high"),
         "Antigravity contribution from dynamic snapshot must contain fictitious model"
     );
-    assert_eq!(antigravity_contrib.models.len(), 15);
+    assert_eq!(antigravity_contrib.models.len(), 19);
     assert!(
         mahoquot_providers::antigravity::is_antigravity_model_in_snapshot(
             &custom_snapshot,

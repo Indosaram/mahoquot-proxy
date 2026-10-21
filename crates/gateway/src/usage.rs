@@ -868,6 +868,11 @@ fn usage_bucket(
 
 pub fn parse_cursor_usage_summary(body: &serde_json::Value, now_unix: i64) -> AccountUsage {
     let mut buckets = Vec::new();
+    let reset_at_unix = body
+        .get("billingCycleEnd")
+        .or_else(|| body.get("billing_cycle_end"))
+        .and_then(|v| v.as_str())
+        .and_then(parse_rfc3339_unix);
     let usage = body
         .get("individualUsage")
         .or_else(|| body.get("individual_usage"));
@@ -893,7 +898,7 @@ pub fn parse_cursor_usage_summary(body: &serde_json::Value, now_unix: i64) -> Ac
         } else {
             0.0
         };
-        buckets.push(usage_bucket(label, used, None, now_unix));
+        buckets.push(usage_bucket(label, used, reset_at_unix, now_unix));
     }
     AccountUsage {
         plan_type: body
@@ -1018,6 +1023,62 @@ pub fn parse_clinepass_usage_summary(
         secondary: flat("weekly", 10_080),
         groups: vec![QuotaGroup {
             display_name: Some("ClinePass".to_string()),
+            models: None,
+            buckets,
+        }],
+        observed_at_unix: Some(now_unix),
+        ..Default::default()
+    })
+}
+
+/// SuperGrok / X Premium weekly credit pool from the Grok CLI chat proxy
+/// (`GET /v1/billing?format=credits`).
+///
+/// Contract: `{config:{currentPeriod:{type,start,end}, creditUsagePercent,
+/// productUsage:[{product, usagePercent?}]}}`. `creditUsagePercent` is already a
+/// percent and covers the whole shared pool; products that have not been used
+/// omit `usagePercent` and are reported as 0. A missing pool percent is a
+/// broken response and yields `None` rather than a fake 0%.
+pub fn parse_xai_billing_credits(body: &serde_json::Value, now_unix: i64) -> Option<AccountUsage> {
+    let config = body.get("config")?;
+    let percent = config.get("creditUsagePercent").and_then(|v| v.as_f64())?;
+    let reset = config
+        .get("currentPeriod")
+        .and_then(|period| period.get("end"))
+        .or_else(|| config.get("billingPeriodEnd"))
+        .and_then(|v| v.as_str())
+        .and_then(parse_offset_datetime_unix);
+    let mut weekly = usage_bucket("Weekly", percent, reset, now_unix);
+    weekly.bucket_id = Some("weekly".to_string());
+    weekly.window = Some("weekly".to_string());
+    let mut buckets = vec![weekly];
+    for item in config
+        .get("productUsage")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+    {
+        let Some(product) = item.get("product").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let used = item
+            .get("usagePercent")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let mut bucket = usage_bucket(product, used, reset, now_unix);
+        bucket.bucket_id = Some(product.to_string());
+        buckets.push(bucket);
+    }
+    Some(AccountUsage {
+        primary: QuotaWindow {
+            used_percent: buckets[0].used_percent,
+            window_minutes: Some(10_080),
+            reset_after_seconds: None,
+            reset_at_unix: reset,
+            limit_name: Some("Weekly".to_string()),
+        },
+        groups: vec![QuotaGroup {
+            display_name: Some("Grok".to_string()),
             models: None,
             buckets,
         }],

@@ -6,7 +6,7 @@ use crate::account::LoadError;
 /// Functional, not cosmetic: the upstream gates on this string. A generic client
 /// UA (e.g. google-api-nodejs-client) is answered with 429 RESOURCE_EXHAUSTED
 /// where this one is answered normally. Verified against live credentials.
-pub const ANTIGRAVITY_USER_AGENT: &str = "antigravity/2.11.0";
+pub const ANTIGRAVITY_USER_AGENT: &str = "antigravity/cli/1.4.0 (aidev_client; os_type=darwin; arch=arm64; cl=1000494485; auth_method=consumer)";
 
 /// Consumer (non-enterprise) credentials MUST use the `daily-` host for
 /// generation. The prod host answers 403 SUBSCRIPTION_REQUIRED for them, since
@@ -317,7 +317,7 @@ mod tests {
             headers,
             vec![
                 ("Authorization".to_string(), "Bearer AT".to_string()),
-                ("User-Agent".to_string(), "antigravity/2.11.0".to_string()),
+                ("User-Agent".to_string(), ANTIGRAVITY_USER_AGENT.to_string()),
             ]
         );
 

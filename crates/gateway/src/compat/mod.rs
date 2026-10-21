@@ -206,6 +206,8 @@ fn classify_anthropic_preamble(buf: &[u8]) -> AnthropicPreamble {
                 let code = match kind {
                     "rate_limit_error" => "resource_exhausted",
                     "overloaded_error" | "api_error" => "unavailable",
+                    "permission_error" => "permission_denied",
+                    _ if message == "Request not allowed" => "permission_denied",
                     // A request-shaped error repeats on every account; let
                     // it reach the client as the upstream sent it.
                     _ => return AnthropicPreamble::Served,
@@ -1080,6 +1082,25 @@ mod bounded_stream_tests {
         .await
         .expect("request errors reach the client verbatim");
         assert!(first.ends_with(error.as_bytes()));
+    }
+
+    #[tokio::test]
+    async fn an_early_request_denial_is_not_served_as_a_success() {
+        for kind in ["permission_error", "invalid_request_error"] {
+            let error = format!(
+                "event: error\ndata: {{\"type\":\"error\",\"error\":{{\"type\":\"{kind}\",\"message\":\"Request not allowed\"}}}}\n\n"
+            );
+            let result = hold_anthropic_preamble(
+                Bytes::from(error),
+                chunks(&[]),
+                std::time::Duration::from_secs(5),
+            )
+            .await;
+            assert_eq!(
+                result.err().expect("denial must reach the failover path"),
+                "permission_denied: Request not allowed"
+            );
+        }
     }
 
     #[test]

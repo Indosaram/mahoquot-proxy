@@ -233,6 +233,10 @@ async fn task_10_http_qa_scenario() {
         "claude-opus-4-6-thinking",
         "gpt-oss-120b-medium",
         "gemini-next-flash-high",
+        "gemini-4-argon",
+        "gemini-4-argon-high",
+        "gemini-4-argon-medium",
+        "gemini-4-argon-low",
     ];
     let blackout_payload = json!({
         "antigravity": all_ag_models

@@ -781,6 +781,12 @@ pub struct Settings {
         skip_serializing_if = "Option::is_none"
     )]
     pub model_catalog: Option<ModelCatalogSettings>,
+    #[serde(
+        rename = "omo-profile",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub omo_profile: Option<OmoProfile>,
     #[serde(default)]
     pub warmup: WarmupSettings,
     #[serde(
@@ -856,11 +862,31 @@ impl Default for Settings {
             oauth_model_alias: serde_json::Value::Null,
             oauth_request_scoped_errors: serde_json::Value::Null,
             model_catalog: None,
+            omo_profile: None,
             warmup: WarmupSettings::default(),
             credit_codex_account_ids: Vec::new(),
             extra: serde_yaml::Mapping::new(),
         }
     }
+}
+
+/// The shared omo client profile served by `/v0/management/omo-profile`.
+///
+/// `compat` and `models` hold opaque client JSON, so the gateway stores them
+/// without interpreting anything beyond each model's `id`. `revision` is the
+/// optimistic-concurrency counter behind the endpoint's ETag; 0 means unset.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct OmoProfile {
+    #[serde(default)]
+    pub revision: u64,
+    #[serde(rename = "updated-at", default)]
+    pub updated_at: u64,
+    #[serde(default)]
+    pub compat: serde_json::Map<String, serde_json::Value>,
+    #[serde(default)]
+    pub models: Vec<serde_json::Map<String, serde_json::Value>>,
+    #[serde(default)]
+    pub remove: Vec<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1312,6 +1338,39 @@ mod tests {
         // and the modelled ones round-trip by value
         assert_eq!(settings.port, 9999);
         assert_eq!(settings.auth_dir, "/tmp/a");
+    }
+
+    #[test]
+    fn omo_profile_round_trips_beside_unmodelled_keys() {
+        // given a config with an omo profile and a key this build does not model
+        let raw = concat!(
+            "port: 9999\n",
+            "tls:\n  enable: true\n",
+            "omo-profile-unmodelled-probe: kept\n",
+            "omo-profile:\n",
+            "  revision: 3\n",
+            "  updated-at: 1700000000\n",
+            "  compat:\n    sendSessionAffinityHeaders: true\n",
+            "  models:\n    - id: glm-5.3-flash\n      contextWindow: 200000\n",
+            "  remove:\n    - old-model\n",
+        );
+        // when it is parsed and re-rendered
+        let settings = Settings::from_yaml(raw).expect("parses");
+        let profile = settings.omo_profile.clone().expect("profile parsed");
+        assert_eq!(profile.revision, 3);
+        assert_eq!(profile.updated_at, 1_700_000_000);
+        assert_eq!(profile.compat["sendSessionAffinityHeaders"], true);
+        assert_eq!(profile.models[0]["id"], "glm-5.3-flash");
+        assert_eq!(profile.remove, vec!["old-model".to_string()]);
+        let reparsed =
+            Settings::from_yaml(&settings.to_yaml().expect("renders")).expect("reparses");
+        // then the profile and the unmodelled key both survive
+        assert_eq!(reparsed.omo_profile, settings.omo_profile);
+        assert!(reparsed.extra.contains_key("omo-profile-unmodelled-probe"));
+        assert!(reparsed.tls.extra.contains_key("enable"));
+        // and an unset profile stays out of the rendered document
+        let bare = Settings::default().to_yaml().expect("renders");
+        assert!(!bare.contains("omo-profile"), "{bare}");
     }
 
     #[test]

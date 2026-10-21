@@ -555,6 +555,7 @@ async fn main() -> anyhow::Result<()> {
     // process-wide client here so Home-authoritative dispatch is reachable.
     app_state.home = mahoquot_gateway::home::get_active_home_client();
     let state = Arc::new(app_state);
+    let cline_catalog = mahoquot_gateway::cline_catalog::spawn(Arc::clone(&state));
     if let Some(client) = mahoquot_gateway::home::get_active_home_client() {
         client.bind_settings(&state.settings);
     }
@@ -644,6 +645,7 @@ async fn main() -> anyhow::Result<()> {
     }
     usage_poller.shutdown().await;
     catalog_refresh.shutdown().await;
+    cline_catalog.shutdown().await;
     flush_worker.shutdown().await;
     discovery_mgr.shutdown();
     // Final snapshot before the process exits, so a replay that arrived inside

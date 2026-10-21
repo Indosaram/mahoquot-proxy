@@ -1126,7 +1126,7 @@ async fn cline_import(State(state): State<Arc<AppState>>) -> Response {
         .header(header::AUTHORIZATION, format!("Bearer {access}"))
         .send()
         .await;
-    let models: Vec<String> = match probe {
+    let mut models: Vec<String> = match probe {
         Ok(response) if response.status().is_success() => {
             match models_from_catalog("cline", response).await {
                 Ok(ids) => ids,
@@ -1146,12 +1146,32 @@ async fn cline_import(State(state): State<Arc<AppState>>) -> Response {
             )
         }
     };
+    let free_models = match crate::cline_catalog::fetch_free_models(
+        &state.http_client(),
+        "https://api.cline.bot/api/v1",
+    )
+    .await
+    {
+        Ok(models) => models,
+        Err(error) => {
+            return json_status(
+                StatusCode::BAD_GATEWAY,
+                json!({"error":format!("Cline free catalog unavailable: {error}")}),
+            )
+        }
+    };
+    let free_ids: Vec<_> = free_models
+        .iter()
+        .filter_map(|m| m.get("id").and_then(Value::as_str))
+        .collect();
+    models.retain(|id| !id.starts_with("cline-free/") && !free_ids.contains(&id.as_str()));
+    models.extend(free_ids.iter().map(|id| id.to_string()));
     let credential = json!({"type":"generic","provider":"cline","label":label,"email":email,
         "adapter":"openai-chat","auth_mode":"oauth",
         "base_url":"https://api.cline.bot/api/v1",
         "api_key":access,"refresh_token":refresh,"expired":expired,
         "token_url":"https://api.cline.bot/api/v1/auth/refresh",
-        "account_id":account_id,
+        "account_id":account_id,"cline_free_models":free_ids,
         "models":models,
         "disabled":false});
     let dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());

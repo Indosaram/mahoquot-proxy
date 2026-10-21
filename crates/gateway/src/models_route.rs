@@ -854,13 +854,13 @@ mod tests {
         assert!(codex_only.iter().all(|e| e.owned_by == "openai"));
 
         let ag_only = model_entries(&[ProviderKind::Antigravity], None);
-        assert_eq!(ag_only.len(), 14);
+        assert_eq!(ag_only.len(), 18);
         assert!(ag_only.iter().any(|e| e.id == "gemini-3.7-flash-high"));
         assert!(ag_only.iter().any(|e| e.id == "gemini-3.8-flash-high"));
         assert!(ag_only.iter().all(|e| e.owned_by == "google"));
 
         let both = model_entries(&[ProviderKind::Codex, ProviderKind::Antigravity], None);
-        assert_eq!(both.len(), 23);
+        assert_eq!(both.len(), 27);
 
         assert!(model_entries(&[], None).is_empty());
     }
@@ -876,7 +876,7 @@ mod tests {
         assert_eq!(codex[0].id, "gpt-x");
         assert_eq!(
             entries.iter().filter(|e| e.owned_by == "google").count(),
-            14
+            18
         );
     }
 

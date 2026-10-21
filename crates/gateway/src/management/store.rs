@@ -576,6 +576,35 @@ mod tests {
     }
 
     #[test]
+    fn try_mutate_refusal_changes_neither_memory_nor_file() {
+        // given a store backed by a file
+        let dir = temp_dir("try-refuse");
+        let path = dir.join("config.yaml");
+        let store = SettingsStore::load_or(path.clone(), Settings::default()).expect("loads");
+        let bytes_before = std::fs::read(&path).expect("file");
+        // when the edit changes the draft and then refuses
+        let refused = store.try_mutate(|s| {
+            s.request_retry = 9;
+            Err("stale")
+        });
+        // then the refusal comes back and nothing was published or persisted
+        assert!(matches!(refused, Err("stale")));
+        assert_eq!(store.current().request_retry, 0);
+        assert_eq!(std::fs::read(&path).expect("file"), bytes_before);
+        // and an accepted edit still persists and publishes
+        store
+            .try_mutate(|s| {
+                s.request_retry = 4;
+                Ok::<(), &str>(())
+            })
+            .expect("not refused")
+            .expect("mutates");
+        assert_eq!(store.current().request_retry, 4);
+        assert_eq!(Settings::load(&path).expect("reloads").request_retry, 4);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn reload_picks_up_an_external_edit() {
         // given a store whose file is changed behind its back
         let dir = temp_dir("reload");

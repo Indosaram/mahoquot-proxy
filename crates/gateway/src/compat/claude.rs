@@ -19,6 +19,27 @@ pub struct AnthropicDecoder {
     cache_read_tokens_known: bool,
     cache_write_tokens_known: bool,
     next_tool_index: u64,
+    diagnostics: StreamDiagnostics,
+}
+
+/// What one upstream Anthropic message actually carried. Kept so a stream that
+/// ends without visible content can be told apart: an upstream that omitted
+/// `output_tokens` versus one that reported zero, and the real `stop_reason`
+/// (e.g. `refusal`) that the OpenAI-shaped downstream collapses into `stop`.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct StreamDiagnostics {
+    pub message_id: Option<String>,
+    pub stop_reason: Option<String>,
+    pub output_tokens_reported: bool,
+    pub text_deltas: u64,
+    pub thinking_deltas: u64,
+    pub tool_calls: u64,
+}
+
+impl StreamDiagnostics {
+    pub fn has_visible_output(&self) -> bool {
+        self.text_deltas > 0 || self.tool_calls > 0
+    }
 }
 
 pub type ClaudeDecoder = AnthropicDecoder;
@@ -43,6 +64,10 @@ impl AnthropicDecoder {
                 self.cache_read_tokens_known = usage["cache_read_input_tokens"].as_u64().is_some();
                 self.cache_write_tokens_known =
                     usage["cache_creation_input_tokens"].as_u64().is_some();
+                self.diagnostics = StreamDiagnostics {
+                    message_id: value["message"]["id"].as_str().map(str::to_string),
+                    ..StreamDiagnostics::default()
+                };
                 out.push(CodexEvent::Created {
                     response_id: value["message"]["id"]
                         .as_str()
@@ -51,6 +76,7 @@ impl AnthropicDecoder {
                 });
             }
             Some("content_block_start") if value["content_block"]["type"] == "tool_use" => {
+                self.diagnostics.tool_calls += 1;
                 out.push(CodexEvent::ToolCallBegin {
                     output_index: self.next_tool_index,
                     call_id: value["content_block"]["id"]
@@ -68,6 +94,9 @@ impl AnthropicDecoder {
             Some("content_block_delta") => match value["delta"]["type"].as_str() {
                 Some("text_delta") => {
                     if let Some(text) = value["delta"]["text"].as_str() {
+                        if !text.trim().is_empty() {
+                            self.diagnostics.text_deltas += 1;
+                        }
                         out.push(CodexEvent::TextDelta(text.to_string()));
                     }
                 }
@@ -76,6 +105,7 @@ impl AnthropicDecoder {
                         .as_str()
                         .or_else(|| value["delta"]["text"].as_str())
                     {
+                        self.diagnostics.thinking_deltas += 1;
                         out.push(CodexEvent::ReasoningDelta(text.to_string()));
                     }
                 }
@@ -99,10 +129,40 @@ impl AnthropicDecoder {
                 {
                     out.push(CodexEvent::OutputLimitReached);
                 }
-                self.output_tokens = value["usage"]["output_tokens"].as_u64().unwrap_or(0);
+                if let Some(stop) = value.pointer("/delta/stop_reason").and_then(Value::as_str) {
+                    self.diagnostics.stop_reason = Some(stop.to_string());
+                }
+                let usage = &value["usage"];
+                self.output_tokens = usage["output_tokens"].as_u64().unwrap_or(0);
+                self.diagnostics.output_tokens_reported = usage["output_tokens"].as_u64().is_some();
+                // Relays such as CCAPI open Opus streams with a placeholder
+                // message_start whose usage is all zero and report the real
+                // input/cache counts only here; prefer them when present.
+                if let Some(input) = usage["input_tokens"].as_u64() {
+                    self.input_tokens = input;
+                }
+                if let Some(read) = usage["cache_read_input_tokens"].as_u64() {
+                    self.cache_read_tokens = read;
+                    self.cache_read_tokens_known = true;
+                }
+                if let Some(write) = usage["cache_creation_input_tokens"].as_u64() {
+                    self.cache_write_tokens = write;
+                    self.cache_write_tokens_known = true;
+                }
             }
             Some("message_stop") => {
                 self.started = false;
+                if !self.diagnostics.has_visible_output() {
+                    let d = &self.diagnostics;
+                    tracing::warn!(
+                        message_id = d.message_id.as_deref().unwrap_or(""),
+                        stop_reason = d.stop_reason.as_deref().unwrap_or("<missing>"),
+                        output_tokens = self.output_tokens,
+                        output_tokens_reported = d.output_tokens_reported,
+                        thinking_deltas = d.thinking_deltas,
+                        "anthropic upstream message ended without text or tool calls"
+                    );
+                }
                 out.push(CodexEvent::Completed {
                     usage: Some(Usage {
                         prompt_tokens: self.input_tokens,
@@ -124,6 +184,10 @@ impl AnthropicDecoder {
             }),
             _ => {}
         }
+    }
+
+    pub fn diagnostics(&self) -> &StreamDiagnostics {
+        &self.diagnostics
     }
 
     pub fn finish(&mut self, out: &mut Vec<CodexEvent>) {
@@ -525,7 +589,13 @@ pub fn openai_to_anthropic_with_capability(
                 {
                     block["cache_control"] = cache_control.clone();
                 }
-                system.push(block);
+                if out.is_empty() {
+                    system.push(block);
+                } else {
+                    // Moving a later instruction ahead of the existing history
+                    // changes every cached message prefix. Keep its position.
+                    out.push(json!({"role": "user", "content": [block]}));
+                }
             }
             continue;
         }
@@ -823,6 +893,54 @@ pub fn ensure_claude_code_system_instruction(body: &mut Value) {
     }
 }
 
+/// Anthropic only caches a prefix up to an explicit `cache_control`
+/// breakpoint. Translated OpenAI requests carry none, so only the prefix the
+/// relay marks itself (the system prompt) gets cached and the growing
+/// conversation is re-billed as uncached input every turn. Marks the last
+/// message block, which caches system + tools + history as one prefix.
+///
+/// `system` is deliberately left untouched: the CCAPI relay keeps a string
+/// system it caches itself, but drops a system that arrives as content
+/// blocks (measured 2026-10-12: block-form system cost the same input tokens
+/// as no system at all). A request that already carries a breakpoint is left
+/// as sent.
+pub fn apply_prompt_cache_breakpoints(body: &mut Value) {
+    if body.to_string().contains("\"cache_control\"") {
+        return;
+    }
+    let ephemeral = || json!({"type": "ephemeral"});
+    let Some(message) = body
+        .get_mut("messages")
+        .and_then(Value::as_array_mut)
+        .and_then(|messages| messages.last_mut())
+    else {
+        return;
+    };
+    if let Some(Value::String(text)) = message.get("content") {
+        if !text.is_empty() {
+            message["content"] =
+                json!([{"type": "text", "text": text, "cache_control": ephemeral()}]);
+        }
+        return;
+    }
+    // Thinking blocks cannot carry cache_control.
+    if let Some(block) = message
+        .get_mut("content")
+        .and_then(Value::as_array_mut)
+        .and_then(|blocks| {
+            blocks.iter_mut().rev().find(|block| {
+                !matches!(
+                    block.get("type").and_then(Value::as_str),
+                    Some("thinking") | Some("redacted_thinking")
+                )
+            })
+        })
+        .and_then(Value::as_object_mut)
+    {
+        block.insert("cache_control".to_string(), ephemeral());
+    }
+}
+
 fn anthropic_tool_name(name: &str) -> String {
     const BUILTINS: [&str; 4] = ["web_search", "code_execution", "text_editor", "computer"];
     if name.starts_with("custom_") || BUILTINS.contains(&name) {
@@ -984,8 +1102,13 @@ pub fn messages_payload_full(
     }
     for (id, name, args) in tool_calls {
         let input = serde_json::from_str::<Value>(args).unwrap_or_else(|_| json!({}));
+        let block_type = if name == "web_search" {
+            "server_tool_use"
+        } else {
+            "tool_use"
+        };
         content.push(json!({
-            "type": "tool_use",
+            "type": block_type,
             "id": id,
             "name": name,
             "input": input
@@ -1347,6 +1470,38 @@ impl AnthropicStreamRenderer {
 #[cfg(test)]
 mod contract_tests {
     use super::*;
+
+    #[test]
+    fn later_system_instructions_preserve_the_cached_history_prefix() {
+        let initial = json!({
+            "model": "fixture",
+            "messages": [
+                {"role": "system", "content": "base instruction"},
+                {"role": "developer", "content": "initial policy"},
+                {"role": "user", "content": "question"},
+                {"role": "assistant", "content": "answer"},
+            ],
+        });
+        let before = openai_to_anthropic(&initial).unwrap();
+        for role in ["system", "developer"] {
+            let mut next = initial.clone();
+            next["messages"].as_array_mut().unwrap().push(json!({
+                "role": role,
+                "content": "new instruction",
+            }));
+            let after = openai_to_anthropic(&next).unwrap();
+            assert_eq!(after["system"], before["system"]);
+            assert_eq!(
+                &after["messages"].as_array().unwrap()[..2],
+                before["messages"].as_array().unwrap()
+            );
+            assert_eq!(after["messages"][2]["role"], "user");
+            assert_eq!(
+                after["messages"][2]["content"][0]["text"],
+                "new instruction"
+            );
+        }
+    }
 
     #[test]
     fn r23_blocks_allocate_from_zero_and_never_reuse_indices() {
@@ -1808,6 +1963,88 @@ mod contract_tests {
     }
 
     #[test]
+    fn empty_stream_keeps_upstream_stop_reason_and_missing_output_tokens() {
+        let mut decoder = ClaudeDecoder::new();
+        let mut events = Vec::new();
+        decoder.decode(
+            br#"{"type":"message_start","message":{"id":"msg_empty","usage":{"input_tokens":4}}}"#,
+            &mut events,
+        );
+        decoder.decode(
+            br#"{"type":"message_delta","delta":{"stop_reason":"refusal"},"usage":{}}"#,
+            &mut events,
+        );
+        decoder.decode(br#"{"type":"message_stop"}"#, &mut events);
+
+        let d = decoder.diagnostics();
+        assert_eq!(d.message_id.as_deref(), Some("msg_empty"));
+        assert_eq!(d.stop_reason.as_deref(), Some("refusal"));
+        assert!(!d.output_tokens_reported);
+        assert!(!d.has_visible_output());
+    }
+
+    #[test]
+    fn diagnostics_count_content_and_reset_per_message() {
+        let mut decoder = ClaudeDecoder::new();
+        let mut events = Vec::new();
+        for frame in [
+            json!({"type":"message_start","message":{"id":"msg_a","usage":{}}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hm"}}),
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"hi"}}),
+            json!({"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"t","name":"x","input":{}}}),
+            json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":0}}),
+            json!({"type":"message_stop"}),
+        ] {
+            decoder.decode(frame.to_string().as_bytes(), &mut events);
+        }
+        let d = decoder.diagnostics().clone();
+        assert_eq!((d.text_deltas, d.thinking_deltas, d.tool_calls), (1, 1, 1));
+        assert!(d.output_tokens_reported);
+        assert!(d.has_visible_output());
+
+        decoder.decode(
+            br#"{"type":"message_start","message":{"id":"msg_b","usage":{}}}"#,
+            &mut events,
+        );
+        assert_eq!(
+            decoder.diagnostics(),
+            &StreamDiagnostics {
+                message_id: Some("msg_b".into()),
+                ..StreamDiagnostics::default()
+            }
+        );
+    }
+
+    #[test]
+    fn relay_usage_reported_only_on_message_delta_is_kept() {
+        let mut decoder = ClaudeDecoder::new();
+        let mut events = Vec::new();
+        decoder.decode(
+            br#"{"type":"message_start","message":{"id":"msg_early","usage":{"input_tokens":0,"output_tokens":0}}}"#,
+            &mut events,
+        );
+        decoder.decode(
+            br#"{"type":"message_delta","usage":{"input_tokens":3,"cache_read_input_tokens":12705,"cache_creation_input_tokens":9,"output_tokens":4}}"#,
+            &mut events,
+        );
+        decoder.decode(br#"{"type":"message_stop"}"#, &mut events);
+
+        let completed = events
+            .iter()
+            .find_map(|e| match e {
+                CodexEvent::Completed { usage } => usage.as_ref(),
+                _ => None,
+            })
+            .expect("completed usage");
+        assert_eq!(completed.prompt_tokens, 3);
+        assert_eq!(completed.cached_tokens, 12705);
+        assert!(completed.cached_tokens_known);
+        assert_eq!(completed.cache_write_tokens, 9);
+        assert!(completed.cache_write_tokens_known);
+        assert_eq!(completed.completion_tokens, 4);
+    }
+
+    #[test]
     fn anthropic_usage_with_cache_creation_input_tokens_parses_into_cache_write_tokens() {
         let mut decoder = ClaudeDecoder::new();
         let mut events = Vec::new();
@@ -2120,5 +2357,54 @@ mod openai_to_anthropic_tests {
                 .extend(extra.as_object().unwrap().clone());
             assert!(openai_to_anthropic(&body).is_err());
         }
+    }
+
+    #[test]
+    fn translated_requests_mark_only_the_conversation_tail_for_caching() {
+        let mut body = openai_to_anthropic(&json!({
+            "model": "claude-opus-5-5",
+            "messages": [
+                {"role": "system", "content": "rules"},
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": null, "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "read", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+            ],
+        }))
+        .unwrap();
+        super::ensure_claude_code_system_instruction(&mut body);
+        super::apply_prompt_cache_breakpoints(&mut body);
+
+        // The relay drops block-form system prompts, so it must stay a string.
+        assert!(body["system"]
+            .as_str()
+            .expect("system stays a string")
+            .ends_with("rules"));
+        let messages = body["messages"].as_array().unwrap();
+        let tail = messages.last().unwrap()["content"].as_array().unwrap();
+        assert_eq!(tail.last().unwrap()["type"], "tool_result");
+        assert_eq!(tail.last().unwrap()["cache_control"]["type"], "ephemeral");
+        assert_eq!(body.to_string().matches("\"cache_control\"").count(), 1);
+    }
+
+    #[test]
+    fn client_breakpoints_are_left_untouched_and_thinking_is_skipped() {
+        let sent = json!({
+            "system": [{"type": "text", "text": "s", "cache_control": {"type": "ephemeral"}}],
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        let mut body = sent.clone();
+        super::apply_prompt_cache_breakpoints(&mut body);
+        assert_eq!(body, sent);
+
+        let mut body = json!({
+            "messages": [{"role": "assistant", "content": [
+                {"type": "text", "text": "a"},
+                {"type": "thinking", "thinking": "t", "signature": "x"},
+            ]}],
+        });
+        super::apply_prompt_cache_breakpoints(&mut body);
+        let blocks = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
+        assert!(blocks[1].get("cache_control").is_none());
     }
 }

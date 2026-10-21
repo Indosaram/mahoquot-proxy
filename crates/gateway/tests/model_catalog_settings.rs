@@ -248,6 +248,10 @@ fn test_complete_provider_blackout_rejection() {
         "claude-sonnet-4-6",
         "claude-opus-4-6-thinking",
         "gpt-oss-120b-medium",
+        "gemini-4-argon",
+        "gemini-4-argon-high",
+        "gemini-4-argon-medium",
+        "gemini-4-argon-low",
     ];
 
     // Attempting to exclude 100% of Antigravity models without an explicit override
@@ -310,7 +314,7 @@ fn test_complete_provider_blackout_rejection() {
             .get("antigravity")
             .unwrap()
             .len(),
-        14
+        18
     );
 }
 

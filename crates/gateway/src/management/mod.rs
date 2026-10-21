@@ -15,6 +15,7 @@ pub mod history;
 pub mod lists;
 pub mod oauth;
 pub mod observability;
+pub mod omo_profile;
 pub mod plugins;
 pub mod quotas;
 pub mod registry;
@@ -41,6 +42,7 @@ pub fn management_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .merge(history::history_routes())
         .merge(observability::observability_routes())
         .merge(plugins::plugins_routes())
+        .merge(omo_profile::omo_profile_routes())
         .merge(registry::registry_routes())
         .merge(core::core_routes())
         .merge(scoped_keys::scoped_keys_routes())

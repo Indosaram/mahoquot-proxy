@@ -8,7 +8,7 @@
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -324,7 +324,7 @@ pub struct RequestHistory {
 #[derive(Clone)]
 pub struct HistoryService {
     sender: Option<mpsc::SyncSender<IngestCommand>>,
-    store: Option<RequestHistory>,
+    store: Arc<OnceLock<RequestHistory>>,
     health: Arc<HistoryHealthState>,
     metrics: Arc<crate::metrics::GatewayMetrics>,
 }
@@ -445,24 +445,23 @@ impl HistoryService {
             database_failures: AtomicU64::new(0),
             last_error: Mutex::new(None),
         });
-        let store = match RequestHistory::open(path) {
-            HistoryState::Ready(store) => store,
+        let store = Arc::new(OnceLock::new());
+        match RequestHistory::open(path) {
+            HistoryState::Ready(opened) => {
+                let _ = store.set(opened);
+                health.ready.store(true, Ordering::Relaxed);
+            }
             HistoryState::Degraded { error } => {
                 health.degraded.store(true, Ordering::Relaxed);
+                tracing::warn!(%error, "request history initialization failed; will retry on ingestion");
                 *health.last_error.lock().unwrap_or_else(|p| p.into_inner()) = Some(error);
-                return Self {
-                    sender: None,
-                    store: None,
-                    health,
-                    metrics,
-                };
             }
-        };
-        health.ready.store(true, Ordering::Relaxed);
+        }
         let (sender, receiver) = mpsc::sync_channel(queue_capacity);
         let worker_store = store.clone();
         let worker_health = Arc::clone(&health);
         let worker_metrics = Arc::clone(&metrics);
+        let worker_path = path.to_path_buf();
         std::thread::Builder::new()
             .name("mahoquot-history-ingest".to_string())
             .spawn(move || {
@@ -488,6 +487,39 @@ impl HistoryService {
                     worker_health
                         .queue_depth
                         .fetch_sub(batch.len() as u64, Ordering::Relaxed);
+                    if worker_store.get().is_none() {
+                        match RequestHistory::open(&worker_path) {
+                            HistoryState::Ready(opened) => {
+                                let _ = worker_store.set(opened);
+                                worker_health.ready.store(true, Ordering::Relaxed);
+                                worker_health.degraded.store(false, Ordering::Relaxed);
+                                *worker_health
+                                    .last_error
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner()) = None;
+                                tracing::info!(
+                                    "request history recovered after initialization failure"
+                                );
+                            }
+                            HistoryState::Degraded { error } => {
+                                *worker_health
+                                    .last_error
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner()) = Some(error);
+                                worker_health
+                                    .dropped_events
+                                    .fetch_add(batch.len() as u64, Ordering::Relaxed);
+                                worker_metrics
+                                    .history_dropped
+                                    .fetch_add(batch.len() as u64, Ordering::Relaxed);
+                                for reply in flushes {
+                                    let _ = reply.send(());
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                    let worker_store = worker_store.get().expect("history initialized above");
                     let (accepted, rejected) = worker_store.insert_batch_skipping_invalid(&batch);
                     if rejected > 0 {
                         worker_health
@@ -530,7 +562,7 @@ impl HistoryService {
             .expect("start history ingestion worker");
         Self {
             sender: Some(sender),
-            store: Some(store),
+            store,
             health,
             metrics,
         }
@@ -596,7 +628,7 @@ impl HistoryService {
     pub fn health(&self) -> HistoryHealth {
         let raw_degraded = self.health.degraded.load(Ordering::Relaxed);
         let degraded = raw_degraded
-            && (self.sender.is_none() || {
+            && (!self.health.ready.load(Ordering::Relaxed) || {
                 // The store is gone forever — the flag must stay lit.
                 let last = self.health.last_degraded_unix_ms.load(Ordering::Relaxed);
                 let now_ms = SystemTime::now()
@@ -624,7 +656,7 @@ impl HistoryService {
     }
 
     pub fn store(&self) -> Result<&RequestHistory, HistoryError> {
-        self.store.as_ref().ok_or(HistoryError::WorkerUnavailable)
+        self.store.get().ok_or(HistoryError::WorkerUnavailable)
     }
 }
 
@@ -2174,6 +2206,47 @@ pub mod tests {
             (actual - expected).abs() < 0.000_001,
             "cost was {actual}, expected {expected}"
         );
+    }
+
+    #[test]
+    fn ingest_recovers_after_an_initial_database_open_failure() {
+        let blocker = TestPath::new("open-recovery");
+        std::fs::write(&blocker.0, b"not a directory").unwrap();
+        let path = blocker.0.join("history.sqlite");
+        let service = HistoryService::open(
+            &path,
+            32,
+            8,
+            Arc::new(crate::metrics::GatewayMetrics::default()),
+        );
+        assert!(!service.health().ready);
+        assert!(service.health().degraded);
+        std::fs::remove_file(&blocker.0).unwrap();
+        std::fs::create_dir(&blocker.0).unwrap();
+        assert!(service.enqueue(event(EventFixture {
+            event_id: "recovered",
+            occurred_at_ms: unix_time_ms(),
+            account: "claude-test",
+            provider: "claude",
+            model: "claude-test",
+            key: "test",
+            status_code: 200,
+            input_tokens: 1,
+            output_tokens: 1,
+            cached_input_tokens: 0,
+        })));
+        service.flush().unwrap();
+        assert!(service.health().ready);
+        assert!(!service.health().degraded);
+        assert_eq!(service.health().written_events, 1);
+        assert!(service
+            .store()
+            .unwrap()
+            .detail("recovered")
+            .unwrap()
+            .is_some());
+        drop(service);
+        std::fs::remove_dir_all(&blocker.0).unwrap();
     }
 
     #[test]

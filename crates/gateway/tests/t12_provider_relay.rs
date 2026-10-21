@@ -971,6 +971,12 @@ async fn assert_anthropic_native(kind: &str, model: &str) {
             .unwrap()
             .starts_with("You are ZCode"));
         assert_eq!(request.body["metadata"]["user_id"], "usr-42");
+    } else if kind == "claude" {
+        // Subscription requests get a cache breakpoint on the conversation
+        // tail, which turns string content into a single text block.
+        let content = request.body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["text"], "ping");
+        assert_eq!(content[0]["cache_control"]["type"], "ephemeral");
     } else {
         assert_eq!(request.body["messages"][0]["content"], "ping");
     }

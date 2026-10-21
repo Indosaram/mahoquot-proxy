@@ -1431,6 +1431,7 @@ fn resolve_target(
                 && member.relay_api_key().is_none()
             {
                 compat::claude::ensure_claude_code_system_instruction(&mut anthropic_val);
+                compat::claude::apply_prompt_cache_breakpoints(&mut anthropic_val);
             }
 
             if member.kind() == crate::account::ProviderKind::Zcode {
@@ -3499,7 +3500,15 @@ fn eligible_indices(
     }
     // Stable: equal priorities retain pool order.
     ranked.sort_by_key(|item| std::cmp::Reverse(item.1));
-    ranked.into_iter().map(|(index, _)| index).collect()
+    let mut ordered: Vec<usize> = ranked.into_iter().map(|(index, _)| index).collect();
+    let ranks = state.claude_reset_order.ranks(&pool.members, now_ms / 1000);
+    crate::claude_reset_order::reorder_claude_slots(
+        &mut ordered,
+        &pool.members,
+        &ranks,
+        now_ms / 1000,
+    );
+    ordered
 }
 
 pub(crate) fn eligible_account_ids_for_model(
