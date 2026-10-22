@@ -279,6 +279,11 @@ pub fn subscribe_finalizer(
     state.subscribe_finalizer(account_or_event)
 }
 
+/// How long an Anthropic stream is held back waiting for its first text or
+/// tool call. Claude occasionally finishes a turn after thinking alone; only a
+/// hold that outlasts the thinking can turn that into a failover.
+const ANTHROPIC_EMPTY_HOLD: std::time::Duration = std::time::Duration::from_secs(180);
+
 fn get_preflight_deadline(headers: &HeaderMap) -> std::time::Duration {
     let ms = headers
         .get("x-test-preflight-deadline-ms")
@@ -4178,7 +4183,15 @@ async fn finish_success(
         .await
         .map_err(|_| "upstream request timed out during preflight".to_string())??
     } else if protocol == compat::Protocol::Anthropic {
-        compat::open_anthropic_stream(resp, get_preflight_deadline(headers)).await?
+        // The hold now spans leading thinking, which routinely outlasts the
+        // generic preflight window; give it room so an empty finish is still
+        // caught before the first byte is committed.
+        let hold = if headers.contains_key("x-test-preflight-deadline-ms") {
+            get_preflight_deadline(headers)
+        } else {
+            ANTHROPIC_EMPTY_HOLD
+        };
+        compat::open_anthropic_stream(resp, hold).await?
     } else {
         compat::open_stream(resp, protocol).await?
     };

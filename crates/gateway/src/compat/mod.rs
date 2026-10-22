@@ -159,13 +159,14 @@ pub async fn open_stream(
     }
 }
 
-/// Upper bound on the Anthropic preamble buffered while looking for an early
-/// `error` event; real preambles (`message_start` + `ping`) are well below it.
-const ANTHROPIC_PREAMBLE_CAP: usize = 64 * 1024;
+/// Upper bound on the Anthropic preamble buffered while looking for the first
+/// visible output. The preamble includes any leading thinking blocks, so it is
+/// sized for long reasoning rather than just `message_start` + `ping`.
+const ANTHROPIC_PREAMBLE_CAP: usize = 1024 * 1024;
 
 /// What the leading complete SSE frames of an Anthropic stream say.
 enum AnthropicPreamble {
-    /// Only `message_start` / `ping` so far; more bytes are needed.
+    /// Only `message_start` / `ping` / thinking so far; more bytes are needed.
     Pending,
     /// A content-bearing event arrived; the stream is genuinely served.
     Served,
@@ -192,7 +193,29 @@ fn classify_anthropic_preamble(buf: &[u8]) -> AnthropicPreamble {
             return AnthropicPreamble::Served;
         };
         match value.get("type").and_then(Value::as_str) {
-            Some("message_start") | Some("ping") => continue,
+            Some("message_start")
+            | Some("ping")
+            | Some("message_delta")
+            | Some("content_block_stop") => continue,
+            // Reasoning is not a deliverable answer: an upstream that thinks
+            // and then stops without text or a tool call must stay retryable.
+            Some("content_block_start")
+                if matches!(
+                    value["content_block"]["type"].as_str(),
+                    Some("thinking") | Some("redacted_thinking")
+                ) =>
+            {
+                continue
+            }
+            Some("content_block_delta")
+                if matches!(
+                    value["delta"]["type"].as_str(),
+                    Some("thinking_delta") | Some("signature_delta")
+                ) =>
+            {
+                continue
+            }
+            Some("message_stop") => return AnthropicPreamble::Failed(empty_message_reason(&text)),
             Some("error") => {
                 let error = value.get("error");
                 let kind = error
@@ -220,12 +243,33 @@ fn classify_anthropic_preamble(buf: &[u8]) -> AnthropicPreamble {
     AnthropicPreamble::Pending
 }
 
-/// Opens an Anthropic SSE stream, holding back only its preamble until the
-/// first content-bearing event. Relays such as CCAPI report a spent account on
-/// streaming requests as HTTP 200 + `message_start` + `event: error`; surfacing
-/// that as `Err` before any byte is committed lets the relay fail over to the
-/// next account instead of handing the client a rate-limit error. On deadline
-/// or cap the buffered bytes are released unchanged.
+/// Failure reason for an upstream message that finished with neither text nor
+/// a tool call. `unavailable` routes it through ordinary failover without
+/// cooling the account down.
+fn empty_message_reason(text: &str) -> String {
+    let stop_reason = text
+        .split("\n\n")
+        .filter_map(|frame| {
+            let data: String = frame
+                .lines()
+                .filter_map(|line| line.strip_prefix("data:"))
+                .map(str::trim_start)
+                .collect();
+            serde_json::from_str::<Value>(&data).ok()
+        })
+        .filter(|value| value["type"] == "message_delta")
+        .find_map(|value| value["delta"]["stop_reason"].as_str().map(str::to_string))
+        .unwrap_or_else(|| "<missing>".to_string());
+    format!("unavailable: upstream message ended without text or tool calls (stop_reason={stop_reason})")
+}
+
+/// Opens an Anthropic SSE stream, holding back its preamble (including leading
+/// thinking) until the first text or tool-call event. Relays such as CCAPI
+/// report a spent account on streaming requests as HTTP 200 + `message_start` +
+/// `event: error`, and Claude sometimes stops after thinking alone; surfacing
+/// either as `Err` before any byte is committed lets the relay fail over to the
+/// next account instead of serving an error or an empty 200. On deadline or cap
+/// the buffered bytes are released unchanged.
 pub async fn open_anthropic_stream(
     resp: reqwest::Response,
     deadline: std::time::Duration,
@@ -254,8 +298,19 @@ async fn hold_anthropic_preamble(
             Ok(Some(Ok(chunk))) => buf.extend_from_slice(&chunk),
             Ok(Some(Err(err))) => return Err(err.to_string()),
             Ok(None) => {
-                let ended: UpstreamStream = Box::pin(futures::stream::empty());
-                return Ok((buf.freeze(), ended));
+                // A truncated tail frame may still hold the decisive event.
+                buf.extend_from_slice(b"\n\n");
+                return match classify_anthropic_preamble(&buf) {
+                    AnthropicPreamble::Failed(reason) => Err(reason),
+                    AnthropicPreamble::Pending => Err(
+                        "unavailable: upstream stream ended before any text or tool calls"
+                            .to_string(),
+                    ),
+                    AnthropicPreamble::Served => {
+                        let ended: UpstreamStream = Box::pin(futures::stream::empty());
+                        Ok((buf.freeze(), ended))
+                    }
+                };
             }
             Err(_) => return Ok((buf.freeze(), stream)),
         }
@@ -1101,6 +1156,62 @@ mod bounded_stream_tests {
                 "permission_denied: Request not allowed"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_message_that_stops_after_thinking_alone_fails_over() {
+        let frames = [
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"hm\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":96}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ];
+        let reason = hold_anthropic_preamble(
+            Bytes::from_static(MESSAGE_START.as_bytes()),
+            chunks(&frames),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .err()
+        .expect("an empty finish must reach the failover path");
+        assert!(reason.starts_with("unavailable: "), "{reason}");
+        assert!(reason.contains("stop_reason=end_turn"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_ends_without_any_content_fails_over() {
+        let reason = hold_anthropic_preamble(
+            Bytes::from_static(MESSAGE_START.as_bytes()),
+            chunks(&[]),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .err()
+        .expect("a bare message_start must not be served");
+        assert!(reason.starts_with("unavailable: "), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn thinking_followed_by_text_is_released_whole() {
+        let thinking = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n";
+        let text = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n";
+        let tail = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        let (first, mut rest) = hold_anthropic_preamble(
+            Bytes::from_static(MESSAGE_START.as_bytes()),
+            chunks(&[thinking, text, tail]),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("text after thinking is a served answer");
+        assert_eq!(
+            first,
+            Bytes::from(format!("{MESSAGE_START}{thinking}{text}"))
+        );
+        assert_eq!(
+            rest.next().await.unwrap().unwrap(),
+            Bytes::from_static(tail.as_bytes())
+        );
     }
 
     #[test]
