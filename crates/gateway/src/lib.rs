@@ -1,5 +1,6 @@
 pub mod account;
 pub mod capability;
+pub mod claude_prefix_watch;
 pub mod claude_reset_order;
 pub mod cline_catalog;
 pub mod cline_usage;

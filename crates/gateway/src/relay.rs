@@ -1437,6 +1437,24 @@ fn resolve_target(
             {
                 compat::claude::ensure_claude_code_system_instruction(&mut anthropic_val);
                 compat::claude::apply_prompt_cache_breakpoints(&mut anthropic_val);
+                if let Some(session) = session_affinity {
+                    if let Some(found) = state.claude_prefix_watch.observe(session, &anthropic_val)
+                    {
+                        tracing::info!(
+                            target: "claude_prefix",
+                            session = %session_digest(session),
+                            account = %member.id(),
+                            model = upstream_model,
+                            index = found.index,
+                            section = found.section,
+                            previous_blocks = found.previous_len,
+                            current_blocks = found.current_len,
+                            previous_kind = %found.previous_kind,
+                            current_kind = %found.current_kind,
+                            "claude prompt prefix changed between turns"
+                        );
+                    }
+                }
             }
 
             if member.kind() == crate::account::ProviderKind::Zcode {
