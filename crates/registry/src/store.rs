@@ -106,6 +106,9 @@ impl StoreOptions {
 }
 
 pub trait StorageBackend: Send + Sync {
+    fn equivalent(&self, _key: &str, left: &[u8], right: &[u8]) -> bool {
+        left == right
+    }
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError>;
     fn put(&self, key: &str, value: &[u8]) -> Result<(), StoreError>;
     fn delete(&self, key: &str) -> Result<(), StoreError>;
@@ -174,7 +177,9 @@ impl StorageManager {
         if spool_file.is_file() {
             if let Ok(spool_bytes) = fs::read(&spool_file) {
                 match self.backend.get(&key) {
-                    Ok(Some(remote_bytes)) if remote_bytes != spool_bytes => {
+                    Ok(Some(remote_bytes))
+                        if !self.backend.equivalent(&key, &remote_bytes, &spool_bytes) =>
+                    {
                         return Err(StoreError::Conflict(format!(
                             "spool conflict for key '{key}': remote backend has diverged from local spool"
                         )));
@@ -187,15 +192,16 @@ impl StorageManager {
         }
 
         // Try persisting to remote backend first.
-        // If the backend fails (e.g. unavailable), we still stage to local spool
-        // so the pending write is not lost, but propagate the backend error honestly.
+        // Failed writes are recovery data, not confirmed remote state. Keep them
+        // outside the authoritative spool so reconciliation cannot erase them.
         match self.backend.put(&key, data) {
             Ok(()) => {
                 self.write_spool(&key, data)?;
+                self.clear_pending(&key)?;
                 Ok(())
             }
             Err(err) => {
-                let _ = self.write_spool(&key, data);
+                LocalStore::new(self.pending_root())?.put(&key, data)?;
                 Err(err)
             }
         }
@@ -205,6 +211,7 @@ impl StorageManager {
         let key = normalize_key(key)?;
         let _guard = self.mutation.lock().unwrap_or_else(|e| e.into_inner());
         self.backend.delete(&key)?;
+        self.clear_pending(&key)?;
         let path = self.spool_path(&key)?;
         match fs::remove_file(path) {
             Ok(()) => Ok(()),
@@ -235,32 +242,56 @@ impl StorageManager {
     }
 
     pub fn sync_all_to_spool(&self) -> Result<(), StoreError> {
+        let _guard = self.mutation.lock().unwrap_or_else(|e| e.into_inner());
         let keys = self.list("")?;
         let backend_key_set: std::collections::HashSet<String> = keys.iter().cloned().collect();
-        if self.spool.exists() {
-            if let Ok(entries) = walk_files(&self.spool) {
-                for file_path in entries {
-                    if let Ok(rel) = file_path.strip_prefix(&self.spool) {
-                        let k = rel.to_string_lossy().replace('\\', "/");
-                        if !backend_key_set.contains(&k) {
-                            let _ = fs::remove_file(&file_path);
-                        }
-                    }
-                }
-            }
-        }
+        // Fetch and validate the whole snapshot before changing any spool bytes.
+        let mut snapshot = Vec::new();
         for key in keys {
-            if let Some(data) = self.backend.get(&key)? {
-                let local_path = self.spool_path(&key)?;
-                if local_path.is_file() && fs::read(&local_path).is_ok_and(|local| local != data) {
-                    return Err(StoreError::Conflict(format!(
-                        "spool conflict for key '{key}': remote backend has diverged from local spool"
-                    )));
-                }
-                self.write_spool(&key, &data)?;
+            let key = normalize_key(&key)?;
+            let data = self.backend.get(&key)?.ok_or_else(|| {
+                StoreError::Conflict(format!("listed storage key disappeared: {key}"))
+            })?;
+            let local_path = self.spool_path(&key)?;
+            if local_path.is_file()
+                && !self
+                    .backend
+                    .equivalent(&key, &fs::read(&local_path)?, &data)
+            {
+                return Err(StoreError::Conflict(format!(
+                    "spool conflict for key '{key}': remote backend has diverged from local spool"
+                )));
+            }
+            snapshot.push((key, data));
+        }
+        for (key, data) in snapshot {
+            self.write_spool(&key, &data)?;
+        }
+        for file_path in walk_files(&self.spool)? {
+            let rel = file_path
+                .strip_prefix(&self.spool)
+                .map_err(|e| StoreError::InvalidConfig(e.to_string()))?;
+            let key = rel.to_string_lossy().replace('\\', "/");
+            if !backend_key_set.contains(&key) {
+                fs::remove_file(file_path)?;
             }
         }
         Ok(())
+    }
+
+    /// Recovery-only failed writes. These are never returned as durable records.
+    pub fn pending_root(&self) -> PathBuf {
+        let mut path = self.spool.as_os_str().to_os_string();
+        path.push(".pending");
+        PathBuf::from(path)
+    }
+
+    fn clear_pending(&self, key: &str) -> Result<(), StoreError> {
+        match fs::remove_file(self.pending_root().join(key)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn spool_path(&self, key: &str) -> Result<PathBuf, StoreError> {
@@ -400,13 +431,8 @@ pub struct PostgresStore {
     config_table: String,
     auth_table: String,
     cooldown_table: String,
-    pool: Option<PgPool>,
-    fallback_data: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
-    fallback_cooldowns: Arc<Mutex<CooldownFallbackMap>>,
+    pool: Result<PgPool, StoreError>,
 }
-
-/// In-memory cooldown rows keyed by (account, scope): payload bytes and whether the row is active.
-type CooldownFallbackMap = BTreeMap<(String, String), (Vec<u8>, bool)>;
 
 impl std::fmt::Debug for PostgresStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -425,6 +451,12 @@ impl PostgresStore {
     pub const DEFAULT_AUTH_TABLE: &'static str = "auth_store";
     pub const DEFAULT_COOLDOWN_TABLE: &'static str = "cooldown_store";
 
+    pub fn try_new(dsn: impl Into<String>, schema: Option<String>) -> Result<Self, StoreError> {
+        let store = Self::new(dsn, schema);
+        store.pool()?;
+        Ok(store)
+    }
+
     pub fn new(dsn: impl Into<String>, schema: Option<String>) -> Self {
         let dsn = dsn.into();
         let schema = schema.unwrap_or_else(|| "public".to_string());
@@ -436,13 +468,28 @@ impl PostgresStore {
             auth_table: Self::DEFAULT_AUTH_TABLE.to_string(),
             cooldown_table: Self::DEFAULT_COOLDOWN_TABLE.to_string(),
             pool,
-            fallback_data: Arc::new(Mutex::new(BTreeMap::new())),
-            fallback_cooldowns: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
-    fn try_connect(dsn: &str, schema: &str) -> Option<PgPool> {
-        let rt = tokio::runtime::Handle::try_current().ok()?;
+    fn runtime() -> Result<tokio::runtime::Handle, StoreError> {
+        let rt = tokio::runtime::Handle::try_current()
+            .map_err(|e| StoreError::Unavailable(format!("tokio runtime required: {e}")))?;
+        if rt.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread {
+            return Err(StoreError::Unavailable(
+                "postgres storage requires a multi-thread tokio runtime".into(),
+            ));
+        }
+        Ok(rt)
+    }
+
+    fn pool(&self) -> Result<&PgPool, StoreError> {
+        self.pool
+            .as_ref()
+            .map_err(|error| StoreError::Unavailable(error.to_string()))
+    }
+
+    fn try_connect(dsn: &str, schema: &str) -> Result<PgPool, StoreError> {
+        let rt = Self::runtime()?;
         tokio::task::block_in_place(|| {
             rt.block_on(async {
                 let pool = PgPoolOptions::new()
@@ -450,19 +497,20 @@ impl PostgresStore {
                     .acquire_timeout(std::time::Duration::from_secs(3))
                     .connect(dsn)
                     .await
-                    .ok()?;
+                    .map_err(|e| StoreError::Database(e.to_string()))?;
                 let store_ref = Self {
                     dsn: dsn.to_string(),
                     schema: schema.to_string(),
                     config_table: Self::DEFAULT_CONFIG_TABLE.to_string(),
                     auth_table: Self::DEFAULT_AUTH_TABLE.to_string(),
                     cooldown_table: Self::DEFAULT_COOLDOWN_TABLE.to_string(),
-                    pool: Some(pool.clone()),
-                    fallback_data: Arc::new(Mutex::new(BTreeMap::new())),
-                    fallback_cooldowns: Arc::new(Mutex::new(BTreeMap::new())),
+                    pool: Ok(pool.clone()),
                 };
-                let _ = store_ref.ensure_schema_async(&pool).await;
-                Some(pool)
+                store_ref
+                    .ensure_schema_async(&pool)
+                    .await
+                    .map_err(|e| StoreError::Database(e.to_string()))?;
+                Ok(pool)
             })
         })
     }
@@ -541,9 +589,9 @@ impl PostgresStore {
         content: &[u8],
         deleted: bool,
     ) -> Result<(), StoreError> {
-        if let Some(ref pool) = self.pool {
-            let rt = tokio::runtime::Handle::try_current()
-                .map_err(|e| StoreError::Unavailable(format!("tokio runtime required: {e}")))?;
+        {
+            let pool = self.pool()?;
+            let rt = Self::runtime()?;
             let query = format!(
                 "INSERT INTO {} (auth_id, model, content, deleted, created_at, updated_at)
                  VALUES ($1, $2, $3::jsonb, $4, NOW(), NOW())
@@ -565,26 +613,18 @@ impl PostgresStore {
                 })
             })?;
         }
-        let mut map = self
-            .fallback_cooldowns
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        map.insert(
-            (auth_id.to_string(), model.to_string()),
-            (content.to_vec(), deleted),
-        );
         Ok(())
     }
 
     pub fn load_cooldowns(&self) -> Result<Vec<(String, String, Vec<u8>)>, StoreError> {
-        if let Some(ref pool) = self.pool {
-            let rt = tokio::runtime::Handle::try_current()
-                .map_err(|e| StoreError::Unavailable(format!("tokio runtime required: {e}")))?;
+        {
+            let pool = self.pool()?;
+            let rt = Self::runtime()?;
             let query = format!(
                 "SELECT auth_id, model, content::text FROM {} WHERE deleted = FALSE",
                 self.full_table_name(&self.cooldown_table)
             );
-            return tokio::task::block_in_place(|| {
+            tokio::task::block_in_place(|| {
                 rt.block_on(async {
                     let rows = sqlx::query(&query)
                         .fetch_all(pool)
@@ -592,25 +632,21 @@ impl PostgresStore {
                         .map_err(|e| StoreError::Database(e.to_string()))?;
                     let mut list = Vec::new();
                     for row in rows {
-                        let auth_id: String = row.try_get(0).unwrap_or_default();
-                        let model: String = row.try_get(1).unwrap_or_default();
-                        let content: String = row.try_get(2).unwrap_or_default();
+                        let auth_id: String = row
+                            .try_get(0)
+                            .map_err(|e| StoreError::Database(e.to_string()))?;
+                        let model: String = row
+                            .try_get(1)
+                            .map_err(|e| StoreError::Database(e.to_string()))?;
+                        let content: String = row
+                            .try_get(2)
+                            .map_err(|e| StoreError::Database(e.to_string()))?;
                         list.push((auth_id, model, content.into_bytes()));
                     }
                     Ok(list)
                 })
-            });
+            })
         }
-        let map = self
-            .fallback_cooldowns
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let active = map
-            .iter()
-            .filter(|(_, (_, deleted))| !deleted)
-            .map(|((a, m), (c, _))| (a.clone(), m.clone(), c.clone()))
-            .collect();
-        Ok(active)
     }
 
     fn route_table(&self, key: &str) -> (&str, bool) {
@@ -623,13 +659,26 @@ impl PostgresStore {
 }
 
 impl StorageBackend for PostgresStore {
+    fn equivalent(&self, key: &str, left: &[u8], right: &[u8]) -> bool {
+        if !self.route_table(key).1 {
+            return left == right;
+        }
+        match (
+            serde_json::from_slice::<serde_json::Value>(left),
+            serde_json::from_slice::<serde_json::Value>(right),
+        ) {
+            (Ok(left), Ok(right)) => left == right,
+            _ => false,
+        }
+    }
+
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
         let key = normalize_key(key)?;
-        if let Some(ref pool) = self.pool {
+        {
+            let pool = self.pool()?;
             let (table_name, is_json) = self.route_table(&key);
             let full_table = self.full_table_name(table_name);
-            let rt = tokio::runtime::Handle::try_current()
-                .map_err(|e| StoreError::Unavailable(format!("tokio runtime required: {e}")))?;
+            let rt = Self::runtime()?;
             let query = if is_json {
                 format!("SELECT content::text FROM {full_table} WHERE id = $1")
             } else {
@@ -645,24 +694,24 @@ impl StorageBackend for PostgresStore {
                 })
             })?;
             if let Some(row) = row_opt {
-                let content: String = row.try_get(0).unwrap_or_default();
+                let content: String = row
+                    .try_get(0)
+                    .map_err(|e| StoreError::Database(e.to_string()))?;
                 return Ok(Some(content.into_bytes()));
             }
-            return Ok(None);
+            Ok(None)
         }
-        let map = self.fallback_data.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(map.get(&key).cloned())
     }
 
     fn put(&self, key: &str, value: &[u8]) -> Result<(), StoreError> {
         let key = normalize_key(key)?;
-        if let Some(ref pool) = self.pool {
+        {
+            let pool = self.pool()?;
             let (table_name, is_json) = self.route_table(&key);
             let full_table = self.full_table_name(table_name);
             let content_str = String::from_utf8(value.to_vec())
                 .map_err(|e| StoreError::Serialization(e.to_string()))?;
-            let rt = tokio::runtime::Handle::try_current()
-                .map_err(|e| StoreError::Unavailable(format!("tokio runtime required: {e}")))?;
+            let rt = Self::runtime()?;
             let query = if is_json {
                 format!(
                     "INSERT INTO {full_table} (id, content, created_at, updated_at)
@@ -689,18 +738,16 @@ impl StorageBackend for PostgresStore {
                 })
             })?;
         }
-        let mut map = self.fallback_data.lock().unwrap_or_else(|e| e.into_inner());
-        map.insert(key, value.to_vec());
         Ok(())
     }
 
     fn delete(&self, key: &str) -> Result<(), StoreError> {
         let key = normalize_key(key)?;
-        if let Some(ref pool) = self.pool {
+        {
+            let pool = self.pool()?;
             let (table_name, _) = self.route_table(&key);
             let full_table = self.full_table_name(table_name);
-            let rt = tokio::runtime::Handle::try_current()
-                .map_err(|e| StoreError::Unavailable(format!("tokio runtime required: {e}")))?;
+            let rt = Self::runtime()?;
             let query = format!("DELETE FROM {full_table} WHERE id = $1");
             tokio::task::block_in_place(|| {
                 rt.block_on(async {
@@ -712,8 +759,6 @@ impl StorageBackend for PostgresStore {
                 })
             })?;
         }
-        let mut map = self.fallback_data.lock().unwrap_or_else(|e| e.into_inner());
-        map.remove(&key);
         Ok(())
     }
 
@@ -723,9 +768,9 @@ impl StorageBackend for PostgresStore {
         } else {
             normalize_key(prefix)?
         };
-        if let Some(ref pool) = self.pool {
-            let rt = tokio::runtime::Handle::try_current()
-                .map_err(|e| StoreError::Unavailable(format!("tokio runtime required: {e}")))?;
+        {
+            let pool = self.pool()?;
+            let rt = Self::runtime()?;
             let q_config = format!(
                 "SELECT id FROM {}",
                 self.full_table_name(&self.config_table)
@@ -734,15 +779,15 @@ impl StorageBackend for PostgresStore {
             let keys = tokio::task::block_in_place(|| {
                 rt.block_on(async {
                     let mut list = Vec::new();
-                    if let Ok(rows) = sqlx::query(&q_config).fetch_all(pool).await {
+                    for query in [&q_config, &q_auth] {
+                        let rows = sqlx::query(query)
+                            .fetch_all(pool)
+                            .await
+                            .map_err(|e| StoreError::Database(e.to_string()))?;
                         for row in rows {
-                            let id: String = row.try_get(0).unwrap_or_default();
-                            list.push(id);
-                        }
-                    }
-                    if let Ok(rows) = sqlx::query(&q_auth).fetch_all(pool).await {
-                        for row in rows {
-                            let id: String = row.try_get(0).unwrap_or_default();
+                            let id: String = row
+                                .try_get(0)
+                                .map_err(|e| StoreError::Database(e.to_string()))?;
                             list.push(id);
                         }
                     }
@@ -754,16 +799,8 @@ impl StorageBackend for PostgresStore {
                 .filter(|k| k.starts_with(&prefix))
                 .collect();
             filtered.sort();
-            return Ok(filtered);
+            Ok(filtered)
         }
-        let map = self.fallback_data.lock().unwrap_or_else(|e| e.into_inner());
-        let mut keys: Vec<String> = map
-            .keys()
-            .filter(|k| k.starts_with(&prefix))
-            .cloned()
-            .collect();
-        keys.sort();
-        Ok(keys)
     }
 }
 
@@ -1066,7 +1103,6 @@ pub struct ObjectStore {
     prefix: String,
     region: String,
     client: HttpClient,
-    fallback_data: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
 }
 
 impl std::fmt::Debug for ObjectStore {
@@ -1129,7 +1165,6 @@ impl ObjectStore {
             prefix,
             region,
             client,
-            fallback_data: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 
@@ -1153,17 +1188,24 @@ impl ObjectStore {
 
     fn object_url(&self, object_key: &str) -> String {
         let base = self.endpoint.trim_end_matches('/');
-        let key = object_key.trim_start_matches('/');
-        format!("{base}/{}/{key}", self.bucket)
+        let key = object_key
+            .trim_start_matches('/')
+            .split('/')
+            .map(urlencoding)
+            .collect::<Vec<_>>()
+            .join("/");
+        format!("{base}/{}/{key}", urlencoding(&self.bucket))
     }
 
-    fn list_url(&self, prefix: &str) -> String {
+    fn list_url(&self, prefix: &str) -> Result<String, StoreError> {
         let base = self.endpoint.trim_end_matches('/');
-        if prefix.is_empty() {
-            format!("{base}/{}?list-type=2", self.bucket)
-        } else {
-            format!("{base}/{}?list-type=2&prefix={prefix}", self.bucket)
+        let mut url = url::Url::parse(&format!("{base}/{}", self.bucket))
+            .map_err(|e| StoreError::InvalidConfig(e.to_string()))?;
+        url.query_pairs_mut().append_pair("list-type", "2");
+        if !prefix.is_empty() {
+            url.query_pairs_mut().append_pair("prefix", prefix);
         }
+        Ok(url.into())
     }
 
     fn sign_request(
@@ -1282,25 +1324,15 @@ impl StorageBackend for ObjectStore {
             req = req.header(h, v);
         }
 
-        match req.send() {
-            Ok(resp) => {
-                if resp.status() == reqwest::StatusCode::OK {
-                    let bytes = resp
-                        .bytes()
-                        .map_err(|e| StoreError::Network(e.to_string()))?;
-                    return Ok(Some(bytes.to_vec()));
-                }
-                if resp.status() == reqwest::StatusCode::NOT_FOUND {
-                    return Ok(None);
-                }
-                let map = self.fallback_data.lock().unwrap_or_else(|e| e.into_inner());
-                Ok(map.get(&full).cloned())
-            }
-            Err(_) => {
-                let map = self.fallback_data.lock().unwrap_or_else(|e| e.into_inner());
-                Ok(map.get(&full).cloned())
-            }
+        let resp = req.send().map_err(|e| StoreError::Network(e.to_string()))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
         }
+        let resp = successful_object_response(resp)?;
+        let bytes = resp
+            .bytes()
+            .map_err(|e| StoreError::Network(e.to_string()))?;
+        Ok(Some(bytes.to_vec()))
     }
 
     fn put(&self, key: &str, value: &[u8]) -> Result<(), StoreError> {
@@ -1310,23 +1342,14 @@ impl StorageBackend for ObjectStore {
 
         let payload_hash = hex::encode(Sha256::digest(value));
         let mut headers = Vec::new();
-        let _ = self.sign_request("PUT", &url_str, &payload_hash, &mut headers);
+        self.sign_request("PUT", &url_str, &payload_hash, &mut headers)?;
 
         let mut req = self.client.put(&url_str).body(value.to_vec());
         for (h, v) in headers {
             req = req.header(h, v);
         }
 
-        if let Ok(resp) = req.send() {
-            if resp.status().is_success() {
-                let mut map = self.fallback_data.lock().unwrap_or_else(|e| e.into_inner());
-                map.insert(full, value.to_vec());
-                return Ok(());
-            }
-        }
-
-        let mut map = self.fallback_data.lock().unwrap_or_else(|e| e.into_inner());
-        map.insert(full, value.to_vec());
+        successful_object_response(req.send().map_err(|e| StoreError::Network(e.to_string()))?)?;
         Ok(())
     }
 
@@ -1337,16 +1360,14 @@ impl StorageBackend for ObjectStore {
 
         let payload_hash = hex::encode(Sha256::digest(b""));
         let mut headers = Vec::new();
-        let _ = self.sign_request("DELETE", &url_str, &payload_hash, &mut headers);
+        self.sign_request("DELETE", &url_str, &payload_hash, &mut headers)?;
 
         let mut req = self.client.delete(&url_str);
         for (h, v) in headers {
             req = req.header(h, v);
         }
 
-        let _ = req.send();
-        let mut map = self.fallback_data.lock().unwrap_or_else(|e| e.into_inner());
-        map.remove(&full);
+        successful_object_response(req.send().map_err(|e| StoreError::Network(e.to_string()))?)?;
         Ok(())
     }
 
@@ -1357,72 +1378,103 @@ impl StorageBackend for ObjectStore {
             normalize_key(prefix)?
         };
         let full_prefix = self.resolve_key(&prefix);
-        let url_str = self.list_url(&full_prefix);
-
-        let payload_hash = hex::encode(Sha256::digest(b""));
-        let mut headers = Vec::new();
-        let _ = self.sign_request("GET", &url_str, &payload_hash, &mut headers);
-
-        let mut req = self.client.get(&url_str);
-        for (h, v) in headers {
-            req = req.header(h, v);
+        #[derive(serde::Deserialize)]
+        enum Listing {
+            ListBucketResult(Page),
         }
-
-        if let Ok(resp) = req.send() {
-            if resp.status().is_success() {
-                if let Ok(xml) = resp.text() {
-                    let mut found = Vec::new();
-                    let strip_prefix_len = if self.prefix.is_empty() {
-                        0
-                    } else {
-                        self.prefix.len() + 1
-                    };
-                    let mut pos = 0;
-                    while let Some(start) = xml[pos..].find("<Key>") {
-                        let actual_start = pos + start + 5;
-                        if let Some(end) = xml[actual_start..].find("</Key>") {
-                            let k = &xml[actual_start..actual_start + end];
-                            if k.starts_with(&full_prefix) {
-                                let stripped = if k.len() >= strip_prefix_len {
-                                    &k[strip_prefix_len..]
-                                } else {
-                                    k
-                                };
-                                found.push(stripped.to_string());
-                            }
-                            pos = actual_start + end + 6;
-                        } else {
-                            break;
-                        }
-                    }
-                    if !found.is_empty() {
-                        found.sort();
-                        return Ok(found);
-                    }
-                }
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Page {
+            is_truncated: bool,
+            next_continuation_token: Option<String>,
+            #[serde(default)]
+            contents: Vec<Entry>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Entry {
+            #[serde(rename = "Key")]
+            key: String,
+        }
+        let mut found = Vec::new();
+        let mut continuation = None::<String>;
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            let mut url = url::Url::parse(&self.list_url(&full_prefix)?)
+                .map_err(|error| StoreError::Serialization(error.to_string()))?;
+            if let Some(token) = &continuation {
+                url.query_pairs_mut()
+                    .append_pair("continuation-token", token);
             }
-        }
-
-        let map = self.fallback_data.lock().unwrap_or_else(|e| e.into_inner());
-        let strip_prefix_len = if self.prefix.is_empty() {
-            0
-        } else {
-            self.prefix.len() + 1
-        };
-        let mut keys: Vec<String> = map
-            .keys()
-            .filter(|k| k.starts_with(&full_prefix))
-            .map(|k| {
-                if k.len() >= strip_prefix_len {
-                    k[strip_prefix_len..].to_string()
-                } else {
-                    k.clone()
+            let url_str = url.as_str();
+            let mut headers = Vec::new();
+            self.sign_request(
+                "GET",
+                url_str,
+                &hex::encode(Sha256::digest(b"")),
+                &mut headers,
+            )?;
+            let mut request = self.client.get(url_str);
+            for (name, value) in headers {
+                request = request.header(name, value);
+            }
+            let response = successful_object_response(
+                request
+                    .send()
+                    .map_err(|error| StoreError::Network(error.to_string()))?,
+            )?;
+            let xml = response
+                .text()
+                .map_err(|error| StoreError::Network(error.to_string()))?;
+            let Listing::ListBucketResult(page) = quick_xml::de::from_str::<Listing>(&xml)
+                .map_err(|error| StoreError::Serialization(error.to_string()))?;
+            for entry in page.contents {
+                if !entry.key.starts_with(&full_prefix) {
+                    return Err(StoreError::Serialization(
+                        "S3 key outside requested prefix".into(),
+                    ));
                 }
-            })
-            .collect();
-        keys.sort();
-        Ok(keys)
+                let key = if self.prefix.is_empty() {
+                    entry.key.as_str()
+                } else {
+                    entry
+                        .key
+                        .strip_prefix(&format!("{}/", self.prefix))
+                        .ok_or_else(|| {
+                            StoreError::Serialization("S3 key outside store prefix".into())
+                        })?
+                };
+                found.push(normalize_key(key)?);
+            }
+            if !page.is_truncated {
+                break;
+            }
+            let token = page
+                .next_continuation_token
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| StoreError::Serialization("S3 continuation token missing".into()))?;
+            if !seen.insert(token.clone()) {
+                return Err(StoreError::Serialization(
+                    "S3 continuation token repeated".into(),
+                ));
+            }
+            continuation = Some(token);
+        }
+        found.sort();
+        found.dedup();
+        Ok(found)
     }
+}
+
+fn successful_object_response(
+    response: reqwest::blocking::Response,
+) -> Result<reqwest::blocking::Response, StoreError> {
+    if !response.status().is_success() {
+        return Err(StoreError::Network(format!(
+            "object store returned HTTP {}",
+            response.status()
+        )));
+    }
+    Ok(response)
 }
 
 fn walk_files(root: &Path) -> Result<Vec<PathBuf>, StoreError> {
@@ -1544,51 +1596,26 @@ mod tests {
     }
 
     #[test]
-    fn postgres_store_survives_mutation_and_cooldown_retention() {
+    fn postgres_store_without_runtime_rejects_false_durability() {
         let pg = PostgresStore::new(
-            "postgres://user:pass@localhost:5432/db",
+            "postgres://fixture@127.0.0.1:18899/db",
             Some("custom_schema".into()),
         );
         assert_eq!(pg.schema(), "custom_schema");
         assert_eq!(pg.config_table(), PostgresStore::DEFAULT_CONFIG_TABLE);
 
-        pg.put("config/config.yaml", b"port: 18801\n").unwrap();
-        assert_eq!(
-            pg.get("config/config.yaml").unwrap().unwrap(),
-            b"port: 18801\n"
-        );
-
-        pg.save_cooldown("auth-1", "claude-sonnet-4-6", b"{\"until\":12345}", false)
-            .unwrap();
-        let cooldowns = pg.load_cooldowns().unwrap();
-        assert_eq!(cooldowns.len(), 1);
-        assert_eq!(cooldowns[0].0, "auth-1");
-        assert_eq!(cooldowns[0].1, "claude-sonnet-4-6");
-
-        pg.save_cooldown("auth-1", "claude-sonnet-4-6", b"{}", true)
-            .unwrap();
-        assert!(pg.load_cooldowns().unwrap().is_empty());
+        assert!(pg.put("config/config.yaml", b"port: 18840\n").is_err());
+        assert!(pg.get("config/config.yaml").is_err());
+        assert!(pg
+            .save_cooldown("auth-1", "fixture", b"{\"until\":12345}", false)
+            .is_err());
+        assert!(pg.load_cooldowns().is_err());
+        assert!(pg.save_cooldown("auth-1", "fixture", b"{}", true).is_err());
     }
 
-    #[tokio::test]
-    async fn postgres_store_live_db_when_dsn_present() {
-        let dsn = match std::env::var("PGSTORE_TEST_DSN").or_else(|_| std::env::var("PGSTORE_DSN"))
-        {
-            Ok(val) if !val.trim().is_empty() => val,
-            _ => {
-                println!("skipping postgres live test: PGSTORE_TEST_DSN absent");
-                return;
-            }
-        };
-        let pg = PostgresStore::new(dsn, Some("test_schema".into()));
-        pg.put("config/config.yaml", b"port: 18801\n").unwrap();
-        assert_eq!(
-            pg.get("config/config.yaml").unwrap().unwrap(),
-            b"port: 18801\n"
-        );
-        pg.delete("config/config.yaml").unwrap();
-        assert!(pg.get("config/config.yaml").unwrap().is_none());
-    }
+    // Moved postgres_store_live_db_when_dsn_present to the integration target
+    // review_20261025_postgres::postgres_store_disposable_cluster_crud, where
+    // the same CRUD assertions always run against an owned disposable cluster.
 
     #[test]
     fn git_store_manages_keys_and_branch_isolation() {
@@ -1620,20 +1647,19 @@ mod tests {
 
     #[test]
     fn object_store_validates_required_fields_and_prefixes_keys() {
-        let obj =
-            ObjectStore::new("s3.amazonaws.com", "test-bucket", "ak", "sk", "subpath").unwrap();
+        let obj = ObjectStore::new(
+            "http://127.0.0.1:18899",
+            "test-bucket",
+            "ak",
+            "sk",
+            "subpath",
+        )
+        .unwrap();
         assert_eq!(obj.bucket(), "test-bucket");
         assert_eq!(obj.prefix(), "subpath");
 
-        obj.put("auths/acc.json", b"{\"key\":\"val\"}").unwrap();
-        assert_eq!(
-            obj.get("auths/acc.json").unwrap().unwrap(),
-            b"{\"key\":\"val\"}"
-        );
-        assert_eq!(obj.list("auths").unwrap(), vec!["auths/acc.json"]);
-
-        obj.delete("auths/acc.json").unwrap();
-        assert!(obj.get("auths/acc.json").unwrap().is_none());
+        assert_eq!(obj.resolve_key("auths/acc.json"), "subpath/auths/acc.json");
+        object_store_mock_s3_http_server_roundtrip();
 
         assert!(ObjectStore::new("", "bucket", "ak", "sk", "").is_err());
         assert!(ObjectStore::new("ep", "", "ak", "sk", "").is_err());
@@ -1697,9 +1723,13 @@ mod tests {
                         let db = db.clone();
                         async move {
                             let map = db.lock().unwrap();
-                            let mut xml = String::from("<ListBucketResult>");
+                            let mut xml =
+                                String::from("<ListBucketResult><IsTruncated>false</IsTruncated>");
                             for key in map.keys() {
-                                xml.push_str(&format!("<Contents><Key>{}</Key></Contents>", key));
+                                xml.push_str(&format!(
+                                    "<Contents><Key>{}</Key></Contents>",
+                                    quick_xml::escape::escape(key)
+                                ));
                             }
                             xml.push_str("</ListBucketResult>");
                             (StatusCode::OK, xml)
@@ -1718,9 +1748,11 @@ mod tests {
                 .build()
                 .unwrap();
             runtime.block_on(async move {
-                let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-                    .await
-                    .expect("bind mock S3 server");
+                let listener = (18840..=18899)
+                    .find_map(|port| std::net::TcpListener::bind(("127.0.0.1", port)).ok())
+                    .expect("bind mock S3 server in QA range");
+                listener.set_nonblocking(true).unwrap();
+                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
                 port_tx.send(listener.local_addr().unwrap().port()).unwrap();
                 axum::serve(listener, app)
                     .with_graceful_shutdown(async {

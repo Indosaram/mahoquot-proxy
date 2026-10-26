@@ -105,14 +105,14 @@ async fn handle(
             if !path.is_empty() {
                 config::project_aliases(&mut view, &path.replace('/', "."))?;
             }
+            let view = config::redact(view);
             let response = if yaml {
                 (
                     [(header::CONTENT_TYPE, "application/yaml; charset=utf-8")],
-                    config::render(&view, &raw, true)?,
+                    config::render(&view, "", false)?,
                 )
                     .into_response()
             } else {
-                let view = config::redact(view);
                 let ptr = if path.is_empty() {
                     String::new()
                 } else {

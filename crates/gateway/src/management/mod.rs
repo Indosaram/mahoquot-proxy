@@ -12,6 +12,8 @@ pub mod core;
 pub mod creds;
 pub mod gate;
 pub mod history;
+#[cfg(test)]
+mod inventory_qa;
 pub mod lists;
 pub mod oauth;
 pub mod observability;
@@ -36,6 +38,7 @@ use crate::state::AppState;
 
 pub fn management_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
     Router::new()
+        .merge(crate::compat::meta::onboarding_routes())
         .merge(accounts::account_management_routes())
         .merge(apikeys::apikeys_routes())
         .merge(creds::creds_routes())

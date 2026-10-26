@@ -674,6 +674,9 @@ fn handle_stream_event(
     state: &mut TranslateState,
     upstream_capture: Option<&Arc<std::sync::Mutex<Option<crate::usage::ResponseTokenUsage>>>>,
 ) {
+    if state.renderer.terminated() {
+        return;
+    }
     capture_stream_usage(&event, upstream_capture);
     state.pending.extend(state.renderer.render(event));
 }
@@ -816,7 +819,7 @@ pub fn aggregate(
         None => match shape {
             ReplyShape::Chat => Ok(aggregator.into_completion()),
             ReplyShape::TextCompletion => Ok(aggregator.into_text_completion()),
-            ReplyShape::Gemini => Ok(aggregator.into_gemini()),
+            ReplyShape::Gemini => aggregator.into_gemini(),
             ReplyShape::Anthropic => Ok(aggregator.into_completion()),
             ReplyShape::Responses => aggregator.into_responses(),
         },

@@ -143,17 +143,33 @@ impl ManagementClient {
             return Err(format!("HTTP {}", resp.status()));
         }
         let val: Value = resp.json().await.map_err(|e| e.to_string())?;
-        if let Some(lines) = val.get("lines").and_then(Value::as_array) {
-            let res: Vec<String> = lines
-                .iter()
-                .filter_map(Value::as_str)
-                .map(|s| s.to_string())
-                .collect();
-            Ok(res)
-        } else {
-            Ok(vec![])
-        }
+        parse_log_records(&val)
     }
+}
+
+fn parse_log_records(value: &Value) -> Result<Vec<String>, String> {
+    let records = value
+        .get("records")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Invalid logs response: expected records array".to_string())?;
+    records
+        .iter()
+        .map(|record| {
+            let kind = record
+                .get("kind")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "Invalid log record: expected kind".to_string())?;
+            if kind == "proxy" {
+                let message = record
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "Invalid proxy log record: expected message".to_string())?;
+                Ok(message.to_string())
+            } else {
+                Ok(record.to_string())
+            }
+        })
+        .collect()
 }
 
 #[derive(Default, Clone)]
@@ -442,7 +458,11 @@ impl TuiState {
             out.push_str("│ [No log lines recorded]                                    │\n");
         } else {
             for line in lines.iter().rev().take(6) {
-                let truncated = if line.len() > 56 { &line[..56] } else { line };
+                let mut end = line.len().min(56);
+                while !line.is_char_boundary(end) {
+                    end -= 1;
+                }
+                let truncated = &line[..end];
                 out.push_str(&format!("│ > {} \n", truncated));
             }
         }
@@ -505,6 +525,19 @@ impl PtySessionSimulator {
     }
 }
 
+#[cfg(unix)]
+unsafe fn read_terminal_attributes(
+    fd: i32,
+    get: unsafe extern "C" fn(i32, *mut libc::termios) -> i32,
+) -> std::io::Result<libc::termios> {
+    let mut attributes = std::mem::MaybeUninit::<libc::termios>::uninit();
+    if unsafe { get(fd, attributes.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // Only tcgetattr-compatible functions may be supplied: success initializes termios.
+    Ok(unsafe { attributes.assume_init() })
+}
+
 pub async fn run_interactive_tui(mut state: TuiState) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
@@ -522,16 +555,11 @@ pub async fn run_interactive_tui(mut state: TuiState) -> anyhow::Result<()> {
         }
 
         // TTY Interactive Mode with raw terminal setup
-        let mut orig_termios = std::mem::MaybeUninit::<libc::termios>::uninit();
-        let tc_res = unsafe { libc::tcgetattr(stdin_fd, orig_termios.as_mut_ptr()) };
-        let raw = unsafe { orig_termios.assume_init() };
-
-        if tc_res == 0 {
-            let mut raw_copy = raw;
-            unsafe {
-                libc::cfmakeraw(&mut raw_copy);
-                libc::tcsetattr(stdin_fd, libc::TCSANOW, &raw_copy);
-            }
+        let raw = unsafe { read_terminal_attributes(stdin_fd, libc::tcgetattr) }?;
+        let mut raw_copy = raw;
+        unsafe { libc::cfmakeraw(&mut raw_copy) };
+        if unsafe { libc::tcsetattr(stdin_fd, libc::TCSANOW, &raw_copy) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
         }
 
         struct RawModeGuard {
@@ -553,7 +581,7 @@ pub async fn run_interactive_tui(mut state: TuiState) -> anyhow::Result<()> {
         let _guard = RawModeGuard {
             fd: stdin_fd,
             orig: raw,
-            active: tc_res == 0,
+            active: true,
         };
 
         // Clear screen and show initial state
@@ -621,6 +649,54 @@ pub async fn run_interactive_tui(mut state: TuiState) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_setup_failure_is_returned() {
+        unsafe extern "C" fn fail(_fd: i32, output: *mut libc::termios) -> i32 {
+            unsafe { libc::tcgetattr(-1, output) }
+        }
+        let result = unsafe { read_terminal_attributes(0, fail) };
+        assert_eq!(result.err().unwrap().raw_os_error(), Some(libc::EBADF));
+    }
+
+    #[test]
+    fn logs_schema_distinguishes_empty_from_invalid() {
+        assert!(parse_log_records(&serde_json::json!({"records": []}))
+            .unwrap()
+            .is_empty());
+        for value in [
+            serde_json::json!({"lines": []}),
+            serde_json::json!({"records": null}),
+            serde_json::json!({"records": ["bad"]}),
+            serde_json::json!({"records": [{"kind": "proxy"}]}),
+        ] {
+            assert!(parse_log_records(&value).is_err());
+        }
+    }
+
+    #[test]
+    fn tui_multibyte_log_boundary() {
+        for character in ["é", "界", "😀"] {
+            for prefix_len in 53..=56 {
+                let buffer = LogBuffer::new(10);
+                let line = format!("{}{}tail", "x".repeat(prefix_len), character);
+                buffer.push(line.clone());
+                let client =
+                    ManagementClient::new("http://127.0.0.1:18840".into(), "fixture".into());
+                let mut sim = PtySessionSimulator::new(TuiState::new(client, true, Some(buffer)));
+                sim.send_key("5");
+                let expected: String = line
+                    .char_indices()
+                    .take_while(|(index, ch)| index + ch.len_utf8() <= 56)
+                    .map(|(_, ch)| ch)
+                    .collect();
+                let screen = sim.current_screen();
+                assert!(screen.contains(&format!("│ > {} \n", expected)));
+                assert!(!screen.contains("tail"));
+            }
+        }
+    }
 
     #[test]
     fn test_tui_tab_cycling() {

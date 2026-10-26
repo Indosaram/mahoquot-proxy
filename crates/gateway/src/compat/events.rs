@@ -76,19 +76,24 @@ pub struct SseParser {
     data: Vec<u8>,
     after_cr: bool,
     failure: Option<SseLimitError>,
+    terminal: bool,
 }
 
 impl SseParser {
     pub fn push(&mut self, chunk: &[u8], out: &mut Vec<CodexEvent>) {
-        if self.failure.is_some() {
+        if self.failure.is_some() || self.terminal {
             return;
         }
         let mut frames = Vec::new();
         let result = self.push_raw_data(chunk, &mut frames);
         for frame in frames {
-            Self::decode(&frame, out);
+            self.decode_codex(&frame, out);
+        }
+        if self.terminal {
+            return;
         }
         if let Err(error) = result {
+            self.terminal = true;
             out.push(CodexEvent::Failed {
                 message: error.message().to_string(),
             });
@@ -96,16 +101,43 @@ impl SseParser {
     }
 
     pub fn finish(&mut self, out: &mut Vec<CodexEvent>) {
+        if self.terminal {
+            return;
+        }
         let mut frames = Vec::new();
         let result = self.finish_raw_data(&mut frames);
         for frame in frames {
-            Self::decode(&frame, out);
+            self.decode_codex(&frame, out);
+        }
+        if self.terminal {
+            return;
         }
         if let Err(error) = result {
+            self.terminal = true;
             out.push(CodexEvent::Failed {
                 message: error.message().to_string(),
             });
         }
+        if !self.terminal {
+            self.terminal = true;
+            out.push(CodexEvent::Failed {
+                message: "Responses stream ended before a terminal event".into(),
+            });
+        }
+    }
+
+    fn decode_codex(&mut self, frame: &[u8], out: &mut Vec<CodexEvent>) {
+        if self.terminal {
+            return;
+        }
+        let start = out.len();
+        Self::decode(frame, out);
+        self.terminal = out[start..].iter().any(|event| {
+            matches!(
+                event,
+                CodexEvent::Completed { .. } | CodexEvent::Failed { .. }
+            )
+        });
     }
 
     /// Feeds raw bytes and reports the first accumulation breach so raw-data

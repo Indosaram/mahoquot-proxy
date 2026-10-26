@@ -6,13 +6,15 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
-use mahoquot_providers::credential_file::write_credential_atomically;
 use serde_json::{json, Value};
 
 use crate::management::settings::ApiKeyBinding;
 use crate::state::AppState;
 
-use super::creds::{credential_identity, validate_provider_credential};
+use super::creds::{
+    credential_identity, persist_credential, remove_credential, storage_error, valid_name,
+    validate_provider_credential,
+};
 
 const EXPORT_AUTHORIZATION_HEADER: &str = "x-mahoquot-export-authorization";
 const GENERIC_ADAPTERS: &[&str] = &[
@@ -33,10 +35,6 @@ fn typed_error(status: StatusCode, code: &str, message: impl ToString) -> Respon
         status,
         json!({ "error": { "code": code, "message": message.to_string() } }),
     )
-}
-
-fn valid_name(name: &str) -> bool {
-    !name.trim().is_empty() && !name.contains('/') && !name.contains("..")
 }
 
 fn auth_dir(state: &AppState) -> std::path::PathBuf {
@@ -65,7 +63,7 @@ fn read_json(path: &std::path::Path) -> ResponseResult<Value> {
         .map_err(|error| boxed_error(StatusCode::BAD_REQUEST, "credential_invalid", error))
 }
 
-fn write_json(path: &std::path::Path, value: &Value) -> ResponseResult<()> {
+fn write_json(state: &AppState, path: &std::path::Path, value: &Value) -> ResponseResult<()> {
     let rendered = serde_json::to_vec_pretty(value).map_err(|error| {
         boxed_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -73,13 +71,7 @@ fn write_json(path: &std::path::Path, value: &Value) -> ResponseResult<()> {
             error,
         )
     })?;
-    write_credential_atomically(path, &rendered).map_err(|error| {
-        boxed_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "credential_write_failed",
-            error,
-        )
-    })
+    persist_credential(state, path, &rendered).map_err(storage_error)
 }
 
 fn rescan(state: &AppState) -> ResponseResult<()> {
@@ -294,48 +286,59 @@ fn provider_credential(
 }
 
 async fn create_provider(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
-    let (id, name, base_url, adapter, models) = match provider_fields(&body) {
-        Ok(fields) => fields,
-        Err(response) => return *response,
-    };
-    let api_key = match required_body_string(&body, "api_key") {
-        Ok(value) => value,
-        Err(_) => {
+    match tokio::task::spawn_blocking(move || {
+        let _mutation = state.settings.composition_lock();
+        let (id, name, base_url, adapter, models) = match provider_fields(&body) {
+            Ok(fields) => fields,
+            Err(response) => return *response,
+        };
+        let api_key = match required_body_string(&body, "api_key") {
+            Ok(value) => value,
+            Err(_) => {
+                return typed_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_provider",
+                    "api_key is required",
+                )
+            }
+        };
+        let dir = auth_dir(&state);
+        if !provider_files(&dir, &id).is_empty() {
             return typed_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_provider",
-                "api_key is required",
-            )
+                StatusCode::CONFLICT,
+                "provider_exists",
+                "provider already exists",
+            );
         }
-    };
-    let dir = auth_dir(&state);
-    if !provider_files(&dir, &id).is_empty() {
-        return typed_error(
-            StatusCode::CONFLICT,
-            "provider_exists",
-            "provider already exists",
-        );
-    }
-    if let Err(error) = std::fs::create_dir_all(&dir) {
-        return typed_error(
+        if let Err(error) = std::fs::create_dir_all(&dir) {
+            return typed_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "credential_write_failed",
+                error,
+            );
+        }
+        let label = body.get("key_label").and_then(Value::as_str).unwrap_or("");
+        let (filename, credential) =
+            provider_credential(&id, &name, &base_url, &adapter, &models, api_key, label);
+        if let Err(response) = write_json(&state, &dir.join(filename), &credential) {
+            return *response;
+        }
+        if let Err(response) = rescan(&state) {
+            return *response;
+        }
+        json_status(
+            StatusCode::CREATED,
+            json!({ "status": "ok", "provider": provider_view(&id, &provider_files(&dir, &id)) }),
+        )
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => json_status(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "credential_write_failed",
-            error,
-        );
+            json!({"error":"credential_mutation_failed", "message":error.to_string()}),
+        ),
     }
-    let label = body.get("key_label").and_then(Value::as_str).unwrap_or("");
-    let (filename, credential) =
-        provider_credential(&id, &name, &base_url, &adapter, &models, api_key, label);
-    if let Err(response) = write_json(&dir.join(filename), &credential) {
-        return *response;
-    }
-    if let Err(response) = rescan(&state) {
-        return *response;
-    }
-    json_status(
-        StatusCode::CREATED,
-        json!({ "status": "ok", "provider": provider_view(&id, &provider_files(&dir, &id)) }),
-    )
 }
 
 async fn update_provider(
@@ -343,6 +346,8 @@ async fn update_provider(
     Path(provider_id): Path<String>,
     Json(body): Json<Value>,
 ) -> Response {
+    match tokio::task::spawn_blocking(move || {
+    let _mutation = state.settings.composition_lock();
     let dir = auth_dir(&state);
     let files = provider_files(&dir, &provider_id);
     if files.is_empty() {
@@ -397,7 +402,7 @@ async fn update_provider(
         value["base_url"] = json!(base_url);
         value["adapter"] = json!(adapter);
         value["models"] = json!(models);
-        if let Err(response) = write_json(&dir.join(filename), &value) {
+        if let Err(response) = write_json(&state, &dir.join(filename), &value) {
             return *response;
         }
     }
@@ -408,34 +413,45 @@ async fn update_provider(
         StatusCode::OK,
         json!({ "status": "ok", "provider": provider_view(&provider_id, &provider_files(&dir, &provider_id)) }),
     )
+    }).await {
+        Ok(response) => response,
+        Err(error) => json_status(StatusCode::INTERNAL_SERVER_ERROR, json!({"error":"credential_mutation_failed", "message":error.to_string()})),
+    }
 }
 
 async fn delete_provider(
     State(state): State<Arc<AppState>>,
     Path(provider_id): Path<String>,
 ) -> Response {
-    let dir = auth_dir(&state);
-    let files = provider_files(&dir, &provider_id);
-    if files.is_empty() {
-        return typed_error(
-            StatusCode::NOT_FOUND,
-            "provider_not_found",
-            "provider not found",
-        );
-    }
-    for (filename, _) in files {
-        if let Err(error) = std::fs::remove_file(dir.join(filename)) {
+    match tokio::task::spawn_blocking(move || {
+        let _mutation = state.settings.composition_lock();
+        let dir = auth_dir(&state);
+        let files = provider_files(&dir, &provider_id);
+        if files.is_empty() {
             return typed_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "credential_delete_failed",
-                error,
+                StatusCode::NOT_FOUND,
+                "provider_not_found",
+                "provider not found",
             );
         }
+        for (filename, _) in files {
+            if let Err(error) = remove_credential(&state, &dir.join(filename)) {
+                return *storage_error(error);
+            }
+        }
+        if let Err(response) = rescan(&state) {
+            return *response;
+        }
+        json_status(StatusCode::OK, json!({ "status": "ok" }))
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => json_status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"error":"credential_mutation_failed", "message":error.to_string()}),
+        ),
     }
-    if let Err(response) = rescan(&state) {
-        return *response;
-    }
-    json_status(StatusCode::OK, json!({ "status": "ok" }))
 }
 
 async fn add_provider_key(
@@ -443,6 +459,8 @@ async fn add_provider_key(
     Path(provider_id): Path<String>,
     Json(body): Json<Value>,
 ) -> Response {
+    match tokio::task::spawn_blocking(move || {
+    let _mutation = state.settings.composition_lock();
     let dir = auth_dir(&state);
     let files = provider_files(&dir, &provider_id);
     let Some((_, first)) = files.first() else {
@@ -480,7 +498,7 @@ async fn add_provider_key(
         api_key,
         label,
     );
-    if let Err(response) = write_json(&dir.join(filename), &credential) {
+    if let Err(response) = write_json(&state, &dir.join(filename), &credential) {
         return *response;
     }
     if let Err(response) = rescan(&state) {
@@ -490,6 +508,10 @@ async fn add_provider_key(
         StatusCode::CREATED,
         json!({ "status": "ok", "provider": provider_view(&provider_id, &provider_files(&dir, &provider_id)) }),
     )
+    }).await {
+        Ok(response) => response,
+        Err(error) => json_status(StatusCode::INTERNAL_SERVER_ERROR, json!({"error":"credential_mutation_failed", "message":error.to_string()})),
+    }
 }
 
 fn provider_key_file(
@@ -507,6 +529,8 @@ async fn patch_provider_key(
     Path((provider_id, key_id)): Path<(String, String)>,
     Json(body): Json<Value>,
 ) -> Response {
+    match tokio::task::spawn_blocking(move || {
+    let _mutation = state.settings.composition_lock();
     let Some(enabled) = body.get("enabled").and_then(Value::as_bool) else {
         return typed_error(
             StatusCode::BAD_REQUEST,
@@ -523,7 +547,7 @@ async fn patch_provider_key(
         );
     };
     value["disabled"] = json!(!enabled);
-    if let Err(response) = write_json(&dir.join(filename), &value) {
+    if let Err(response) = write_json(&state, &dir.join(filename), &value) {
         return *response;
     }
     if let Err(response) = rescan(&state) {
@@ -533,12 +557,18 @@ async fn patch_provider_key(
         StatusCode::OK,
         json!({ "status": "ok", "provider": provider_view(&provider_id, &provider_files(&dir, &provider_id)) }),
     )
+    }).await {
+        Ok(response) => response,
+        Err(error) => json_status(StatusCode::INTERNAL_SERVER_ERROR, json!({"error":"credential_mutation_failed", "message":error.to_string()})),
+    }
 }
 
 async fn delete_provider_key(
     State(state): State<Arc<AppState>>,
     Path((provider_id, key_id)): Path<(String, String)>,
 ) -> Response {
+    match tokio::task::spawn_blocking(move || {
+    let _mutation = state.settings.composition_lock();
     let dir = auth_dir(&state);
     let Some((filename, _)) = provider_key_file(&dir, &provider_id, &key_id) else {
         return typed_error(
@@ -547,12 +577,8 @@ async fn delete_provider_key(
             "provider key not found",
         );
     };
-    if let Err(error) = std::fs::remove_file(dir.join(filename)) {
-        return typed_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "credential_delete_failed",
-            error,
-        );
+    if let Err(error) = remove_credential(&state, &dir.join(filename)) {
+        return *storage_error(error);
     }
     if let Err(response) = rescan(&state) {
         return *response;
@@ -561,6 +587,10 @@ async fn delete_provider_key(
         StatusCode::OK,
         json!({ "status": "ok", "provider": provider_view(&provider_id, &provider_files(&dir, &provider_id)) }),
     )
+    }).await {
+        Ok(response) => response,
+        Err(error) => json_status(StatusCode::INTERNAL_SERVER_ERROR, json!({"error":"credential_mutation_failed", "message":error.to_string()})),
+    }
 }
 
 fn existing_identities(dir: &std::path::Path) -> BTreeMap<String, String> {
@@ -590,85 +620,100 @@ async fn import_auth_files(
     State(state): State<Arc<AppState>>,
     Json(body): Json<Value>,
 ) -> Response {
-    let Some(files) = body.get("files").and_then(Value::as_array) else {
-        return typed_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_import",
-            "files is required",
-        );
-    };
-    if files.is_empty() {
-        return typed_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_import",
-            "files cannot be empty",
-        );
-    }
-    let dir = auth_dir(&state);
-    if let Err(error) = std::fs::create_dir_all(&dir) {
-        return typed_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "credential_write_failed",
-            error,
-        );
-    }
-    let mut existing = existing_identities(&dir);
-    let mut pending = Vec::new();
-    for file in files {
-        let Some(name) = file.get("name").and_then(Value::as_str).map(str::trim) else {
+    match tokio::task::spawn_blocking(move || {
+        let _mutation = state.settings.composition_lock();
+        let Some(files) = body.get("files").and_then(Value::as_array) else {
             return typed_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_import",
-                "file name is required",
+                "files is required",
             );
         };
-        if !valid_name(name) || !name.to_ascii_lowercase().ends_with(".json") {
+        if files.is_empty() {
             return typed_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_import",
-                "invalid credential name",
+                "files cannot be empty",
             );
         }
-        let content = file.get("content").cloned().unwrap_or(Value::Null);
-        if let Err(error) = validate_provider_credential(&content) {
-            return typed_error(StatusCode::BAD_REQUEST, "invalid_credential", error);
-        }
-        if dir.join(name).exists() {
+        let dir = auth_dir(&state);
+        if let Err(error) = std::fs::create_dir_all(&dir) {
             return typed_error(
-                StatusCode::CONFLICT,
-                "duplicate_credential",
-                "credential name already exists",
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "credential_write_failed",
+                error,
             );
         }
-        if let Some(identity) = credential_identity(&content) {
-            if existing.contains_key(&identity) {
+        let mut existing = existing_identities(&dir);
+        let mut pending = Vec::new();
+        let mut pending_names = BTreeSet::new();
+        for file in files {
+            let Some(name) = file.get("name").and_then(Value::as_str).map(str::trim) else {
+                return typed_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_import",
+                    "file name is required",
+                );
+            };
+            if !valid_name(name) || !name.to_ascii_lowercase().ends_with(".json") {
+                return typed_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_import",
+                    "invalid credential name",
+                );
+            }
+            let content = file.get("content").cloned().unwrap_or(Value::Null);
+            if let Err(error) = validate_provider_credential(&content) {
+                return typed_error(StatusCode::BAD_REQUEST, "invalid_credential", error);
+            }
+            if dir.join(name).symlink_metadata().is_ok() || !pending_names.insert(name.to_string())
+            {
                 return typed_error(
                     StatusCode::CONFLICT,
                     "duplicate_credential",
-                    "credential identity already exists",
+                    "credential name already exists",
                 );
             }
-            existing.insert(identity, name.to_string());
-        }
-        pending.push((name.to_string(), content));
-    }
-    let mut written = Vec::new();
-    for (name, content) in &pending {
-        if let Err(response) = write_json(&dir.join(name), content) {
-            for previous in written {
-                let _ = std::fs::remove_file(dir.join(previous));
+            if let Some(identity) = credential_identity(&content) {
+                if existing.contains_key(&identity) {
+                    return typed_error(
+                        StatusCode::CONFLICT,
+                        "duplicate_credential",
+                        "credential identity already exists",
+                    );
+                }
+                existing.insert(identity, name.to_string());
             }
+            pending.push((name.to_string(), content));
+        }
+        let mut written = Vec::new();
+        for (name, content) in &pending {
+            if let Err(response) = write_json(&state, &dir.join(name), content) {
+                for previous in &written {
+                    if let Err(error) = remove_credential(&state, &dir.join(previous)) {
+                        return *storage_error(error);
+                    }
+                }
+                return *response;
+            }
+            written.push(name.clone());
+        }
+        if let Err(response) = rescan(&state) {
             return *response;
         }
-        written.push(name.clone());
+        json_status(
+            StatusCode::CREATED,
+            json!({ "status": "ok", "names": written }),
+        )
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => json_status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"error":"credential_mutation_failed", "message":error.to_string()}),
+        ),
     }
-    if let Err(response) = rescan(&state) {
-        return *response;
-    }
-    json_status(
-        StatusCode::CREATED,
-        json!({ "status": "ok", "names": written }),
-    )
 }
 
 pub(crate) fn export_authorized(state: &AppState, headers: &HeaderMap) -> bool {
@@ -736,61 +781,72 @@ async fn export_auth_files(
 }
 
 async fn bulk_auth_files(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
-    let Some(action) = body.get("action").and_then(Value::as_str) else {
-        return typed_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_bulk_action",
-            "action is required",
-        );
-    };
-    let Some(names) = body.get("names").and_then(Value::as_array) else {
-        return typed_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_bulk_action",
-            "names is required",
-        );
-    };
-    let disabled = match action {
-        "disable" => true,
-        "enable" => false,
-        _ => {
+    match tokio::task::spawn_blocking(move || {
+        let _mutation = state.settings.composition_lock();
+        let Some(action) = body.get("action").and_then(Value::as_str) else {
             return typed_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_bulk_action",
-                "unsupported action",
-            )
-        }
-    };
-    let dir = auth_dir(&state);
-    let mut changes = Vec::new();
-    for name in names.iter().filter_map(Value::as_str) {
-        if !valid_name(name) {
-            return typed_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_bulk_action",
-                "invalid credential name",
+                "action is required",
             );
-        }
-        let path = dir.join(name);
-        let mut value = match read_json(&path) {
-            Ok(value) => value,
-            Err(response) => return *response,
         };
-        value["disabled"] = json!(disabled);
-        changes.push((path, value));
-    }
-    for (path, value) in &changes {
-        if let Err(response) = write_json(path, value) {
+        let Some(names) = body.get("names").and_then(Value::as_array) else {
+            return typed_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_bulk_action",
+                "names is required",
+            );
+        };
+        let disabled = match action {
+            "disable" => true,
+            "enable" => false,
+            _ => {
+                return typed_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_bulk_action",
+                    "unsupported action",
+                )
+            }
+        };
+        let dir = auth_dir(&state);
+        let mut changes = Vec::new();
+        for name in names.iter().filter_map(Value::as_str) {
+            if !valid_name(name) {
+                return typed_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_bulk_action",
+                    "invalid credential name",
+                );
+            }
+            let path = dir.join(name);
+            let mut value = match read_json(&path) {
+                Ok(value) => value,
+                Err(response) => return *response,
+            };
+            value["disabled"] = json!(disabled);
+            changes.push((path, value));
+        }
+        for (path, value) in &changes {
+            if let Err(response) = write_json(&state, path, value) {
+                return *response;
+            }
+        }
+        if let Err(response) = rescan(&state) {
             return *response;
         }
+        json_status(
+            StatusCode::OK,
+            json!({ "status": "ok", "changed": changes.len() }),
+        )
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => json_status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"error":"credential_mutation_failed", "message":error.to_string()}),
+        ),
     }
-    if let Err(response) = rescan(&state) {
-        return *response;
-    }
-    json_status(
-        StatusCode::OK,
-        json!({ "status": "ok", "changed": changes.len() }),
-    )
 }
 
 fn binding_view(binding: &ApiKeyBinding) -> Value {

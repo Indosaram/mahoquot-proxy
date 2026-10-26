@@ -1,5 +1,4 @@
 use std::collections::{BTreeSet, HashMap};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -384,12 +383,19 @@ async fn refresh_generic_usage(
     // Grok Chat, Build and the CLI; the Grok CLI's own usage view reads it from
     // the CLI chat proxy with the same OAuth bearer the relay uses.
     if provider.eq_ignore_ascii_case("xai") {
+        // The billing endpoint never refreshes on its own; an access token past
+        // its expiry would read as a permanent credential rejection.
+        if state.auth_refresh_enabled && member.is_expired(now_unix()) {
+            let _ = state.refresh_member(member, None).await;
+        }
         let url = member
             .usage_override
             .as_deref()
             .map(|base| format!("{}/v1/billing?format=credits", base.trim_end_matches('/')))
             .unwrap_or_else(|| XAI_USAGE_URL.to_string());
-        let client = state.client_for_member(member);
+        let client = state.try_client_for_member(member).map_err(|error| {
+            QuotaError::Upstream(format!("proxy client construction failed: {error}"))
+        })?;
         return refresh_json_usage(member, &client, &url, |body, now| {
             parse_xai_billing_credits(body, now).unwrap_or_default()
         })
@@ -426,67 +432,17 @@ async fn refresh_generic_usage(
 /// ZCode plan quota comes from the gateway's billing control plane: a direct
 /// `billing/balance` probe with the plan JWT and the client identity headers
 /// (minus X-ZCode-Agent) plus the per-install device id — the same call the
-/// desktop client makes. Accounts that cannot probe yet (old credentials, WAF
-/// challenge) fall back to scraping the desktop app's balance logs.
+/// desktop client makes. Global desktop logs have no verified account binding
+/// and must not replace a member's quota when its authenticated probe fails.
 async fn refresh_zcode_usage(
     state: &AppState,
     member: &Arc<AccountMember>,
 ) -> Result<(), QuotaError> {
-    let now_unix = now_unix();
-    match try_zcode_balance_probe(state, member, now_unix).await {
-        Ok(()) => return Ok(()),
-        Err(QuotaError::Unauthorized) => return Err(QuotaError::Unauthorized),
-        Err(error @ QuotaError::Upstream(_))
-            if error
-                .to_string()
-                .starts_with("proxy client construction failed:") =>
-        {
-            return Err(error);
-        }
-        Err(_) => {}
-    }
-    let logs_dir = std::env::var("ZCODE_LOGS_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_default();
-            PathBuf::from(home).join(".zcode/v2/logs")
-        });
-    if !logs_dir.is_dir() {
-        return Err(QuotaError::Unsupported);
-    }
-    let scan = tokio::task::spawn_blocking(
-        move || -> Result<Vec<crate::usage::ZcodeBalanceEntry>, QuotaError> {
-        let mut entries: Vec<PathBuf> = std::fs::read_dir(&logs_dir)
-            .map_err(|error| QuotaError::Upstream(format!(
-                "ZCode desktop logs not readable at {}: {error} (is the ZCode desktop app installed?)",
-                logs_dir.display()
-            )))?
-            .flatten()
-            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "log"))
-            .map(|entry| entry.path())
-            .collect();
-        entries.sort();
-        let newest = entries
-            .pop()
-            .ok_or_else(|| QuotaError::Upstream("no ZCode desktop logs found".to_string()))?;
-        let text = std::fs::read_to_string(&newest)
-            .map_err(|error| QuotaError::Upstream(error.to_string()))?;
-        crate::usage::extract_zcode_balances(&text)
-            .ok_or_else(|| QuotaError::Upstream(
-                "no plan balance entry found in ZCode desktop logs - open the ZCode desktop app once".to_string(),
-            ))
-    })
-    .await
-    .map_err(|error| QuotaError::Upstream(error.to_string()))?;
-    scan.map(|balances| {
-        let usage = crate::usage::zcode_balances_usage(&balances, now_unix);
-        member.set_usage(usage);
-    })
+    try_zcode_balance_probe(state, member, now_unix()).await
 }
 
 /// One billing/balance probe against the plan gateway's control plane.
-/// `Unauthorized` on a 4xx (terminal — no log-scan fallback), other failures
-/// let the caller fall back to the desktop-log scrape.
+/// Failures preserve the previous account-specific snapshot.
 async fn try_zcode_balance_probe(
     state: &AppState,
     member: &Arc<AccountMember>,
@@ -568,7 +524,10 @@ async fn try_zcode_balance_probe(
             period_end_unix: row.period_end_unix.unwrap_or(0),
         })
         .collect::<Vec<_>>();
-    let usage = crate::usage::zcode_balances_usage(&entries, now_unix);
+    let mut usage = crate::usage::zcode_balances_usage(&entries, now_unix);
+    usage.refreshed_at_unix = Some(now_unix);
+    usage.refresh_status = Some("ok".to_string());
+    usage.last_refresh_error = None;
     member.set_usage(usage);
     Ok(())
 }
@@ -612,6 +571,26 @@ fn urlencode_component(value: &str) -> String {
     out
 }
 
+/// A 401/403 from a usage endpoint, keeping the provider's own reason. The
+/// generic text hid causes the operator acts on differently, such as an xAI
+/// account blocked for exhausted credits versus a revoked login.
+fn rejected_usage_error(status: reqwest::StatusCode, body: &str) -> QuotaError {
+    let reason = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("error")
+                .and_then(|error| error.as_str().or_else(|| error.get("message")?.as_str()))
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| body.trim().chars().take(200).collect());
+    if reason.is_empty() {
+        QuotaError::Unauthorized
+    } else {
+        QuotaError::Upstream(format!("credentials rejected ({status}): {reason}"))
+    }
+}
+
 async fn refresh_json_usage(
     member: &Arc<AccountMember>,
     client: &reqwest::Client,
@@ -632,7 +611,8 @@ async fn refresh_json_usage(
         .map_err(|error| QuotaError::Upstream(error.to_string()))?;
     let status = response.status();
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        return Err(QuotaError::Unauthorized);
+        let body = response.text().await.unwrap_or_default();
+        return Err(rejected_usage_error(status, &body));
     }
     if !status.is_success() {
         return Err(QuotaError::Upstream(format!(
@@ -643,8 +623,16 @@ async fn refresh_json_usage(
         .json::<serde_json::Value>()
         .await
         .map_err(|error| QuotaError::Upstream(error.to_string()))?;
-    let usage = parser(&body, now_unix);
-    member.set_usage(usage.clone());
+    let mut usage = parser(&body, now_unix);
+    if usage.observed_at_unix.is_none() {
+        return Err(QuotaError::Upstream(
+            "quota payload had no usage".to_string(),
+        ));
+    }
+    usage.refreshed_at_unix = Some(now_unix);
+    usage.refresh_status = Some("ok".to_string());
+    usage.last_refresh_error = None;
+    member.set_usage(usage);
     Ok(())
 }
 
@@ -1391,6 +1379,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn model_quota_reset_restores_only_the_due_model() {
+        use crate::account::{AccountMember, GenericAccount, ProviderAccount};
+        use mahoquot_types::{Health, PoolMember};
+
+        let member = AccountMember::for_test(ProviderAccount::Generic(GenericAccount {
+            identity_slug: "quota-reset".into(),
+            provider: "claude".into(),
+            adapter: "anthropic".into(),
+            models: vec!["claude-sonnet-4-6".into(), "claude-haiku-4-5".into()],
+            ..Default::default()
+        }));
+        let affected = "claude-sonnet-4-6";
+        let other = "claude-haiku-4-5";
+        let now = 1_000_000;
+        let reset = now + 60_000;
+        assert!(member.group_available(affected, now));
+        member.set_model_cooldown(affected, reset);
+        assert!(!member.group_available(affected, now));
+        assert!(!member.group_available(affected, reset - 1));
+        assert!(member.group_available(other, reset - 1));
+        assert_eq!(member.earliest_group_cooldown_ms(now), Some(reset));
+        assert!(member.group_available(affected, reset));
+        assert!(member.group_available(affected, reset + 1));
+        assert_eq!(member.earliest_group_cooldown_ms(reset), None);
+        assert_eq!(member.health(), Health::Available);
+
+        // Expiration is model-specific, not an account-wide clear operation.
+        member.set_model_cooldown(other, reset + 60_000);
+        assert!(member.group_available(affected, reset));
+        assert!(!member.group_available(other, reset));
+        assert_eq!(
+            member.earliest_group_cooldown_ms(reset),
+            Some(reset + 60_000)
+        );
+    }
+
+    #[test]
     fn redeem_ids_are_v4_shaped_and_unique() {
         let a = uuid_v4();
         let b = uuid_v4();
@@ -1406,6 +1431,32 @@ mod tests {
             codex_usage_status_error(reqwest::StatusCode::TOO_MANY_REQUESTS),
             Some(QuotaError::RateLimited)
         ));
+    }
+
+    #[test]
+    fn rejected_usage_keeps_the_provider_reason() {
+        // xAI blocks an out-of-credit account with 403; the reason, not a
+        // generic credential failure, is what the operator has to act on.
+        let error = rejected_usage_error(
+            reqwest::StatusCode::FORBIDDEN,
+            r#"{"code":"personal-team-blocked:spending-limit","error":"You have run out of credits"}"#,
+        );
+        assert_eq!(
+            error.to_string(),
+            "credentials rejected (403 Forbidden): You have run out of credits"
+        );
+        let nested = rejected_usage_error(
+            reqwest::StatusCode::UNAUTHORIZED,
+            r#"{"error":{"message":"token revoked"}}"#,
+        );
+        assert_eq!(
+            nested.to_string(),
+            "credentials rejected (401 Unauthorized): token revoked"
+        );
+        assert_eq!(
+            rejected_usage_error(reqwest::StatusCode::UNAUTHORIZED, "  "),
+            QuotaError::Unauthorized
+        );
     }
 
     #[tokio::test]

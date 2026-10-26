@@ -17,9 +17,90 @@ fn json_status(status: StatusCode, body: Value) -> Response {
 
 const ACCOUNT_ORDER_FILE: &str = ".mahoquot-account-order.json";
 
+pub(crate) fn storage_error(error: mahoquot_registry::store::StoreError) -> Box<Response> {
+    use mahoquot_registry::store::StoreError;
+    let (status, code) = match &error {
+        StoreError::Conflict(_) => (StatusCode::CONFLICT, "storage_conflict"),
+        StoreError::Unavailable(_) | StoreError::Network(_) | StoreError::Database(_) => {
+            (StatusCode::SERVICE_UNAVAILABLE, "storage_unavailable")
+        }
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "credential_persistence_failed",
+        ),
+    };
+    Box::new(json_status(
+        status,
+        json!({"error": code, "message": error.to_string()}),
+    ))
+}
+
+/// Commit authoritative bytes before publishing the local credential projection.
+pub(crate) fn persist_credential(
+    state: &AppState,
+    path: &std::path::Path,
+    bytes: &[u8],
+) -> Result<(), mahoquot_registry::store::StoreError> {
+    if let Some(store) = state.settings.storage_manager() {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                mahoquot_registry::store::StoreError::InvalidConfig(
+                    "invalid credential name".into(),
+                )
+            })?;
+        store.put(&format!("auths/{name}"), bytes)?;
+        if path == store.auth_dir().join(name) {
+            return Ok(());
+        }
+    }
+    write_credential_atomically(path, bytes)?;
+    Ok(())
+}
+
+pub(crate) fn remove_credential(
+    state: &AppState,
+    path: &std::path::Path,
+) -> Result<(), mahoquot_registry::store::StoreError> {
+    if let Some(store) = state.settings.storage_manager() {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                mahoquot_registry::store::StoreError::InvalidConfig(
+                    "invalid credential name".into(),
+                )
+            })?;
+        store.delete(&format!("auths/{name}"))?;
+        if path == store.auth_dir().join(name) {
+            return Ok(());
+        }
+        match std::fs::remove_file(path) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    std::fs::remove_file(path)?;
+    Ok(())
+}
+
+/// A single filename on every supported host, not a host-dependent path.
+/// Check Windows separators and drive/stream syntax even on Unix before joining.
+pub(crate) fn valid_name(name: &str) -> bool {
+    if name.trim().is_empty() || name.contains(['/', '\\', ':', '\0']) {
+        return false;
+    }
+    let mut components = std::path::Path::new(name).components();
+    matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_none()
+}
+
 fn is_credential_filename(name: &str) -> bool {
     let lowered = name.to_ascii_lowercase();
-    lowered.ends_with(".json")
+    valid_name(name)
+        && lowered.ends_with(".json")
         && lowered != ACCOUNT_ORDER_FILE
         && lowered != "account-order.json"
         && lowered != "telemetry.json"
@@ -37,6 +118,7 @@ fn is_credential_document(value: &Value) -> bool {
                 | "kiro"
                 | "zcode"
                 | "generic"
+                | "meta"
                 | "vertex"
                 | "google-vertex"
                 | "devin"
@@ -227,7 +309,7 @@ async fn save_auth_file_order(State(state): State<Arc<AppState>>, raw: bytes::By
         .iter()
         .filter_map(Value::as_str)
         .map(str::trim)
-        .filter(|name| !name.is_empty() && !name.contains('/') && !name.contains(".."))
+        .filter(|name| valid_name(name))
         .map(str::to_string)
         .collect();
     if names.len() != body["names"].as_array().map_or(0, Vec::len) {
@@ -267,6 +349,8 @@ pub(crate) async fn create_auth_file(
     State(state): State<Arc<AppState>>,
     raw: bytes::Bytes,
 ) -> Response {
+    match tokio::task::spawn_blocking(move || {
+    let _mutation = state.settings.composition_lock();
     let Ok(body) = serde_json::from_slice::<Value>(&raw) else {
         return json_status(StatusCode::BAD_REQUEST, json!({ "error": "invalid body" }));
     };
@@ -276,7 +360,7 @@ pub(crate) async fn create_auth_file(
             json!({ "error": "name is required" }),
         );
     };
-    if name.is_empty() || name.contains('/') || name.contains("..") {
+    if !valid_name(name) {
         return json_status(StatusCode::BAD_REQUEST, json!({ "error": "invalid name" }));
     }
     let mut content = body.get("content").cloned().unwrap_or(Value::Null);
@@ -314,43 +398,6 @@ pub(crate) async fn create_auth_file(
         };
     }
     let dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
-    // Task 33: with a selected store backend the store is authoritative. The
-    // write goes through it first (the manager keeps the pending bytes in its
-    // spool); an unavailable backend is reported honestly as 503 and a
-    // diverged spool as 409, with nothing published locally.
-    if let Some(store) = state.settings.storage_manager() {
-        let rendered = match serde_json::to_string_pretty(&content) {
-            Ok(rendered) => rendered,
-            Err(err) => {
-                return json_status(
-                    StatusCode::BAD_REQUEST,
-                    json!({ "error": format!("invalid content: {err}") }),
-                )
-            }
-        };
-        let key = format!("auths/{}", name.trim_start_matches('/'));
-        match store.put(&key, rendered.as_bytes()) {
-            Ok(()) => {}
-            Err(mahoquot_registry::store::StoreError::Unavailable(message)) => {
-                return json_status(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    json!({ "error": "storage_unavailable", "message": message, "spooled": true }),
-                )
-            }
-            Err(mahoquot_registry::store::StoreError::Conflict(message)) => {
-                return json_status(
-                    StatusCode::CONFLICT,
-                    json!({ "error": "storage_conflict", "message": message }),
-                )
-            }
-            Err(err) => {
-                return json_status(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    json!({ "error": format!("failed to persist auth file: {err}") }),
-                )
-            }
-        }
-    }
     if let Err(err) = std::fs::create_dir_all(&dir) {
         return json_status(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -366,17 +413,18 @@ pub(crate) async fn create_auth_file(
             )
         }
     };
-    match write_credential_atomically(&dir.join(name), rendered.as_bytes()) {
+    match persist_credential(&state, &dir.join(name), rendered.as_bytes()) {
         Ok(()) => {
             if let Err(error) = state.rescan_pool() {
                 eprintln!("pool rescan failed after credential write: {error}");
             }
             json_status(StatusCode::OK, json!({ "status": "ok", "name": name }))
         }
-        Err(err) => json_status(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            json!({ "error": format!("failed to write auth file: {err}") }),
-        ),
+        Err(err) => *storage_error(err),
+    }
+    }).await {
+        Ok(response) => response,
+        Err(error) => json_status(StatusCode::INTERNAL_SERVER_ERROR, json!({"error":"credential_mutation_failed", "message":error.to_string()})),
     }
 }
 
@@ -516,29 +564,39 @@ pub(crate) async fn delete_auth_file(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    let Some(name) = params.get("name").map(|v| v.trim()) else {
-        return json_status(
-            StatusCode::BAD_REQUEST,
-            json!({ "error": "name is required" }),
-        );
-    };
-    if name.is_empty() || name.contains('/') || name.contains("..") {
-        return json_status(StatusCode::BAD_REQUEST, json!({ "error": "invalid name" }));
-    }
-    let dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
-    match std::fs::remove_file(dir.join(name)) {
-        Ok(()) => {
-            if let Err(error) = state.rescan_pool() {
-                eprintln!("pool rescan failed after credential delete: {error}");
+    match tokio::task::spawn_blocking(move || {
+        let _mutation = state.settings.composition_lock();
+        let Some(name) = params.get("name").map(|v| v.trim()) else {
+            return json_status(
+                StatusCode::BAD_REQUEST,
+                json!({ "error": "name is required" }),
+            );
+        };
+        if !valid_name(name) {
+            return json_status(StatusCode::BAD_REQUEST, json!({ "error": "invalid name" }));
+        }
+        let dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
+        match remove_credential(&state, &dir.join(name)) {
+            Ok(()) => {
+                if let Err(error) = state.rescan_pool() {
+                    eprintln!("pool rescan failed after credential delete: {error}");
+                }
+                json_status(StatusCode::OK, json!({ "status": "ok" }))
             }
-            json_status(StatusCode::OK, json!({ "status": "ok" }))
+            Err(mahoquot_registry::store::StoreError::Io(err))
+                if err.kind() == std::io::ErrorKind::NotFound =>
+            {
+                json_status(StatusCode::NOT_FOUND, json!({ "error": "auth not found" }))
+            }
+            Err(err) => *storage_error(err),
         }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            json_status(StatusCode::NOT_FOUND, json!({ "error": "auth not found" }))
-        }
-        Err(err) => json_status(
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => json_status(
             StatusCode::INTERNAL_SERVER_ERROR,
-            json!({ "error": format!("failed to delete auth file: {err}") }),
+            json!({"error":"credential_mutation_failed", "message":error.to_string()}),
         ),
     }
 }
@@ -625,7 +683,7 @@ pub(crate) async fn download_auth_file(
             json!({ "error": "name is required" }),
         );
     };
-    if name.is_empty() || name.contains('/') || name.contains("..") {
+    if !valid_name(name) {
         return json_status(StatusCode::BAD_REQUEST, json!({ "error": "invalid name" }));
     }
     let dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
@@ -650,221 +708,236 @@ pub(crate) async fn patch_auth_file_status(
     State(state): State<Arc<AppState>>,
     Json(body): Json<Value>,
 ) -> Response {
-    let Some(name) = body.get("name").and_then(Value::as_str) else {
-        return json_status(
-            StatusCode::BAD_REQUEST,
-            json!({ "error": "name is required" }),
-        );
-    };
-    let Some(disabled) = body.get("disabled").and_then(Value::as_bool) else {
-        return json_status(
-            StatusCode::BAD_REQUEST,
-            json!({ "error": "disabled is required" }),
-        );
-    };
-    if name.is_empty() || name.contains('/') || name.contains("..") || !is_credential_filename(name)
-    {
-        return json_status(StatusCode::BAD_REQUEST, json!({ "error": "invalid name" }));
-    }
-    let dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
-    let path = dir.join(name);
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(raw) => raw,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return json_status(StatusCode::NOT_FOUND, json!({ "error": "auth not found" }))
-        }
-        Err(error) => {
-            return json_status(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                json!({ "error": error.to_string() }),
-            )
-        }
-    };
-    let mut value: Value = match serde_json::from_str(&raw) {
-        Ok(value) => value,
-        Err(error) => {
+    match tokio::task::spawn_blocking(move || {
+        let _mutation = state.settings.composition_lock();
+        let Some(name) = body.get("name").and_then(Value::as_str) else {
             return json_status(
                 StatusCode::BAD_REQUEST,
-                json!({ "error": error.to_string() }),
-            )
+                json!({ "error": "name is required" }),
+            );
+        };
+        let Some(disabled) = body.get("disabled").and_then(Value::as_bool) else {
+            return json_status(
+                StatusCode::BAD_REQUEST,
+                json!({ "error": "disabled is required" }),
+            );
+        };
+        if !is_credential_filename(name) {
+            return json_status(StatusCode::BAD_REQUEST, json!({ "error": "invalid name" }));
         }
-    };
-    if !value.is_object() {
-        return json_status(
-            StatusCode::BAD_REQUEST,
-            json!({ "error": "auth file must be a JSON object" }),
-        );
-    }
-    let legacy_codex = name.starts_with("codex-")
-        && serde_json::from_value::<mahoquot_providers::CodexAccount>(value.clone()).is_ok();
-    if !is_credential_document(&value) && !legacy_codex {
-        return json_status(
-            StatusCode::BAD_REQUEST,
-            json!({ "error": "invalid credential document" }),
-        );
-    }
-    if let Value::Object(fields) = &mut value {
-        fields.insert("disabled".into(), json!(disabled));
-    }
-    let rendered = match serde_json::to_string_pretty(&value) {
-        Ok(rendered) => rendered,
-        Err(error) => {
+        let dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
+        let path = dir.join(name);
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return json_status(StatusCode::NOT_FOUND, json!({ "error": "auth not found" }))
+            }
+            Err(error) => {
+                return json_status(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({ "error": error.to_string() }),
+                )
+            }
+        };
+        let mut value: Value = match serde_json::from_str(&raw) {
+            Ok(value) => value,
+            Err(error) => {
+                return json_status(
+                    StatusCode::BAD_REQUEST,
+                    json!({ "error": error.to_string() }),
+                )
+            }
+        };
+        if !value.is_object() {
+            return json_status(
+                StatusCode::BAD_REQUEST,
+                json!({ "error": "auth file must be a JSON object" }),
+            );
+        }
+        let legacy_codex = name.starts_with("codex-")
+            && serde_json::from_value::<mahoquot_providers::CodexAccount>(value.clone()).is_ok();
+        if !is_credential_document(&value) && !legacy_codex {
+            return json_status(
+                StatusCode::BAD_REQUEST,
+                json!({ "error": "invalid credential document" }),
+            );
+        }
+        if let Value::Object(fields) = &mut value {
+            fields.insert("disabled".into(), json!(disabled));
+        }
+        let rendered = match serde_json::to_string_pretty(&value) {
+            Ok(rendered) => rendered,
+            Err(error) => {
+                return json_status(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({ "error": error.to_string() }),
+                )
+            }
+        };
+        if let Err(error) = persist_credential(&state, &path, rendered.as_bytes()) {
+            return *storage_error(error);
+        }
+        if let Err(error) = state.rescan_pool() {
             return json_status(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 json!({ "error": error.to_string() }),
-            )
+            );
         }
-    };
-    if let Err(error) = write_credential_atomically(&path, rendered.as_bytes()) {
-        return json_status(
+        if !disabled {
+            let state_clone = Arc::clone(&state);
+            tokio::spawn(async move {
+                crate::quota::refresh_all_usage(&state_clone).await;
+            });
+        }
+        json_status(
+            StatusCode::OK,
+            json!({ "status": "ok", "name": name, "disabled": disabled }),
+        )
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => json_status(
             StatusCode::INTERNAL_SERVER_ERROR,
-            json!({ "error": error.to_string() }),
-        );
+            json!({"error":"credential_mutation_failed", "message":error.to_string()}),
+        ),
     }
-    if let Err(error) = state.rescan_pool() {
-        return json_status(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            json!({ "error": error.to_string() }),
-        );
-    }
-    if !disabled {
-        let state_clone = Arc::clone(&state);
-        tokio::spawn(async move {
-            crate::quota::refresh_all_usage(&state_clone).await;
-        });
-    }
-    json_status(
-        StatusCode::OK,
-        json!({ "status": "ok", "name": name, "disabled": disabled }),
-    )
 }
 
 pub(crate) async fn patch_auth_file_fields(
     State(state): State<Arc<AppState>>,
     Json(body): Json<Value>,
 ) -> Response {
-    let Some(obj) = body.as_object() else {
-        return json_status(
-            StatusCode::BAD_REQUEST,
-            json!({ "error": "invalid request body" }),
-        );
-    };
-    let Some(name) = obj.get("name").and_then(Value::as_str) else {
-        return json_status(
-            StatusCode::BAD_REQUEST,
-            json!({ "error": "name is required" }),
-        );
-    };
-    let name = name.trim();
-    if name.is_empty() || name.contains('/') || name.contains("..") {
-        return json_status(StatusCode::BAD_REQUEST, json!({ "error": "invalid name" }));
-    }
-    let dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
-    let path = dir.join(name);
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(raw) => raw,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return json_status(StatusCode::NOT_FOUND, json!({ "error": "auth not found" }))
-        }
-        Err(error) => {
-            return json_status(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                json!({ "error": error.to_string() }),
-            )
-        }
-    };
-    let mut file_value: Value = match serde_json::from_str(&raw) {
-        Ok(val) => val,
-        Err(error) => {
+    match tokio::task::spawn_blocking(move || {
+        let _mutation = state.settings.composition_lock();
+        let Some(obj) = body.as_object() else {
             return json_status(
                 StatusCode::BAD_REQUEST,
-                json!({ "error": error.to_string() }),
-            )
+                json!({ "error": "invalid request body" }),
+            );
+        };
+        let Some(name) = obj.get("name").and_then(Value::as_str) else {
+            return json_status(
+                StatusCode::BAD_REQUEST,
+                json!({ "error": "name is required" }),
+            );
+        };
+        let name = name.trim();
+        if !valid_name(name) {
+            return json_status(StatusCode::BAD_REQUEST, json!({ "error": "invalid name" }));
         }
-    };
-    let Some(target_map) = file_value.as_object_mut() else {
-        return json_status(
-            StatusCode::BAD_REQUEST,
-            json!({ "error": "auth file is not a json object" }),
-        );
-    };
+        let dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
+        let path = dir.join(name);
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return json_status(StatusCode::NOT_FOUND, json!({ "error": "auth not found" }))
+            }
+            Err(error) => {
+                return json_status(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({ "error": error.to_string() }),
+                )
+            }
+        };
+        let mut file_value: Value = match serde_json::from_str(&raw) {
+            Ok(val) => val,
+            Err(error) => {
+                return json_status(
+                    StatusCode::BAD_REQUEST,
+                    json!({ "error": error.to_string() }),
+                )
+            }
+        };
+        let Some(target_map) = file_value.as_object_mut() else {
+            return json_status(
+                StatusCode::BAD_REQUEST,
+                json!({ "error": "auth file is not a json object" }),
+            );
+        };
 
-    for (key, val) in obj {
-        if key == "name" {
-            continue;
-        }
-        let key = key.trim();
-        if key.is_empty() {
-            continue;
-        }
-        if key.contains('.') {
-            let parts: Vec<&str> = key
-                .split('.')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .collect();
-            if parts.is_empty() {
+        for (key, val) in obj {
+            if key == "name" {
                 continue;
             }
-            let mut curr = &mut *target_map;
-            for p in parts.iter().take(parts.len().saturating_sub(1)) {
-                if !curr.contains_key(*p) || !curr[*p].is_object() {
-                    curr.insert((*p).to_string(), json!({}));
+            let key = key.trim();
+            if key.is_empty() {
+                continue;
+            }
+            if key.contains('.') {
+                let parts: Vec<&str> = key
+                    .split('.')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if parts.is_empty() {
+                    continue;
                 }
-                curr = curr.get_mut(*p).unwrap().as_object_mut().unwrap();
-            }
-            let last = parts[parts.len() - 1];
-            if val.is_null() {
-                curr.remove(last);
-            } else {
-                curr.insert(last.to_string(), val.clone());
-            }
-        } else if val.is_null() {
-            target_map.remove(key);
-        } else if let Some(sub_obj) = val.as_object() {
-            let entry = target_map
-                .entry(key.to_string())
-                .or_insert_with(|| json!({}));
-            if let Some(entry_map) = entry.as_object_mut() {
-                for (sub_k, sub_v) in sub_obj {
-                    if sub_v.is_null()
-                        || (sub_v.is_string() && sub_v.as_str().unwrap().trim().is_empty())
-                    {
-                        entry_map.remove(sub_k);
-                    } else {
-                        entry_map.insert(sub_k.clone(), sub_v.clone());
+                let mut curr = &mut *target_map;
+                for p in parts.iter().take(parts.len().saturating_sub(1)) {
+                    if !curr.contains_key(*p) || !curr[*p].is_object() {
+                        curr.insert((*p).to_string(), json!({}));
                     }
+                    curr = curr.get_mut(*p).unwrap().as_object_mut().unwrap();
+                }
+                let last = parts[parts.len() - 1];
+                if val.is_null() {
+                    curr.remove(last);
+                } else {
+                    curr.insert(last.to_string(), val.clone());
+                }
+            } else if val.is_null() {
+                target_map.remove(key);
+            } else if let Some(sub_obj) = val.as_object() {
+                let entry = target_map
+                    .entry(key.to_string())
+                    .or_insert_with(|| json!({}));
+                if let Some(entry_map) = entry.as_object_mut() {
+                    for (sub_k, sub_v) in sub_obj {
+                        if sub_v.is_null()
+                            || (sub_v.is_string() && sub_v.as_str().unwrap().trim().is_empty())
+                        {
+                            entry_map.remove(sub_k);
+                        } else {
+                            entry_map.insert(sub_k.clone(), sub_v.clone());
+                        }
+                    }
+                } else {
+                    target_map.insert(key.to_string(), val.clone());
                 }
             } else {
                 target_map.insert(key.to_string(), val.clone());
             }
-        } else {
-            target_map.insert(key.to_string(), val.clone());
         }
-    }
 
-    let rendered = match serde_json::to_string_pretty(&file_value) {
-        Ok(rendered) => rendered,
-        Err(error) => {
+        let rendered = match serde_json::to_string_pretty(&file_value) {
+            Ok(rendered) => rendered,
+            Err(error) => {
+                return json_status(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({ "error": error.to_string() }),
+                )
+            }
+        };
+        if let Err(error) = persist_credential(&state, &path, rendered.as_bytes()) {
+            return *storage_error(error);
+        }
+        if let Err(error) = state.rescan_pool() {
             return json_status(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 json!({ "error": error.to_string() }),
-            )
+            );
         }
-    };
-    if let Err(error) = write_credential_atomically(&path, rendered.as_bytes()) {
-        return json_status(
+        json_status(StatusCode::OK, json!({ "status": "ok" }))
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => json_status(
             StatusCode::INTERNAL_SERVER_ERROR,
-            json!({ "error": error.to_string() }),
-        );
+            json!({"error":"credential_mutation_failed", "message":error.to_string()}),
+        ),
     }
-    if let Err(error) = state.rescan_pool() {
-        return json_status(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            json!({ "error": error.to_string() }),
-        );
-    }
-    json_status(StatusCode::OK, json!({ "status": "ok" }))
 }
 
 #[derive(serde::Serialize)]
@@ -1030,22 +1103,30 @@ pub(crate) async fn vertex_import(
             )
         }
     };
-    if let Err(error) = write_credential_atomically(&path, rendered.as_bytes()) {
-        return json_status(
+    match tokio::task::spawn_blocking(move || {
+        let _mutation = state.settings.composition_lock();
+        if let Err(error) = persist_credential(&state, &path, rendered.as_bytes()) {
+            return *storage_error(error);
+        }
+        if let Err(error) = state.rescan_pool() {
+            return json_status(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({ "error": error.to_string() }),
+            );
+        }
+        json_status(
+            StatusCode::OK,
+            json!({ "status":"ok", "name":path.file_name().and_then(|name|name.to_str()) }),
+        )
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => json_status(
             StatusCode::INTERNAL_SERVER_ERROR,
-            json!({ "error": error.to_string() }),
-        );
+            json!({"error":"credential_mutation_failed", "message":error.to_string()}),
+        ),
     }
-    if let Err(error) = state.rescan_pool() {
-        return json_status(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            json!({ "error": error.to_string() }),
-        );
-    }
-    json_status(
-        StatusCode::OK,
-        json!({ "status":"ok", "name":path.file_name().and_then(|name|name.to_str()) }),
-    )
 }
 
 /// Cline CLI login import. Reads the WorkOS OAuth session the `cline`
@@ -1192,22 +1273,30 @@ async fn cline_import(State(state): State<Arc<AppState>>) -> Response {
             )
         }
     };
-    if let Err(error) = write_credential_atomically(&path, rendered.as_bytes()) {
-        return json_status(
+    match tokio::task::spawn_blocking(move || {
+        let _mutation = state.settings.composition_lock();
+        if let Err(error) = persist_credential(&state, &path, rendered.as_bytes()) {
+            return *storage_error(error);
+        }
+        if let Err(error) = state.rescan_pool() {
+            return json_status(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error":error.to_string()}),
+            );
+        }
+        json_status(
+            StatusCode::OK,
+            json!({"status":"ok","name":path.file_name().unwrap_or_default()}),
+        )
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => json_status(
             StatusCode::INTERNAL_SERVER_ERROR,
-            json!({"error":error.to_string()}),
-        );
+            json!({"error":"credential_mutation_failed", "message":error.to_string()}),
+        ),
     }
-    if let Err(error) = state.rescan_pool() {
-        return json_status(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            json!({"error":error.to_string()}),
-        );
-    }
-    json_status(
-        StatusCode::OK,
-        json!({"status":"ok","name":path.file_name().unwrap_or_default()}),
-    )
 }
 
 /// Devin CLI login import. Reads the session token written by Devin CLI
@@ -1366,7 +1455,9 @@ async fn devin_import_cli(State(state): State<Arc<AppState>>, raw: bytes::Bytes)
         );
     }
 
+    let import_state = Arc::clone(&state);
     let import_task = tokio::task::spawn_blocking(move || {
+        let _mutation = import_state.settings.composition_lock();
         let explicit = std::env::var_os(mahoquot_providers::devin::DEVIN_CREDENTIALS_PATH_ENV)
             .map(std::path::PathBuf::from);
         let xdg = std::env::var_os("XDG_DATA_HOME").map(std::path::PathBuf::from);
@@ -1430,8 +1521,11 @@ async fn devin_import_cli(State(state): State<Arc<AppState>>, raw: bytes::Bytes)
         let rendered = serde_json::to_string_pretty(&validated)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("failed serializing Devin account: {e}")))?;
 
-        mahoquot_providers::credential_file::write_credential_atomically(&target_path, rendered.as_bytes())
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("failed saving Devin account: {e}")))?;
+        persist_credential(&import_state, &target_path, rendered.as_bytes())
+            .map_err(|e| {
+                let message = format!("failed saving Devin account: {e}");
+                (storage_error(e).status(), message)
+            })?;
 
         Ok((filename, slug))
     })
@@ -1582,22 +1676,30 @@ async fn command_code_import(
             )
         }
     };
-    if let Err(error) = write_credential_atomically(&path, rendered.as_bytes()) {
-        return json_status(
+    match tokio::task::spawn_blocking(move || {
+        let _mutation = state.settings.composition_lock();
+        if let Err(error) = persist_credential(&state, &path, rendered.as_bytes()) {
+            return *storage_error(error);
+        }
+        if let Err(error) = state.rescan_pool() {
+            return json_status(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error":error.to_string()}),
+            );
+        }
+        json_status(
+            StatusCode::OK,
+            json!({"status":"ok","name":path.file_name().and_then(|name|name.to_str())}),
+        )
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => json_status(
             StatusCode::INTERNAL_SERVER_ERROR,
-            json!({"error":error.to_string()}),
-        );
+            json!({"error":"credential_mutation_failed", "message":error.to_string()}),
+        ),
     }
-    if let Err(error) = state.rescan_pool() {
-        return json_status(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            json!({"error":error.to_string()}),
-        );
-    }
-    json_status(
-        StatusCode::OK,
-        json!({"status":"ok","name":path.file_name().and_then(|name|name.to_str())}),
-    )
 }
 
 async fn trae_import(State(state): State<Arc<AppState>>, raw: bytes::Bytes) -> Response {
@@ -1673,16 +1775,24 @@ async fn trae_import(State(state): State<Arc<AppState>>, raw: bytes::Bytes) -> R
     let dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
     let target = dir.join("monitor-trae.json");
     let rendered = serde_json::to_string_pretty(&credential).unwrap_or_default();
-    if let Err(error) = write_credential_atomically(&target, rendered.as_bytes()) {
-        return json_status(
+    match tokio::task::spawn_blocking(move || {
+        let _mutation = state.settings.composition_lock();
+        if let Err(error) = persist_credential(&state, &target, rendered.as_bytes()) {
+            return *storage_error(error);
+        }
+        json_status(
+            StatusCode::OK,
+            json!({"status":"ok","name":"monitor-trae.json"}),
+        )
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => json_status(
             StatusCode::INTERNAL_SERVER_ERROR,
-            json!({"error":error.to_string()}),
-        );
+            json!({"error":"credential_mutation_failed", "message":error.to_string()}),
+        ),
     }
-    json_status(
-        StatusCode::OK,
-        json!({"status":"ok","name":"monitor-trae.json"}),
-    )
 }
 
 async fn discover_provider_models(

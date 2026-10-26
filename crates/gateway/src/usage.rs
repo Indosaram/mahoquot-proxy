@@ -915,6 +915,7 @@ pub fn parse_cursor_usage_summary(body: &serde_json::Value, now_unix: i64) -> Ac
                 models: None,
             }]
         },
+        observed_at_unix: Some(now_unix),
         ..AccountUsage::default()
     }
 }
@@ -960,6 +961,7 @@ pub fn parse_kiro_usage_summary(body: &serde_json::Value, now_unix: i64) -> Acco
                 models: None,
             }]
         },
+        observed_at_unix: Some(now_unix),
         ..AccountUsage::default()
     }
 }
@@ -2141,6 +2143,7 @@ struct UsageSampleInner {
     /// so a standalone store accepts every push until membership is explicit.
     active: Option<std::collections::BTreeSet<String>>,
     entries: std::collections::BTreeMap<String, Vec<UsageSample>>,
+    migration_pending: bool,
 }
 
 #[derive(Debug, Default)]
@@ -2212,6 +2215,9 @@ impl UsageSampleStore {
     pub fn load(path: std::path::PathBuf) -> Self {
         let raw = std::fs::read_to_string(&path).unwrap_or_default();
         let entries = Self::parse_log(&raw);
+        let migration_pending =
+            serde_json::from_str::<std::collections::BTreeMap<String, Vec<UsageSample>>>(&raw)
+                .is_ok();
         // The file may already hold orphaned lines, so start the compaction
         // counter at their count rather than at zero.
         let appended = raw.lines().filter(|line| !line.trim().is_empty()).count();
@@ -2220,6 +2226,7 @@ impl UsageSampleStore {
             inner: std::sync::Mutex::new(UsageSampleInner {
                 active: None,
                 entries,
+                migration_pending,
             }),
             appended: std::sync::atomic::AtomicUsize::new(appended),
         }
@@ -2278,6 +2285,18 @@ impl UsageSampleStore {
         prune_window(window);
         let pruned = window.len() != before + 1;
         let retained = window.clone();
+        if inner.migration_pending {
+            match self.rewrite_log(&inner.entries) {
+                Ok(()) => {
+                    inner.migration_pending = false;
+                    self.appended.store(0, std::sync::atomic::Ordering::Relaxed);
+                }
+                Err(error) => {
+                    tracing::warn!(path = %self.path.display(), %error, "usage sample migration failed; retaining legacy file for retry");
+                }
+            }
+            return retained;
+        }
         let record = SampleRecord {
             account_id: account_id.to_string(),
             sample,
@@ -2290,8 +2309,12 @@ impl UsageSampleStore {
                 + 1;
             let retained_lines: usize = inner.entries.values().map(Vec::len).sum();
             if pruned && appended > retained_lines * COMPACT_GROWTH_FACTOR {
-                self.rewrite_log(&inner.entries);
-                self.appended.store(0, std::sync::atomic::Ordering::Relaxed);
+                match self.rewrite_log(&inner.entries) {
+                    Ok(()) => self.appended.store(0, std::sync::atomic::Ordering::Relaxed),
+                    Err(error) => {
+                        tracing::warn!(path = %self.path.display(), %error, "usage sample compaction failed")
+                    }
+                }
             }
         }
         retained
@@ -2308,8 +2331,15 @@ impl UsageSampleStore {
         inner.entries.retain(|id, _| active.contains(id));
         let dropped = before - inner.entries.len();
         if dropped > 0 {
-            self.rewrite_log(&inner.entries);
-            self.appended.store(0, std::sync::atomic::Ordering::Relaxed);
+            match self.rewrite_log(&inner.entries) {
+                Ok(()) => {
+                    inner.migration_pending = false;
+                    self.appended.store(0, std::sync::atomic::Ordering::Relaxed);
+                }
+                Err(error) => {
+                    tracing::warn!(path = %self.path.display(), %error, "usage sample membership rewrite failed")
+                }
+            }
         }
         dropped
     }
@@ -2321,7 +2351,10 @@ impl UsageSampleStore {
     }
 
     /// Rewrites the log from memory, dropping the lines pruning has orphaned.
-    fn rewrite_log(&self, entries: &std::collections::BTreeMap<String, Vec<UsageSample>>) {
+    fn rewrite_log(
+        &self,
+        entries: &std::collections::BTreeMap<String, Vec<UsageSample>>,
+    ) -> std::io::Result<()> {
         let mut rendered = String::new();
         for (id, samples) in entries.iter() {
             for sample in samples {
@@ -2329,16 +2362,15 @@ impl UsageSampleStore {
                     account_id: id.clone(),
                     sample: *sample,
                 };
-                if let Ok(line) = serde_json::to_string(&record) {
-                    rendered.push_str(&line);
-                    rendered.push('\n');
-                }
+                let line = serde_json::to_string(&record).map_err(std::io::Error::other)?;
+                rendered.push_str(&line);
+                rendered.push('\n');
             }
         }
-        let _ = mahoquot_providers::credential_file::write_credential_atomically(
+        mahoquot_providers::credential_file::write_credential_atomically(
             &self.path,
             rendered.as_bytes(),
-        );
+        )
     }
 
     /// Appends one record. Append is atomic enough for this log because a torn
@@ -2503,6 +2535,80 @@ pub fn parse_relay_account_usage(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_sample_append_survives_restart() {
+        for newline in [false, true] {
+            let root =
+                std::env::temp_dir().join(format!("usage-migration-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&root).unwrap();
+            let path = root.join("samples.json");
+            let sample = |unix, requests| UsageSample {
+                unix,
+                requests,
+                tokens: requests * 10,
+                cost_usd: None,
+            };
+            let old = vec![sample(1_789_000, 10), sample(1_800_060, 20)];
+            let legacy = std::collections::BTreeMap::from([("account".to_string(), old)]);
+            let mut raw = serde_json::to_string(&legacy).unwrap();
+            if newline {
+                raw.push('\n');
+            }
+            std::fs::write(&path, raw).unwrap();
+            let store = UsageSampleStore::load(path.clone());
+            assert_eq!(store.retain_accounts(&["account".to_string()].into()), 0);
+            let expected = store.push("account", sample(1_800_120, 30));
+            drop(store);
+            let reopened = UsageSampleStore::load(path.clone());
+            let inner = reopened.inner.lock().unwrap();
+            let restored = &inner.entries["account"];
+            assert_eq!(restored.len(), 3);
+            assert_eq!(
+                serde_json::to_value(restored).unwrap(),
+                serde_json::to_value(&expected).unwrap()
+            );
+            assert_eq!(
+                window_deltas(restored, 1_800_120),
+                window_deltas(&expected, 1_800_120)
+            );
+            assert_eq!(window_deltas(restored, 1_800_120)[0].requests, 20);
+            assert!(!inner.migration_pending);
+            assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 3);
+            drop(inner);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn legacy_sample_failed_migration_retries_without_appending() {
+        let root =
+            std::env::temp_dir().join(format!("usage-migration-failure-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("samples.json");
+        let raw = r#"{"account":[{"unix":1800000,"requests":1,"tokens":10}]}"#;
+        std::fs::write(&path, raw).unwrap();
+        let store = UsageSampleStore::load(path.clone());
+        let backup = root.join("legacy.json");
+        std::fs::rename(&path, &backup).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let sample = |requests| UsageSample {
+            unix: 1_800_060,
+            requests,
+            tokens: requests * 10,
+            cost_usd: None,
+        };
+        assert_eq!(store.push("account", sample(2)).len(), 2);
+        assert!(store.inner.lock().unwrap().migration_pending);
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), raw);
+        assert!(path.is_dir());
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(&backup, &path).unwrap();
+        store.push("account", sample(3));
+        let reopened = UsageSampleStore::load(path);
+        assert_eq!(reopened.inner.lock().unwrap().entries["account"].len(), 3);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn primary_is_always_the_short_window_across_providers() {

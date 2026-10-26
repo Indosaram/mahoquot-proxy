@@ -69,12 +69,11 @@ impl ClineDailyTracker {
         Some((self.used_tokens() as f64 * 100.0 / budget as f64).min(100.0))
     }
 
-    /// The best-known reset: the upstream-named deadline while it is still
-    /// ahead, otherwise window start + 24h. Zero when no window is open.
+    /// The best-known reset, including an elapsed upstream deadline until
+    /// rollover clears the window. Zero when no window is open.
     pub fn estimated_reset_unix(&self) -> i64 {
-        let now = now_unix();
         let over = self.reset_override_unix.load(Ordering::Relaxed);
-        if over > now {
+        if over > 0 {
             return over;
         }
         let start = self.window_start_unix.load(Ordering::Relaxed);
@@ -90,7 +89,7 @@ impl ClineDailyTracker {
         let now = now_unix;
         let start = self.window_start_unix.load(Ordering::Relaxed);
         let over = self.reset_override_unix.load(Ordering::Relaxed);
-        let reset = if over > now {
+        let reset = if over > 0 {
             over
         } else if start > 0 {
             start + DAY_SECS
@@ -145,8 +144,12 @@ impl ClineDailyTracker {
     /// Reconcile with an upstream cap 429: it names the exact reset time, so
     /// the estimate becomes exact and the budget counts as consumed.
     pub fn on_cap_429(&self, reset_at_unix: i64) {
+        self.on_cap_429_at(reset_at_unix, now_unix());
+    }
+
+    fn on_cap_429_at(&self, reset_at_unix: i64, now: i64) {
         // A past reset carries no information about the current window.
-        if reset_at_unix <= now_unix() {
+        if reset_at_unix <= now {
             return;
         }
         self.reset_override_unix
@@ -438,6 +441,20 @@ mod tests {
         t.on_cap_429(now - 10);
         assert_eq!(t.estimated_reset_unix(), now + DAY_SECS);
         assert_eq!(t.used_tokens(), 100, "no false consumption");
+    }
+
+    #[test]
+    fn elapsed_upstream_reset_rolls_over_before_estimated_deadline() {
+        let t = tracker();
+        let now = 1_000_000;
+        let reset = now + 13 * 3600;
+        t.observe(100, now);
+        t.on_cap_429_at(reset, now);
+        assert_eq!(t.used_tokens(), 1000);
+        assert_eq!(t.estimated_reset_unix(), reset);
+        t.observe(7, reset + 1);
+        assert_eq!(t.used_tokens(), 7);
+        assert_eq!(t.estimated_reset_unix(), reset + 1 + DAY_SECS);
     }
 
     #[test]

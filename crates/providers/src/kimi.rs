@@ -317,17 +317,27 @@ pub struct CredentialUpdate {
 impl CredentialUpdate {
     /// Retain IDs, order, disabled state, overrides and all unrecognized settings.
     pub fn apply(self, credential: &mut Value, now_unix: i64) -> Result<(), Error> {
+        self.token.apply(credential, now_unix)?;
+        credential
+            .as_object_mut()
+            .ok_or(Error::Credential)?
+            .insert("models".into(), json!(self.models));
+        Ok(())
+    }
+}
+
+impl Token {
+    pub fn apply(self, credential: &mut Value, now_unix: i64) -> Result<(), Error> {
         let object = credential.as_object_mut().ok_or(Error::Credential)?;
-        object.insert("api_key".into(), json!(self.token.access_token));
+        object.insert("api_key".into(), json!(self.access_token));
         if object.contains_key("access_token") {
             object.insert("access_token".into(), object["api_key"].clone());
         }
-        if !self.token.refresh_token.is_empty() {
-            object.insert("refresh_token".into(), json!(self.token.refresh_token));
+        if !self.refresh_token.is_empty() {
+            object.insert("refresh_token".into(), json!(self.refresh_token));
         }
         // Absent expiry is not an invented one-hour lifetime.
         let expires_at = self
-            .token
             .expires_in
             .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
             .and_then(|seconds| std::time::Duration::try_from_secs_f64(seconds).ok())
@@ -338,7 +348,6 @@ impl CredentialUpdate {
             .map(|date| date.to_rfc3339())
             .unwrap_or_default();
         object.insert("expired".into(), json!(expired));
-        object.insert("models".into(), json!(self.models));
         Ok(())
     }
 }
@@ -426,6 +435,12 @@ impl KimiClient {
     }
 
     pub async fn refresh(&self, refresh_token: &str) -> Result<CredentialUpdate, Error> {
+        let token = self.refresh_tokens(refresh_token).await?;
+        let models = self.fetch_models(&token.access_token).await?;
+        Ok(CredentialUpdate { token, models })
+    }
+
+    pub async fn refresh_tokens(&self, refresh_token: &str) -> Result<Token, Error> {
         if refresh_token.trim().is_empty() {
             return Err(Error::Credential);
         }
@@ -443,7 +458,11 @@ impl KimiClient {
         {
             return Err(Error::OAuth);
         }
-        self.complete(body).await
+        let token: Token = serde_json::from_value(body).map_err(Error::Json)?;
+        if token.access_token.trim().is_empty() {
+            return Err(Error::MissingToken);
+        }
+        Ok(token)
     }
 
     async fn exchange(&self, form: &[(&str, &str)]) -> Result<Value, Error> {
@@ -465,10 +484,15 @@ impl KimiClient {
         if token.access_token.trim().is_empty() {
             return Err(Error::MissingToken);
         }
+        let models = self.fetch_models(&token.access_token).await?;
+        Ok(CredentialUpdate { token, models })
+    }
+
+    pub async fn fetch_models(&self, access_token: &str) -> Result<Vec<String>, Error> {
         let response = self
             .identity
             .decorate(self.client.get(api_url(&self.api_base, "models")))
-            .bearer_auth(&token.access_token)
+            .bearer_auth(access_token)
             .send()
             .await
             .map_err(Error::Transport)?;
@@ -477,10 +501,7 @@ impl KimiClient {
             return Err(Error::Http(status.as_u16()));
         }
         let catalog: Value = response.json().await.map_err(Error::Transport)?;
-        Ok(CredentialUpdate {
-            token,
-            models: model_ids(&catalog)?,
-        })
+        model_ids(&catalog)
     }
 }
 
@@ -717,6 +738,29 @@ mod tests {
         assert_eq!(update.token.refresh_token, "rotated");
         assert_eq!(update.models, vec!["remote-fresh"]);
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn token_rotation_can_be_committed_without_a_catalog() {
+        let (client, task, shutdown, count) = mock_client(503).await;
+        let token = client.refresh_tokens("old").await.unwrap();
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let mut credential =
+            json!({"api_key":"old","refresh_token":"old-grant","models":["retained"]});
+        token.apply(&mut credential, 100).unwrap();
+        assert_eq!(credential["api_key"], "new");
+        assert_eq!(credential["refresh_token"], "rotated");
+        assert_eq!(credential["models"], json!(["retained"]));
+        assert!(matches!(
+            client.fetch_models("new").await,
+            Err(Error::Http(503))
+        ));
+        assert_eq!(credential["refresh_token"], "rotated");
+        shutdown.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

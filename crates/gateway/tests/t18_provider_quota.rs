@@ -51,6 +51,7 @@ fn cursor_and_kiro_quota_payloads_normalize_to_account_usage() {
         1_800_000_000,
     );
     assert_eq!(cursor.plan_type.as_deref(), Some("pro"));
+    assert_eq!(cursor.observed_at_unix, Some(1_800_000_000));
     assert_eq!(cursor.groups[0].buckets[0].used_percent, Some(75.0));
     assert_eq!(cursor.groups[0].buckets[1].used_percent, Some(20.0));
     assert_eq!(
@@ -66,6 +67,7 @@ fn cursor_and_kiro_quota_payloads_normalize_to_account_usage() {
         }),
         1_800_000_000,
     );
+    assert_eq!(kiro.observed_at_unix, Some(1_800_000_000));
     assert_eq!(kiro.groups[0].buckets[0].used_percent, Some(30.0));
     assert_eq!(kiro.groups[0].buckets[0].reset_at_unix, Some(1_900_000_000));
 }

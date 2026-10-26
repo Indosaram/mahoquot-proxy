@@ -11,18 +11,26 @@ use axum::response::{IntoResponse, Response};
 const MAX_FAILURES: u32 = 5;
 const BAN_DURATION: Duration = Duration::from_secs(30 * 60);
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ManagementAttempts {
     ips: HashMap<IpAddr, (u32, Option<Instant>, Instant)>,
+    verifiers: std::sync::Arc<tokio::sync::Semaphore>,
+}
+
+impl Default for ManagementAttempts {
+    fn default() -> Self {
+        Self {
+            ips: HashMap::new(),
+            verifiers: std::sync::Arc::new(tokio::sync::Semaphore::new(128)),
+        }
+    }
 }
 
 impl ManagementAttempts {
-    pub(crate) fn authenticate(
+    pub(crate) fn preflight(
         &mut self,
         peer: IpAddr,
         allow_remote: bool,
-        valid: bool,
-        missing: bool,
         now: Instant,
     ) -> Result<(), (StatusCode, String)> {
         self.ips.retain(|_, (_, ban, activity)| {
@@ -50,6 +58,33 @@ impl ManagementAttempts {
         {
             return Err((StatusCode::FORBIDDEN, "remote management disabled".into()));
         }
+        Ok(())
+    }
+
+    pub(crate) fn begin_verification(
+        &mut self,
+        peer: IpAddr,
+        allow_remote: bool,
+        now: Instant,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, (StatusCode, String)> {
+        self.preflight(peer, allow_remote, now)?;
+        self.verifiers.clone().try_acquire_owned().map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "management verifier busy".into(),
+            )
+        })
+    }
+
+    pub(crate) fn authenticate(
+        &mut self,
+        peer: IpAddr,
+        allow_remote: bool,
+        valid: bool,
+        missing: bool,
+        now: Instant,
+    ) -> Result<(), (StatusCode, String)> {
+        self.preflight(peer, allow_remote, now)?;
         if valid {
             self.ips.remove(&peer);
             return Ok(());
@@ -126,10 +161,22 @@ pub async fn require_management_key(
     let provided = presented_management_key(req.headers()).to_owned();
     let secret = secret.to_owned();
     let missing = provided.is_empty();
+    let permit = match attempts.lock() {
+        Ok(mut attempts) => attempts.begin_verification(peer, allow_remote, Instant::now()),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let permit = match permit {
+        Ok(permit) => permit,
+        Err((status, error)) => {
+            return (status, axum::Json(serde_json::json!({"error":error}))).into_response()
+        }
+    };
     let valid = if missing {
+        drop(permit);
         false
     } else {
         match tokio::task::spawn_blocking(move || {
+            let _permit = permit;
             if !env_secret.is_empty() && constant_time_equal(&env_secret, &provided) {
                 return true;
             }
@@ -210,4 +257,66 @@ pub async fn require_management_auth(
 ) -> axum::response::Response {
     let attempts = state.api_keys.management_attempts();
     require_management_key(Some(&state.settings), &attempts, req, next).await
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+
+    #[test]
+    fn review_preflight_skips_denied_verifiers_and_rechecks_bans() {
+        let mut attempts = ManagementAttempts::default();
+        let now = Instant::now();
+        let local: IpAddr = "127.0.0.1".parse().unwrap();
+        let remote: IpAddr = "192.0.2.1".parse().unwrap();
+        let mut calls = 0;
+        let mut verify = |attempts: &mut ManagementAttempts, peer, at| {
+            let _permit = attempts.begin_verification(peer, false, at)?;
+            calls += 1;
+            Ok::<_, (StatusCode, String)>(())
+        };
+        assert_eq!(
+            verify(&mut attempts, remote, now).unwrap_err().0,
+            StatusCode::FORBIDDEN
+        );
+        for _ in 0..MAX_FAILURES {
+            assert_eq!(
+                attempts
+                    .authenticate(local, false, false, false, now)
+                    .unwrap_err()
+                    .0,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        assert_eq!(
+            verify(&mut attempts, local, now).unwrap_err().0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            attempts
+                .authenticate(local, false, true, false, now)
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        verify(&mut attempts, local, now + BAN_DURATION).unwrap();
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn review_verifier_capacity_is_reclaimed() {
+        let mut attempts = ManagementAttempts::default();
+        let now = Instant::now();
+        let peer = "127.0.0.1".parse().unwrap();
+        let mut permits = Vec::new();
+        for _ in 0..128 {
+            permits.push(attempts.begin_verification(peer, false, now).unwrap());
+        }
+        assert_eq!(
+            attempts.begin_verification(peer, false, now).unwrap_err().0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        permits.pop();
+        assert!(attempts.begin_verification(peer, false, now).is_ok());
+    }
 }

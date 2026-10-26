@@ -1331,6 +1331,13 @@ impl AppState {
                 Some(previous_member) => {
                     // fresh parse wins (new tokens/project), runtime state transfers
                     adopt_runtime_state(&m, previous_member);
+                    // Rotation changes token identity, not the credential file's
+                    // singleflight domain. A refresh reloads under this lock.
+                    if m.file_path == previous_member.file_path {
+                        Arc::get_mut(&mut m)
+                            .expect("freshly loaded account")
+                            .refresh_lock = Arc::clone(&previous_member.refresh_lock);
+                    }
                     if m.same_credential_identity(previous_member) {
                         let fresh = Arc::get_mut(&mut m).expect("freshly loaded account");
                         fresh.last_activity = previous_member.last_activity.clone();
@@ -1441,7 +1448,12 @@ impl AppState {
             ))
         })?;
         let did_refresh = member
-            .refresh(&client, &self.refresh_url, presented_token)
+            .refresh_with_store(
+                &client,
+                &self.refresh_url,
+                presented_token,
+                Some(Arc::clone(&self.settings)),
+            )
             .await?;
         if did_refresh {
             self.refreshed.fetch_add(1, Ordering::Relaxed);
@@ -1595,15 +1607,14 @@ impl AppState {
                 );
                 Ok(client)
             }
-            Err(err) => {
+            Err(_) => {
                 tracing::error!(
                     provider = %provider_name,
                     member_id = %member_id,
-                    proxy_url = %proxy_url,
-                    "failed to configure outbound proxy: {err}"
+                    "failed to configure outbound proxy"
                 );
                 Err(crate::proxy_policy::ProxyClientBuildError::ProxyConfig(
-                    err.to_string(),
+                    "invalid outbound proxy configuration".to_string(),
                 ))
             }
         }

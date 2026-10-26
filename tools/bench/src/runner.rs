@@ -20,19 +20,61 @@ pub struct BenchConfig {
     pub headers: Vec<String>,
     pub body_json: Option<String>,
     pub timeout_ms: u64,
+    pub phase: String,
 }
 
-#[derive(Debug)]
-pub enum SampleResult {
-    Success {
-        ttft_ms: f64,
-        ttfb_ms: f64,
-        completion_ms: f64,
-        semantic: bool,
-    },
-    Error {
-        kind: String,
-    },
+/// Correlated observations, including failed attempts. Times are elapsed from
+/// this attempt's start; null means that boundary was never observed.
+#[derive(Debug, Default, serde::Serialize)]
+pub struct RequestObservation {
+    pub request_id: String,
+    pub phase: String,
+    pub headers_ms: Option<f64>,
+    pub content_ms: Option<f64>,
+    pub end_ms: Option<f64>,
+    pub first_body_ms: Option<f64>,
+    pub status: Option<u16>,
+    pub error: Option<String>,
+    pub semantic_error: Option<String>,
+    pub semantic_verified: bool,
+    pub response_body: Vec<u8>,
+    pub observed: SemanticGate,
+}
+
+impl RequestObservation {
+    fn feed(&mut self, bytes: &[u8], elapsed_ms: f64) {
+        self.first_body_ms.get_or_insert(elapsed_ms);
+        self.response_body.extend_from_slice(bytes);
+        if self.semantic_error.is_some() {
+            return;
+        }
+        let before = self.observed.content_len();
+        let result = self.observed.feed(bytes, elapsed_ms);
+        if self.observed.content_len() > before && self.content_ms.is_none() {
+            self.content_ms = Some(elapsed_ms);
+        }
+        if let Err(error) = result {
+            self.semantic_error = Some(error);
+        }
+    }
+
+    fn finish(&mut self, expected: Option<&ExpectedOutput>) {
+        if self.semantic_error.is_none() {
+            if let Some(expected) = expected {
+                match self.observed.finish(expected) {
+                    Ok(()) => self.semantic_verified = true,
+                    Err(error) => self.semantic_error = Some(error),
+                }
+            }
+        }
+        if self.error.is_none() {
+            if let Some(error) = &self.semantic_error {
+                self.error = Some(format!("semantic:{error}"));
+            } else if self.content_ms.is_none() {
+                self.error = Some("semantic:missing_content".into());
+            }
+        }
+    }
 }
 
 /// Splits the benchmark-only `bench_expect` block off the request body: the
@@ -103,7 +145,7 @@ pub fn validate_bench_url(raw: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ExpectedOutput {
     pub text: String,
     pub input_tokens: u64,
@@ -112,7 +154,7 @@ pub struct ExpectedOutput {
     pub tool_arguments: Option<String>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize)]
 pub struct SemanticGate {
     buffer: Vec<u8>,
     text: String,
@@ -368,7 +410,16 @@ pub struct RequestParams<'a> {
     pub expected: Option<Arc<ExpectedOutput>>,
 }
 
-pub async fn run_single_request(params: RequestParams<'_>) -> SampleResult {
+pub(crate) async fn observe_request(
+    params: RequestParams<'_>,
+    request_id: String,
+    phase: String,
+) -> RequestObservation {
+    let mut sample = RequestObservation {
+        request_id,
+        phase,
+        ..Default::default()
+    };
     let start = Instant::now();
     let resp = match params
         .client
@@ -379,89 +430,30 @@ pub async fn run_single_request(params: RequestParams<'_>) -> SampleResult {
         .send()
         .await
     {
-        Ok(r) => r,
-        Err(e) => {
-            return SampleResult::Error {
-                kind: map_reqwest_error(&e),
-            };
+        Ok(response) => response,
+        Err(error) => {
+            sample.end_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
+            sample.error = Some(map_reqwest_error(&error));
+            return sample;
         }
     };
-
-    let status = resp.status();
-    if !status.is_success() {
-        return SampleResult::Error {
-            kind: format!("status:{}", status.as_u16()),
-        };
-    }
-
+    sample.headers_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
+    sample.status = Some(resp.status().as_u16());
+    // Drain HTTP failures too: their body and completion are real evidence.
+    // Status remains separate so phase verifiers can classify expected failures.
     let mut stream = resp.bytes_stream();
-    let first = match stream.next().await {
-        Some(Ok(bytes)) => bytes,
-        Some(Err(e)) => {
-            return SampleResult::Error {
-                kind: map_reqwest_error(&e),
-            };
-        }
-        None => {
-            return SampleResult::Error {
-                kind: "io:empty_body".to_string(),
-            };
-        }
-    };
-
-    let ttfb_ms = start.elapsed().as_secs_f64() * 1000.0;
-    let mut gate = SemanticGate::default();
-    // Content TTFT is the first frame that carries meaningful text/tool
-    // content, distinct from the first byte (Task 35).
-    let mut ttft_ms: Option<f64> = None;
-    let feed = |gate: &mut SemanticGate, bytes: &[u8], ttft: &mut Option<f64>| {
-        let before = gate.content_len();
-        let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-        let result = gate.feed(bytes, elapsed);
-        if ttft.is_none() && gate.content_len() > before {
-            *ttft = Some(elapsed);
-        }
-        result
-    };
-    if let Err(kind) = feed(&mut gate, &first, &mut ttft_ms) {
-        return SampleResult::Error {
-            kind: format!("semantic:{kind}"),
-        };
-    }
     while let Some(chunk) = stream.next().await {
         match chunk {
-            Ok(bytes) => {
-                if let Err(kind) = feed(&mut gate, &bytes, &mut ttft_ms) {
-                    return SampleResult::Error {
-                        kind: format!("semantic:{kind}"),
-                    };
-                }
-            }
-            Err(e) => {
-                return SampleResult::Error {
-                    kind: map_reqwest_error(&e),
-                };
+            Ok(bytes) => sample.feed(&bytes, start.elapsed().as_secs_f64() * 1000.0),
+            Err(error) => {
+                sample.error = Some(map_reqwest_error(&error));
+                break;
             }
         }
     }
-    let completion_ms = start.elapsed().as_secs_f64() * 1000.0;
-    let semantic = match params.expected.as_deref() {
-        Some(expected) => {
-            if let Err(kind) = gate.finish(expected) {
-                return SampleResult::Error {
-                    kind: format!("semantic:{kind}"),
-                };
-            }
-            true
-        }
-        None => false,
-    };
-    SampleResult::Success {
-        ttft_ms: ttft_ms.unwrap_or(ttfb_ms),
-        ttfb_ms,
-        completion_ms,
-        semantic,
-    }
+    sample.end_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
+    sample.finish(params.expected.as_deref());
+    sample
 }
 
 pub async fn run_benchmark(
@@ -486,6 +478,7 @@ pub async fn run_benchmark(
     let mut set = JoinSet::new();
     let mut spawned = 0;
     let mut results = Vec::with_capacity(cfg.total);
+    let mut attempts = std::collections::HashMap::new();
 
     while spawned < cfg.total || !set.is_empty() {
         while spawned < cfg.total && set.len() < concurrency {
@@ -494,27 +487,45 @@ pub async fn run_benchmark(
             let hdrs = parsed_headers.clone();
             let b = Arc::clone(&body);
             let e = expected.clone();
-            set.spawn(async move {
-                run_single_request(RequestParams {
-                    client: &cl,
-                    url: &u,
-                    headers: hdrs,
-                    body: b,
-                    timeout,
-                    expected: e,
-                })
+            let request_id = format!("{}:{spawned}", cfg.phase);
+            let phase = cfg.phase.clone();
+            let handle = set.spawn(async move {
+                observe_request(
+                    RequestParams {
+                        client: &cl,
+                        url: &u,
+                        headers: hdrs,
+                        body: b,
+                        timeout,
+                        expected: e,
+                    },
+                    request_id,
+                    phase,
+                )
                 .await
             });
+            attempts.insert(handle.id(), spawned);
             spawned += 1;
         }
 
-        if let Some(res) = set.join_next().await {
-            match res {
-                Ok(sample) => results.push(sample),
-                Err(_) => results.push(SampleResult::Error {
-                    kind: "io:task_join".to_string(),
-                }),
-            }
+        if let Some(res) = set.join_next_with_id().await {
+            let (task_id, sample) = match res {
+                Ok((task_id, sample)) => (task_id, sample),
+                Err(error) => {
+                    let ordinal = attempts[&error.id()];
+                    (
+                        error.id(),
+                        RequestObservation {
+                            request_id: format!("{}:{ordinal}", cfg.phase),
+                            phase: cfg.phase.clone(),
+                            error: Some("io:task_join".into()),
+                            ..Default::default()
+                        },
+                    )
+                }
+            };
+            let ordinal = attempts.remove(&task_id).expect("scheduled attempt");
+            results.push((ordinal, sample));
         }
     }
 
@@ -526,22 +537,22 @@ pub async fn run_benchmark(
     let mut semantic_samples = 0usize;
     let mut errors: BTreeMap<String, usize> = BTreeMap::new();
 
-    for r in results {
-        match r {
-            SampleResult::Success {
-                ttft_ms,
-                ttfb_ms,
-                completion_ms,
-                semantic,
-            } => {
-                ttft_samples.push(ttft_ms);
-                ttfb_samples.push(ttfb_ms);
-                completion_samples.push(completion_ms);
-                semantic_samples += usize::from(semantic);
-            }
-            SampleResult::Error { kind } => {
-                *errors.entry(kind).or_insert(0) += 1;
-            }
+    results.sort_by_key(|(ordinal, _)| *ordinal);
+    let requests: Vec<_> = results.into_iter().map(|(_, sample)| sample).collect();
+    for sample in &requests {
+        let error = sample.error.clone().or_else(|| {
+            sample
+                .status
+                .filter(|status| !(200..300).contains(status))
+                .map(|status| format!("status:{status}"))
+        });
+        if let Some(kind) = error {
+            *errors.entry(kind).or_insert(0) += 1;
+        } else {
+            ttft_samples.push(sample.content_ms.expect("successful content observation"));
+            ttfb_samples.push(sample.first_body_ms.expect("successful body observation"));
+            completion_samples.push(sample.end_ms.expect("successful completion observation"));
+            semantic_samples += usize::from(sample.semantic_verified);
         }
     }
 
@@ -554,8 +565,8 @@ pub async fn run_benchmark(
         sorted_ttft_ms: &ttft_samples,
         errors,
     });
-    // Correctness first: every sample must pass the semantic gate when an
-    // expectation was given; a failed gate publishes no timing/throughput.
+    // Aggregates are legacy success-only diagnostics, never certification.
+    // All observed timings remain in requests, including failed attempts.
     let correctness_passed = report.failed == 0
         && report.successful == report.total
         && (expected.is_none() || semantic_samples == report.total);
@@ -563,15 +574,19 @@ pub async fn run_benchmark(
     if let Some(object) = json.as_object_mut() {
         object.insert("correctness_passed".into(), correctness_passed.into());
         object.insert("semantic_samples".into(), semantic_samples.into());
-        if correctness_passed {
-            object.insert("ttfb_ms".into(), serde_json::json!(ttfb_samples));
-            object.insert(
-                "completion_ms".into(),
-                serde_json::json!(completion_samples),
-            );
-        } else {
-            object.remove("ttft_ms");
-            object.remove("rps");
+        object.insert("request_schema".into(), "mahoquot/core-requests-v1".into());
+        object.insert("requests".into(), serde_json::to_value(&requests)?);
+        object.insert(
+            "expected".into(),
+            serde_json::to_value(expected.as_deref())?,
+        );
+        object.insert("ttfb_ms".into(), serde_json::json!(ttfb_samples));
+        object.insert(
+            "completion_ms".into(),
+            serde_json::json!(completion_samples),
+        );
+        if ttft_samples.is_empty() {
+            object.insert("ttft_ms".into(), serde_json::Value::Null);
         }
     }
     tokio::fs::write(&cfg.out, serde_json::to_vec_pretty(&json)?).await?;
@@ -583,4 +598,77 @@ pub async fn run_benchmark(
     }
 
     Ok(report)
+}
+
+#[cfg(test)]
+mod raw_observation_tests {
+    use super::*;
+
+    #[test]
+    fn content_timing_and_failed_evidence_remain_correlated() {
+        let mut sample = RequestObservation {
+            request_id: "B0:0".into(),
+            phase: "B0".into(),
+            headers_ms: Some(1.0),
+            status: Some(200),
+            ..Default::default()
+        };
+        // Fixture timestamps only; production timestamps come from Instant.
+        sample.feed(b": keepalive\n\n", 2.0);
+        sample.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"hel", 3.0);
+        assert_eq!(sample.content_ms, None);
+        sample.feed(b"lo\"}}]}\n\n", 4.0);
+        sample.feed(b"data: {\"error\":\"broken\"}\n\n", 5.0);
+        sample.feed(b"trailing evidence", 6.0);
+        sample.end_ms = Some(7.0);
+        sample.finish(None);
+        let json = serde_json::to_value(&sample).unwrap();
+        assert_eq!(json["request_id"], "B0:0");
+        assert_eq!(json["phase"], "B0");
+        assert_eq!(json["headers_ms"], 1.0);
+        assert_eq!(json["first_body_ms"], 2.0);
+        assert_eq!(json["content_ms"], 4.0);
+        assert_eq!(json["end_ms"], 7.0);
+        assert!(json["error"].is_string());
+        assert_eq!(json["observed"]["text"], "hello");
+        assert!(sample.response_body.ends_with(b"trailing evidence"));
+    }
+
+    #[test]
+    fn unavailable_content_is_null_and_transport_error_survives() {
+        let mut sample = RequestObservation::default();
+        sample.feed(b"data: [DONE]\n\n", 2.0);
+        sample.error = Some("io:body".into());
+        sample.end_ms = Some(3.0);
+        sample.finish(None);
+        let json = serde_json::to_value(&sample).unwrap();
+        assert_eq!(json["error"], "io:body");
+        assert!(json["headers_ms"].is_null());
+        assert!(json["content_ms"].is_null());
+        assert_eq!(json["first_body_ms"], 2.0);
+        assert_eq!(json["end_ms"], 3.0);
+        let empty = serde_json::to_value(RequestObservation::default()).unwrap();
+        for key in ["headers_ms", "content_ms", "end_ms", "error", "status"] {
+            assert!(empty[key].is_null());
+        }
+    }
+
+    #[test]
+    fn semantic_mismatch_preserves_observed_usage_and_content() {
+        let mut sample = RequestObservation::default();
+        sample.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1}}\n\ndata: [DONE]\n\n", 4.0);
+        sample.finish(Some(&ExpectedOutput {
+            text: "wrong".into(),
+            input_tokens: 2,
+            output_tokens: 1,
+            cached_tokens: None,
+            tool_arguments: None,
+        }));
+        assert!(!sample.semantic_verified);
+        assert!(sample.error.is_some());
+        assert_eq!(sample.content_ms, Some(4.0));
+        assert_eq!(sample.observed.text, "hello");
+        assert_eq!(sample.observed.input_tokens, Some(2));
+        assert_eq!(sample.observed.output_tokens, Some(1));
+    }
 }

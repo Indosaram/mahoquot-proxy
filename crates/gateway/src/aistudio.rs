@@ -26,7 +26,23 @@ pub struct Message {
 }
 
 struct Pending {
+    worker_id: String,
+    generation: uuid::Uuid,
     sender: oneshot::Sender<Result<Message, WorkerError>>,
+}
+
+struct PendingGuard {
+    pending: Arc<RwLock<HashMap<String, Pending>>>,
+    id: String,
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        self.pending
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.id);
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,6 +72,7 @@ pub struct WorkerRegistry {
 }
 #[derive(Clone)]
 struct Worker {
+    generation: uuid::Uuid,
     tx: mpsc::Sender<Message>,
     catalog: Option<Vec<String>>,
     connected_at: Instant,
@@ -72,24 +89,21 @@ impl WorkerRegistry {
             known_models: Arc::new(RwLock::new(HashSet::new())),
         }
     }
-    fn insert(&self, id: String, tx: mpsc::Sender<Message>) {
+    fn insert(&self, id: String, tx: mpsc::Sender<Message>) -> uuid::Uuid {
+        let generation = uuid::Uuid::new_v4();
         self.workers
             .write()
             .unwrap_or_else(|p| p.into_inner())
             .insert(
                 id,
                 Worker {
+                    generation,
                     tx,
                     catalog: None,
                     connected_at: Instant::now(),
                 },
             );
-    }
-    fn remove(&self, id: &str) {
-        self.workers
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(id);
+        generation
     }
     pub fn connected(&self) -> Vec<String> {
         let mut workers: Vec<_> = self
@@ -344,17 +358,6 @@ impl Relay {
         headers: HeaderMap,
         body: Vec<u8>,
     ) -> Result<Message, WorkerError> {
-        let tx = self
-            .registry
-            .workers
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(worker_id)
-            .map(|w| w.tx.clone())
-            .ok_or(WorkerError::Unavailable)?;
-        if self.pending.read().unwrap_or_else(|p| p.into_inner()).len() >= PENDING_LIMIT {
-            return Err(WorkerError::Unavailable);
-        }
         let id = uuid::Uuid::new_v4().to_string();
         let payload = json!({"method":method,"url":url,"headers":headers.iter().filter(|(k,_)| is_safe_worker_header(k.as_str())).filter_map(|(k,v)|v.to_str().ok().map(|v|(k.as_str(),v))).collect::<HashMap<_,_>>(),"body":String::from_utf8_lossy(&body)});
         let msg = Message {
@@ -363,65 +366,110 @@ impl Relay {
             payload: Some(payload),
         };
         let (sender, receiver) = oneshot::channel();
-        self.pending
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(id.clone(), Pending { sender });
-        if tx.send(msg).await.is_err() {
-            self.pending
-                .write()
-                .unwrap_or_else(|p| p.into_inner())
-                .remove(&id);
-            return Err(WorkerError::Disconnected);
-        }
-        let result = tokio::time::timeout(REQUEST_TIMEOUT, receiver)
-            .await
-            .map_err(|_| WorkerError::Timeout)?
-            .map_err(|_| WorkerError::Disconnected)?;
-        result
-    }
-    fn dispatch(&self, worker_id: &str, message: Message) {
-        if message.kind == "catalog" {
-            if let Some(payload) = message.payload.as_ref() {
-                self.registry.update_catalog(worker_id, payload)
+        let tx = {
+            let workers = self
+                .registry
+                .workers
+                .read()
+                .unwrap_or_else(|p| p.into_inner());
+            let worker = workers.get(worker_id).ok_or(WorkerError::Unavailable)?;
+            let mut pending = self.pending.write().unwrap_or_else(|p| p.into_inner());
+            if pending.len() >= PENDING_LIMIT {
+                return Err(WorkerError::Unavailable);
             }
+            pending.insert(
+                id.clone(),
+                Pending {
+                    worker_id: worker_id.to_owned(),
+                    generation: worker.generation,
+                    sender,
+                },
+            );
+            worker.tx.clone()
+        };
+        let _guard = PendingGuard {
+            pending: self.pending.clone(),
+            id,
+        };
+        tokio::time::timeout(REQUEST_TIMEOUT, async {
+            tx.send(msg).await.map_err(|_| WorkerError::Disconnected)?;
+            receiver.await.map_err(|_| WorkerError::Disconnected)?
+        })
+        .await
+        .map_err(|_| WorkerError::Timeout)?
+    }
+    fn dispatch(&self, worker_id: &str, generation: uuid::Uuid, message: Message) {
+        if message.kind == "catalog" {
+            let mut workers = self
+                .registry
+                .workers
+                .write()
+                .unwrap_or_else(|p| p.into_inner());
+            let Some(worker) = workers
+                .get_mut(worker_id)
+                .filter(|w| w.generation == generation)
+            else {
+                return;
+            };
+            if let Some(payload) = message.payload.as_ref() {
+                if let Some(rows) = payload.get("models").and_then(Value::as_array) {
+                    let models: Vec<String> = rows
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .filter(|s| !s.trim().is_empty())
+                        .take(CATALOG_LIMIT)
+                        .map(str::to_owned)
+                        .collect();
+                    self.registry
+                        .known_models
+                        .write()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .extend(models.iter().cloned());
+                    worker.catalog = Some(models);
+                }
+            }
+            return;
+        }
+        let mut pending = self.pending.write().unwrap_or_else(|p| p.into_inner());
+        if !pending
+            .get(&message.id)
+            .is_some_and(|p| p.worker_id == worker_id && p.generation == generation)
+        {
             return;
         }
         if matches!(
             message.kind.as_str(),
             "http_response" | "stream_end" | "error"
         ) {
-            if let Some(pending) = self
-                .pending
-                .write()
-                .unwrap_or_else(|p| p.into_inner())
-                .remove(&message.id)
-            {
+            if let Some(pending) = pending.remove(&message.id) {
                 let _ = pending.sender.send(Ok(message));
             }
         } else if message.kind == "stream_start" || message.kind == "stream_chunk" {
             // This HTTP relay surface is non-streaming; stream frames are accumulated
             // only by callers which explicitly use the stream API, never misreported as 200.
-            if let Some(pending) = self
-                .pending
-                .write()
-                .unwrap_or_else(|p| p.into_inner())
-                .remove(&message.id)
-            {
+            if let Some(pending) = pending.remove(&message.id) {
                 let _ = pending.sender.send(Err(WorkerError::InvalidResponse));
             }
         }
     }
-    fn disconnect(&self, worker_id: &str) {
-        self.registry.remove(worker_id);
-        let ids: Vec<_> = self
-            .pending
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .keys()
-            .cloned()
-            .collect();
+    fn disconnect(&self, worker_id: &str, generation: uuid::Uuid) {
+        let mut workers = self
+            .registry
+            .workers
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        if workers
+            .get(worker_id)
+            .is_some_and(|w| w.generation == generation)
+        {
+            workers.remove(worker_id);
+        }
         let mut pending = self.pending.write().unwrap_or_else(|p| p.into_inner());
+        let ids: Vec<_> = pending
+            .iter()
+            .filter(|(_, p)| p.worker_id == worker_id && p.generation == generation)
+            .map(|(id, _)| id.clone())
+            .collect();
         for id in ids {
             if let Some(p) = pending.remove(&id) {
                 let _ = p.sender.send(Err(WorkerError::Disconnected));
@@ -450,6 +498,11 @@ pub async fn worker_upgrade(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
+    if !crate::inbound::presented_api_key(&headers).is_some_and(|key| {
+        state.api_keys.accepts(key) || state.settings.current().api_keys.iter().any(|k| k == key)
+    }) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     let relay = Arc::clone(&state.aistudio);
     let Some(id) = worker_id(&headers) else {
         return (
@@ -465,7 +518,7 @@ pub async fn worker_upgrade(
 async fn worker_session(relay: Arc<Relay>, id: String, socket: WebSocket) {
     let (mut sink, mut stream) = socket.split();
     let (tx, mut rx) = mpsc::channel::<Message>(64);
-    relay.registry.insert(id.clone(), tx);
+    let generation = relay.registry.insert(id.clone(), tx.clone());
     let writer = async {
         while let Some(msg) = rx.recv().await {
             let Ok(bytes) = serde_json::to_string(&msg) else {
@@ -480,13 +533,34 @@ async fn worker_session(relay: Arc<Relay>, id: String, socket: WebSocket) {
         while let Some(Ok(frame)) = stream.next().await {
             if let WsMessage::Text(text) = frame {
                 if let Ok(message) = serde_json::from_str::<Message>(text.as_str()) {
-                    relay.dispatch(&id, message);
+                    let ack = (message.kind == "catalog"
+                        && message
+                            .payload
+                            .as_ref()
+                            .and_then(|p| p.get("ack"))
+                            .and_then(Value::as_bool)
+                            == Some(true))
+                    .then(|| message.id.clone());
+                    relay.dispatch(&id, generation, message);
+                    if let Some(id) = ack {
+                        if tx
+                            .send(Message {
+                                id,
+                                kind: "catalog_ack".into(),
+                                payload: None,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
                 }
             }
         }
     };
     tokio::select! { _=writer=>{}, _=reader=>{} }
-    relay.disconnect(&id);
+    relay.disconnect(&id, generation);
 }
 
 pub async fn execute(
@@ -505,7 +579,8 @@ pub async fn execute(
     let status = payload
         .get("status")
         .and_then(Value::as_u64)
-        .and_then(|s| StatusCode::from_u16(s as u16).ok())
+        .and_then(|s| u16::try_from(s).ok())
+        .and_then(|s| StatusCode::from_u16(s).ok())
         .ok_or(WorkerError::InvalidResponse)?;
     let body = match payload.get("body") {
         Some(Value::String(s)) => s.as_bytes().to_vec(),
@@ -529,6 +604,172 @@ pub async fn execute(
 mod tests {
     use super::*;
     use tokio::time::timeout;
+
+    fn start(
+        relay: &Arc<Relay>,
+        id: &'static str,
+    ) -> tokio::task::JoinHandle<Result<Message, WorkerError>> {
+        let relay = relay.clone();
+        tokio::spawn(async move {
+            relay
+                .execute(id, "POST", "/fixture", HeaderMap::new(), vec![])
+                .await
+        })
+    }
+
+    async fn receive(rx: &mut mpsc::Receiver<Message>) -> Message {
+        timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    fn reply(id: String) -> Message {
+        Message {
+            id,
+            kind: "http_response".into(),
+            payload: Some(json!({"status":200,"body":"owned"})),
+        }
+    }
+
+    #[tokio::test]
+    async fn review_worker_ownership_and_replacement() {
+        let relay = Arc::new(Relay::new());
+        let (tx_a, mut rx_a) = mpsc::channel(8);
+        let (tx_b, mut rx_b) = mpsc::channel(8);
+        let a = relay.registry.insert("a".into(), tx_a);
+        let b = relay.registry.insert("b".into(), tx_b);
+        let task_a = start(&relay, "a");
+        let task_b = start(&relay, "b");
+        let _ = receive(&mut rx_a).await;
+        let req_b = receive(&mut rx_b).await;
+        relay.dispatch("a", a, reply(req_b.id.clone()));
+        assert!(relay.pending.read().unwrap().contains_key(&req_b.id));
+        relay.disconnect("a", a);
+        assert_eq!(
+            timeout(Duration::from_secs(1), task_a)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err(),
+            WorkerError::Disconnected
+        );
+        relay.dispatch("b", b, reply(req_b.id));
+        assert_eq!(
+            timeout(Duration::from_secs(1), task_b)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .payload
+                .unwrap()["body"],
+            "owned"
+        );
+
+        let (tx_new, mut rx_new) = mpsc::channel(8);
+        let new = relay.registry.insert("b".into(), tx_new);
+        let task = start(&relay, "b");
+        let req = receive(&mut rx_new).await;
+        relay.dispatch("b", b, reply(req.id.clone()));
+        relay.dispatch(
+            "b",
+            b,
+            Message {
+                id: "old".into(),
+                kind: "catalog".into(),
+                payload: Some(json!({"models":["stale"]})),
+            },
+        );
+        relay.disconnect("b", b);
+        assert_eq!(relay.registry.connected(), vec!["b"]);
+        assert_eq!(relay.registry.catalog("b"), None);
+        assert!(relay.pending.read().unwrap().contains_key(&req.id));
+        relay.dispatch("b", new, reply(req.id));
+        assert!(timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn review_pending_cancel_timeout_queue_and_capacity() {
+        let relay = Arc::new(Relay::new());
+        let (tx, mut rx) = mpsc::channel(PENDING_LIMIT);
+        let generation = relay.registry.insert("worker".into(), tx);
+        let mut tasks = Vec::new();
+        for _ in 0..PENDING_LIMIT {
+            let task = start(&relay, "worker");
+            let _ = receive(&mut rx).await;
+            tasks.push(task);
+        }
+        assert_eq!(relay.pending.read().unwrap().len(), PENDING_LIMIT);
+        assert_eq!(
+            relay
+                .execute("worker", "POST", "/fixture", HeaderMap::new(), vec![])
+                .await
+                .unwrap_err(),
+            WorkerError::Unavailable
+        );
+        for task in tasks {
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        }
+        assert!(relay.pending.read().unwrap().is_empty());
+        let task = start(&relay, "worker");
+        let request = receive(&mut rx).await;
+        relay.dispatch("worker", generation, reply(request.id));
+        assert!(task.await.unwrap().is_ok());
+
+        let (tx, _rx) = mpsc::channel(1);
+        tx.send(reply("queued".into())).await.unwrap();
+        relay.registry.insert("blocked".into(), tx);
+        let future = relay.execute("blocked", "POST", "/fixture", HeaderMap::new(), vec![]);
+        tokio::pin!(future);
+        assert!(futures::poll!(&mut future).is_pending());
+        assert_eq!(relay.pending.read().unwrap().len(), 1);
+        tokio::time::advance(REQUEST_TIMEOUT).await;
+        assert_eq!(future.await.unwrap_err(), WorkerError::Timeout);
+        assert!(relay.pending.read().unwrap().is_empty());
+        {
+            let future = relay.execute("blocked", "POST", "/fixture", HeaderMap::new(), vec![]);
+            tokio::pin!(future);
+            assert!(futures::poll!(&mut future).is_pending());
+        }
+        assert!(relay.pending.read().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn review_worker_status_does_not_wrap() {
+        let relay = Arc::new(Relay::new());
+        let (tx, mut rx) = mpsc::channel(1);
+        let generation = relay.registry.insert("worker".into(), tx);
+        for status in [200u64, 65736, u64::MAX] {
+            let r = relay.clone();
+            let task = tokio::spawn(async move {
+                super::execute(&r, "worker", "POST", "/fixture", HeaderMap::new(), vec![]).await
+            });
+            let req = receive(&mut rx).await;
+            relay.dispatch(
+                "worker",
+                generation,
+                Message {
+                    id: req.id,
+                    kind: "http_response".into(),
+                    payload: Some(json!({"status":status,"body":"ok"})),
+                },
+            );
+            let result = timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap();
+            if status == 200 {
+                assert_eq!(result.unwrap().status(), StatusCode::OK);
+            } else {
+                assert_eq!(result.unwrap_err(), WorkerError::InvalidResponse);
+            }
+        }
+    }
     #[test]
     fn worker_identity_is_explicit_and_nonempty() {
         assert!(mahoquot_providers::aistudio::is_worker_id(
@@ -541,7 +782,7 @@ mod tests {
         let relay = Arc::new(Relay::new());
         let id = "aistudio-worker-a".to_string();
         let (tx, mut rx) = mpsc::channel::<Message>(8);
-        relay.registry.insert(id.clone(), tx);
+        let generation = relay.registry.insert(id.clone(), tx);
         let a = {
             let r = relay.clone();
             let id = id.clone();
@@ -575,6 +816,7 @@ mod tests {
         for request in [first, second].into_iter().rev() {
             relay.dispatch(
                 &id,
+                generation,
                 Message {
                     id: request.id,
                     kind: "http_response".into(),
@@ -606,7 +848,7 @@ mod tests {
         let relay = Arc::new(Relay::new());
         let id = "aistudio-worker-b";
         let (tx, mut rx) = mpsc::channel(8);
-        relay.registry.insert(id.into(), tx);
+        let generation = relay.registry.insert(id.into(), tx);
         let task = {
             let r = relay.clone();
             tokio::spawn(async move {
@@ -621,7 +863,7 @@ mod tests {
             })
         };
         let _request = rx.recv().await.unwrap();
-        relay.disconnect(id);
+        relay.disconnect(id, generation);
         assert!(matches!(
             timeout(Duration::from_secs(1), task)
                 .await
@@ -634,10 +876,11 @@ mod tests {
     async fn catalog_is_worker_owned_and_unknown_until_sent() {
         let relay = Relay::new();
         let (tx, _rx) = mpsc::channel(1);
-        relay.registry.insert("aistudio-worker-c".into(), tx);
+        let generation = relay.registry.insert("aistudio-worker-c".into(), tx);
         assert_eq!(relay.registry.catalog("aistudio-worker-c"), None);
         relay.dispatch(
             "aistudio-worker-c",
+            generation,
             Message {
                 id: "catalog-1".into(),
                 kind: "catalog".into(),
@@ -654,7 +897,7 @@ mod tests {
         let relay = Arc::new(Relay::new());
         let id = "aistudio-worker-d";
         let (tx, mut rx) = mpsc::channel(8);
-        relay.registry.insert(id.into(), tx);
+        let generation = relay.registry.insert(id.into(), tx);
         let task = {
             let r = relay.clone();
             tokio::spawn(async move {
@@ -671,13 +914,14 @@ mod tests {
         let request = rx.recv().await.unwrap();
         relay.dispatch(
             id,
+            generation,
             Message {
                 id: "unmatched".into(),
                 kind: "http_response".into(),
                 payload: Some(json!({"status":200})),
             },
         );
-        relay.disconnect(id);
+        relay.disconnect(id, generation);
         assert!(matches!(
             timeout(Duration::from_secs(1), task)
                 .await

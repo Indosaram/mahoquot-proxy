@@ -524,11 +524,15 @@ fn codex_reasoning_survives_every_byte_split() {
         let mut events = Vec::new();
         parser.push(&wire[..split], &mut events);
         parser.push(&wire[split..], &mut events);
-        parser.finish(&mut events);
         assert_eq!(
             events,
             vec![CodexEvent::ReasoningDelta("think".into())],
             "split {split}"
+        );
+        parser.finish(&mut events);
+        assert!(
+            matches!(events.as_slice(), [CodexEvent::ReasoningDelta(text), CodexEvent::Failed { .. }] if text == "think"),
+            "split {split}: {events:?}"
         );
     }
 }

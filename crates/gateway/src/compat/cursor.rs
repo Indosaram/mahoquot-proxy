@@ -445,7 +445,7 @@ impl CursorDecoder {
 
     pub fn finish(&mut self, out: &mut Vec<CodexEvent>) {
         if !self.completed {
-            self.complete(out);
+            self.fail("cursor stream ended before completion", out);
         }
     }
 }

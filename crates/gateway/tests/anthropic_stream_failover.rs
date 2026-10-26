@@ -152,3 +152,162 @@ async fn spent_streaming_accounts_are_skipped_until_a_serving_account_is_found()
     drop(state);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[tokio::test]
+async fn request_not_allowed_stream_denials_cool_down_and_walk_past_max_failover_without_poisoning_session_affinity(
+) {
+    // Given: three accounts returning HTTP 200 + SSE "Request not allowed"
+    // before one serving account, with max_failover=2 and an explicit session id.
+    let mut listener = None;
+    for port in 18840..=18899 {
+        match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+            Ok(bound) => {
+                listener = Some(bound);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(error) => panic!("fixture bind failed: {error}"),
+        }
+    }
+    let listener = listener.expect("available fixture port");
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    let seen_tokens = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let observed = Arc::clone(&seen_tokens);
+    let fixture = Router::new().route(
+        "/v1/messages",
+        post(move |headers: axum::http::HeaderMap| {
+            let observed = Arc::clone(&observed);
+            async move {
+                let auth = headers
+                    .get("authorization")
+                    .or_else(|| headers.get("x-api-key"))
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                observed.lock().unwrap().push(auth.clone());
+                let start = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"fixture\",\"role\":\"assistant\",\"content\":[]}}\n\n";
+                let result = if !auth.ends_with("account-3") {
+                    "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"permission_error\",\"message\":\"Request not allowed\"}}\n\n"
+                } else {
+                    "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"served-by-account-3\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+                };
+                ([("content-type", "text/event-stream")], format!("{start}{result}"))
+            }
+        }),
+    );
+    let server = tokio::spawn(async move { axum::serve(listener, fixture).await.unwrap() });
+    let dir = common::unique_temp_dir("anthropic-denial-failover");
+    for index in 0..4 {
+        std::fs::write(
+            dir.join(format!("claude-{index}.json")),
+            json!({
+                "type": "claude",
+                "identity_slug": format!("account-{index}"),
+                "email": format!("account-{index}@example.test"),
+                "access_token": format!("tok-account-{index}"),
+                "upstream_override": upstream
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+    let state = Arc::new(
+        AppState::new(&GatewayConfig {
+            auth_dir: dir.clone(),
+            config_path: dir.join("config.yaml"),
+            api_keys: ApiKeys::new(vec!["fixture".to_string()]),
+            auth_refresh_enabled: false,
+            strategy: Strategy::FillFirst,
+            max_failover: 2,
+            ..GatewayConfig::default()
+        })
+        .unwrap(),
+    );
+    let app = create_app(Arc::clone(&state));
+    let mut finalizer = state.subscribe_finalizer("account-3");
+
+    // When: turn 1 with x-session-id hits the 3 denied accounts and reaches account-3.
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        app.clone().oneshot(
+            Request::post("/v1/chat/completions")
+                .header("authorization", "Bearer fixture")
+                .header("content-type", "application/json")
+                .header("x-session-id", "session-denial-check")
+                .body(Body::from(
+                    json!({"model":"claude-opus-5-5", "stream":true,
+                    "messages":[{"role":"user", "content":"hello"}]})
+                    .to_string(),
+                ))
+                .unwrap(),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        response.into_body().collect(),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .to_bytes();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(text.contains("served-by-account-3"), "{text}");
+    tokio::time::timeout(std::time::Duration::from_secs(10), finalizer.recv())
+        .await
+        .unwrap()
+        .expect("turn 1 finalized");
+
+    // And: even if the denied accounts' cooldowns are cleared before turn 2,
+    // session affinity stays bound to the account that actually succeeded (claude-3),
+    // never to a failed earlier candidate.
+    for member in state.pool.load().members.iter() {
+        if member.id != "account-3" {
+            member.set_health(Health::Available);
+        }
+    }
+    seen_tokens.lock().unwrap().clear();
+    let mut finalizer2 = state.subscribe_finalizer("account-3");
+
+    let response2 = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        app.oneshot(
+            Request::post("/v1/chat/completions")
+                .header("authorization", "Bearer fixture")
+                .header("content-type", "application/json")
+                .header("x-session-id", "session-denial-check")
+                .body(Body::from(
+                    json!({"model":"claude-opus-5-5", "stream":true,
+                    "messages":[{"role":"user", "content":"turn 2"}]})
+                    .to_string(),
+                ))
+                .unwrap(),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(response2.status(), StatusCode::OK);
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        response2.into_body().collect(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), finalizer2.recv())
+        .await
+        .unwrap()
+        .expect("turn 2 finalized");
+
+    let turn2_tokens = seen_tokens.lock().unwrap().clone();
+    assert_eq!(turn2_tokens, vec!["Bearer tok-account-3".to_string()]);
+
+    server.abort();
+    let _ = server.await;
+    drop(state);
+    std::fs::remove_dir_all(dir).unwrap();
+}

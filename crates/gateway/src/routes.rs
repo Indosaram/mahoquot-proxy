@@ -215,7 +215,6 @@ pub fn create_app(state: Arc<AppState>) -> Router {
             "/v0/management",
             crate::management::management_router(Arc::clone(&state)),
         )
-        .nest("/v0/management", crate::compat::meta::onboarding_routes())
         .merge(crate::management::store::routes::v8_management_router(
             Arc::clone(&state),
         ))

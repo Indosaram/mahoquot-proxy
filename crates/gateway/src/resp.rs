@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 use crate::management::gate::ManagementAttempts;
@@ -289,84 +289,118 @@ impl RedisQueueHub {
     }
 }
 
-pub async fn read_resp_array(stream: &mut ProtocolStream) -> Result<Vec<String>, String> {
+const MAX_RESP_ARGS: usize = 128;
+const MAX_RESP_LINE: usize = 8 * 1024;
+const MAX_RESP_BULK: usize = 64 * 1024;
+const MAX_RESP_COMMAND: usize = 256 * 1024;
+const RESP_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+
+pub async fn read_resp_array<R: tokio::io::AsyncRead + Unpin>(
+    stream: &mut R,
+) -> Result<Vec<String>, String> {
+    tokio::time::timeout(RESP_COMMAND_TIMEOUT, read_resp_command(stream))
+        .await
+        .map_err(|_| "command read timed out".to_string())?
+}
+
+async fn read_resp_command<R: tokio::io::AsyncRead + Unpin>(
+    stream: &mut R,
+) -> Result<Vec<String>, String> {
     let prefix = match stream.read_u8().await {
         Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Err("EOF".to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Err("EOF".into()),
         Err(e) => return Err(e.to_string()),
     };
-
     if prefix != b'*' {
-        return Err("protocol error".to_string());
+        return Err("protocol error".into());
     }
-
-    let line = read_resp_line(stream).await?;
-    let count: i64 = line.parse().map_err(|_| "protocol error".to_string())?;
-    if count < 0 {
-        return Err("protocol error".to_string());
+    let mut remaining = MAX_RESP_COMMAND - 1;
+    let count: usize = read_resp_line(stream, &mut remaining)
+        .await?
+        .parse()
+        .map_err(|_| "protocol error".to_string())?;
+    if count > MAX_RESP_ARGS {
+        return Err("too many command arguments".into());
     }
-
-    let mut args = Vec::with_capacity(count as usize);
+    let mut args = Vec::with_capacity(count);
     for _ in 0..count {
-        let arg = read_resp_string(stream).await?;
+        charge_resp(&mut remaining, 1)?;
+        let prefix = stream.read_u8().await.map_err(|e| e.to_string())?;
+        let line = read_resp_line(stream, &mut remaining).await?;
+        let arg = match prefix {
+            b'$' => {
+                let len: usize = line.parse().map_err(|_| "protocol error".to_string())?;
+                if len > MAX_RESP_BULK {
+                    return Err("bulk string too large".into());
+                }
+                let framed = len.checked_add(2).ok_or("bulk string too large")?;
+                charge_resp(&mut remaining, framed)?;
+                let mut buf = vec![0; framed];
+                stream
+                    .read_exact(&mut buf)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if &buf[len..] != b"\r\n" {
+                    return Err("protocol error".into());
+                }
+                buf.truncate(len);
+                String::from_utf8(buf).map_err(|_| "protocol error: invalid utf-8".to_string())?
+            }
+            b'+' | b':' => line,
+            _ => return Err("protocol error".into()),
+        };
         args.push(arg);
     }
     Ok(args)
 }
 
-async fn read_resp_string(stream: &mut ProtocolStream) -> Result<String, String> {
-    let prefix = stream.read_u8().await.map_err(|e| e.to_string())?;
-    match prefix {
-        b'$' => read_resp_bulk_string(stream).await,
-        b'+' | b':' => read_resp_line(stream).await,
-        _ => Err("protocol error".to_string()),
+fn charge_resp(remaining: &mut usize, count: usize) -> Result<(), String> {
+    *remaining = remaining.checked_sub(count).ok_or("command too large")?;
+    Ok(())
+}
+
+async fn read_resp_line<R: tokio::io::AsyncRead + Unpin>(
+    stream: &mut R,
+    remaining: &mut usize,
+) -> Result<String, String> {
+    let mut line = Vec::new();
+    loop {
+        if line.len() == MAX_RESP_LINE {
+            return Err("line too large".into());
+        }
+        charge_resp(remaining, 1)?;
+        let byte = stream.read_u8().await.map_err(|e| e.to_string())?;
+        line.push(byte);
+        if byte == b'\n' {
+            line.pop();
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            return String::from_utf8(line).map_err(|_| "protocol error: invalid utf-8".into());
+        }
     }
 }
 
-async fn read_resp_bulk_string(stream: &mut ProtocolStream) -> Result<String, String> {
-    let line = read_resp_line(stream).await?;
-    let len: i64 = line.parse().map_err(|_| "protocol error".to_string())?;
-    if len < 0 {
-        return Ok(String::new());
-    }
-    let usize_len = len as usize;
-    let mut buf = vec![0u8; usize_len + 2];
-    stream
-        .read_exact(&mut buf)
-        .await
-        .map_err(|e| e.to_string())?;
-    if buf[usize_len] != b'\r' || buf[usize_len + 1] != b'\n' {
-        return Err("protocol error".to_string());
-    }
-    String::from_utf8(buf[..usize_len].to_vec())
-        .map_err(|_| "protocol error: invalid utf-8".to_string())
-}
-
-async fn read_resp_line(stream: &mut ProtocolStream) -> Result<String, String> {
-    let mut line = String::new();
-    stream
-        .read_line(&mut line)
-        .await
-        .map_err(|e| e.to_string())?;
-    if line.ends_with("\r\n") {
-        line.truncate(line.len() - 2);
-    } else if line.ends_with('\n') {
-        line.truncate(line.len() - 1);
-    }
-    Ok(line)
-}
-
-pub async fn write_simple_string(stream: &mut ProtocolStream, s: &str) -> std::io::Result<()> {
+pub async fn write_simple_string(
+    stream: &mut (impl tokio::io::AsyncWrite + Unpin),
+    s: &str,
+) -> std::io::Result<()> {
     stream.write_all(format!("+{s}\r\n").as_bytes()).await?;
     stream.flush().await
 }
 
-pub async fn write_error(stream: &mut ProtocolStream, msg: &str) -> std::io::Result<()> {
+pub async fn write_error(
+    stream: &mut (impl tokio::io::AsyncWrite + Unpin),
+    msg: &str,
+) -> std::io::Result<()> {
     stream.write_all(format!("-{msg}\r\n").as_bytes()).await?;
     stream.flush().await
 }
 
-pub async fn write_integer(stream: &mut ProtocolStream, val: i64) -> std::io::Result<()> {
+pub async fn write_integer(
+    stream: &mut (impl tokio::io::AsyncWrite + Unpin),
+    val: i64,
+) -> std::io::Result<()> {
     stream.write_all(format!(":{val}\r\n").as_bytes()).await?;
     stream.flush().await
 }
@@ -376,7 +410,10 @@ pub async fn write_nil_bulk_string(stream: &mut ProtocolStream) -> std::io::Resu
     stream.flush().await
 }
 
-pub async fn write_bulk_string(stream: &mut ProtocolStream, data: &[u8]) -> std::io::Result<()> {
+pub async fn write_bulk_string(
+    stream: &mut (impl tokio::io::AsyncWrite + Unpin),
+    data: &[u8],
+) -> std::io::Result<()> {
     stream
         .write_all(format!("${}\r\n", data.len()).as_bytes())
         .await?;
@@ -386,7 +423,7 @@ pub async fn write_bulk_string(stream: &mut ProtocolStream, data: &[u8]) -> std:
 }
 
 pub async fn write_array_of_bulk_strings(
-    stream: &mut ProtocolStream,
+    stream: &mut (impl tokio::io::AsyncWrite + Unpin),
     items: &[Bytes],
 ) -> std::io::Result<()> {
     stream
@@ -403,7 +440,7 @@ pub async fn write_array_of_bulk_strings(
 }
 
 pub async fn write_pubsub_subscribe(
-    stream: &mut ProtocolStream,
+    stream: &mut (impl tokio::io::AsyncWrite + Unpin),
     channel: &str,
     count: usize,
 ) -> std::io::Result<()> {
@@ -416,7 +453,7 @@ pub async fn write_pubsub_subscribe(
 }
 
 pub async fn write_pubsub_unsubscribe(
-    stream: &mut ProtocolStream,
+    stream: &mut (impl tokio::io::AsyncWrite + Unpin),
     channel: &str,
     count: usize,
 ) -> std::io::Result<()> {
@@ -429,7 +466,7 @@ pub async fn write_pubsub_unsubscribe(
 }
 
 pub async fn write_pubsub_message(
-    stream: &mut ProtocolStream,
+    stream: &mut (impl tokio::io::AsyncWrite + Unpin),
     channel: &str,
     payload: &[u8],
 ) -> std::io::Result<()> {
@@ -446,7 +483,7 @@ pub async fn write_pubsub_message(
 }
 
 pub async fn write_pubsub_pong(
-    stream: &mut ProtocolStream,
+    stream: &mut (impl tokio::io::AsyncWrite + Unpin),
     payload: Option<&[u8]>,
 ) -> std::io::Result<()> {
     stream.write_all(b"*2\r\n$4\r\npong\r\n").await?;
@@ -489,6 +526,10 @@ fn check_management_auth(
             .as_ref()
             .is_some_and(|s| s.remote_management.allow_remote);
     let missing = password.is_empty();
+    let _permit = attempts
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .begin_verification(ip, allow_remote, Instant::now())?;
 
     let valid = if missing {
         false
@@ -769,59 +810,79 @@ async fn stream_subscription(
     let mut unsubscribe = Some(unsubscribe);
     let _unsubscribe_guard = defer_unsubscribe(&mut unsubscribe);
 
+    let (mut reader, mut writer) = tokio::io::split(stream);
     loop {
-        tokio::select! {
-            msg = messages.recv() => {
-                match msg {
-                    Some(payload) => {
-                        if write_pubsub_message(stream, channel, &payload).await.is_err() {
+        let command = async {
+            let prefix = reader.read_u8().await.map_err(|e| {
+                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    "EOF".to_string()
+                } else {
+                    e.to_string()
+                }
+            })?;
+            let mut input = std::io::Cursor::new([prefix]).chain(&mut reader);
+            read_resp_array(&mut input).await
+        };
+        tokio::pin!(command);
+        let read_res = loop {
+            tokio::select! {
+                msg = messages.recv() => {
+                    match msg {
+                        Some(payload) => {
+                            if write_pubsub_message(&mut writer, channel, &payload).await.is_err() {
+                                return;
+                            }
+                        }
+                        None => return,
+                    }
+                }
+                result = &mut command => break result,
+            }
+        };
+        match read_res {
+            Ok(args) => {
+                if args.is_empty() {
+                    let _ = write_error(&mut writer, "ERR empty command").await;
+                    continue;
+                }
+                let sub_cmd = args[0].to_ascii_uppercase();
+                match sub_cmd.as_str() {
+                    "PING" => {
+                        let payload = if args.len() > 1 {
+                            Some(args[1].as_bytes())
+                        } else {
+                            None
+                        };
+                        if write_pubsub_pong(&mut writer, payload).await.is_err() {
                             return;
                         }
                     }
-                    None => return,
-                }
-            }
-            read_res = read_resp_array(stream) => {
-                match read_res {
-                    Ok(args) => {
-                        if args.is_empty() {
-                            let _ = write_error(stream, "ERR empty command").await;
-                            continue;
-                        }
-                        let sub_cmd = args[0].to_ascii_uppercase();
-                        match sub_cmd.as_str() {
-                            "PING" => {
-                                let payload = if args.len() > 1 {
-                                    Some(args[1].as_bytes())
-                                } else {
-                                    None
-                                };
-                                if write_pubsub_pong(stream, payload).await.is_err() {
-                                    return;
-                                }
-                            }
-                            "UNSUBSCRIBE" => {
-                                let _ = write_pubsub_unsubscribe(stream, channel, 0).await;
-                                return;
-                            }
-                            "QUIT" => {
-                                let _ = write_simple_string(stream, "OK").await;
-                                return;
-                            }
-                            _ => {
-                                if write_error(stream, &format!("ERR unknown command '{}'", sub_cmd.to_ascii_lowercase())).await.is_err() {
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        if e != "EOF" {
-                            let _ = write_error(stream, &format!("ERR {e}")).await;
-                        }
+                    "UNSUBSCRIBE" => {
+                        let _ = write_pubsub_unsubscribe(&mut writer, channel, 0).await;
                         return;
                     }
+                    "QUIT" => {
+                        let _ = write_simple_string(&mut writer, "OK").await;
+                        return;
+                    }
+                    _ => {
+                        if write_error(
+                            &mut writer,
+                            &format!("ERR unknown command '{}'", sub_cmd.to_ascii_lowercase()),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            return;
+                        }
+                    }
                 }
+            }
+            Err(e) => {
+                if e != "EOF" {
+                    let _ = write_error(&mut writer, &format!("ERR {e}")).await;
+                }
+                return;
             }
         }
     }
@@ -842,6 +903,215 @@ fn defer_unsubscribe(unsub: &mut Option<Box<dyn FnOnce() + Send + 'static>>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn management_auth_preflights_shared_verifier_capacity_and_policy() {
+        use axum::http::StatusCode;
+        assert!(
+            std::env::var("MANAGEMENT_PASSWORD")
+                .unwrap_or_default()
+                .is_empty(),
+            "run with MANAGEMENT_PASSWORD unset"
+        );
+        let mut settings = crate::management::settings::Settings::default();
+        settings.remote_management.secret_key = "resp-fixture".into();
+        let store = SettingsStore::new(settings, Default::default());
+        let attempts = Mutex::new(ManagementAttempts::default());
+        let local: SocketAddr = "127.0.0.1:18840".parse().unwrap();
+        let remote: SocketAddr = "192.0.2.1:18840".parse().unwrap();
+        let mut permits = Vec::new();
+        for _ in 0..128 {
+            permits.push(
+                attempts
+                    .lock()
+                    .unwrap()
+                    .begin_verification(local.ip(), false, Instant::now())
+                    .unwrap(),
+            );
+        }
+        assert_eq!(
+            check_management_auth(Some(&store), &attempts, local, "resp-fixture")
+                .unwrap_err()
+                .0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            check_management_auth(Some(&store), &attempts, remote, "resp-fixture")
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        permits.pop();
+        for _ in 0..2 {
+            check_management_auth(Some(&store), &attempts, local, "resp-fixture").unwrap();
+        }
+        for _ in 0..5 {
+            assert_eq!(
+                check_management_auth(Some(&store), &attempts, local, "wrong")
+                    .unwrap_err()
+                    .0,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        assert_eq!(
+            check_management_auth(Some(&store), &attempts, local, "resp-fixture")
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_subscription_releases_hub_subscriber() {
+        let hub = Arc::new(RedisQueueHub::default());
+        let (rx, unsub) = hub.subscribe_errors();
+        let (mut client, server) = tokio::io::duplex(128);
+        let mut server: ProtocolStream = tokio::io::BufReader::new(Box::new(server));
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            stream_subscription(&mut server, "errors", rx, unsub).await;
+        });
+        hub.enqueue_error(Bytes::from_static(b"ready"));
+        tokio::time::timeout(Duration::from_secs(1), read_resp_array(&mut client))
+            .await
+            .unwrap()
+            .unwrap();
+        tasks.shutdown().await;
+        assert!(hub.global_errors.lock().unwrap().subscribers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_headers_before_payload() {
+        let mut aggregate = b"*4\r\n".to_vec();
+        for _ in 0..3 {
+            aggregate.extend_from_slice(format!("${MAX_RESP_BULK}\r\n").as_bytes());
+            aggregate.extend(vec![b'x'; MAX_RESP_BULK]);
+            aggregate.extend_from_slice(b"\r\n");
+        }
+        aggregate.extend_from_slice(format!("${MAX_RESP_BULK}\r\n").as_bytes());
+        let cases = [
+            (
+                b"*9223372036854775807\r\n".to_vec(),
+                "too many command arguments",
+            ),
+            (
+                b"*1\r\n$9223372036854775807\r\n".to_vec(),
+                "bulk string too large",
+            ),
+            (
+                [b"*".as_slice(), &vec![b'1'; MAX_RESP_LINE]].concat(),
+                "line too large",
+            ),
+            (b"*-1\r\n".to_vec(), "protocol error"),
+            (b"*1\r\n$-2\r\n".to_vec(), "protocol error"),
+            (aggregate, "command too large"),
+        ];
+        for (wire, expected) in cases {
+            let (mut client, mut server) = tokio::io::duplex(wire.len() + 1);
+            client.write_all(&wire).await.unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(1), read_resp_array(&mut server))
+                .await
+                .expect("must reject without payload or EOF");
+            assert_eq!(result.unwrap_err(), expected);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn partial_command_read_expires() {
+        let (mut client, mut server) = tokio::io::duplex(64);
+        client.write_all(b"*1\r\n$4\r\nPI").await.unwrap();
+        assert_eq!(
+            read_resp_array(&mut server).await.unwrap_err(),
+            "command read timed out"
+        );
+    }
+
+    #[tokio::test]
+    async fn fragmented_command_survives_publication() {
+        struct Observed {
+            io: tokio::io::DuplexStream,
+            remaining: usize,
+            consumed: Option<tokio::sync::oneshot::Sender<()>>,
+        }
+        impl tokio::io::AsyncRead for Observed {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                let before = buf.filled().len();
+                let result = std::pin::Pin::new(&mut self.io).poll_read(cx, buf);
+                self.remaining = self.remaining.saturating_sub(buf.filled().len() - before);
+                if self.remaining == 0 {
+                    if let Some(tx) = self.consumed.take() {
+                        tx.send(()).unwrap();
+                    }
+                }
+                result
+            }
+        }
+        impl tokio::io::AsyncWrite for Observed {
+            fn poll_write(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+                data: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                std::pin::Pin::new(&mut self.io).poll_write(cx, data)
+            }
+            fn poll_flush(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::pin::Pin::new(&mut self.io).poll_flush(cx)
+            }
+            fn poll_shutdown(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::pin::Pin::new(&mut self.io).poll_shutdown(cx)
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let fragment = b"*1\r\n$4\r\nPI";
+            let (mut client, server) = tokio::io::duplex(1024);
+            let (tx, consumed) = tokio::sync::oneshot::channel();
+            let mut server: ProtocolStream = tokio::io::BufReader::with_capacity(
+                1,
+                Box::new(Observed {
+                    io: server,
+                    remaining: fragment.len(),
+                    consumed: Some(tx),
+                }),
+            );
+            let hub = Arc::new(RedisQueueHub::default());
+            let (rx, unsub) = hub.subscribe_errors();
+            let mut tasks = tokio::task::JoinSet::new();
+            tasks.spawn(async move {
+                stream_subscription(&mut server, "errors", rx, unsub).await;
+            });
+            client.write_all(fragment).await.unwrap();
+            consumed.await.unwrap();
+            hub.enqueue_error(Bytes::from_static(b"event"));
+            assert_eq!(
+                read_resp_array(&mut client).await.unwrap(),
+                ["message", "errors", "event"]
+            );
+            client.write_all(b"NG\r\n").await.unwrap();
+            assert_eq!(read_resp_array(&mut client).await.unwrap(), ["pong", ""]);
+            client
+                .write_all(b"*1\r\n$11\r\nUNSUBSCRIBE\r\n")
+                .await
+                .unwrap();
+            assert_eq!(
+                read_resp_array(&mut client).await.unwrap(),
+                ["unsubscribe", "errors", "0"]
+            );
+            tasks.join_next().await.unwrap().unwrap();
+            assert!(hub.global_errors.lock().unwrap().subscribers.is_empty());
+        })
+        .await
+        .unwrap();
+    }
 
     #[tokio::test]
     async fn test_hub_queue_enqueue_pop_and_broadcast() {

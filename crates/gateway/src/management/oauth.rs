@@ -86,6 +86,7 @@ pub fn create_antigravity_auth_url(
         .get("load_url")
         .cloned()
         .unwrap_or_else(|| ANTIGRAVITY_DEFAULT_LOAD_URL.to_string());
+    let daily_url = params.get("daily_url").cloned();
 
     let redirect_uri = params
         .get("redirect_uri")
@@ -113,6 +114,7 @@ pub fn create_antigravity_auth_url(
         "client_secret": client_secret,
         "userinfo_url": userinfo_url,
         "load_url": load_url,
+        "daily_url": daily_url,
         "credential_name": params.get("credential_name"),
     })
     .to_string();
@@ -132,6 +134,29 @@ pub fn create_antigravity_auth_url(
     };
 
     (url, state, session)
+}
+
+fn antigravity_daily_url<'a>(session: &OAuthSession, meta: &'a Value) -> Result<&'a str, String> {
+    if let Some(url) = meta
+        .get("daily_url")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        return Ok(url);
+    }
+    if session.token_url != ANTIGRAVITY_DEFAULT_TOKEN_URL
+        || meta
+            .get("userinfo_url")
+            .and_then(Value::as_str)
+            .is_some_and(|url| url != ANTIGRAVITY_DEFAULT_USERINFO_URL)
+        || meta
+            .get("load_url")
+            .and_then(Value::as_str)
+            .is_some_and(|url| url != ANTIGRAVITY_DEFAULT_LOAD_URL)
+    {
+        return Err("Custom Antigravity endpoints require daily_url".to_string());
+    }
+    Ok(ANTIGRAVITY_DEFAULT_DAILY_URL)
 }
 
 fn extract_antigravity_project_id(data: &Value) -> String {
@@ -176,6 +201,9 @@ async fn exchange_antigravity_code(
         .get("load_url")
         .and_then(Value::as_str)
         .unwrap_or(ANTIGRAVITY_DEFAULT_LOAD_URL);
+    // A redirected onboarding chain must never silently send its token to the
+    // production fallback. Validate before even exchanging the code.
+    let daily_url = antigravity_daily_url(session, &extra_meta)?;
 
     let response = state
         .http_client()
@@ -297,7 +325,6 @@ async fn exchange_antigravity_code(
     }
 
     if project_id.is_empty() {
-        let daily_url = ANTIGRAVITY_DEFAULT_DAILY_URL;
         let onboard_resp = state
             .http_client()
             .post(daily_url)
@@ -406,7 +433,7 @@ async fn exchange_antigravity_code(
         credential = old;
     }
     let rendered = serde_json::to_string_pretty(&credential).map_err(|error| error.to_string())?;
-    write_session_credential(session, &target, rendered.as_bytes())?;
+    persist_session_credential(state, session, &target, rendered.as_bytes())?;
 
     session.saved_account_email = Some(email);
     session.status = SessionStatus::Completed;
@@ -458,11 +485,11 @@ fn create_xai_auth_url(params: &HashMap<String, String>) -> (String, String, OAu
     let auth_url = params
         .get("auth_url")
         .cloned()
-        .unwrap_or_else(|| "https://auth.x.ai/oauth/authorize".to_string());
+        .unwrap_or_else(|| "https://auth.x.ai/oauth2/authorize".to_string());
     let token_url = params
         .get("token_url")
         .cloned()
-        .unwrap_or_else(|| "https://auth.x.ai/oauth/token".to_string());
+        .unwrap_or_else(|| "https://auth.x.ai/oauth2/token".to_string());
     let redirect_uri = params
         .get("redirect_uri")
         .cloned()
@@ -539,7 +566,8 @@ async fn exchange_xai_code(
     });
     let auth_dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
     let rendered = serde_json::to_string_pretty(&credential).map_err(|error| error.to_string())?;
-    write_session_credential(
+    persist_session_credential(
+        state,
         session,
         &auth_dir.join(format!("generic-xai-{}.json", sanitize_filename(email))),
         rendered.as_bytes(),
@@ -582,9 +610,21 @@ async fn fetch_credential_models(
         .map_err(|error| format!("{provider} model catalog unreachable: {error}"))?;
     let status = response.status();
     if !status.is_success() {
-        return Err(format!(
-            "{provider} model catalog rejected the token ({status})"
-        ));
+        let body = response.text().await.unwrap_or_default();
+        let reason = serde_json::from_str::<Value>(&body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+        return Err(if reason.is_empty() {
+            format!("{provider} model catalog rejected the token ({status})")
+        } else {
+            format!("{provider} model catalog rejected the token ({status}): {reason}")
+        });
     }
     let parsed: Value = response
         .json()
@@ -638,6 +678,7 @@ pub(crate) fn device_provider(provider: &str) -> Option<DeviceProvider> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionStatus {
     Pending,
+    Exchanging,
     Completed,
     Failed(String),
 }
@@ -754,6 +795,11 @@ fn spawn_callback_listener(
 /// state is a no-op. The caller holds the `SESSIONS` write guard.
 fn update_session_in(sessions: &mut HashMap<String, OAuthSession>, session: OAuthSession) {
     if let Some(slot) = sessions.get_mut(&session.state) {
+        if session.provider == "command-code"
+            && (slot.status != SessionStatus::Exchanging || slot.uuid != session.uuid)
+        {
+            return;
+        }
         *slot = session;
     }
 }
@@ -1127,13 +1173,44 @@ fn write_session_credential(
     path: &std::path::Path,
     contents: &[u8],
 ) -> Result<(), String> {
+    write_session_credential_with(session, || {
+        write_credential_atomically(path, contents).map_err(|error| error.to_string())
+    })
+}
+
+fn persist_session_credential(
+    state: &AppState,
+    session: &OAuthSession,
+    path: &std::path::Path,
+    contents: &[u8],
+) -> Result<(), String> {
+    if state.settings.storage_manager().is_none() {
+        return write_session_credential(session, path, contents);
+    }
+    tokio::task::block_in_place(|| {
+        let _mutation = state.settings.composition_lock();
+        write_session_credential_with(session, || {
+            super::creds::persist_credential(state, path, contents)
+                .map_err(|error| error.to_string())
+        })
+    })
+}
+
+fn write_session_credential_with(
+    session: &OAuthSession,
+    persist: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
     let sessions = SESSIONS.read().unwrap();
     if !sessions.get(&session.state).is_some_and(|active| {
         Instant::now().saturating_duration_since(active.created_at) < OAUTH_SESSION_TTL
+            && (session.provider != "command-code"
+                || (active.status == SessionStatus::Exchanging
+                    && active.uuid == session.uuid
+                    && active.created_at == session.created_at))
     }) {
         return Err("OAuth session expired or cancelled".to_string());
     }
-    write_credential_atomically(path, contents).map_err(|error| error.to_string())
+    persist()
 }
 
 async fn start_device_session(
@@ -1350,8 +1427,13 @@ async fn poll_device_session(
         sanitize_filename(email)
     );
     let rendered = serde_json::to_string_pretty(&credential).map_err(|error| error.to_string())?;
-    write_session_credential(session, &auth_dir.join(filename), rendered.as_bytes())
-        .map_err(|error| error.to_string())?;
+    persist_session_credential(
+        state,
+        session,
+        &auth_dir.join(filename),
+        rendered.as_bytes(),
+    )
+    .map_err(|error| error.to_string())?;
     session.saved_account_email = Some(email.to_string());
     session.status = SessionStatus::Completed;
     Ok(Some(credential))
@@ -1374,6 +1456,7 @@ fn expiry_from_token_body(body: &Value) -> String {
 }
 
 pub async fn exchange_anthropic_code(
+    state: &AppState,
     client: &reqwest::Client,
     auth_dir: &std::path::Path,
     session: &mut OAuthSession,
@@ -1462,7 +1545,7 @@ pub async fn exchange_anthropic_code(
     let file_path = auth_dir.join(&filename);
     let rendered = serde_json::to_string_pretty(&cred_json)
         .map_err(|e| format!("failed to format json: {e}"))?;
-    write_session_credential(session, &file_path, rendered.as_bytes())
+    persist_session_credential(state, session, &file_path, rendered.as_bytes())
         .map_err(|e| format!("failed writing credential file: {e}"))?;
 
     session.saved_account_email = Some(email.to_string());
@@ -1561,8 +1644,13 @@ async fn exchange_codex_code(
     let filename = format!("codex-{}{}.json", sanitize_filename(email), suffix);
     let rendered = serde_json::to_string_pretty(&credential).map_err(|error| error.to_string())?;
     let auth_dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
-    write_session_credential(session, &auth_dir.join(filename), rendered.as_bytes())
-        .map_err(|error| error.to_string())?;
+    persist_session_credential(
+        state,
+        session,
+        &auth_dir.join(filename),
+        rendered.as_bytes(),
+    )
+    .map_err(|error| error.to_string())?;
     session.saved_account_email = Some(email.to_string());
     session.status = SessionStatus::Completed;
     Ok(())
@@ -1587,6 +1675,7 @@ fn decode_jwt_claims(token: &str) -> Option<Value> {
 }
 
 pub async fn poll_cursor_session(
+    state: &AppState,
     client: &reqwest::Client,
     auth_dir: &std::path::Path,
     session: &mut OAuthSession,
@@ -1674,7 +1763,7 @@ pub async fn poll_cursor_session(
     let file_path = auth_dir.join(&filename);
     let rendered = serde_json::to_string_pretty(&cred_json)
         .map_err(|e| format!("failed formatting json: {e}"))?;
-    write_session_credential(session, &file_path, rendered.as_bytes())
+    persist_session_credential(state, session, &file_path, rendered.as_bytes())
         .map_err(|e| format!("failed writing credential file: {e}"))?;
 
     session.saved_account_email = Some(email.to_string());
@@ -1738,7 +1827,7 @@ pub(crate) async fn auth_status(
             if session.provider == "zcode" && session.status == SessionStatus::Pending {
                 let auth_dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
                 let poll_result =
-                    poll_zcode_session(&state.http_client(), &auth_dir, &mut session).await;
+                    poll_zcode_session(&state, &state.http_client(), &auth_dir, &mut session).await;
                 if !session_is_active(session_state) {
                     return json_status(
                         StatusCode::NOT_FOUND,
@@ -1784,7 +1873,8 @@ pub(crate) async fn auth_status(
             if session.provider == "cursor" && session.status == SessionStatus::Pending {
                 let auth_dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
                 let poll_result =
-                    poll_cursor_session(&state.http_client(), &auth_dir, &mut session).await;
+                    poll_cursor_session(&state, &state.http_client(), &auth_dir, &mut session)
+                        .await;
                 if !session_is_active(session_state) {
                     return json_status(
                         StatusCode::NOT_FOUND,
@@ -1879,7 +1969,7 @@ pub(crate) async fn auth_status(
                         json!({ "status": "ok", "provider": session.provider }),
                     );
                 }
-                SessionStatus::Pending => {
+                SessionStatus::Pending | SessionStatus::Exchanging => {
                     return json_status(StatusCode::OK, json!({ "status": "pending" }));
                 }
                 SessionStatus::Failed(msg) => {
@@ -2036,12 +2126,32 @@ async fn exchange_command_code_callback(
     );
     let auth_dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
     let rendered = serde_json::to_string_pretty(&credential).map_err(|e| e.to_string())?;
-    write_session_credential(session, &auth_dir.join(filename), rendered.as_bytes())?;
+    persist_session_credential(
+        state,
+        session,
+        &auth_dir.join(filename),
+        rendered.as_bytes(),
+    )?;
 
     session.saved_account_email = Some(final_label.to_string());
     state.rescan_pool().map_err(|error| error.to_string())?;
     session.status = SessionStatus::Completed;
     Ok(())
+}
+
+fn claim_command_code_session(state: &str) -> Result<OAuthSession, String> {
+    let mut sessions = SESSIONS.write().unwrap();
+    let session = sessions
+        .get_mut(state)
+        .filter(|session| {
+            session.provider == "command-code"
+                && session.status == SessionStatus::Pending
+                && Instant::now().saturating_duration_since(session.created_at) < OAUTH_SESSION_TTL
+        })
+        .ok_or_else(|| "Command Code OAuth state is not pending".to_string())?;
+    session.status = SessionStatus::Exchanging;
+    session.uuid = new_state();
+    Ok(session.clone())
 }
 
 pub async fn oauth_callback(
@@ -2072,25 +2182,6 @@ pub async fn oauth_callback(
             );
         }
 
-        let session_opt = {
-            let sessions = SESSIONS.read().unwrap();
-            sessions.get(state_val).cloned()
-        };
-
-        let Some(mut session) = session_opt else {
-            return json_status(
-                StatusCode::BAD_REQUEST,
-                json!({ "error": "Command Code OAuth state mismatch", "status": "error" }),
-            );
-        };
-
-        if session.provider != "command-code" {
-            return json_status(
-                StatusCode::BAD_REQUEST,
-                json!({ "error": "OAuth session provider mismatch", "status": "error" }),
-            );
-        }
-
         let api_key = body_json
             .get("apiKey")
             .or_else(|| body_json.get("api_key"))
@@ -2117,15 +2208,21 @@ pub async fn oauth_callback(
             || user_name.trim().is_empty()
             || key_name.trim().is_empty()
         {
-            session.status =
-                SessionStatus::Failed("Command Code callback missing required fields".to_string());
-            update_session_in(&mut SESSIONS.write().unwrap(), session);
             return json_status(
                 StatusCode::BAD_REQUEST,
                 json!({ "error": "Command Code callback missing required fields", "status": "error" }),
             );
         }
 
+        let mut session = match claim_command_code_session(state_val) {
+            Ok(session) => session,
+            Err(error) => {
+                return json_status(
+                    StatusCode::BAD_REQUEST,
+                    json!({ "error": error, "status": "error" }),
+                )
+            }
+        };
         let exchange_result =
             exchange_command_code_callback(&state, &mut session, api_key, user_name).await;
         if !session_is_active(state_val) {
@@ -2184,6 +2281,7 @@ pub async fn oauth_callback(
             {
                 let auth_dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
                 let exchange_res = exchange_anthropic_code(
+                    &state,
                     &state.http_client(),
                     &auth_dir,
                     &mut session,
@@ -2404,6 +2502,59 @@ fn auth_url_for(
     json_status(StatusCode::OK, body)
 }
 
+async fn bound_oauth_callback(
+    state: Arc<AppState>,
+    provider: &str,
+    expected: &str,
+    finished: Arc<Notify>,
+    query: HashMap<String, String>,
+    body: axum::body::Bytes,
+) -> Response {
+    let valid_shape = if provider == "command-code" {
+        serde_json::from_slice::<Value>(&body)
+            .ok()
+            .is_some_and(|value| value.get("state").and_then(Value::as_str) == Some(expected))
+    } else {
+        body.is_empty()
+            && query.get("state").map(String::as_str) == Some(expected)
+            && query
+                .get("code")
+                .is_some_and(|code| !code.trim().is_empty())
+    };
+    let valid_session = SESSIONS
+        .read()
+        .unwrap()
+        .get(expected)
+        .is_some_and(|session| {
+            session.provider == provider && session.status == SessionStatus::Pending
+        });
+    if !valid_shape || !valid_session {
+        return json_status(
+            StatusCode::BAD_REQUEST,
+            json!({"status":"error","error":"Invalid OAuth callback"}),
+        );
+    }
+    let response = oauth_callback(State(state), Query(query), body).await;
+    let completed = SESSIONS
+        .read()
+        .unwrap()
+        .get(expected)
+        .is_some_and(|session| {
+            session.provider == provider && session.status == SessionStatus::Completed
+        });
+    if completed && response.status().is_success() {
+        finished.notify_one();
+        response
+    } else if response.status().is_success() {
+        json_status(
+            StatusCode::BAD_REQUEST,
+            json!({"status":"error","error":"OAuth exchange did not complete"}),
+        )
+    } else {
+        response
+    }
+}
+
 async fn antigravity_auth_url_handler(
     State(app_state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
@@ -2425,20 +2576,23 @@ async fn antigravity_auth_url_handler(
         let finished = Arc::new(Notify::new());
         let callback_state = app_state.clone();
         let callback_finished = finished.clone();
+        let expected_state = state.clone();
         let callback_app = Router::new().route(
             "/oauth-callback",
             get(move |Query(query): Query<HashMap<String, String>>| {
                 let callback_state = callback_state.clone();
                 let callback_finished = callback_finished.clone();
+                let expected_state = expected_state.clone();
                 async move {
-                    let response = oauth_callback(
-                        State(callback_state),
-                        Query(query),
+                    bound_oauth_callback(
+                        callback_state,
+                        "antigravity",
+                        &expected_state,
+                        callback_finished,
+                        query,
                         axum::body::Bytes::new(),
                     )
-                    .await;
-                    callback_finished.notify_one();
-                    response
+                    .await
                 }
             }),
         );
@@ -2498,20 +2652,23 @@ async fn codex_auth_url_handler(
         let finished = Arc::new(Notify::new());
         let callback_state = app_state.clone();
         let callback_finished = finished.clone();
+        let expected_state = state.clone();
         let callback_app = Router::new().route(
             "/auth/callback",
             get(move |Query(query): Query<HashMap<String, String>>| {
                 let callback_state = callback_state.clone();
                 let callback_finished = callback_finished.clone();
+                let expected_state = expected_state.clone();
                 async move {
-                    let response = oauth_callback(
-                        State(callback_state),
-                        Query(query),
+                    bound_oauth_callback(
+                        callback_state,
+                        "codex",
+                        &expected_state,
+                        callback_finished,
+                        query,
                         axum::body::Bytes::new(),
                     )
-                    .await;
-                    callback_finished.notify_one();
-                    response
+                    .await
                 }
             }),
         );
@@ -2552,16 +2709,23 @@ async fn command_code_auth_url_handler(
         let finished = Arc::new(Notify::new());
         let callback_state = app_state.clone();
         let callback_finished = finished.clone();
+        let expected_state = state.clone();
         let callback_app = Router::new().route(
             "/callback",
             post(move |body: axum::body::Bytes| {
                 let callback_state = callback_state.clone();
                 let callback_finished = callback_finished.clone();
+                let expected_state = expected_state.clone();
                 async move {
-                    let res =
-                        oauth_callback(State(callback_state), Query(HashMap::new()), body).await;
-                    callback_finished.notify_one();
-                    res
+                    bound_oauth_callback(
+                        callback_state,
+                        "command-code",
+                        &expected_state,
+                        callback_finished,
+                        HashMap::new(),
+                        body,
+                    )
+                    .await
                 }
             })
             .options(|| async {
@@ -2654,6 +2818,7 @@ async fn start_zcode_plan_session(
 /// it terminally — the plan JWT has no refresh grant, so a rejected flow needs
 /// a fresh browser login.
 pub(crate) async fn poll_zcode_session(
+    state: &AppState,
     client: &reqwest::Client,
     auth_dir: &Path,
     session: &mut OAuthSession,
@@ -2709,7 +2874,12 @@ pub(crate) async fn poll_zcode_session(
                 "disabled": false,
             });
             let rendered = serde_json::to_string_pretty(&credential).map_err(|e| e.to_string())?;
-            write_session_credential(session, &auth_dir.join(filename), rendered.as_bytes())?;
+            persist_session_credential(
+                state,
+                session,
+                &auth_dir.join(filename),
+                rendered.as_bytes(),
+            )?;
             session.saved_account_email = Some(identity.clone());
             session.status = SessionStatus::Completed;
             Ok(Some(identity))
@@ -2836,6 +3006,13 @@ pub async fn start_oauth_by_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn xai_defaults_use_the_published_oauth2_endpoints() {
+        let (url, _, session) = create_xai_auth_url(&HashMap::new());
+        assert!(url.starts_with("https://auth.x.ai/oauth2/authorize?"));
+        assert_eq!(session.token_url, "https://auth.x.ai/oauth2/token");
+    }
 
     #[test]
     fn every_provider_upstream_advertises_has_a_route() {
@@ -3188,6 +3365,441 @@ mod tests {
 
         assert_port_released(port).await;
         drop(hung);
+    }
+
+    struct ReviewFixture {
+        state: Arc<AppState>,
+        root: std::path::PathBuf,
+        sessions: Vec<String>,
+        tasks: Vec<tokio::task::AbortHandle>,
+    }
+
+    impl ReviewFixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!("review-oauth-{}", new_state()));
+            std::fs::create_dir(&root).unwrap();
+            let state = Arc::new(
+                AppState::new(&crate::config::GatewayConfig {
+                    auth_dir: root.clone(),
+                    config_path: root.join("config.yaml"),
+                    auth_refresh_enabled: false,
+                    ..Default::default()
+                })
+                .unwrap(),
+            );
+            Self {
+                state,
+                root,
+                sessions: Vec::new(),
+                tasks: Vec::new(),
+            }
+        }
+
+        fn insert(&mut self, session: OAuthSession) {
+            self.sessions.push(session.state.clone());
+            SESSIONS
+                .write()
+                .unwrap()
+                .insert(session.state.clone(), session);
+        }
+    }
+
+    impl Drop for ReviewFixture {
+        fn drop(&mut self) {
+            for task in &self.tasks {
+                task.abort();
+            }
+            for state in &self.sessions {
+                SESSIONS.write().unwrap().remove(state);
+            }
+            std::fs::remove_dir_all(&self.root).expect("remove owned OAuth fixture");
+        }
+    }
+
+    async fn review_bounded<T>(future: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(5), future)
+            .await
+            .expect("OAuth fixture deadline")
+    }
+
+    #[tokio::test]
+    async fn review_callback_listeners_reject_invalid_then_complete_locally() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for provider in ["codex", "antigravity", "command-code"] {
+            let mut fixture = ReviewFixture::new();
+            let hits = Arc::new(AtomicUsize::new(0));
+            let daily_hits = Arc::new(AtomicUsize::new(0));
+            let seen = hits.clone();
+            let daily_seen = daily_hits.clone();
+            let mock = Router::new()
+                .route("/token", post(move || { let seen = seen.clone(); async move {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({"access_token":"fixture-token","refresh_token":"fixture-refresh","email":"fixture@example.invalid"}))
+                }}))
+                .route("/userinfo", get(|| async { Json(json!({"email":"fixture@example.invalid"})) }))
+                .route("/load", post(|| async { Json(json!({})) }))
+                .route("/daily", post(move || { let seen = daily_seen.clone(); async move {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({"response":{"projectId":"local-project"}}))
+                }}))
+                .route("/whoami", get({ let seen = hits.clone(); move || { let seen = seen.clone(); async move {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({"user":{"id":"fixture-id","userName":"fixture-user"}}))
+                }}}))
+                .route("/models", get(|| async { Json(json!({"data":[{"id":"fixture-model"}]})) }));
+            let (upstream, upstream_port) = allocate_test_listener().await;
+            let base = format!("http://127.0.0.1:{upstream_port}");
+            let task = tokio::spawn(async move { axum::serve(upstream, mock).await.unwrap() });
+            fixture.tasks.push(task.abort_handle());
+            let params = HashMap::from([
+                ("token_url".into(), format!("{base}/token")),
+                ("userinfo_url".into(), format!("{base}/userinfo")),
+                ("load_url".into(), format!("{base}/load")),
+                ("daily_url".into(), format!("{base}/daily")),
+                ("whoami_url".into(), format!("{base}/whoami")),
+                ("base_url".into(), base.clone()),
+            ]);
+            let (_, key, session) = match provider {
+                "codex" => create_codex_auth_url(&params),
+                "antigravity" => create_antigravity_auth_url(&params),
+                _ => create_command_code_auth_url(&params),
+            };
+            fixture.insert(session);
+            let finished = Arc::new(Notify::new());
+            let app = Router::new().route(
+                "/callback",
+                get({
+                    let state = fixture.state.clone();
+                    let key = key.clone();
+                    let finished = finished.clone();
+                    move |Query(query): Query<HashMap<String, String>>| {
+                        let state = state.clone();
+                        let key = key.clone();
+                        let finished = finished.clone();
+                        async move {
+                            bound_oauth_callback(
+                                state,
+                                provider,
+                                &key,
+                                finished,
+                                query,
+                                axum::body::Bytes::new(),
+                            )
+                            .await
+                        }
+                    }
+                })
+                .post({
+                    let state = fixture.state.clone();
+                    let key = key.clone();
+                    let finished = finished.clone();
+                    move |body: axum::body::Bytes| {
+                        let state = state.clone();
+                        let key = key.clone();
+                        let finished = finished.clone();
+                        async move {
+                            bound_oauth_callback(
+                                state,
+                                provider,
+                                &key,
+                                finished,
+                                HashMap::new(),
+                                body,
+                            )
+                            .await
+                        }
+                    }
+                }),
+            );
+            let (listener, port) = allocate_test_listener().await;
+            let mut handle = spawn_callback_listener(
+                listener,
+                app,
+                finished,
+                tokio::time::Instant::now() + OAUTH_SESSION_TTL,
+            );
+            fixture.tasks.push(handle.abort.clone());
+            handle.ready.take().unwrap().send(()).unwrap();
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap();
+            let url = format!("http://127.0.0.1:{port}/callback");
+            for request in [
+                client.get(&url),
+                client
+                    .get(&url)
+                    .query(&[("state", "wrong"), ("code", "valid")]),
+                client.post(&url).body("{"),
+            ] {
+                let response = request.send().await.unwrap();
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                response.bytes().await.unwrap();
+            }
+            assert_eq!(hits.load(Ordering::SeqCst), 0);
+            let request = if provider == "command-code" {
+                client.post(&url).json(&json!({"state":key,"apiKey":"fixture-key","userId":"id","userName":"name","keyName":"key"}))
+            } else {
+                client
+                    .get(&url)
+                    .query(&[("state", key.as_str()), ("code", "valid")])
+            };
+            let response = request.send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            response.bytes().await.unwrap();
+            review_bounded(handle.join).await.unwrap();
+            assert_port_released(port).await;
+            assert_eq!(
+                SESSIONS.read().unwrap()[&key].status,
+                SessionStatus::Completed
+            );
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+            if provider == "antigravity" {
+                assert_eq!(daily_hits.load(Ordering::SeqCst), 1);
+                let saved: Value = serde_json::from_slice(
+                    &std::fs::read(
+                        fixture
+                            .root
+                            .join("antigravity-fixture_example.invalid.json"),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(saved["project_id"], "local-project");
+            }
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn review_command_code_claim_rejects_overlap_and_replay() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut fixture = ReviewFixture::new();
+        let arrived = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mock = Router::new()
+            .route(
+                "/whoami",
+                get({
+                    let arrived = arrived.clone();
+                    let release = release.clone();
+                    let hits = hits.clone();
+                    move || {
+                        let arrived = arrived.clone();
+                        let release = release.clone();
+                        let hits = hits.clone();
+                        async move {
+                            hits.fetch_add(1, Ordering::SeqCst);
+                            arrived.notify_one();
+                            release.notified().await;
+                            Json(json!({"user":{"id":"id","userName":"fixture-user"}}))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/models",
+                get(|| async { Json(json!({"data":[{"id":"fixture-model"}]})) }),
+            );
+        let (listener, port) = allocate_test_listener().await;
+        let task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+        fixture.tasks.push(task.abort_handle());
+        let (_, key, session) = create_command_code_auth_url(&HashMap::from([
+            (
+                "whoami_url".into(),
+                format!("http://127.0.0.1:{port}/whoami"),
+            ),
+            ("base_url".into(), format!("http://127.0.0.1:{port}")),
+        ]));
+        fixture.insert(session);
+        let payload = axum::body::Bytes::from(json!({"state":key,"apiKey":"first-key","userId":"id","userName":"name","keyName":"key"}).to_string());
+        let arrival = arrived.notified();
+        let first = tokio::spawn(oauth_callback(
+            State(fixture.state.clone()),
+            Query(HashMap::new()),
+            payload.clone(),
+        ));
+        fixture.tasks.push(first.abort_handle());
+        review_bounded(arrival).await;
+        let overlap = review_bounded(oauth_callback(
+            State(fixture.state.clone()),
+            Query(HashMap::new()),
+            payload,
+        ))
+        .await;
+        assert_eq!(overlap.status(), StatusCode::BAD_REQUEST);
+        release.notify_one();
+        assert_eq!(
+            review_bounded(first).await.unwrap().status(),
+            StatusCode::OK
+        );
+        let path = fixture.root.join("generic-command-code-fixture-user.json");
+        let before = std::fs::read(&path).unwrap();
+        let replay = axum::body::Bytes::from(json!({"state":key,"apiKey":"second-key","userId":"id","userName":"name","keyName":"key"}).to_string());
+        assert_eq!(
+            review_bounded(oauth_callback(
+                State(fixture.state.clone()),
+                Query(HashMap::new()),
+                replay
+            ))
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(std::fs::read(path).unwrap(), before);
+        assert_eq!(
+            SESSIONS.read().unwrap()[&key].status,
+            SessionStatus::Completed
+        );
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn review_antigravity_custom_chain_requires_daily_before_exchange() {
+        let mut fixture = ReviewFixture::new();
+        let (_, _, mut session) = create_antigravity_auth_url(&HashMap::from([(
+            "token_url".into(),
+            "http://127.0.0.1:18899/token".into(),
+        )]));
+        fixture.insert(session.clone());
+        let error = review_bounded(exchange_antigravity_code(
+            &fixture.state,
+            &mut session,
+            "fixture-code",
+        ))
+        .await
+        .unwrap_err();
+        assert_eq!(error, "Custom Antigravity endpoints require daily_url");
+        assert_eq!(session.status, SessionStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn review_failed_exchange_does_not_finish_listener() {
+        use tower::ServiceExt;
+        let mut fixture = ReviewFixture::new();
+        let (listener, port) = allocate_test_listener().await;
+        let task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/token",
+                    post(|| async {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({"error":"invalid_grant"})),
+                        )
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        fixture.tasks.push(task.abort_handle());
+        let (_, key, session) = create_codex_auth_url(&HashMap::from([(
+            "token_url".into(),
+            format!("http://127.0.0.1:{port}/token"),
+        )]));
+        fixture.insert(session);
+        let finished = Arc::new(Notify::new());
+        let response = review_bounded(bound_oauth_callback(
+            fixture.state.clone(),
+            "codex",
+            &key,
+            finished.clone(),
+            HashMap::from([("state".into(), key.clone()), ("code".into(), "bad".into())]),
+            axum::body::Bytes::new(),
+        ))
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(matches!(
+            SESSIONS.read().unwrap()[&key].status,
+            SessionStatus::Failed(_)
+        ));
+        assert!(
+            std::future::poll_fn(|cx| {
+                let future = finished.notified();
+                tokio::pin!(future);
+                std::task::Poll::Ready(std::future::Future::poll(future.as_mut(), cx).is_pending())
+            })
+            .await
+        );
+        let response = oauth_routes()
+            .with_state(fixture.state.clone())
+            .oneshot(
+                axum::http::Request::get(format!("/get-auth-status?state={key}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["status"], "error");
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn review_command_code_commit_requires_current_claim() {
+        let mut fixture = ReviewFixture::new();
+        let (_, key, session) = create_command_code_auth_url(&HashMap::new());
+        fixture.insert(session.clone());
+        let path = fixture.root.join("claim.json");
+        assert!(write_session_credential(&session, &path, b"pending").is_err());
+        let claimed = claim_command_code_session(&key).unwrap();
+        assert!(claim_command_code_session(&key).is_err());
+        let mut stale = claimed.clone();
+        stale.uuid = new_state();
+        assert!(write_session_credential(&stale, &path, b"stale").is_err());
+        write_session_credential(&claimed, &path, b"accepted").unwrap();
+        let mut completed = claimed.clone();
+        completed.status = SessionStatus::Completed;
+        update_session_in(&mut SESSIONS.write().unwrap(), completed);
+        assert!(write_session_credential(&claimed, &path, b"replay").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"accepted");
+        SESSIONS.write().unwrap().remove(&key);
+        assert!(write_session_credential(&claimed, &path, b"cancelled").is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn review_session_commit_survives_authoritative_store_reconstruction() {
+        use mahoquot_registry::store::{LocalStore, StorageManager};
+        let mut fixture = ReviewFixture::new();
+        let remote = Arc::new(LocalStore::new(fixture.root.join("remote")).unwrap());
+        let storage =
+            Arc::new(StorageManager::new(remote.clone(), fixture.root.join("spool")).unwrap());
+        fixture.state.settings.set_storage_manager(storage);
+        let session = test_session(&new_state(), Instant::now());
+        fixture.insert(session.clone());
+        let path = fixture.root.join("claude-store.json");
+        persist_session_credential(
+            &fixture.state,
+            &session,
+            &path,
+            b"{\"access_token\":\"rotated\"}",
+        )
+        .unwrap();
+        let reopened = StorageManager::new(remote, fixture.root.join("reopened")).unwrap();
+        reopened.sync_all_to_spool().unwrap();
+        assert_eq!(
+            std::fs::read(reopened.auth_dir().join("claude-store.json")).unwrap(),
+            std::fs::read(&path).unwrap()
+        );
+        SESSIONS.write().unwrap().remove(&session.state);
+        assert!(persist_session_credential(&fixture.state, &session, &path, b"cancelled").is_err());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"{\"access_token\":\"rotated\"}"
+        );
     }
 
     #[tokio::test]

@@ -193,7 +193,10 @@ fn sse_decodes_optional_spaces_multiline_data_and_all_line_endings() {
             parser.finish(&mut events);
 
             // Then: framing differences do not discard or duplicate the delta.
-            assert_eq!(events, vec![CodexEvent::TextDelta("한".to_string())]);
+            assert!(
+                matches!(events.as_slice(), [CodexEvent::TextDelta(text), CodexEvent::Failed { .. }] if text == "한"),
+                "split {split}: {events:?}"
+            );
         }
     }
 }

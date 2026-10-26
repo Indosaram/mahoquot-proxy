@@ -28,7 +28,7 @@ fn task34_debug_real_discovery() {
     assert_eq!(list.len(), 1, "browse result: {list:?}");
     assert_eq!(list[0].port, 18840);
     assert_eq!(list[0].product, "cliproxyapi");
-    mgr.shutdown();
+    mgr.shutdown().unwrap();
     assert!(!mgr.is_advertising());
 }
 
@@ -202,7 +202,7 @@ fn task34_discovery_manager_start_and_teardown() {
     assert_eq!(list[0].port, 18801);
     assert!(list[0].instance_name.starts_with("cluster-gw-"));
 
-    mgr.shutdown();
+    mgr.shutdown().unwrap();
     assert!(!mgr.is_advertising());
 
     let empty_list = browser

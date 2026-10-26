@@ -7,6 +7,220 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+#[path = "locality_raw_tests.rs"]
+mod raw_tests;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalityRequestObservation {
+    pub request_id: String,
+    pub phase: String,
+    pub headers_ms: Option<f64>,
+    pub content_ms: Option<f64>,
+    pub end_ms: Option<f64>,
+    pub status: Option<u16>,
+    pub error: Option<String>,
+    pub semantic_error: Option<String>,
+    pub response_body: Vec<u8>,
+}
+
+impl LocalityRequestObservation {
+    fn feed(&mut self, gate: &mut SemanticGate, bytes: &[u8], elapsed: f64) {
+        self.response_body.extend_from_slice(bytes);
+        if self.semantic_error.is_none() {
+            let before = gate.content_len();
+            let parsed = gate.feed(bytes, elapsed);
+            if gate.content_len() > before && self.content_ms.is_none() {
+                self.content_ms = Some(elapsed);
+            }
+            if let Err(error) = parsed {
+                self.semantic_error = Some(error);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalityResourceObservation {
+    pub phase: String,
+    pub pid: u32,
+    pub event: String,
+    pub rss_bytes: u64,
+    pub fd_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalityPhaseObservations {
+    pub phase: String,
+    pub requests: Vec<LocalityRequestObservation>,
+    pub resources: Vec<LocalityResourceObservation>,
+    pub observed_turns: Vec<MockObservedTurn>,
+    pub upstream_executions: Vec<WorkloadExecution>,
+    pub resource_error: Option<String>,
+    pub failure: Option<String>,
+}
+
+impl LocalityPhaseObservations {
+    async fn enter(&mut self) -> Result<(), String> {
+        if std::env::var("MAHOQUOT_BENCH_PHASE_ACK").as_deref() != Ok("1") {
+            return Ok(());
+        }
+        use std::io::{BufRead, Write};
+        let pid = std::env::var("BENCH_GATEWAY_PID")
+            .map_err(|error| error.to_string())?
+            .parse::<u32>()
+            .map_err(|error| error.to_string())?;
+        if pid == 0 || pid == std::process::id() {
+            return Err("phase hook requires the explicitly supplied gateway PID".into());
+        }
+        {
+            let mut stderr = std::io::stderr().lock();
+            writeln!(
+                stderr,
+                "MAHOQUOT_BENCH_PHASE {}",
+                serde_json::json!({
+                    "phase": self.phase, "pid": pid, "event": "entered"
+                })
+            )
+            .map_err(|error| error.to_string())?;
+            stderr.flush().map_err(|error| error.to_string())?;
+        }
+        // Do not use tokio stdin's uncancellable blocking worker: on timeout
+        // it can keep runtime shutdown waiting forever. A dedicated reader
+        // thread is not joined by runtime shutdown.
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let result = std::io::stdin()
+                .lock()
+                .read_line(&mut line)
+                .map(|count| (count, line));
+            let _ = sender.send(result);
+        });
+        let (count, line) = tokio::time::timeout(Duration::from_secs(30), receiver)
+            .await
+            .map_err(|_| "phase acknowledgement timeout".to_string())?
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        if count == 0 {
+            return Err("phase acknowledgement EOF".into());
+        }
+        validate_phase_ack(&line, &self.phase, pid)
+    }
+
+    fn new(phase: &str) -> Self {
+        Self {
+            phase: phase.into(),
+            requests: Vec::new(),
+            resources: Vec::new(),
+            observed_turns: Vec::new(),
+            upstream_executions: Vec::new(),
+            resource_error: Some(
+                "no native phase resource observation; external observer required".into(),
+            ),
+            failure: None,
+        }
+    }
+
+    fn complete<T: Default>(&mut self, outcome: Result<T, String>) -> T {
+        match outcome {
+            Ok(value) => value,
+            Err(error) => {
+                self.failure = Some(error);
+                T::default()
+            }
+        }
+    }
+
+    async fn send(&mut self, builder: reqwest::RequestBuilder) -> Result<RecordedResponse, String> {
+        use futures::StreamExt;
+        let start = Instant::now();
+        let mut observation = LocalityRequestObservation {
+            request_id: format!("{}:{}", self.phase, self.requests.len()),
+            phase: self.phase.clone(),
+            headers_ms: None,
+            content_ms: None,
+            end_ms: None,
+            status: None,
+            error: None,
+            semantic_error: None,
+            response_body: Vec::new(),
+        };
+        let response = match builder.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                observation.end_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
+                observation.error = Some(error.to_string());
+                self.requests.push(observation);
+                return Err(format!("locality request failed: {error}"));
+            }
+        };
+        observation.headers_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
+        let status = response.status();
+        observation.status = Some(status.as_u16());
+        let mut gate = SemanticGate::default();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    observation.feed(&mut gate, &bytes, start.elapsed().as_secs_f64() * 1000.0)
+                }
+                Err(error) => {
+                    observation.error = Some(error.to_string());
+                    break;
+                }
+            }
+        }
+        observation.end_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
+        if observation.error.is_none() {
+            observation.error = observation
+                .semantic_error
+                .as_ref()
+                .map(|error| format!("semantic:{error}"));
+            if observation.error.is_none() && observation.content_ms.is_none() {
+                observation.error = Some("semantic:missing_content".into());
+            }
+        }
+        let error = observation.error.clone();
+        let body = bytes::Bytes::copy_from_slice(&observation.response_body);
+        self.requests.push(observation);
+        match error {
+            Some(error) => Err(format!("locality response body failed: {error}")),
+            None => Ok(RecordedResponse { status, body }),
+        }
+    }
+}
+
+fn validate_phase_ack(line: &str, phase: &str, pid: u32) -> Result<(), String> {
+    let payload = line
+        .trim_end()
+        .strip_prefix("MAHOQUOT_BENCH_PHASE_ACK ")
+        .ok_or_else(|| "invalid phase acknowledgement prefix".to_string())?;
+    let value: serde_json::Value =
+        serde_json::from_str(payload).map_err(|error| error.to_string())?;
+    if value["phase"] != phase || value["pid"].as_u64() != Some(u64::from(pid)) {
+        return Err("phase acknowledgement identity mismatch".into());
+    }
+    Ok(())
+}
+
+// Existing phase semantic checks consume the retained bytes, not the network
+// again. Their failures are captured by the owning phase without losing raw.
+struct RecordedResponse {
+    status: reqwest::StatusCode,
+    body: bytes::Bytes,
+}
+
+impl RecordedResponse {
+    fn status(&self) -> reqwest::StatusCode {
+        self.status
+    }
+
+    fn bytes_stream(self) -> impl futures::Stream<Item = Result<bytes::Bytes, String>> {
+        futures::stream::iter([Ok(self.body)])
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalityBenchmarkReport {
     pub matrix: String,
@@ -17,6 +231,8 @@ pub struct LocalityBenchmarkReport {
     pub b9_antigravity: B9AntigravityResult,
     pub correctness_passed: bool,
     pub errors: BTreeMap<String, usize>,
+    pub raw_schema: String,
+    pub phases: BTreeMap<String, LocalityPhaseObservations>,
 }
 
 pub async fn run_locality_benchmarks(
@@ -24,12 +240,49 @@ pub async fn run_locality_benchmarks(
     session: &str,
     turns: usize,
 ) -> Result<LocalityBenchmarkReport, String> {
-    let b3_history = run_b3_benchmark(base_url, session, turns).await?;
-    let b4_alternating = run_b4_benchmark(base_url, session, 4).await?;
-    let b5_hierarchy = run_b5_benchmark(base_url, session, 3).await?;
-    let b8_egress = run_b8_benchmark(base_url, 10).await?;
-    let b9_antigravity = run_b9_benchmark(base_url, true, 2).await?;
+    let mut phases = BTreeMap::new();
+    let mut raw = LocalityPhaseObservations::new("B3");
+    let outcome = run_b3_benchmark(base_url, session, turns, &mut raw).await;
+    let b3_history = raw.complete(outcome);
+    phases.insert("B3".into(), raw);
+    let mut raw = LocalityPhaseObservations::new("B4");
+    let outcome = if phases.values().any(|phase| phase.failure.is_some()) {
+        Err("not attempted after prior phase failure".into())
+    } else {
+        run_b4_benchmark(base_url, session, 6, &mut raw).await
+    };
+    let b4_alternating = raw.complete(outcome);
+    phases.insert("B4".into(), raw);
+    let mut raw = LocalityPhaseObservations::new("B5");
+    let outcome = if phases.values().any(|phase| phase.failure.is_some()) {
+        Err("not attempted after prior phase failure".into())
+    } else {
+        run_b5_benchmark(base_url, session, 3, &mut raw).await
+    };
+    let b5_hierarchy = raw.complete(outcome);
+    phases.insert("B5".into(), raw);
+    let mut raw = LocalityPhaseObservations::new("B8");
+    let outcome = if phases.values().any(|phase| phase.failure.is_some()) {
+        Err("not attempted after prior phase failure".into())
+    } else {
+        run_b8_benchmark(base_url, 10, &mut raw).await
+    };
+    let b8_egress = raw.complete(outcome);
+    phases.insert("B8".into(), raw);
+    let mut raw = LocalityPhaseObservations::new("B9");
+    let outcome = if phases.values().any(|phase| phase.failure.is_some()) {
+        Err("not attempted after prior phase failure".into())
+    } else {
+        run_b9_benchmark(base_url, true, 2, &mut raw).await
+    };
+    let b9_antigravity = raw.complete(outcome);
+    phases.insert("B9".into(), raw);
     let mut errors = BTreeMap::new();
+    for (phase, raw) in &phases {
+        if let Some(failure) = &raw.failure {
+            errors.insert(format!("{phase}:{failure}"), 1);
+        }
+    }
     if b3_history.raw_routing_headers_leaked > 0 {
         errors.insert(
             "routing_headers_leaked".into(),
@@ -69,6 +322,8 @@ pub async fn run_locality_benchmarks(
         b9_antigravity,
         correctness_passed,
         errors,
+        raw_schema: "mahoquot/locality-requests-v1".into(),
+        phases,
     })
 }
 
@@ -209,7 +464,9 @@ pub async fn run_b3_benchmark(
     base_url: &str,
     session_id: &str,
     turns: usize,
+    raw: &mut LocalityPhaseObservations,
 ) -> Result<B3HistoryResult, String> {
+    raw.enter().await?;
     validate_bench_url(base_url)?;
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -254,14 +511,16 @@ pub async fn run_b3_benchmark(
         });
 
         let start = Instant::now();
-        let resp = client
-            .post(base_url)
-            .header("Authorization", "Bearer benchkey")
-            .header("x-session-id", session_id)
-            .header("content-type", "application/json")
-            .json(&body)
-            .timeout(Duration::from_millis(10_000))
-            .send()
+        let resp = raw
+            .send(
+                client
+                    .post(base_url)
+                    .header("Authorization", "Bearer benchkey")
+                    .header("x-session-id", session_id)
+                    .header("content-type", "application/json")
+                    .json(&body)
+                    .timeout(Duration::from_millis(10_000)),
+            )
             .await
             .map_err(|e| format!("b3:request_failed: {e}"))?;
 
@@ -321,7 +580,9 @@ pub async fn run_b4_benchmark(
     base_url: &str,
     session_id: &str,
     alternations: usize,
+    raw: &mut LocalityPhaseObservations,
 ) -> Result<B4AlternatingResult, String> {
+    raw.enter().await?;
     validate_bench_url(base_url)?;
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -340,20 +601,15 @@ pub async fn run_b4_benchmark(
         failover_recovery_ok: false,
     };
 
-    let turn_offset = if std::env::var("BENCH_FAULT_COLLISION")
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(false)
-    {
-        1
-    } else {
-        0
-    };
+    if alternations != 6 {
+        return Err("B4 requires six correlated failover steps".into());
+    }
     let models = ["gpt-5.6-sol", "claude-sonnet-4"];
     for i in 0..alternations {
         let model = models[i % models.len()];
         let body = serde_json::json!({
             "model": model,
-            "messages": [{ "role": "user", "content": "alternating route test" }],
+            "messages": [{ "role": "user", "content": format!("alternating route test request_id=B4:{i} step={}{}", i + 1, if i == 2 { " fault=bound-a" } else { "" }) }],
             "stream": true,
             "stream_options": { "include_usage": true },
             "bench_expect": {
@@ -363,16 +619,18 @@ pub async fn run_b4_benchmark(
             }
         });
 
-        let resp = client
-            .post(base_url)
-            .header("Authorization", "Bearer benchkey")
-            .header("x-bench-phase", "b4")
-            .header("x-bench-turn", i + 1 + turn_offset)
-            .header("x-session-id", session_id)
-            .header("content-type", "application/json")
-            .json(&body)
-            .timeout(Duration::from_millis(5000))
-            .send()
+        let resp = raw
+            .send(
+                client
+                    .post(base_url)
+                    .header("Authorization", "Bearer b4key")
+                    .header("x-bench-phase", "b4")
+                    .header("x-bench-turn", i + 1)
+                    .header("x-session-id", session_id)
+                    .header("content-type", "application/json")
+                    .json(&body)
+                    .timeout(Duration::from_millis(5000)),
+            )
             .await
             .map_err(|e| format!("b4:request_failed: {e}"))?;
 
@@ -383,18 +641,27 @@ pub async fn run_b4_benchmark(
     }
 
     let stats = fetch_mock_stats(&client).await?;
-    let observed = stats.require_turns("b4", alternations)?;
+    raw.upstream_executions = stats
+        .workload_executions
+        .iter()
+        .filter(|row| row.phase == "B4")
+        .cloned()
+        .collect();
+    verify_b4(&raw.upstream_executions)?;
+    let observed: Vec<_> = raw
+        .upstream_executions
+        .iter()
+        .filter(|row| (200..300).contains(&row.status))
+        .collect();
     result.route_a_account = observed[0].account.clone();
     result.route_b_account = observed[1].account.clone();
     result.account_hops = observed
         .windows(2)
         .filter(|pair| pair[0].account != pair[1].account)
         .count();
-    result.independent_binding_retained = observed.iter().all(|turn| {
-        turn.account == result.route_a_account || turn.account == result.route_b_account
-    });
+    result.independent_binding_retained = true;
     result.cache_affinity_opportunity_loss = result.account_hops;
-    result.failover_recovery_ok = observed.iter().all(|turn| !turn.account.is_empty());
+    result.failover_recovery_ok = true;
 
     Ok(result)
 }
@@ -403,7 +670,9 @@ pub async fn run_b5_benchmark(
     base_url: &str,
     parent_session: &str,
     branch_count: usize,
+    raw: &mut LocalityPhaseObservations,
 ) -> Result<B5HierarchyResult, String> {
+    raw.enter().await?;
     validate_bench_url(base_url)?;
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -416,43 +685,6 @@ pub async fn run_b5_benchmark(
         subagent_sessions.push(format!("{}:subagent-{}", parent_session, b));
     }
 
-    if std::env::var("BENCH_FAULT_COLLISION")
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(false)
-    {
-        // Multi-tenant collision fault injection:
-        // A second tenant (tenant2) sends a request sharing the session id with different user/intent.
-        // If the proxy mistakenly routes tenant2's request via tenant1's bound account,
-        // the mock observes and reports the collision.
-        let body_tenant2 = serde_json::json!({
-            "model": "gpt-5.6-sol",
-            "messages": [{ "role": "user", "content": "tenant2 collision probe intent" }],
-            "stream": true,
-            "stream_options": { "include_usage": true },
-            "bench_expect": { "text": "xx", "input_tokens": 16, "output_tokens": 2 }
-        });
-
-        // Send with tenant2 authorization header
-        let collision_resp = client
-            .post(base_url)
-            .header("Authorization", "Bearer tenant2key")
-            .header("x-bench-phase", "b5")
-            .header("x-bench-turn", 1)
-            .header("x-bench-tenant", "tenant2")
-            .header("x-session-id", parent_session)
-            .header("content-type", "application/json")
-            .json(&body_tenant2)
-            .send()
-            .await
-            .map_err(|e| format!("b5:collision_probe_failed: {e}"))?;
-        if !collision_resp.status().is_success() {
-            return Err(format!(
-                "b5:collision_probe_status:{}",
-                collision_resp.status()
-            ));
-        }
-    }
-
     let mut result = B5HierarchyResult {
         branches_tested: branch_count,
         parent_session: parent_session.to_string(),
@@ -462,11 +694,7 @@ pub async fn run_b5_benchmark(
         parent_policy_honored: false,
     };
 
-    let turn_offset = usize::from(
-        std::env::var("BENCH_FAULT_COLLISION")
-            .map(|v| v == "true" || v == "1")
-            .unwrap_or(false),
-    );
+    let turn_offset = 0;
 
     let body_parent = serde_json::json!({
         "model": "gpt-5.6-sol",
@@ -476,15 +704,18 @@ pub async fn run_b5_benchmark(
         "bench_expect": { "text": "xx", "input_tokens": 16, "output_tokens": 2 }
     });
 
-    let resp_parent = client
-        .post(base_url)
-        .header("Authorization", "Bearer benchkey")
-        .header("x-bench-phase", "b5")
-        .header("x-bench-turn", turn_offset + 1)
-        .header("x-session-id", parent_session)
-        .header("content-type", "application/json")
-        .json(&body_parent)
-        .send()
+    let resp_parent = raw
+        .send(
+            client
+                .post(base_url)
+                .header("Authorization", "Bearer benchkey")
+                .header("x-bench-phase", "b5")
+                .header("x-bench-turn", turn_offset + 1)
+                .header("x-session-id", parent_session)
+                .header("content-type", "application/json")
+                .json(&body_parent)
+                .timeout(Duration::from_secs(10)),
+        )
         .await
         .map_err(|e| format!("b5:parent_failed: {e}"))?;
 
@@ -501,15 +732,18 @@ pub async fn run_b5_benchmark(
             "bench_expect": { "text": "xx", "input_tokens": 16, "output_tokens": 2 }
         });
 
-        let resp_sub = client
-            .post(base_url)
-            .header("Authorization", "Bearer benchkey")
-            .header("x-bench-phase", "b5")
-            .header("x-bench-turn", turn_offset + index + 2)
-            .header("x-session-id", sub)
-            .header("content-type", "application/json")
-            .json(&body_sub)
-            .send()
+        let resp_sub = raw
+            .send(
+                client
+                    .post(base_url)
+                    .header("Authorization", "Bearer benchkey")
+                    .header("x-bench-phase", "b5")
+                    .header("x-bench-turn", turn_offset + index + 2)
+                    .header("x-session-id", sub)
+                    .header("content-type", "application/json")
+                    .json(&body_sub)
+                    .timeout(Duration::from_secs(10)),
+            )
             .await
             .map_err(|e| format!("b5:sub_failed: {e}"))?;
 
@@ -518,11 +752,37 @@ pub async fn run_b5_benchmark(
         }
     }
 
+    let body_tenant2 = serde_json::json!({
+        "model": "gpt-5.6-sol",
+        "messages": [{"role":"user", "content":"tenant2 collision probe intent"}],
+        "stream": true, "stream_options": {"include_usage": true},
+        "bench_expect": {"text":"xx", "input_tokens":16, "output_tokens":2}
+    });
+    let response = raw
+        .send(
+            client
+                .post(base_url)
+                .header("Authorization", "Bearer tenant2key")
+                .header("x-bench-phase", "b5")
+                .header("x-bench-turn", branch_count + 2)
+                .header("x-bench-tenant", "tenant2")
+                .header("x-session-id", parent_session)
+                .json(&body_tenant2)
+                .timeout(Duration::from_secs(10)),
+        )
+        .await?;
+    if !response.status().is_success() {
+        return Err(format!("b5:tenant2_status:{}", response.status()));
+    }
     let stats = fetch_mock_stats(&client).await?;
-    let collision_injected = std::env::var("BENCH_FAULT_COLLISION")
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(false);
-    let observed = stats.require_turns("b5", branch_count + 1 + usize::from(collision_injected))?;
+    raw.observed_turns = stats
+        .observed_turns
+        .iter()
+        .filter(|row| row.phase == "b5")
+        .cloned()
+        .collect();
+    let observed = stats.require_turns("b5", branch_count + 2)?;
+    verify_b5(&raw.observed_turns, branch_count)?;
     result.cross_tenant_collisions = observed
         .iter()
         .filter(|turn| turn.tenant != turn.requested_tenant)
@@ -591,8 +851,116 @@ pub fn measure_process_rss_and_fds(pid: u32) -> Result<(u64, usize), String> {
     Ok((rss_bytes, fds))
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkloadExecution {
+    pub phase: String,
+    pub request_id: String,
+    pub account: String,
+    pub connection_id: Option<String>,
+    pub status: u16,
+}
+
+fn verify_b4(executions: &[WorkloadExecution]) -> Result<(), String> {
+    let success = |id: &str| -> Result<&WorkloadExecution, String> {
+        let rows: Vec<_> = executions
+            .iter()
+            .filter(|row| row.request_id == id && (200..300).contains(&row.status))
+            .collect();
+        if rows.len() != 1 || rows[0].account.is_empty() {
+            return Err(format!("B4 missing/duplicate successful execution {id}"));
+        }
+        Ok(rows[0])
+    };
+    let a = success("B4:0")?;
+    let b = success("B4:1")?;
+    let recovered = success("B4:2")?;
+    let failures: Vec<_> = executions
+        .iter()
+        .filter(|row| row.request_id == "B4:2" && row.status == 503 && row.account == a.account)
+        .collect();
+    if a.account == b.account
+        || failures.is_empty()
+        || recovered.account == a.account
+        || success("B4:3")?.account != b.account
+        || success("B4:5")?.account != b.account
+        || success("B4:4")?.account != recovered.account
+    {
+        return Err(
+            "B4 bound-account failure/recovery or independent binding proof missing".into(),
+        );
+    }
+    let failed_index = executions
+        .iter()
+        .position(|row| std::ptr::eq(row, failures[0]))
+        .unwrap();
+    let recovered_index = executions
+        .iter()
+        .position(|row| std::ptr::eq(row, recovered))
+        .unwrap();
+    if failed_index >= recovered_index {
+        return Err("B4 recovery precedes fault".into());
+    }
+    Ok(())
+}
+
+fn verify_b5(turns: &[MockObservedTurn], branches: usize) -> Result<(), String> {
+    if turns.len() != branches + 2 {
+        return Err("B5 incomplete tenant workload".into());
+    }
+    let parent = &turns[0];
+    let other = &turns[branches + 1];
+    if parent.account.is_empty()
+        || other.account.is_empty()
+        || parent.account == other.account
+        || turns[..=branches].iter().any(|row| {
+            row.tenant != "tenant1"
+                || row.requested_tenant != "tenant1"
+                || row.account != parent.account
+        })
+        || other.tenant != "tenant2"
+        || other.requested_tenant != "tenant2"
+    {
+        return Err("B5 parent binding or cross-tenant isolation proof missing".into());
+    }
+    Ok(())
+}
+
+fn verify_b9(executions: &[WorkloadExecution]) -> Result<(), String> {
+    let mut rows = Vec::new();
+    for index in 0..4 {
+        let id = format!("B9:{index}");
+        let matching: Vec<_> = executions
+            .iter()
+            .filter(|row| row.request_id == id)
+            .collect();
+        if matching.len() != 1
+            || !(200..300).contains(&matching[0].status)
+            || matching[0].account.is_empty()
+            || !matching[0]
+                .connection_id
+                .as_deref()
+                .is_some_and(|id| !id.is_empty())
+        {
+            return Err(format!("B9 missing/failed/duplicate execution {id}"));
+        }
+        rows.push(matching[0]);
+    }
+    if rows[0].account != rows[1].account
+        || rows[2].account != rows[3].account
+        || rows[0].account == rows[2].account
+        || rows[0].connection_id != rows[1].connection_id
+        || rows[2].connection_id != rows[3].connection_id
+        || rows[0].connection_id == rows[2].connection_id
+    {
+        return Err("B9 distinct-account connection reuse/isolation proof missing".into());
+    }
+    Ok(())
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct MockObservedStats {
+    #[serde(default)]
+    pub workload_executions: Vec<WorkloadExecution>,
     pub total_requests: usize,
     pub proxy_hops: usize,
     pub direct_hops: usize,
@@ -708,7 +1076,12 @@ async fn fetch_mock_stats(client: &reqwest::Client) -> Result<MockObservedStats,
     Ok(stats)
 }
 
-pub async fn run_b8_benchmark(base_url: &str, requests: usize) -> Result<B8EgressResult, String> {
+pub async fn run_b8_benchmark(
+    base_url: &str,
+    requests: usize,
+    raw: &mut LocalityPhaseObservations,
+) -> Result<B8EgressResult, String> {
+    raw.enter().await?;
     validate_bench_url(base_url)?;
 
     let stats_url = std::env::var("BENCH_MOCK_STATS_URL").map_err(|_| {
@@ -736,15 +1109,17 @@ pub async fn run_b8_benchmark(base_url: &str, requests: usize) -> Result<B8Egres
             }
         });
 
-        let resp = client
-            .post(base_url)
-            .header("Authorization", "Bearer benchkey")
-            .header("x-bench-req", &req_id)
-            .header("x-session-id", format!("bench-locality-b8-{}", i))
-            .header("content-type", "application/json")
-            .json(&body)
-            .timeout(Duration::from_millis(10_000))
-            .send()
+        let resp = raw
+            .send(
+                client
+                    .post(base_url)
+                    .header("Authorization", "Bearer benchkey")
+                    .header("x-bench-req", &req_id)
+                    .header("x-session-id", format!("bench-locality-b8-{}", i))
+                    .header("content-type", "application/json")
+                    .json(&body)
+                    .timeout(Duration::from_millis(10_000)),
+            )
             .await
             .map_err(|e| format!("b8:request_failed: {e}"))?;
 
@@ -833,7 +1208,9 @@ pub async fn run_b9_benchmark(
     base_url: &str,
     pooling: bool,
     accounts: usize,
+    raw: &mut LocalityPhaseObservations,
 ) -> Result<B9AntigravityResult, String> {
+    raw.enter().await?;
     validate_bench_url(base_url)?;
 
     let pid_str = std::env::var("BENCH_GATEWAY_PID").map_err(|_| {
@@ -864,11 +1241,15 @@ pub async fn run_b9_benchmark(
         .build()
         .map_err(|e| e.to_string())?;
 
-    for acc in 0..accounts {
+    if accounts != 2 || !pooling {
+        return Err("B9 requires two explicit accounts with pooling enabled".into());
+    }
+    let routing_keys = ["benchkey", "tenant2key"];
+    for (acc, routing_key) in routing_keys.iter().enumerate() {
         for req in 0..2 {
             let body = serde_json::json!({
                 "model": "gpt-5.6-sol",
-                "messages": [{ "role": "user", "content": format!("b9 antigravity request acc={} req={}", acc, req) }],
+                "messages": [{ "role": "user", "content": format!("b9 antigravity request acc={} req={} request_id=B9:{}", acc, req, acc * 2 + req) }],
                 "stream": true,
                 "stream_options": { "include_usage": true },
                 "bench_expect": {
@@ -878,17 +1259,16 @@ pub async fn run_b9_benchmark(
                 }
             });
 
-            let resp = client
-                .post(base_url)
-                .header("Authorization", "Bearer benchkey")
-                .header(
-                    "x-session-id",
-                    format!("bench-locality-b9-acc-{}-req-{}", acc, req),
+            let resp = raw
+                .send(
+                    client
+                        .post(base_url)
+                        .header("Authorization", format!("Bearer {routing_key}"))
+                        .header("x-session-id", format!("bench-locality-b9-acc-{}", acc))
+                        .header("content-type", "application/json")
+                        .json(&body)
+                        .timeout(Duration::from_millis(10_000)),
                 )
-                .header("content-type", "application/json")
-                .json(&body)
-                .timeout(Duration::from_millis(10_000))
-                .send()
                 .await
                 .map_err(|e| format!("b9:request_failed: {e}"))?;
 
@@ -938,13 +1318,35 @@ pub async fn run_b9_benchmark(
     let stats: MockObservedStats = serde_json::from_str(&stats_text)
         .map_err(|e| format!("failed to parse mock stats JSON: {e} from '{stats_text}'"))?;
 
+    raw.upstream_executions = stats
+        .workload_executions
+        .iter()
+        .filter(|row| row.phase == "B9")
+        .cloned()
+        .collect();
+    verify_b9(&raw.upstream_executions)?;
     let result = B9AntigravityResult {
         pooling_enabled: pooling,
         idle_timeout_secs: stats.idle_timeout_secs,
         max_idle_per_host: stats.max_idle_per_host,
         accounts_tested: accounts,
-        connection_reuse_count: stats.connection_reuse_count,
-        cross_account_leaks: stats.cross_account_leaks,
+        connection_reuse_count: raw
+            .upstream_executions
+            .windows(2)
+            .filter(|pair| {
+                pair[0].account == pair[1].account && pair[0].connection_id == pair[1].connection_id
+            })
+            .count(),
+        cross_account_leaks: raw
+            .upstream_executions
+            .iter()
+            .enumerate()
+            .filter(|(index, row)| {
+                raw.upstream_executions[..*index].iter().any(|prior| {
+                    prior.account != row.account && prior.connection_id == row.connection_id
+                })
+            })
+            .count(),
         stale_resets: stats.stale_resets,
         peak_rss_bytes: peak_rss,
         peak_fds,

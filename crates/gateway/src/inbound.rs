@@ -186,6 +186,9 @@ fn request_targets_management(req: &Request) -> bool {
 
 /// Control-plane prefixes a scoped key may never reach.
 fn is_management_path(path: &str) -> bool {
+    if path == "/api/codex-auth/accounts/credits" {
+        return true;
+    }
     const PREFIXES: [&str; 3] = ["/v0/management", "/v8/management", "/admin"];
     PREFIXES.iter().any(|prefix| {
         path.strip_prefix(prefix)
@@ -203,6 +206,11 @@ pub async fn require_api_key(
             keys.authorizes(extract_presented_key(&req)),
             Some(AuthIdentity::Scoped(_))
         );
+        // Reject before invoking the handler, even if another supplied header
+        // happens to contain the management secret.
+        if scoped_key {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
         let attempts = keys.management_attempts();
         let identity = AuthIdentity::Master;
         req.extensions_mut().insert(ResolvedAuth {
@@ -217,9 +225,6 @@ pub async fn require_api_key(
             next,
         )
         .await;
-        if scoped_key && response.status() != StatusCode::UNAUTHORIZED {
-            return StatusCode::FORBIDDEN.into_response();
-        }
         return response;
     }
     let Some(identity) = keys.authorizes(extract_presented_key(&req)) else {

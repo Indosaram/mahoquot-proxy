@@ -265,6 +265,31 @@ struct FinalFailure {
     body: Bytes,
 }
 
+const MAX_BUFFERED_UPSTREAM_BYTES: usize = 32 * 1024 * 1024;
+
+async fn bounded_response_bytes(resp: reqwest::Response) -> Result<Bytes, String> {
+    let mut stream = resp.bytes_stream();
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| error.to_string())?;
+        if chunk.len() > MAX_BUFFERED_UPSTREAM_BYTES.saturating_sub(body.len()) {
+            return Err("upstream response exceeds buffered byte limit".to_string());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(body))
+}
+
+fn buffered_failure_response(message: &str) -> reqwest::Response {
+    rebuild_plan_response(
+        StatusCode::BAD_GATEWAY,
+        &HeaderMap::new(),
+        serde_json::json!({"error":{"type":"upstream_error","message":message}})
+            .to_string()
+            .as_bytes(),
+    )
+}
+
 fn now_unix_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -322,6 +347,13 @@ struct StreamCapture {
     outcome: Option<StreamedOutcome>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StreamEnd {
+    Eof,
+    TransportError,
+    Cancelled,
+}
+
 impl StreamCapture {
     fn observe(&mut self, data: &[u8]) {
         self.bytes_out += data.len() as u64;
@@ -329,7 +361,7 @@ impl StreamCapture {
     }
 
     /// Spawn the deferred record exactly once; safe to call from `Drop`.
-    fn finalize(&mut self) {
+    fn finalize(&mut self, end: StreamEnd) {
         let Some(outcome) = self.outcome.take() else {
             return;
         };
@@ -347,10 +379,18 @@ impl StreamCapture {
             });
         let tokens = token_usage.map(crate::usage::ResponseTokenUsage::total_tokens);
         let bytes_out = self.bytes_out;
-        let state = outcome.state;
+        let state = Arc::clone(&outcome.state);
 
-        let mut success = true;
+        let mut success = end == StreamEnd::Eof && outcome.status < 400;
         let mut status = outcome.status;
+
+        if status < 400 {
+            status = match end {
+                StreamEnd::Eof => status,
+                StreamEnd::TransportError => 502,
+                StreamEnd::Cancelled => 499,
+            };
+        }
 
         // A locally rendered stream that ended on an error frame (an upstream
         // truncated before its finish reason, a mid-stream failure) delivered
@@ -358,7 +398,20 @@ impl StreamCapture {
         if outcome.provider != "devin" && stream_ended_with_error(self.head_tail.parts().1) {
             success = false;
             status = 502;
-            outcome.member.record_fail();
+        }
+
+        if outcome.provider != "devin" {
+            if success {
+                outcome.member.record_ok();
+                state.metrics.served.fetch_add(1, Ordering::Relaxed);
+                state.monitor.clear_error(outcome.member.id());
+                state
+                    .scheduler
+                    .record_success(outcome.member.id(), &state.pool.load().members);
+                state.router.feedback(outcome.member.id(), Outcome::Success);
+            } else {
+                outcome.member.record_fail();
+            }
         }
 
         if outcome.provider == "devin" {
@@ -394,7 +447,7 @@ impl StreamCapture {
                 }
             }
 
-            if terminal_success {
+            if terminal_success && end == StreamEnd::Eof {
                 success = true;
                 outcome.member.record_ok();
                 if let Some(ref current) = current_pool_member {
@@ -475,6 +528,8 @@ impl StreamCapture {
             success = false;
         }
 
+        observe_stream_account(&outcome, "finalized", Some(status));
+
         tokio::spawn(async move {
             let record = OutcomeRecord {
                 event_id: &outcome.event_id,
@@ -496,23 +551,54 @@ impl StreamCapture {
             };
             record_request_outcome(&state, record).await;
             state.notify_finalizer(Some(outcome.member.id()), &outcome.event_id);
+            tracing::info!(
+                "cancel_observation={}",
+                serde_json::json!({
+                    "event": "recorded", "request_id": outcome.event_id
+                })
+            );
         });
     }
 }
 
-/// Whether the SSE tail's last data frame (before an optional `[DONE]`) is a
-/// top-level error object.
 fn stream_ended_with_error(tail: &[u8]) -> bool {
     let text = String::from_utf8_lossy(tail);
     text.lines()
         .rev()
         .filter_map(|line| line.strip_prefix("data:").map(str::trim))
-        .find(|data| !data.is_empty() && *data != "[DONE]")
-        .and_then(|data| serde_json::from_str::<serde_json::Value>(data).ok())
-        .is_some_and(|value| value.get("error").is_some_and(|e| !e.is_null()))
+        .filter(|data| !data.is_empty() && *data != "[DONE]")
+        .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+        .any(|value| {
+            value.get("error").is_some_and(|e| !e.is_null())
+                || matches!(
+                    value["type"].as_str(),
+                    Some("response.failed" | "response.incomplete")
+                )
+        })
 }
 
 type SharedCapture = Arc<std::sync::Mutex<StreamCapture>>;
+
+// No credentials, headers, prompts or response content in lifecycle observations.
+fn observe_stream_account(outcome: &StreamedOutcome, event: &str, status: Option<u16>) {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or(0);
+    let health = outcome.member.health();
+    tracing::info!(
+        "cancel_observation={}",
+        serde_json::json!({
+            "event": event, "request_id": outcome.event_id,
+            "account": outcome.member.id(), "model": outcome.model,
+            "health": format!("{health:?}"),
+            "group_cooldown_ms": outcome.member.earliest_group_cooldown_ms(now_ms),
+            "eligible": health.is_available(now_ms) && outcome.model.as_deref()
+                .is_none_or(|model| outcome.member.group_available(model, now_ms)),
+            "status": status,
+        })
+    );
+}
 
 fn with_capture(shared: &SharedCapture, f: impl FnOnce(&mut StreamCapture)) {
     let mut guard = shared
@@ -542,6 +628,7 @@ impl CountedStream {
         plugins: Option<Arc<crate::plugins::loader::PluginHost>>,
     ) -> Self {
         let stream_request_id = outcome.event_id.clone();
+        observe_stream_account(&outcome, "stream-open", None);
         Self {
             in_flight: Some(in_flight),
             inner: http_body_util::BodyStream::new(body),
@@ -555,11 +642,26 @@ impl CountedStream {
             stream_chunk_index: 0,
         }
     }
+
+    fn release_guard(&mut self) {
+        if let Some(guard) = self.in_flight.take() {
+            drop(guard);
+            tracing::info!(
+                "cancel_observation={}",
+                serde_json::json!({
+                    "event": "guard-release", "request_id": self.stream_request_id
+                })
+            );
+        }
+    }
 }
 
 impl Drop for CountedStream {
     fn drop(&mut self) {
-        with_capture(&self.shared, StreamCapture::finalize);
+        self.release_guard();
+        with_capture(&self.shared, |capture| {
+            capture.finalize(StreamEnd::Cancelled)
+        });
     }
 }
 
@@ -608,13 +710,15 @@ impl futures::Stream for CountedStream {
                     }
                 }
                 Some(Err(error)) => {
-                    self.in_flight.take();
-                    with_capture(&self.shared, StreamCapture::finalize);
+                    self.release_guard();
+                    with_capture(&self.shared, |capture| {
+                        capture.finalize(StreamEnd::TransportError)
+                    });
                     return std::task::Poll::Ready(Some(Err(error)));
                 }
                 None => {
-                    self.in_flight.take();
-                    with_capture(&self.shared, StreamCapture::finalize);
+                    self.release_guard();
+                    with_capture(&self.shared, |capture| capture.finalize(StreamEnd::Eof));
                     return std::task::Poll::Ready(None);
                 }
             }
@@ -1739,7 +1843,15 @@ async fn send_upstream(
             if response.status() == StatusCode::BAD_REQUEST {
                 let status = response.status();
                 let response_headers = response.headers().clone();
-                let bytes = response.bytes().await?;
+                let bytes = match bounded_response_bytes(response).await {
+                    Ok(bytes) => bytes,
+                    Err(message) => {
+                        return Ok(UpstreamExchange {
+                            response: buffered_failure_response(&message),
+                            cursor_reply: None,
+                        })
+                    }
+                };
                 let retryable = serde_json::from_slice::<serde_json::Value>(&bytes)
                     .ok()
                     .is_some_and(|value| {
@@ -1801,7 +1913,10 @@ async fn zcode_plan_gateway_response(
         .map(|v| !v.trim().is_empty())
         .unwrap_or(false);
     let upstream_headers = resp.headers().clone();
-    let body = resp.bytes().await.unwrap_or_default();
+    let body = match bounded_response_bytes(resp).await {
+        Ok(body) => body,
+        Err(message) => return buffered_failure_response(&message),
+    };
     if !status.is_success() {
         if challenge_header
             || mahoquot_providers::zcode::ZCODE_CAPTCHA_BODY_MARKERS
@@ -1822,7 +1937,10 @@ async fn zcode_plan_gateway_response(
                             return replayed;
                         }
                         let replay_headers = replayed.headers().clone();
-                        let replay_body = replayed.bytes().await.unwrap_or_default();
+                        let replay_body = match bounded_response_bytes(replayed).await {
+                            Ok(body) => body,
+                            Err(message) => return buffered_failure_response(&message),
+                        };
                         let replay_challenge = mahoquot_providers::zcode::is_plan_captcha_challenge(
                             replay_status.as_u16(),
                             replay_headers
@@ -1927,7 +2045,16 @@ async fn extract_failure(resp: reqwest::Response, status_code: u16) -> FinalFail
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(ToString::to_string);
-    let body = resp.bytes().await.unwrap_or_default();
+    let body = match bounded_response_bytes(resp).await {
+        Ok(body) => body,
+        Err(message) => {
+            return FinalFailure {
+                status: StatusCode::BAD_GATEWAY,
+                content_type: Some("application/json".to_string()),
+                body: Bytes::from(serde_json::json!({"error":{"message":message}}).to_string()),
+            }
+        }
+    };
     let status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     FinalFailure {
         status,
@@ -2805,12 +2932,16 @@ fn final_anthropic_message(bytes: &[u8]) -> Option<serde_json::Value> {
     let mut partial_json: std::collections::BTreeMap<usize, String> = Default::default();
     let mut stopped = false;
     for event in sse_events(bytes) {
-        let index = event["index"].as_u64().map(|i| i as usize);
+        // Wire bytes do not bound a sparse upstream index's allocation.
+        let index = event["index"]
+            .as_u64()
+            .and_then(|i| usize::try_from(i).ok())
+            .filter(|i| *i < 1024);
         match event["type"].as_str() {
             Some("content_block_start") => {
                 let index = index?;
                 if blocks.len() <= index {
-                    blocks.resize(index + 1, serde_json::Value::Null);
+                    blocks.resize(index.checked_add(1)?, serde_json::Value::Null);
                 }
                 blocks[index] = event["content_block"].clone();
             }
@@ -3877,6 +4008,113 @@ mod usage_capture_tests {
     }
 }
 
+async fn collect_antigravity_once(
+    first: Bytes,
+    stream: compat::UpstreamStream,
+    session: compat::ProtocolSession,
+    model: String,
+    created: i64,
+    shape: compat::ReplyShape,
+) -> Result<serde_json::Value, String> {
+    let mut decoder = match session.replay.clone() {
+        Some(replay) => compat::gemini::GeminiDecoder::with_replay(replay),
+        None => compat::gemini::GeminiDecoder::new(),
+    };
+    let mut aggregator = compat::render::Aggregator::new(model.clone(), created);
+    if let Some(replay) = session.replay {
+        aggregator = aggregator.with_replay(replay);
+    }
+    let mut parser = compat::events::SseParser::default();
+    let source = futures::stream::once(async { Ok(first) }).chain(stream);
+    futures::pin_mut!(source);
+    let mut total = 0usize;
+    let mut usage = None;
+    let mut signature = None;
+    loop {
+        let mut frames = Vec::new();
+        let eof = match source.next().await {
+            Some(chunk) => {
+                let chunk = chunk.map_err(|error| error.to_string())?;
+                if chunk.len() > MAX_BUFFERED_UPSTREAM_BYTES.saturating_sub(total) {
+                    return Err("upstream response exceeds buffered byte limit".to_string());
+                }
+                total += chunk.len();
+                parser
+                    .push_raw_data(&chunk, &mut frames)
+                    .map_err(|e| e.message().to_string())?;
+                false
+            }
+            None => {
+                parser
+                    .finish_raw_data(&mut frames)
+                    .map_err(|e| e.message().to_string())?;
+                true
+            }
+        };
+        let mut events = Vec::new();
+        for frame in frames {
+            decoder.decode(&frame, &mut events);
+        }
+        if eof {
+            decoder.finish(&mut events);
+        }
+        for event in events {
+            match &event {
+                compat::events::CodexEvent::Failed { message } => return Err(message.clone()),
+                compat::events::CodexEvent::Completed { usage: value } => usage = value.clone(),
+                compat::events::CodexEvent::ReasoningSignature(value) => {
+                    signature = Some(value.clone())
+                }
+                _ => {}
+            }
+            aggregator.push(event);
+        }
+        if eof {
+            break;
+        }
+    }
+    match shape {
+        compat::ReplyShape::Chat => Ok(aggregator.into_completion()),
+        compat::ReplyShape::TextCompletion => Ok(aggregator.into_text_completion()),
+        compat::ReplyShape::Gemini => aggregator.into_gemini(),
+        compat::ReplyShape::Responses => aggregator.into_responses(),
+        compat::ReplyShape::Anthropic => {
+            let chat = aggregator.into_completion();
+            let message = &chat["choices"][0]["message"];
+            let tools = message["tool_calls"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|tool| {
+                    (
+                        tool["id"].as_str().unwrap_or_default().to_string(),
+                        tool["function"]["name"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string(),
+                        tool["function"]["arguments"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            Ok(compat::claude::messages_payload_full(
+                &format!("msg_{created}"),
+                &model,
+                message["content"].as_str().unwrap_or_default(),
+                &tools,
+                chat["choices"][0]["finish_reason"]
+                    .as_str()
+                    .unwrap_or("stop"),
+                usage.as_ref(),
+                message["reasoning_content"].as_str(),
+                signature.as_deref(),
+            ))
+        }
+    }
+}
+
 pub fn connect_code_to_http_status(code: &str) -> StatusCode {
     match code {
         "canceled" => StatusCode::REQUEST_TIMEOUT,
@@ -4072,10 +4310,6 @@ async fn finish_success(
         }
     } else {
         capture_usage(member, resp.headers());
-        state.monitor.clear_error(member.id());
-        state
-            .scheduler
-            .record_success(member.id(), &state.pool.load().members);
     }
 
     // Generic accounts relay verbatim only when the upstream speaks the same
@@ -4093,9 +4327,6 @@ async fn finish_success(
         {
             return Err("upstream returned html instead of an api response".to_string());
         }
-        member.record_ok();
-        state.metrics.served.fetch_add(1, Ordering::Relaxed);
-        state.router.feedback(member.id(), Outcome::Success);
         return Ok(stream_response(resp, status_code));
     }
 
@@ -4112,9 +4343,6 @@ async fn finish_success(
         {
             return Err("upstream returned html instead of an api response".to_string());
         }
-        member.record_ok();
-        state.metrics.served.fetch_add(1, Ordering::Relaxed);
-        state.router.feedback(member.id(), Outcome::Success);
         return Ok(stream_response(resp, status_code));
     }
 
@@ -4131,7 +4359,7 @@ async fn finish_success(
             .as_deref()
             .is_some_and(|ct| ct.starts_with("application/json"))
     {
-        let raw = resp.bytes().await.map_err(|e| e.to_string())?;
+        let raw = bounded_response_bytes(resp).await?;
         let value: serde_json::Value = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
         member.record_ok();
         state.metrics.served.fetch_add(1, Ordering::Relaxed);
@@ -4168,7 +4396,7 @@ async fn finish_success(
             .as_deref()
             .is_some_and(|ct| ct.starts_with("application/json"))
     {
-        let raw = resp.bytes().await.map_err(|error| error.to_string())?;
+        let raw = bounded_response_bytes(resp).await?;
         let value: serde_json::Value =
             serde_json::from_slice(&raw).map_err(|error| error.to_string())?;
         let mut output = compat::gemini::gemini_json_to_openai(
@@ -4215,14 +4443,33 @@ async fn finish_success(
     };
     let model = plan.model.clone().unwrap_or_default();
 
+    if protocol == compat::Protocol::Antigravity && !plan.client_stream {
+        let completion = collect_antigravity_once(
+            first,
+            stream,
+            session,
+            model,
+            created,
+            if plan.mode == RelayMode::Anthropic {
+                compat::ReplyShape::Anthropic
+            } else {
+                reply_shape(plan.mode)
+            },
+        )
+        .await?;
+        member.record_ok();
+        state.metrics.served.fetch_add(1, Ordering::Relaxed);
+        state.router.feedback(member.id(), Outcome::Success);
+        return Ok(body_response(
+            StatusCode::OK,
+            Some("application/json"),
+            Bytes::from(completion.to_string()),
+        ));
+    }
+
     if plan.mode == RelayMode::Anthropic && plan.client_stream {
         let devin_outcome =
             (protocol == compat::Protocol::Devin).then(|| Arc::new(std::sync::Mutex::new(None)));
-        if protocol != compat::Protocol::Devin {
-            member.record_ok();
-            state.metrics.served.fetch_add(1, Ordering::Relaxed);
-            state.router.feedback(member.id(), Outcome::Success);
-        }
         let upstream_capture = Arc::new(std::sync::Mutex::new(None));
         let body = compat::streaming_body(compat::StreamingBodyParams {
             first,
@@ -4285,11 +4532,6 @@ async fn finish_success(
     if plan.client_stream {
         let devin_outcome =
             (protocol == compat::Protocol::Devin).then(|| Arc::new(std::sync::Mutex::new(None)));
-        if protocol != compat::Protocol::Devin {
-            member.record_ok();
-            state.metrics.served.fetch_add(1, Ordering::Relaxed);
-            state.router.feedback(member.id(), Outcome::Success);
-        }
         let upstream_capture = Arc::new(std::sync::Mutex::new(None));
         let body = compat::streaming_body(compat::StreamingBodyParams {
             first,
@@ -4994,6 +5236,22 @@ pub async fn handle_relay(
 ) -> Response {
     let request_started = std::time::Instant::now();
     let event_id = uuid::Uuid::new_v4().to_string();
+    // Private QA correlation only: never log an arbitrary caller header.
+    if std::env::var("MAHOQUOT_QA_LOOPBACK_ONLY").as_deref() == Ok("1") {
+        if let Some(observation_id) = headers
+            .get("x-mahoquot-observation-id")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| uuid::Uuid::parse_str(value).ok())
+        {
+            tracing::info!(
+                "history_observation={}",
+                serde_json::json!({
+                    "event": "request", "observation_id": observation_id.to_string(),
+                    "event_id": event_id,
+                })
+            );
+        }
+    }
     let occurred_at_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
@@ -5063,6 +5321,12 @@ pub async fn handle_relay(
         .find(|binding| Some(&binding.key_identifier) == key_identifier.as_ref())
         .cloned();
     let _in_flight = state.monitor.track_in_flight();
+    tracing::info!(
+        "cancel_observation={}",
+        serde_json::json!({
+            "event": "guard-acquire", "request_id": event_id
+        })
+    );
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
@@ -5115,56 +5379,98 @@ pub async fn handle_relay(
 
             let method = "POST";
             let url = format!("/v1beta/models/{}:generateContent", requested_model);
-            match crate::aistudio::execute(
-                &state.aistudio,
-                &worker_id,
-                method,
-                &url,
-                worker_headers,
-                gemini_body,
-            )
-            .await
-            {
-                Ok(upstream_resp) => {
-                    let status = upstream_resp.status();
-                    let (parts, body) = upstream_resp.into_parts();
-                    let bytes = match http_body_util::BodyExt::collect(body).await {
-                        Ok(c) => c.to_bytes(),
-                        Err(e) => {
-                            return json_error(
-                                StatusCode::BAD_GATEWAY,
-                                &format!("AI Studio worker body failed: {e}"),
-                            )
-                        }
-                    };
+            let mut token_usage = None;
+            let response = async {
+                match crate::aistudio::execute(
+                    &state.aistudio,
+                    &worker_id,
+                    method,
+                    &url,
+                    worker_headers,
+                    gemini_body,
+                )
+                .await
+                {
+                    Ok(upstream_resp) => {
+                        let status = upstream_resp.status();
+                        let (parts, body) = upstream_resp.into_parts();
+                        let bytes =
+                            match axum::body::to_bytes(body, MAX_BUFFERED_UPSTREAM_BYTES).await {
+                                Ok(bytes) => bytes,
+                                Err(e) => {
+                                    return json_error(
+                                        StatusCode::BAD_GATEWAY,
+                                        &format!("AI Studio worker body failed: {e}"),
+                                    )
+                                }
+                            };
 
-                    if status == StatusCode::OK {
-                        let response_body = if let Ok(gemini_json) =
-                            serde_json::from_slice::<serde_json::Value>(&bytes)
-                        {
-                            let openai_json = compat::gemini::gemini_json_to_openai(
-                                &gemini_json,
-                                requested_model,
-                                created,
+                        if status == StatusCode::OK {
+                            let response_body = if let Ok(gemini_json) =
+                                serde_json::from_slice::<serde_json::Value>(&bytes)
+                            {
+                                let openai_json = compat::gemini::gemini_json_to_openai(
+                                    &gemini_json,
+                                    requested_model,
+                                    created,
+                                );
+                                Bytes::from(
+                                    serde_json::to_vec(&openai_json)
+                                        .unwrap_or_else(|_| bytes.to_vec()),
+                                )
+                            } else {
+                                bytes
+                            };
+                            token_usage = crate::usage::extract_response_token_usage(
+                                &response_body,
+                                &response_body,
                             );
-                            Bytes::from(
-                                serde_json::to_vec(&openai_json).unwrap_or_else(|_| bytes.to_vec()),
-                            )
+                            Response::from_parts(parts, axum::body::Body::from(response_body))
                         } else {
-                            bytes
-                        };
-                        return Response::from_parts(parts, axum::body::Body::from(response_body));
-                    } else {
-                        return Response::from_parts(parts, axum::body::Body::from(bytes));
+                            Response::from_parts(parts, axum::body::Body::from(bytes))
+                        }
                     }
-                }
-                Err(e) => {
-                    return json_error(
+                    Err(e) => json_error(
                         StatusCode::SERVICE_UNAVAILABLE,
                         &format!("AI Studio worker error: {e}"),
-                    );
+                    ),
                 }
             }
+            .await;
+            let success = response.status().is_success();
+            record_request_outcome(
+                &state,
+                OutcomeRecord {
+                    event_id: &event_id,
+                    occurred_at_ms,
+                    provider: "aistudio".to_string(),
+                    account: Some(&worker_id),
+                    model: Some(requested_model),
+                    key_identifier: key_identifier.as_deref(),
+                    session: headers
+                        .get("x-session-id")
+                        .and_then(|v| v.to_str().ok())
+                        .map(session_digest)
+                        .as_deref(),
+                    scoped_entry: scoped_entry.as_deref(),
+                    status: response.status().as_u16(),
+                    success,
+                    elapsed_ms: request_started.elapsed().as_millis() as u64,
+                    bytes_in: plan.original_body.len(),
+                    bytes_out: http_body::Body::size_hint(response.body())
+                        .exact()
+                        .unwrap_or(0),
+                    tokens: token_usage.map(crate::usage::ResponseTokenUsage::total_tokens),
+                    fast: false,
+                    token_usage,
+                },
+            )
+            .await;
+            if success {
+                state.metrics.served.fetch_add(1, Ordering::Relaxed);
+            }
+            state.notify_finalizer(Some(&worker_id), &event_id);
+            return response;
         }
     }
 
@@ -5491,9 +5797,6 @@ pub async fn handle_relay(
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        if let Some(h) = hierarchy.as_mut() {
-            h.bind(&state, member.id(), now_ms);
-        }
         let member_at = member.access_token();
 
         if state.auth_refresh_enabled && member.is_expired(now_unix) {
@@ -5788,6 +6091,9 @@ pub async fn handle_relay(
             .await
             {
                 Ok(mut response) => {
+                    if let Some(h) = hierarchy.as_mut() {
+                        h.bind(&state, member.id(), now_ms);
+                    }
                     if let Some(capture) = replay_capture.take() {
                         response = capture.wrap(response);
                     }
@@ -5847,6 +6153,12 @@ pub async fn handle_relay(
                             .or_else(|| crate::usage::extract_response_token_usage(&bytes, &bytes));
                         let tokens =
                             token_usage.map(crate::usage::ResponseTokenUsage::total_tokens);
+                        if parts.status.is_success() {
+                            state.monitor.clear_error(member.id());
+                            state
+                                .scheduler
+                                .record_success(member.id(), &state.pool.load().members);
+                        }
                         record_request_outcome(
                             &state,
                             OutcomeRecord {
@@ -5858,8 +6170,8 @@ pub async fn handle_relay(
                                 key_identifier: key_identifier.as_deref(),
                                 session: session.as_deref(),
                                 scoped_entry: scoped_entry.as_deref(),
-                                status: status_code,
-                                success: true,
+                                status: parts.status.as_u16(),
+                                success: parts.status.is_success(),
                                 elapsed_ms: request_started.elapsed().as_millis() as u64,
                                 bytes_in,
                                 bytes_out: bytes.len() as u64,
@@ -5964,7 +6276,7 @@ pub async fn handle_relay(
                     // log. A persistent banner would just linger on accounts
                     // that recover moments later.
 
-                    if code == "resource_exhausted" {
+                    if matches!(code, "resource_exhausted" | "permission_denied") {
                         let now_ms = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
                             .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
@@ -5995,10 +6307,9 @@ pub async fn handle_relay(
                     {
                         break;
                     }
-                    if code == "resource_exhausted" {
+                    if matches!(code, "resource_exhausted" | "permission_denied") {
                         round_attempts = round_attempts.saturating_sub(1);
-                    }
-                    if code != "resource_exhausted" {
+                    } else {
                         failover_budget += 1;
                     }
                     continue;
@@ -6356,6 +6667,297 @@ mod limit_exhaustion_tests {
 mod routing_tests {
     use super::*;
     use crate::config::GatewayConfig;
+
+    struct ReviewRoot(std::path::PathBuf);
+    impl Drop for ReviewRoot {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn counted_stream_records_cancel_error_and_eof_once() {
+        use http_body_util::BodyExt;
+        for end in [
+            StreamEnd::Cancelled,
+            StreamEnd::TransportError,
+            StreamEnd::Eof,
+        ] {
+            let root = ReviewRoot(
+                std::env::temp_dir().join(format!("relay-outcome-{}", uuid::Uuid::new_v4())),
+            );
+            std::fs::create_dir_all(&root.0).unwrap();
+            std::fs::write(root.0.join("codex.json"), credential("codex")).unwrap();
+            let state = Arc::new(
+                AppState::new(&GatewayConfig {
+                    auth_dir: root.0.clone(),
+                    config_path: root.0.join("config.yaml"),
+                    auth_refresh_enabled: false,
+                    ..Default::default()
+                })
+                .unwrap(),
+            );
+            let member = state.pool.load().members[0].clone();
+            let mut finalized = subscribe_finalizer(&state, member.id());
+            let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(2);
+            let source = futures::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|chunk| (chunk, rx))
+            });
+            let outcome = StreamedOutcome {
+                _activity: member.begin_activity(),
+                state: state.clone(),
+                member: member.clone(),
+                credential_token: member.access_token(),
+                event_id: uuid::Uuid::new_v4().to_string(),
+                occurred_at_ms: 1,
+                provider: member.provider_name(),
+                model: Some("test".into()),
+                key_identifier: None,
+                session: None,
+                scoped_entry: None,
+                upstream_capture: None,
+                devin_outcome: None,
+                status: 200,
+                started: std::time::Instant::now(),
+                bytes_in: 2,
+                fast: false,
+            };
+            let mut body = Body::from_stream(CountedStream::new(
+                Body::from_stream(source),
+                outcome,
+                state.monitor.track_in_flight(),
+                None,
+            ));
+            tx.send(Ok(Bytes::from_static(
+                b"data: {\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3}}\n\n",
+            )))
+            .await
+            .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), body.frame())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(member.ok_count.load(Ordering::Relaxed), 0);
+            assert_eq!(state.metrics.served.load(Ordering::Relaxed), 0);
+            if end == StreamEnd::Cancelled {
+                drop(body);
+            } else {
+                if end == StreamEnd::TransportError {
+                    tx.send(Err(std::io::Error::other("fixture failure")))
+                        .await
+                        .unwrap();
+                }
+                drop(tx);
+                let result =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), body.collect())
+                        .await
+                        .unwrap();
+                assert_eq!(result.is_ok(), end == StreamEnd::Eof);
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(5), finalized.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let status = match end {
+                StreamEnd::Cancelled => 499,
+                StreamEnd::TransportError => 502,
+                StreamEnd::Eof => 200,
+            };
+            let history_state = state.clone();
+            let (totals, status_totals) = tokio::task::spawn_blocking(move || {
+                history_state.history.flush().unwrap();
+                let totals = history_state
+                    .history
+                    .store()
+                    .unwrap()
+                    .query(&Default::default())
+                    .unwrap()
+                    .totals;
+                let status_totals = history_state
+                    .history
+                    .store()
+                    .unwrap()
+                    .query(&crate::request_history::HistoryQuery {
+                        status_codes: vec![status],
+                        ..Default::default()
+                    })
+                    .unwrap()
+                    .totals;
+                (totals, status_totals)
+            })
+            .await
+            .unwrap();
+            assert_eq!(totals.requests, 1);
+            assert_eq!(status_totals.requests, 1);
+            assert_eq!(totals.successful_requests, u64::from(end == StreamEnd::Eof));
+            assert_eq!(totals.failed_requests, u64::from(end != StreamEnd::Eof));
+            assert_eq!(totals.total_tokens, 10);
+            assert_eq!(
+                member.ok_count.load(Ordering::Relaxed),
+                u64::from(end == StreamEnd::Eof)
+            );
+            assert_eq!(
+                member.fail_count.load(Ordering::Relaxed),
+                u64::from(end != StreamEnd::Eof)
+            );
+            assert_eq!(
+                state.metrics.served.load(Ordering::Relaxed),
+                u64::from(end == StreamEnd::Eof)
+            );
+            assert_eq!(state.monitor.in_flight(), 0);
+        }
+    }
+
+    #[test]
+    fn kimi_replay_rejects_oversized_block_index() {
+        for index in [1024, 1_000_000_000, u64::MAX] {
+            let wire = format!("data: {{\"type\":\"content_block_start\",\"index\":{index},\"content_block\":{{\"type\":\"text\",\"text\":\"x\"}}}}\n\ndata: {{\"type\":\"message_stop\"}}\n\n");
+            assert!(final_anthropic_message(wire.as_bytes()).is_none());
+        }
+        let wire = b"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"hello\"}}\n\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"name\":\"todo\",\"input\":{}}}\n\ndata: {\"type\":\"message_stop\"}\n\n";
+        let value = final_anthropic_message(wire).unwrap();
+        assert_eq!(value["content"].as_array().unwrap().len(), 2);
+        assert_eq!(value["content"][0]["text"], "hello");
+        assert_eq!(value["content"][1]["name"], "todo");
+    }
+
+    #[tokio::test]
+    async fn antigravity_nonstream_preserves_signed_generated_ids() {
+        for shape in [compat::ReplyShape::Chat, compat::ReplyShape::Anthropic] {
+            let ledger = compat::signature_ledger::SignatureLedger::in_memory();
+            let replay = ledger.scope("gemini-test", "session-test");
+            let wire = Bytes::from_static(b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"todo\",\"args\":{}},\"thoughtSignature\":\"original-signature\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":7,\"candidatesTokenCount\":3,\"totalTokenCount\":10}}\n\n");
+            let value = collect_antigravity_once(
+                wire,
+                Box::pin(futures::stream::empty()),
+                compat::ProtocolSession {
+                    protocol: compat::Protocol::Antigravity,
+                    cursor_reply: None,
+                    replay: Some(replay.clone()),
+                },
+                "gemini-test".into(),
+                1,
+                shape,
+            )
+            .await
+            .unwrap();
+            let id = if shape == compat::ReplyShape::Chat {
+                value["choices"][0]["message"]["tool_calls"][0]["id"]
+                    .as_str()
+                    .unwrap()
+            } else {
+                value["content"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|v| v["type"] == "tool_use")
+                    .unwrap()["id"]
+                    .as_str()
+                    .unwrap()
+            };
+            assert_eq!(
+                replay.recall(id, "todo", "{}").as_deref(),
+                Some("original-signature")
+            );
+            let next = compat::gemini::openai_to_gemini_with_replay(&serde_json::json!({
+                "model":"gemini-test", "messages":[
+                    {"role":"user","content":"use todo"},
+                    {"role":"assistant","tool_calls":[{"id":id,"type":"function","function":{"name":"todo","arguments":"{}"}}]},
+                    {"role":"tool","tool_call_id":id,"name":"todo","content":"done"}
+                ]
+            }), &replay).unwrap();
+            assert_eq!(
+                next["contents"][1]["parts"][0]["thoughtSignature"],
+                "original-signature"
+            );
+        }
+    }
+
+    fn chunked_response(status: StatusCode, extra: bool) -> reqwest::Response {
+        let chunk = Bytes::from(vec![b'x'; 1024 * 1024]);
+        let count = MAX_BUFFERED_UPSTREAM_BYTES / chunk.len() + usize::from(extra);
+        let chunks =
+            futures::stream::iter((0..count).map(move |_| Ok::<_, std::io::Error>(chunk.clone())));
+        reqwest::Response::from(
+            http::Response::builder()
+                .status(status)
+                .header("content-type", "application/json")
+                .body(reqwest::Body::wrap_stream(chunks))
+                .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn buffered_upstream_limits_cover_chunked_errors_and_zcode() {
+        assert_eq!(
+            bounded_response_bytes(chunked_response(StatusCode::OK, false))
+                .await
+                .unwrap()
+                .len(),
+            MAX_BUFFERED_UPSTREAM_BYTES
+        );
+        assert!(
+            bounded_response_bytes(chunked_response(StatusCode::OK, true))
+                .await
+                .is_err()
+        );
+        let failure = extract_failure(chunked_response(StatusCode::BAD_REQUEST, true), 400).await;
+        assert_eq!(failure.status, StatusCode::BAD_GATEWAY);
+        assert!(failure.body.len() < 1024);
+        let response =
+            zcode_plan_gateway_response(chunked_response(StatusCode::OK, true), None).await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(bounded_response_bytes(response).await.unwrap().len() < 1024);
+    }
+
+    #[tokio::test]
+    async fn buffered_json_adapters_reject_oversized_success() {
+        for (kind, protocol) in [
+            ("claude", compat::Protocol::Anthropic),
+            ("vertex", compat::Protocol::Antigravity),
+        ] {
+            let root = ReviewRoot(
+                std::env::temp_dir().join(format!("relay-limit-{}", uuid::Uuid::new_v4())),
+            );
+            std::fs::create_dir_all(&root.0).unwrap();
+            std::fs::write(root.0.join(format!("{kind}.json")), credential(kind)).unwrap();
+            let state = AppState::new(&GatewayConfig {
+                auth_dir: root.0.clone(),
+                config_path: root.0.join("config.yaml"),
+                auth_refresh_enabled: false,
+                ..Default::default()
+            })
+            .unwrap();
+            let member = state.pool.load().members[0].clone();
+            let plan = build_plan(
+                RelayMode::OpenAiCompat,
+                "/v1/chat/completions",
+                Bytes::from_static(
+                    b"{\"model\":\"test\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}",
+                ),
+                None,
+            )
+            .unwrap();
+            let result = finish_success(
+                &state,
+                &member,
+                &plan,
+                &HeaderMap::new(),
+                chunked_response(StatusCode::OK, true),
+                200,
+                1,
+                compat::ProtocolSession {
+                    protocol,
+                    cursor_reply: None,
+                    replay: None,
+                },
+            )
+            .await;
+            assert!(result.is_err());
+            assert_eq!(member.ok_count.load(Ordering::Relaxed), 0);
+        }
+    }
 
     #[test]
     fn body_affinity_key_extracts_expected_fields() {

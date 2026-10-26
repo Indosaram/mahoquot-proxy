@@ -1,5 +1,5 @@
 use crate::mock::{create_mock_router, MockConfig, MockState};
-use crate::runner::{parse_headers, run_benchmark, run_single_request, BenchConfig, RequestParams};
+use crate::runner::{parse_headers, run_benchmark, BenchConfig, RequestParams};
 use crate::stats::{nearest_rank_percentile, BenchReport};
 use futures::StreamExt;
 use reqwest::header::HeaderMap;
@@ -197,6 +197,7 @@ async fn test_50req_10conc_zero_error_run() {
         headers: vec!["Authorization: Bearer test-token".to_string()],
         body_json: Some(r#"{"model":"test-pinned-body"}"#.to_string()),
         timeout_ms: 5000,
+        phase: "core".into(),
     };
 
     // When: run benchmark
@@ -275,21 +276,20 @@ async fn test_headers_and_body_json_literal_pinning() {
         reqwest::header::HeaderValue::from_static("Bearer pinned"),
     );
 
-    let res = run_single_request(RequestParams {
-        client: &client,
-        url: &url,
-        headers: hdrs,
-        body: body_literal,
-        timeout: Duration::from_millis(5000),
-        expected: None,
-    })
+    let res = crate::runner::observe_request(
+        RequestParams {
+            client: &client,
+            url: &url,
+            headers: hdrs,
+            body: body_literal,
+            timeout: Duration::from_millis(5000),
+            expected: None,
+        },
+        "pinning:0".into(),
+        "pinning".into(),
+    )
     .await;
-    match res {
-        crate::runner::SampleResult::Success { ttft_ms, .. } => {
-            assert!(ttft_ms > 0.0);
-        }
-        crate::runner::SampleResult::Error { kind } => {
-            panic!("expected success, got error: {kind}");
-        }
-    }
+    assert!(res.error.is_none(), "{:?}", res.error);
+    assert_eq!(res.status, Some(200));
+    assert!(res.content_ms.unwrap() > 0.0);
 }

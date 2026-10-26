@@ -5,7 +5,9 @@ use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mahoquot_providers::credential_file::write_credential_atomically;
-use mahoquot_providers::refresh_exec::{apply_refresh_to_file, execute_refresh_spec, RefreshError};
+use mahoquot_providers::refresh_exec::{
+    apply_refresh_to_value, execute_refresh_spec, RefreshError,
+};
 use mahoquot_providers::{
     derive_identity_slug, is_antigravity_model, load_antigravity_account, AntigravityAccount,
     ClaudeAccount, CodexAccount, CursorAccount, KiroAccount, LoadError, VertexAccount,
@@ -1136,16 +1138,20 @@ impl ProviderAccount {
             Self::Generic(a) if a.provider == "xai" => {
                 mahoquot_providers::xai::refresh_request(&a.refresh_token, &a.token_url)
             }
-            Self::Generic(a) if a.provider == "kimi" => mahoquot_providers::RefreshRequest {
-                url: a.token_url.clone(),
-                form_fields: vec![
-                    ("grant_type".to_string(), "refresh_token".to_string()),
-                    ("refresh_token".to_string(), a.refresh_token.clone()),
-                    ("client_id".to_string(), a.client_id.clone()),
-                ],
-                json_body: None,
-                headers: Vec::new(),
-            },
+            Self::Generic(a)
+                if a.provider == "kimi" || (a.auth_mode == "oauth" && !a.token_url.is_empty()) =>
+            {
+                mahoquot_providers::RefreshRequest {
+                    url: a.token_url.clone(),
+                    form_fields: vec![
+                        ("grant_type".to_string(), "refresh_token".to_string()),
+                        ("refresh_token".to_string(), a.refresh_token.clone()),
+                        ("client_id".to_string(), a.client_id.clone()),
+                    ],
+                    json_body: None,
+                    headers: Vec::new(),
+                }
+            }
             Self::Generic(_) => mahoquot_providers::build_refresh_request(""),
             Self::Vertex(_) => mahoquot_providers::build_refresh_request(""),
             other => mahoquot_providers::build_refresh_request(&other.refresh_token()),
@@ -2172,7 +2178,10 @@ impl AccountMember {
     /// first use and persisted so it survives restarts. It is deliberately
     /// random rather than derived from the machine, which would be a stable
     /// device fingerprint.
-    fn ensure_mimo_client_id(&self) -> Result<(String, String), RefreshError> {
+    async fn ensure_mimo_client_id(
+        &self,
+        settings: Option<Arc<crate::management::store::SettingsStore>>,
+    ) -> Result<(String, String), RefreshError> {
         let (token_url, client_id) = {
             let guard = self
                 .inner
@@ -2197,13 +2206,14 @@ impl AccountMember {
         let content = std::fs::read_to_string(&self.file_path)?;
         let mut root: serde_json::Value =
             serde_json::from_str(&content).map_err(|e| RefreshError::Parse(e.to_string()))?;
+        let expected = root.clone();
         root.as_object_mut()
             .ok_or_else(|| RefreshError::Parse("root is not a JSON object".to_string()))?
             .insert(
                 "client_id".to_string(),
                 serde_json::Value::String(fresh.clone()),
             );
-        write_credential_atomically(&self.file_path, root.to_string().as_bytes())?;
+        commit_refresh(self.file_path.clone(), Some(expected), root, settings).await?;
         self.reload_from_file()
             .map_err(|e| RefreshError::Parse(e.to_string()))?;
         Ok((bootstrap_url, fresh))
@@ -2309,6 +2319,17 @@ impl AccountMember {
         refresh_url: &str,
         presented_token: Option<&str>,
     ) -> Result<bool, RefreshError> {
+        self.refresh_with_store(client, refresh_url, presented_token, None)
+            .await
+    }
+
+    pub(crate) async fn refresh_with_store(
+        &self,
+        client: &reqwest::Client,
+        refresh_url: &str,
+        presented_token: Option<&str>,
+        settings: Option<Arc<crate::management::store::SettingsStore>>,
+    ) -> Result<bool, RefreshError> {
         // Relay keys are static; there is nothing to refresh and the token
         // endpoint would only reject the empty grant.
         if self.relay_api_key().is_some() || self.kind() == ProviderKind::Devin {
@@ -2318,6 +2339,12 @@ impl AccountMember {
             tracing::debug!(name: "reactive_refresh_entered", account = self.id());
         }
         let _guard = self.refresh_lock.lock().await;
+
+        // A rescan can publish another member while this file's rotation is
+        // in flight. Re-read its committed generation before testing expiry
+        // or choosing a grant; the mutex alone does not update that snapshot.
+        self.reload_from_file()
+            .map_err(|error| RefreshError::Parse(error.to_string()))?;
 
         let now_unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2333,7 +2360,7 @@ impl AccountMember {
         }
 
         if self.provider_name() == "meta" {
-            return crate::compat::meta::refresh_member(self, client, presented_token)
+            return crate::compat::meta::refresh_member(self, client, presented_token, settings)
                 .await
                 .map_err(RefreshError::Parse);
         }
@@ -2343,6 +2370,7 @@ impl AccountMember {
                 let raw = tokio::fs::read(&self.file_path).await?;
                 let mut credential: serde_json::Value = serde_json::from_slice(&raw)
                     .map_err(|error| RefreshError::Parse(error.to_string()))?;
+                let expected = credential.clone();
                 let domain = mahoquot_providers::kimi::credential_domain(&credential);
                 let token_url = credential
                     .get("token_url")
@@ -2365,27 +2393,42 @@ impl AccountMember {
                     &api_base,
                     mahoquot_providers::kimi::device_identity(&credential),
                 );
+                let grant = credential
+                    .get("refresh_token")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| RefreshError::Parse("missing refresh token".into()))?;
                 let update = native
-                    .refresh(&self.refresh_token())
+                    .refresh_tokens(grant)
                     .await
                     .map_err(|error| match error {
                         mahoquot_providers::kimi::Error::Http(code) => RefreshError::Status {
                             code,
-                            body: "Kimi refresh or catalog rejected".into(),
+                            body: "Kimi refresh rejected".into(),
                         },
                         other => RefreshError::Parse(other.to_string()),
                     })?;
                 update
                     .apply(&mut credential, now_unix)
                     .map_err(|error| RefreshError::Parse(error.to_string()))?;
-                let path = self.file_path.clone();
-                let rendered = serde_json::to_vec_pretty(&credential)
-                    .map_err(|error| RefreshError::Parse(error.to_string()))?;
-                tokio::task::spawn_blocking(move || write_credential_atomically(&path, &rendered))
-                    .await
-                    .map_err(|error| RefreshError::Parse(error.to_string()))??;
+                credential = commit_refresh(
+                    self.file_path.clone(),
+                    Some(expected),
+                    credential,
+                    settings.clone(),
+                )
+                .await?;
                 self.reload_from_file()
                     .map_err(|error| RefreshError::Parse(error.to_string()))?;
+                match native.fetch_models(&self.access_token()).await {
+                    Ok(models) => {
+                        let expected = credential.clone();
+                        credential["models"] = serde_json::json!(models);
+                        commit_refresh(self.file_path.clone(), Some(expected), credential, settings.clone()).await?;
+                        self.reload_from_file()
+                            .map_err(|error| RefreshError::Parse(error.to_string()))?;
+                    }
+                    Err(_) => tracing::warn!(account = self.id(), "Kimi catalog refresh failed; retained previous models and committed tokens"),
+                }
                 return Ok(true);
             }
         }
@@ -2400,6 +2443,37 @@ impl AccountMember {
         } else {
             spec.url.as_str()
         };
+        // Capture the grant generation before issuing network requests.
+        let mimo = if self.generic_adapter().as_deref() == Some("mimo-free") {
+            Some(self.ensure_mimo_client_id(settings.clone()).await?)
+        } else {
+            None
+        };
+        let expected: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(&self.file_path).await?)
+                .map_err(|error| RefreshError::Parse(error.to_string()))?;
+        let expected_access = match self.kind() {
+            ProviderKind::Generic => expected.get("api_key"),
+            ProviderKind::Vertex => expected
+                .get("access_token")
+                .or_else(|| expected.get("api_key")),
+            _ => expected.get("access_token"),
+        };
+        if (self.kind() != ProviderKind::Vertex
+            && expected
+                .get("refresh_token")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                != self.refresh_token())
+            || expected_access
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                != self.access_token()
+        {
+            return Err(RefreshError::Parse(
+                "credential grant changed before refresh".into(),
+            ));
+        }
         let tokens = if self.kind() == ProviderKind::Vertex {
             let (token_url, email, private_key, private_key_id) = {
                 let account = self
@@ -2411,6 +2485,18 @@ impl AccountMember {
                         "vertex account kind mismatch".to_string(),
                     ));
                 };
+                let snapshot: mahoquot_providers::VertexAccount =
+                    serde_json::from_value(expected.clone())
+                        .map_err(|error| RefreshError::Parse(error.to_string()))?;
+                if snapshot.effective_token_url() != account.effective_token_url()
+                    || snapshot.effective_email() != account.effective_email()
+                    || snapshot.effective_private_key() != account.effective_private_key()
+                    || snapshot.private_key_id != account.private_key_id
+                {
+                    return Err(RefreshError::Parse(
+                        "Vertex identity changed before refresh".into(),
+                    ));
+                }
                 (
                     account.effective_token_url().to_string(),
                     account.effective_email().to_string(),
@@ -2426,8 +2512,7 @@ impl AccountMember {
                 private_key_id.as_deref(),
             )
             .await?
-        } else if self.generic_adapter().as_deref() == Some("mimo-free") {
-            let (bootstrap_url, client_id) = self.ensure_mimo_client_id()?;
+        } else if let Some((bootstrap_url, client_id)) = mimo {
             mahoquot_providers::execute_mimo_bootstrap(client, &bootstrap_url, &client_id, now_unix)
                 .await?
         } else if self.kind() == ProviderKind::Generic && self.provider_name() == "cline" {
@@ -2443,12 +2528,141 @@ impl AccountMember {
         } else {
             execute_refresh_spec(client, url, &spec).await?
         };
-        apply_refresh_to_file(&self.file_path, &tokens, now_unix)?;
+        let mut credential = expected.clone();
+        apply_refresh_to_value(&mut credential, &tokens, now_unix)?;
+        if self.kind() == ProviderKind::Vertex {
+            // api_key aliases access_token: retaining both makes serde reject
+            // the refreshed file as a duplicate field on the next load.
+            credential.as_object_mut().unwrap().remove("api_key");
+        }
+        commit_refresh(self.file_path.clone(), Some(expected), credential, settings).await?;
         if let Err(e) = self.reload_from_file() {
             return Err(RefreshError::Parse(e.to_string()));
         }
         Ok(true)
     }
+}
+
+/// Merge a provider update into the current credential under the same coordinator
+/// used by management writers. No network await occurs while the guard is held.
+/// None is reserved for onboarding a file observed to be absent.
+pub(crate) async fn commit_refresh(
+    path: std::path::PathBuf,
+    expected: Option<serde_json::Value>,
+    candidate: serde_json::Value,
+    settings: Option<Arc<crate::management::store::SettingsStore>>,
+) -> Result<serde_json::Value, RefreshError> {
+    tokio::task::spawn_blocking(move || {
+        let _mutation = settings
+            .as_ref()
+            .map(|settings| settings.composition_lock());
+        let current = match std::fs::read(&path) {
+            Ok(bytes) => Some(
+                serde_json::from_slice::<serde_json::Value>(&bytes)
+                    .map_err(|error| RefreshError::Parse(error.to_string()))?,
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(RefreshError::Io(error)),
+        };
+        let conflict =
+            || RefreshError::Parse("credential changed or deleted during refresh".into());
+        let merged = match (expected, current) {
+            (None, None) => candidate,
+            (Some(expected), Some(mut current)) => {
+                // Identity, grant and routing changes invalidate the network result;
+                // cosmetic edits deliberately do not. Compare optional values too.
+                for key in [
+                    "type",
+                    "provider",
+                    "identity_slug",
+                    "email",
+                    "account_id",
+                    "refresh_token",
+                    "dca_token",
+                    "access_token",
+                    "api_key",
+                    "client_id",
+                    "token_url",
+                    "base_url",
+                    "upstream_override",
+                    "auth_kind",
+                    "adapter",
+                    "private_key",
+                    "private_key_id",
+                    "client_email",
+                    "service_account",
+                    "token_uri",
+                    "auth_mode",
+                    "client_secret",
+                    "region",
+                ] {
+                    if current.get(key) != expected.get(key) {
+                        return Err(conflict());
+                    }
+                }
+                let object = current.as_object_mut().ok_or_else(conflict)?;
+                for key in [
+                    "access_token",
+                    "api_key",
+                    "refresh_token",
+                    "id_token",
+                    "expired",
+                    "last_refresh",
+                    "timestamp",
+                    "client_id",
+                    "models",
+                    "dca_token",
+                    "token_type",
+                    "expires_in",
+                    "dca_expires_at",
+                    "dca_expired",
+                    "auth_kind",
+                    "base_url",
+                    "email",
+                    "name",
+                    "subs_tier_name",
+                    "subs_tier_id",
+                    "is_subs_active",
+                    "has_payment_method",
+                    "require_payment",
+                    "can_subscribe",
+                ] {
+                    if candidate.get(key) != expected.get(key) {
+                        match candidate.get(key) {
+                            Some(value) => {
+                                object.insert(key.into(), value.clone());
+                            }
+                            None => {
+                                object.remove(key);
+                            }
+                        }
+                    }
+                }
+                current
+            }
+            _ => return Err(conflict()),
+        };
+        let rendered = serde_json::to_vec_pretty(&merged)
+            .map_err(|error| RefreshError::Parse(error.to_string()))?;
+        if let Some(store) = settings
+            .as_ref()
+            .and_then(|settings| settings.storage_manager())
+        {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| RefreshError::Parse("invalid credential filename".into()))?;
+            save_account_to_store(&store, name, &rendered)
+                .map_err(|error| RefreshError::Parse(error.to_string()))?;
+            if path == store.auth_dir().join(name) {
+                return Ok(merged);
+            }
+        }
+        write_credential_atomically(&path, &rendered).map_err(RefreshError::Io)?;
+        Ok(merged)
+    })
+    .await
+    .map_err(|error| RefreshError::Parse(error.to_string()))?
 }
 
 /// Provider credentials all carry an ISO-8601 `expired`; the older Codex and

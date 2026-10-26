@@ -365,7 +365,9 @@ impl SettingsStore {
         let root = v8_config::normalize(root).map_err(v8_store_error)?;
         let updated = if let Some(raw) = raw.filter(|raw| !raw.trim().is_empty()) {
             let submitted = v8_config::parse(raw).map_err(v8_store_error)?;
-            let submitted = v8_config::normalize(submitted).map_err(v8_store_error)?;
+            let mut submitted = v8_config::normalize(submitted).map_err(v8_store_error)?;
+            v8_config::preserve_management_secret(&mut submitted, &root).map_err(v8_store_error)?;
+            v8_config::preserve_turn(&mut submitted, &root);
             v8_config::runtime(&submitted).map_err(v8_store_error)?;
             submitted
         } else {
@@ -380,7 +382,12 @@ impl SettingsStore {
                 error.to_string(),
             ))
         })?;
-        next.validate_against_registry(&self.active_snapshot())?;
+        let document = SettingsDocument::new(next, &self.auth_dir_fallback);
+        let candidate_registry = document
+            .effective
+            .validate_against_registry(&self.active_snapshot())?;
+        let proxy_snapshot = crate::proxy_policy::ProxySnapshot::from_settings(&document.effective)
+            .map_err(|e| SettingsError::InvalidProxyUrl(e.to_string()))?;
         // Render against the operator's file, not a re-serialisation of the
         // runtime view, so comments, ordering and quoting survive a v8 write
         // (Task 27 live migration). The rendered document is what is
@@ -394,7 +401,6 @@ impl SettingsStore {
         v8_config::parse(&rendered)
             .and_then(v8_config::normalize)
             .map_err(v8_store_error)?;
-        let document = SettingsDocument::new(next, &self.auth_dir_fallback);
         if self.path.as_os_str().is_empty() {
             // In-memory store (embedding/tests): nothing to write.
         } else if on_disk.is_some() || self.storage_manager().is_some() {
@@ -405,6 +411,14 @@ impl SettingsStore {
         let published = Arc::clone(&document.effective);
         self.current.store(Arc::new(document));
         self.notify_observers(&published);
+        if let Some(ref publisher) = *self.proxy_publisher.read().unwrap() {
+            publisher(Arc::new(proxy_snapshot));
+        }
+        if let Some(ref publisher) = *self.pool_publisher.read().unwrap() {
+            if let Err(err) = publisher(Arc::new(candidate_registry)) {
+                tracing::error!("failed to publish candidate registry on v8 mutation: {err}");
+            }
+        }
         Ok(published)
     }
 
@@ -481,6 +495,36 @@ impl SettingsStore {
 mod tests {
     use super::super::settings::{WarmupAccountPolicy, WarmupProviderPolicy};
     use super::*;
+
+    #[test]
+    fn v8_failed_persist_publishes_no_projection() {
+        let dir = std::env::temp_dir().join(format!("v8-persist-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let blocker = dir.join("blocker");
+        std::fs::write(&blocker, "not a directory").unwrap();
+        let store = SettingsStore::new(Settings::default(), blocker.join("config.yaml"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let proxy_tx = tx.clone();
+        store.set_proxy_publisher(Arc::new(move |_| proxy_tx.send("proxy").unwrap()));
+        store.set_pool_publisher(Arc::new(move |_| {
+            tx.send("registry").unwrap();
+            Ok(())
+        }));
+        let before = store.current();
+        assert!(store
+            .mutate_v8(
+                "requests/proxy-url",
+                v8_config::Mutation::Put,
+                Some(serde_json::json!("http://127.0.0.1:18842")),
+                true,
+                None,
+            )
+            .is_err());
+        assert!(Arc::ptr_eq(&before, &store.current()));
+        assert_eq!(rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty));
+        assert_eq!(std::fs::read(&blocker).unwrap(), b"not a directory");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

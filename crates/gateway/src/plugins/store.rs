@@ -313,17 +313,33 @@ impl PluginStore {
                     http_status: Some(409),
                 });
             }
-            let _ = host.unload_plugin(id);
+            host.try_unload_plugin(id)?;
         }
 
         let mut deleted = false;
-        if let Ok(entries) = fs::read_dir(&self.plugins_dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with(id) {
-                    let _ = fs::remove_file(entry.path());
-                    deleted = true;
-                }
+        let fs_error = |e: std::io::Error| PluginError {
+            code: "fs_error".into(),
+            message: e.to_string(),
+            retryable: false,
+            http_status: Some(500),
+        };
+        let entries = match fs::read_dir(&self.plugins_dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(fs_error(e)),
+        };
+        for entry in entries {
+            let entry = entry.map_err(fs_error)?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            let library = [".so", ".dylib", ".dll"].iter().any(|ext| {
+                name.strip_suffix(*ext).is_some_and(|stem| {
+                    let (base, _) = stem.split_once("-v").unwrap_or((stem, ""));
+                    base == id
+                })
+            });
+            if library || name == format!("{id}.config.json") {
+                fs::remove_file(entry.path()).map_err(fs_error)?;
+                deleted = true;
             }
         }
         Ok(deleted)
@@ -505,6 +521,18 @@ impl PluginStore {
                 retryable: false,
                 http_status: Some(404),
             })?;
+
+        if !requested_version.is_empty() && requested_version != plugin.version {
+            return Err(PluginError {
+                code: "version_unavailable".into(),
+                message: format!(
+                    "requested version '{requested_version}' does not match registry version '{}'",
+                    plugin.version
+                ),
+                retryable: false,
+                http_status: Some(400),
+            });
+        }
 
         let (goos, goarch) = Self::current_platform();
         let install_plan = plugin.install.as_ref().ok_or_else(|| PluginError {

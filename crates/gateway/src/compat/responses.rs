@@ -704,17 +704,26 @@ fn sse_frame(event_name: &str, payload: &Value) -> Bytes {
 fn build_usage_json(usage: Option<&Usage>) -> Value {
     match usage {
         None => Value::Null,
-        Some(u) => json!({
+        Some(u) => {
+            let mut value = json!({
             "input_tokens": u.prompt_tokens,
             "output_tokens": u.completion_tokens,
             "total_tokens": u.total_tokens,
-            "input_tokens_details": {
-                "cached_tokens": u.cached_tokens,
-            },
             "output_tokens_details": {
                 "reasoning_tokens": u.reasoning_tokens,
             }
-        }),
+            });
+            if u.cached_tokens_known {
+                value["input_tokens_details"] = json!({"cached_tokens":u.cached_tokens});
+            }
+            if u.cache_write_tokens_known {
+                if value.get("input_tokens_details").is_none() {
+                    value["input_tokens_details"] = json!({});
+                }
+                value["input_tokens_details"]["cache_write_tokens"] = json!(u.cache_write_tokens);
+            }
+            value
+        }
     }
 }
 
@@ -722,7 +731,7 @@ fn build_usage_json(usage: Option<&Usage>) -> Value {
 enum TextItemState {
     Unstarted,
     Open { item_id: String, output_index: u64 },
-    Done { item_id: String, output_index: u64 },
+    Done,
 }
 
 #[derive(Debug, Clone)]
@@ -735,6 +744,22 @@ struct ToolCallItem {
     arguments: String,
     args_done_emitted: bool,
     item_done_emitted: bool,
+}
+
+impl ToolCallItem {
+    fn value(&self, status: &str) -> Value {
+        if self.name == "web_search" && self.call_id.starts_with("srvtoolu_") {
+            let query = serde_json::from_str::<Value>(&self.arguments)
+                .ok()
+                .and_then(|args| args.get("query").cloned())
+                .unwrap_or(Value::Null);
+            json!({"id":self.item_id,"type":"web_search_call","status":status,
+                "action":{"type":"search","query":query}})
+        } else {
+            json!({"id":self.item_id,"type":"function_call","status":status,
+                "arguments":self.arguments,"call_id":self.call_id,"name":self.name})
+        }
+    }
 }
 
 /// Renderer translating upstream [`CodexEvent`] streams into standard OpenAI
@@ -755,6 +780,8 @@ pub struct ResponsesStreamRenderer {
     text_state: TextItemState,
     tools: Vec<ToolCallItem>,
     next_output_index: u64,
+    closed_text: std::collections::BTreeMap<u64, Value>,
+    reasoning_index: Option<u64>,
     /// Monotonic `sequence_number` for locally rendered events (Task 9).
     next_sequence: u64,
 }
@@ -806,6 +833,8 @@ impl ResponsesStreamRenderer {
             text_state: TextItemState::Unstarted,
             tools: Vec::new(),
             next_output_index: 0,
+            closed_text: std::collections::BTreeMap::new(),
+            reasoning_index: None,
             next_sequence: 0,
         }
     }
@@ -847,12 +876,7 @@ impl ResponsesStreamRenderer {
             } else {
                 "completed"
             };
-            out.push(sse_frame(
-                "response.output_item.done",
-                &json!({
-                    "type": "response.output_item.done",
-                    "output_index": output_index,
-                    "item": {
+            let mut item = json!({
                         "id": item_id,
                         "type": "message",
                         "status": item_status,
@@ -861,13 +885,23 @@ impl ResponsesStreamRenderer {
                             "type": "output_text",
                             "text": self.text_accumulator,
                         }]
-                    }
-                }),
+            });
+            if !self.reasoning_accumulator.is_empty() {
+                item["reasoning_content"] = json!(self.reasoning_accumulator);
+            }
+            if let Some(sig) = &self.reasoning_signature {
+                item["reasoning_signature"] = json!(sig);
+            }
+            if self.reasoning_redacted {
+                item["reasoning_redacted"] = json!(true);
+            }
+            out.push(sse_frame(
+                "response.output_item.done",
+                &json!({"type":"response.output_item.done", "output_index":output_index, "item":item}),
             ));
-            self.text_state = TextItemState::Done {
-                item_id: item_id.clone(),
-                output_index,
-            };
+            self.text_state = TextItemState::Done;
+            self.closed_text.insert(output_index, item);
+            self.text_accumulator.clear();
         }
     }
 
@@ -900,14 +934,7 @@ impl ResponsesStreamRenderer {
                 &json!({
                     "type": "response.output_item.done",
                     "output_index": tool.output_index,
-                    "item": {
-                        "id": tool.item_id,
-                        "type": "function_call",
-                        "status": item_status,
-                        "arguments": tool.arguments,
-                        "call_id": tool.call_id,
-                        "name": tool.name,
-                    }
+                    "item": tool.value(item_status)
                 }),
             ));
         }
@@ -916,6 +943,46 @@ impl ResponsesStreamRenderer {
     pub fn render(&mut self, event: CodexEvent) -> Vec<Bytes> {
         let frames = self.render_unstamped(event);
         stamp_sequence(frames, &mut self.next_sequence)
+    }
+
+    fn ensure_reasoning_item(&mut self, out: &mut Vec<Bytes>) -> u64 {
+        self.ensure_created_frame(out);
+        if let Some(index) = self.reasoning_index {
+            return index;
+        }
+        let index = self.next_output_index;
+        self.next_output_index += 1;
+        self.reasoning_index = Some(index);
+        out.push(sse_frame(
+            "response.output_item.added",
+            &json!({
+                "type":"response.output_item.added", "output_index":index,
+                "item":{"id":format!("rs_{index}"),"type":"reasoning","summary":[]}
+            }),
+        ));
+        index
+    }
+
+    fn reasoning_item(&self, index: u64) -> Value {
+        let mut item = json!({"id":format!("rs_{index}"),"type":"reasoning",
+            "summary":if self.reasoning_accumulator.is_empty() { json!([]) }
+                else { json!([{"type":"summary_text","text":self.reasoning_accumulator}]) }});
+        if let Some(sig) = &self.reasoning_signature {
+            item["encrypted_content"] = json!(sig);
+        }
+        item
+    }
+
+    fn close_reasoning_item(&self, out: &mut Vec<Bytes>) {
+        if let Some(index) = self.reasoning_index {
+            out.push(sse_frame(
+                "response.output_item.done",
+                &json!({
+                    "type":"response.output_item.done","output_index":index,
+                    "item":self.reasoning_item(index)
+                }),
+            ));
+        }
     }
 
     fn render_unstamped(&mut self, event: CodexEvent) -> Vec<Bytes> {
@@ -937,28 +1004,31 @@ impl ResponsesStreamRenderer {
                 self.ensure_created_frame(&mut out);
             }
             CodexEvent::ReasoningDelta(delta) => {
-                self.ensure_created_frame(&mut out);
+                let index = self.ensure_reasoning_item(&mut out);
                 self.reasoning_accumulator.push_str(&delta);
                 out.push(sse_frame(
                     "response.reasoning_text.delta",
                     &json!({
                         "type": "response.reasoning_text.delta",
                         "delta": delta,
-                        "output_index": 0,
+                        "output_index": index,
+                        "item_id": format!("rs_{index}"),
                     }),
                 ));
             }
             CodexEvent::ReasoningSignature(sig) => {
+                self.ensure_reasoning_item(&mut out);
                 self.reasoning_signature = Some(sig);
             }
             CodexEvent::ReasoningRedacted => {
+                self.ensure_reasoning_item(&mut out);
                 self.reasoning_redacted = true;
             }
             CodexEvent::TextDelta(delta) => {
                 self.ensure_created_frame(&mut out);
 
                 let (item_id, output_index) = match self.text_state {
-                    TextItemState::Unstarted => {
+                    TextItemState::Unstarted | TextItemState::Done => {
                         let out_idx = self.next_output_index;
                         self.next_output_index += 1;
                         let id = format!("msg_{out_idx}");
@@ -999,13 +1069,6 @@ impl ResponsesStreamRenderer {
                         ref item_id,
                         output_index,
                     } => (item_id.clone(), output_index),
-                    TextItemState::Done {
-                        ref item_id,
-                        output_index,
-                    } => {
-                        // Re-open if subsequent text arrives
-                        (item_id.clone(), output_index)
-                    }
                 };
 
                 self.text_accumulator.push_str(&delta);
@@ -1031,7 +1094,11 @@ impl ResponsesStreamRenderer {
 
                 let resp_output_idx = self.next_output_index;
                 self.next_output_index += 1;
-                let item_id = format!("fc_{resp_output_idx}");
+                let item_id = if name == "web_search" && call_id.starts_with("srvtoolu_") {
+                    call_id.clone()
+                } else {
+                    format!("fc_{resp_output_idx}")
+                };
 
                 let tool_item = ToolCallItem {
                     item_id: item_id.clone(),
@@ -1043,6 +1110,7 @@ impl ResponsesStreamRenderer {
                     args_done_emitted: false,
                     item_done_emitted: false,
                 };
+                let added_item = tool_item.value("in_progress");
                 self.tools.push(tool_item);
 
                 out.push(sse_frame(
@@ -1050,14 +1118,7 @@ impl ResponsesStreamRenderer {
                     &json!({
                         "type": "response.output_item.added",
                         "output_index": resp_output_idx,
-                        "item": {
-                            "id": item_id,
-                            "type": "function_call",
-                            "status": "in_progress",
-                            "arguments": "",
-                            "call_id": call_id,
-                            "name": name,
-                        }
+                        "item": added_item
                     }),
                 ));
             }
@@ -1089,6 +1150,7 @@ impl ResponsesStreamRenderer {
             }
             CodexEvent::Completed { usage } => {
                 self.ensure_created_frame(&mut out);
+                self.close_reasoning_item(&mut out);
                 self.close_text_item(&mut out);
                 for i in 0..self.tools.len() {
                     self.close_tool_item(i, &mut out);
@@ -1117,6 +1179,7 @@ impl ResponsesStreamRenderer {
                 }
             }
             CodexEvent::Failed { message } => {
+                self.close_reasoning_item(&mut out);
                 self.close_text_item(&mut out);
                 for i in 0..self.tools.len() {
                     self.close_tool_item(i, &mut out);
@@ -1152,104 +1215,29 @@ impl ResponsesStreamRenderer {
     }
 
     fn close_unstamped(&mut self) -> Vec<Bytes> {
-        if self.terminated {
-            return Vec::new();
-        }
-        let mut out = Vec::new();
-        self.ensure_created_frame(&mut out);
-        self.close_text_item(&mut out);
-        for i in 0..self.tools.len() {
-            self.close_tool_item(i, &mut out);
-        }
-        self.terminated = true;
-
-        let resp_val = self.current_response();
-        if self.output_limit_reached {
-            out.push(sse_frame(
-                "response.incomplete",
-                &json!({
-                    "type": "response.incomplete",
-                    "response": resp_val,
-                }),
-            ));
-        } else {
-            out.push(sse_frame(
-                "response.completed",
-                &json!({
-                    "type": "response.completed",
-                    "response": resp_val,
-                }),
-            ));
-        }
-        out
+        self.render_unstamped(CodexEvent::Failed {
+            message: "upstream stream ended before completion".into(),
+        })
     }
 
     /// Assembles the complete canonical Responses JSON response object.
     pub fn current_response(&self) -> Value {
-        let mut output_items = Vec::new();
-        // Reasoning is its own Responses output item (Task 9): the summary
-        // text, and the provider signature as encrypted_content for replay.
-        if !self.reasoning_accumulator.is_empty()
-            || self.reasoning_signature.is_some()
-            || self.reasoning_redacted
-        {
-            let mut reasoning = json!({
-                "id": "rs_0",
-                "type": "reasoning",
-                "summary": if self.reasoning_accumulator.is_empty() {
-                    json!([])
-                } else {
-                    json!([{"type": "summary_text", "text": self.reasoning_accumulator}])
-                },
-            });
-            if let Some(ref sig) = self.reasoning_signature {
-                reasoning["encrypted_content"] = json!(sig);
-            }
-            output_items.push(reasoning);
+        let mut output_items = self.closed_text.clone();
+        if let Some(index) = self.reasoning_index {
+            output_items.insert(index, self.reasoning_item(index));
         }
-
-        if !matches!(self.text_state, TextItemState::Unstarted) || !self.text_accumulator.is_empty()
+        if let TextItemState::Open {
+            ref item_id,
+            output_index,
+        } = self.text_state
         {
-            let (item_id, item_status) = match self.text_state {
-                TextItemState::Open { ref item_id, .. }
-                | TextItemState::Done { ref item_id, .. } => (
-                    item_id.clone(),
-                    if self.output_limit_reached {
-                        "incomplete"
-                    } else {
-                        "completed"
-                    },
-                ),
-                TextItemState::Unstarted => (
-                    "msg_0".to_string(),
-                    if self.output_limit_reached {
-                        "incomplete"
-                    } else {
-                        "completed"
-                    },
-                ),
-            };
-
-            let mut msg_obj = json!({
-                "id": item_id,
-                "type": "message",
-                "status": item_status,
-                "role": "assistant",
-                "content": [{
-                    "type": "output_text",
-                    "text": self.text_accumulator,
-                }]
-            });
-            if !self.reasoning_accumulator.is_empty() {
-                msg_obj["reasoning_content"] = json!(self.reasoning_accumulator);
-            }
-            if let Some(ref sig) = self.reasoning_signature {
-                msg_obj["reasoning_signature"] = json!(sig);
-            }
-            if self.reasoning_redacted {
-                msg_obj["reasoning_redacted"] = json!(true);
-            }
-            output_items.push(msg_obj);
+            output_items.insert(
+                output_index,
+                json!({
+                    "id":item_id,"type":"message","status":"in_progress","role":"assistant",
+                    "content":[{"type":"output_text","text":self.text_accumulator}]
+                }),
+            );
         }
 
         for tool in &self.tools {
@@ -1258,29 +1246,7 @@ impl ResponsesStreamRenderer {
             } else {
                 "completed"
             };
-            // Claude's server-side web search is surfaced as the Responses
-            // built-in search call, not as a client function call (Task 25).
-            if tool.name == "web_search" && tool.call_id.starts_with("srvtoolu_") {
-                let query = serde_json::from_str::<Value>(&tool.arguments)
-                    .ok()
-                    .and_then(|args| args.get("query").cloned())
-                    .unwrap_or(Value::Null);
-                output_items.push(json!({
-                    "id": tool.call_id,
-                    "type": "web_search_call",
-                    "status": status,
-                    "action": {"type": "search", "query": query},
-                }));
-                continue;
-            }
-            output_items.push(json!({
-                "id": tool.item_id,
-                "type": "function_call",
-                "status": status,
-                "call_id": tool.call_id,
-                "name": tool.name,
-                "arguments": tool.arguments,
-            }));
+            output_items.insert(tool.output_index, tool.value(status));
         }
 
         let status = if self.failure.is_some() {
@@ -1299,7 +1265,7 @@ impl ResponsesStreamRenderer {
             "created_at": self.created,
             "status": status,
             "model": self.model,
-            "output": output_items,
+            "output": output_items.into_values().collect::<Vec<_>>(),
             "usage": build_usage_json(self.usage.as_ref()),
         });
 

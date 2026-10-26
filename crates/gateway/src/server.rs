@@ -131,6 +131,7 @@ pub struct ProtocolListener {
     updates: watch::Receiver<Settings>,
     updates_open: bool,
     connections: JoinSet<anyhow::Result<(ProtocolStream, SocketAddr)>>,
+    resp_sessions: Arc<std::sync::Mutex<Option<JoinSet<()>>>>,
 }
 
 impl ProtocolListener {
@@ -150,6 +151,7 @@ impl ProtocolListener {
             updates,
             updates_open: true,
             connections: JoinSet::new(),
+            resp_sessions: Arc::new(std::sync::Mutex::new(Some(JoinSet::new()))),
         })
     }
 
@@ -161,6 +163,19 @@ impl ProtocolListener {
         self.settings = Some(settings);
         self.attempts = attempts;
         self
+    }
+}
+
+impl Drop for ProtocolListener {
+    fn drop(&mut self) {
+        if let Some(sessions) = self
+            .resp_sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_mut()
+        {
+            sessions.abort_all();
+        }
     }
 }
 
@@ -216,6 +231,7 @@ impl axum::serve::Listener for ProtocolListener {
                             let settings = self.settings.clone();
                             let attempts = self.attempts.clone();
                             let hub = self.hub.clone();
+                            let resp_sessions = self.resp_sessions.clone();
                             self.connections.spawn(async move {
                                 tokio::time::timeout(HANDSHAKE_TIMEOUT, async move {
                                     let io: Box<dyn ConnectionIo> = match tls {
@@ -226,7 +242,19 @@ impl axum::serve::Listener for ProtocolListener {
                                     match sniff(&mut stream).await? {
                                         Protocol::Http => Ok((stream, peer)),
                                         Protocol::Resp => {
-                                            tokio::spawn(async move {
+                                            let mut sessions = resp_sessions.lock().unwrap_or_else(|p| p.into_inner());
+                                            let Some(sessions) = sessions.as_mut() else {
+                                                anyhow::bail!("server shutting down");
+                                            };
+                                            while let Some(result) = sessions.try_join_next() {
+                                                if let Err(error) = result {
+                                                    tracing::warn!(%error, "RESP session failed");
+                                                }
+                                            }
+                                            if sessions.len() >= 1024 {
+                                                anyhow::bail!("RESP session capacity reached");
+                                            }
+                                            sessions.spawn(async move {
                                                 crate::resp::handle_redis_connection(stream, peer, settings, attempts, hub).await;
                                             });
                                             anyhow::bail!("handled as resp");
@@ -250,6 +278,8 @@ pub async fn run_protocol_server(
     app: Router,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
+    let resp_sessions = listener.resp_sessions.clone();
+    let shutdown_sessions = resp_sessions.clone();
     let make_service = tower::service_fn(
         move |stream: axum::serve::IncomingStream<'_, ProtocolListener>| {
             let app = app
@@ -258,10 +288,25 @@ pub async fn run_protocol_server(
             std::future::ready(Ok::<_, std::convert::Infallible>(app))
         },
     );
-    axum::serve(listener, make_service)
-        .with_graceful_shutdown(shutdown)
+    let result = axum::serve(listener, make_service)
+        .with_graceful_shutdown(async move {
+            shutdown.await;
+            let mut sessions = shutdown_sessions
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take()
+                .unwrap_or_default();
+            sessions.shutdown().await;
+        })
         .await
-        .map_err(|e| anyhow::anyhow!("server error: {}", e))
+        .map_err(|e| anyhow::anyhow!("server error: {}", e));
+    let mut sessions = resp_sessions
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take()
+        .unwrap_or_default();
+    sessions.shutdown().await;
+    result
 }
 
 pub async fn run_server(

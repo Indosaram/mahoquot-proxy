@@ -171,7 +171,17 @@ pub fn apply_refresh_to_file(
     let content = std::fs::read_to_string(path)?;
     let mut root: Value =
         serde_json::from_str(&content).map_err(|e| RefreshError::Parse(e.to_string()))?;
+    apply_refresh_to_value(&mut root, tokens, now_unix)?;
+    let serialized =
+        serde_json::to_string(&root).map_err(|e| RefreshError::Parse(e.to_string()))?;
+    write_credential_atomically(path, serialized.as_bytes()).map_err(RefreshError::Io)
+}
 
+pub fn apply_refresh_to_value(
+    root: &mut Value,
+    tokens: &Tokens,
+    now_unix: i64,
+) -> Result<(), RefreshError> {
     let obj = root
         .as_object_mut()
         .ok_or_else(|| RefreshError::Parse("root is not a JSON object".to_string()))?;
@@ -223,9 +233,7 @@ pub fn apply_refresh_to_file(
         None => {}
     }
 
-    let serialized =
-        serde_json::to_string(&root).map_err(|e| RefreshError::Parse(e.to_string()))?;
-    write_credential_atomically(path, serialized.as_bytes()).map_err(RefreshError::Io)
+    Ok(())
 }
 
 #[cfg(test)]

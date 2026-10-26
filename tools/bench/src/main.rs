@@ -80,6 +80,10 @@ pub struct RunArgs {
 
     #[arg(long, default_value_t = 10000)]
     pub timeout_ms: u64,
+
+    /// Phase identity copied verbatim into every raw request observation.
+    #[arg(long, default_value = "core")]
+    pub phase: String,
 }
 
 #[tokio::main]
@@ -106,6 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 headers: args.header,
                 body_json: args.body_json,
                 timeout_ms: args.timeout_ms,
+                phase: args.phase,
             };
             runner::run_benchmark(cfg).await?;
         }
@@ -113,6 +118,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let report =
                 locality::run_locality_benchmarks(&args.url, &args.session, args.turns).await?;
             tokio::fs::write(&args.out, serde_json::to_vec_pretty(&report)?).await?;
+            if !report.correctness_passed {
+                return Err(format!("locality correctness failed: {:?}", report.errors).into());
+            }
         }
     }
     Ok(())

@@ -107,6 +107,18 @@ impl Default for HomeTLSConfig {
     }
 }
 
+impl HomeTLSConfig {
+    fn selected_server_name(&self, target: &str) -> Result<ServerName<'static>, HomeError> {
+        let name = if self.use_target_server_name || self.server_name.trim().is_empty() {
+            target
+        } else {
+            self.server_name.trim()
+        };
+        ServerName::try_from(name.to_owned())
+            .map_err(|e| HomeError::Certificate(format!("invalid server name {name}: {e}")))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HomeConfig {
     #[serde(default)]
@@ -828,16 +840,19 @@ impl HomeClient {
         if self.dispatch_fenced() {
             return Err(HomeError::DispatchFenced);
         }
-        let tcp = self.connect_plain()?;
-        let use_tls = self.config.read().unwrap().tls.enable;
-        if !use_tls {
-            return Ok(HomeStream::Plain(tcp));
-        }
-
+        let server_name = {
+            let cfg = self.config.read().unwrap();
+            if cfg.tls.enable {
+                Some(cfg.tls.selected_server_name(&cfg.host)?)
+            } else {
+                None
+            }
+        };
+        let Some(server_name) = server_name else {
+            return Ok(HomeStream::Plain(self.connect_plain()?));
+        };
         let tls_cfg = self.build_tls_client_config()?;
-        let (host, _) = self.get_target_addr();
-        let server_name = ServerName::try_from(host.clone())
-            .map_err(|e| HomeError::Certificate(format!("invalid server name {host}: {e}")))?;
+        let tcp = self.connect_plain()?;
 
         let conn = ClientConnection::new(tls_cfg, server_name)
             .map_err(|e| HomeError::Certificate(format!("failed creating TLS connection: {e}")))?;
@@ -1390,6 +1405,24 @@ pub fn is_home_authoritative() -> bool {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn tls_name_respects_configuration() {
+        let mut cfg = HomeTLSConfig::default();
+        let target = ServerName::try_from("127.0.0.1".to_owned()).unwrap();
+        assert_eq!(cfg.selected_server_name("127.0.0.1").unwrap(), target);
+        cfg.server_name = "localhost".into();
+        assert_eq!(cfg.selected_server_name("127.0.0.1").unwrap(), target);
+        cfg.use_target_server_name = false;
+        assert_eq!(
+            cfg.selected_server_name("127.0.0.1").unwrap(),
+            ServerName::try_from("localhost".to_owned()).unwrap()
+        );
+        cfg.server_name.clear();
+        assert_eq!(cfg.selected_server_name("127.0.0.1").unwrap(), target);
+        cfg.server_name = "bad name".into();
+        assert!(cfg.selected_server_name("127.0.0.1").is_err());
+    }
 
     #[test]
     fn test_normalize_home_port() {

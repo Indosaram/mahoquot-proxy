@@ -413,17 +413,9 @@ impl ChunkRenderer {
         if self.terminated {
             return Vec::new();
         }
-        self.terminated = true;
-        let mut out = Vec::new();
-        self.role_prelude(&mut out);
-        let reason = if self.saw_tool_call {
-            "tool_calls"
-        } else {
-            "stop"
-        };
-        out.push(self.chunk(json!({}), Some(reason)));
-        out.push(Bytes::from_static(DONE_FRAME));
-        out
+        self.render(CodexEvent::Failed {
+            message: "upstream stream ended before completion".into(),
+        })
     }
 }
 
@@ -539,7 +531,7 @@ impl Aggregator {
 
     /// Gemini-native shape for the `/v1beta` surface, which nests text under
     /// `candidates[].content.parts[]` instead of `choices[]`.
-    pub fn into_gemini(self) -> Value {
+    pub fn into_gemini(self) -> Result<Value, String> {
         let replay = self.replay;
         let mut renderer = match replay {
             Some(replay) => {
@@ -552,6 +544,9 @@ impl Aggregator {
             for frame in renderer.render(event) {
                 let payload: Value =
                     serde_json::from_slice(&frame[6..]).expect("renderer emits JSON");
+                if let Some(error) = payload.pointer("/error/message").and_then(Value::as_str) {
+                    return Err(error.to_string());
+                }
                 if let Some(emitted) = payload
                     .pointer("/candidates/0/content/parts")
                     .and_then(Value::as_array)
@@ -562,6 +557,9 @@ impl Aggregator {
         }
         for frame in renderer.close_unterminated() {
             let payload: Value = serde_json::from_slice(&frame[6..]).expect("renderer emits JSON");
+            if let Some(error) = payload.pointer("/error/message").and_then(Value::as_str) {
+                return Err(error.to_string());
+            }
             if let Some(emitted) = payload
                 .pointer("/candidates/0/content/parts")
                 .and_then(Value::as_array)
@@ -593,7 +591,7 @@ impl Aggregator {
                 payload["usageMetadata"]["cachedContentTokenCount"] = json!(usage.cached_tokens);
             }
         }
-        payload
+        Ok(payload)
     }
 
     /// Canonical OpenAI Responses shape for the `/v1/responses` surface,
@@ -682,6 +680,7 @@ mod openai_stream_tests {
             assert_eq!(
                 aggregate
                     .into_gemini()
+                    .expect("valid usage")
                     .pointer("/usageMetadata/cachedContentTokenCount")
                     .and_then(Value::as_u64),
                 value
@@ -881,7 +880,7 @@ mod gemini_stream_tests {
             output_index: 0,
             delta: "{\"city\":\"Seoul\"}".to_string(),
         });
-        let out = agg.into_gemini();
+        let out = agg.into_gemini().expect("valid tool call");
 
         let parts = out["candidates"][0]["content"]["parts"]
             .as_array()

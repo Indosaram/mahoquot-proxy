@@ -158,17 +158,17 @@ pub(crate) async fn api_call(State(state): State<Arc<AppState>>, body: Bytes) ->
         let auth_dir = state.settings.current().auth_dir.clone();
         let auth_path = std::path::PathBuf::from(&auth_dir);
         let resolved_filename = crate::management::creds::resolve_auth_index(&state, auth_index);
-        let cred_file = resolved_filename
-            .as_deref()
-            .map(|f| auth_path.join(f))
-            .or_else(|| {
-                let candidate = auth_path.join(auth_index);
-                if candidate.exists() {
-                    Some(candidate)
-                } else {
-                    None
-                }
-            });
+        let cred_file = resolved_filename.as_deref().and_then(|name| {
+            let directory = auth_path.canonicalize().ok()?;
+            let file = directory.join(name).canonicalize().ok()?;
+            (file.starts_with(&directory) && file.is_file()).then_some(file)
+        });
+        if cred_file.is_none() {
+            return json_status(
+                StatusCode::BAD_REQUEST,
+                json!({"error":"invalid auth index"}),
+            );
+        }
 
         if let Some(file) = cred_file {
             if let Ok(content) = std::fs::read_to_string(&file) {

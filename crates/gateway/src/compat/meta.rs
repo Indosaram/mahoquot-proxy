@@ -262,6 +262,7 @@ pub async fn refresh_member(
     member: &crate::account::AccountMember,
     client: &reqwest::Client,
     presented_token: Option<&str>,
+    settings: Option<std::sync::Arc<crate::management::store::SettingsStore>>,
 ) -> Result<bool, String> {
     use mahoquot_providers::meta::MetaAccount;
     // The caller (`AccountMember::refresh`) already holds `refresh_lock`;
@@ -289,7 +290,15 @@ pub async fn refresh_member(
     )
     .await
     .map_err(|e| e.to_string())?;
-    persist_account(member.file_path.clone(), &candidate).await?;
+    let expected: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    crate::account::commit_refresh(
+        member.file_path.clone(),
+        Some(expected),
+        serde_json::to_value(&candidate).map_err(|e| e.to_string())?,
+        settings,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     member.reload_from_file().map_err(|e| e.to_string())?;
     Ok(true)
 }
@@ -308,19 +317,6 @@ pub fn endpoints_from_account(
     endpoints
 }
 
-async fn persist_account(
-    path: std::path::PathBuf,
-    account: &mahoquot_providers::meta::MetaAccount,
-) -> Result<(), String> {
-    let bytes = serde_json::to_vec_pretty(account).map_err(|e| e.to_string())?;
-    tokio::task::spawn_blocking(move || {
-        mahoquot_providers::credential_file::write_credential_atomically(&path, &bytes)
-    })
-    .await
-    .map_err(|e| e.to_string())?
-    .map_err(|e| e.to_string())
-}
-
 pub async fn onboard_device(
     state: &crate::state::AppState,
     endpoints: &mahoquot_providers::meta::MetaEndpoints,
@@ -329,6 +325,39 @@ pub async fn onboard_device(
     let client = state
         .try_client_for_target("meta", "device-onboarding")
         .map_err(|error| error.to_string())?;
+    // Snapshot existing identities before mint/discovery. A deletion while the
+    // network request is in flight must not turn an update into a new account.
+    let dir = std::path::PathBuf::from(&state.settings.current().auth_dir);
+    let snapshot_dir = dir.clone();
+    let settings = std::sync::Arc::clone(&state.settings);
+    let previous = tokio::task::spawn_blocking(
+        move || -> Result<std::collections::HashMap<std::path::PathBuf, Value>, String> {
+            let _mutation = settings.composition_lock();
+            let mut previous = std::collections::HashMap::new();
+            let entries = match std::fs::read_dir(&snapshot_dir) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(previous),
+                Err(error) => return Err(error.to_string()),
+            };
+            for entry in entries {
+                let path = entry.map_err(|e| e.to_string())?.path();
+                if path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("meta-") && name.ends_with(".json"))
+                {
+                    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+                    previous.insert(
+                        path,
+                        serde_json::from_slice(&bytes).map_err(|e| e.to_string())?,
+                    );
+                }
+            }
+            Ok(previous)
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())??;
     let mut account = mahoquot_providers::meta::complete_device(
         &client,
         endpoints,
@@ -350,14 +379,11 @@ pub async fn onboard_device(
         .map(|byte| format!("{byte:02x}"))
         .collect();
     account.identity_slug = format!("meta-{suffix}");
-    let dir = std::path::PathBuf::from(&state.settings.current().auth_dir);
-    tokio::fs::create_dir_all(&dir)
-        .await
-        .map_err(|e| e.to_string())?;
     let path = dir.join(format!("{}.json", account.identity_slug));
-    if let Ok(bytes) = tokio::fs::read(&path).await {
+    let expected = previous.get(&path).cloned();
+    if let Some(ref value) = expected {
         let existing: mahoquot_providers::meta::MetaAccount =
-            serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+            serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
         account.identity_slug = existing.identity_slug;
         account.disabled = existing.disabled;
         for (key, value) in existing.metadata {
@@ -382,7 +408,14 @@ pub async fn onboard_device(
     account
         .metadata
         .insert("mint_url".into(), json!(endpoints.mint));
-    persist_account(path, &account).await?;
+    crate::account::commit_refresh(
+        path,
+        expected,
+        serde_json::to_value(&account).map_err(|e| e.to_string())?,
+        Some(std::sync::Arc::clone(&state.settings)),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     state.rescan_pool().map_err(|e| e.to_string())?;
     Ok(account.identity_slug)
 }

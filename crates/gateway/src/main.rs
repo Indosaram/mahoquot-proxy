@@ -1,16 +1,19 @@
 fn init_storage_manager(
     auth_dir: &std::path::Path,
-) -> Option<Arc<mahoquot_registry::store::StorageManager>> {
+) -> Result<
+    Option<Arc<mahoquot_registry::store::StorageManager>>,
+    mahoquot_registry::store::StoreError,
+> {
     use mahoquot_registry::store::{
         BackendConfig, GitStore, ObjectStore, PostgresStore, StorageBackend, StorageManager,
         StoreOptions,
     };
 
-    let options = StoreOptions::from_env(auth_dir).ok()?;
+    let options = StoreOptions::from_env(auth_dir)?;
     let (backend, spool): (Arc<dyn StorageBackend>, std::path::PathBuf) = match options.config {
         BackendConfig::Postgres { dsn, schema, spool } => {
-            info!(dsn = %dsn, schema = ?schema, spool = %spool.display(), "enabling postgres-backed storage");
-            (Arc::new(PostgresStore::new(dsn, schema)), spool)
+            info!(schema = ?schema, spool = %spool.display(), "enabling postgres-backed storage");
+            (Arc::new(PostgresStore::try_new(dsn, schema)?), spool)
         }
         BackendConfig::Object {
             endpoint,
@@ -21,7 +24,7 @@ fn init_storage_manager(
             spool,
         } => {
             info!(endpoint = %endpoint, bucket = %bucket, prefix = %prefix, spool = %spool.display(), "enabling object-backed storage");
-            let store = ObjectStore::new(endpoint, bucket, access_key, secret_key, prefix).ok()?;
+            let store = ObjectStore::new(endpoint, bucket, access_key, secret_key, prefix)?;
             (Arc::new(store), spool)
         }
         BackendConfig::Git { repository, spool } => {
@@ -30,10 +33,10 @@ fn init_storage_manager(
             let branch = std::env::var("GITSTORE_GIT_BRANCH").ok();
             (Arc::new(GitStore::new(repository, remote, branch)), spool)
         }
-        BackendConfig::Local { .. } => return None,
+        BackendConfig::Local { .. } => return Ok(None),
     };
 
-    StorageManager::new(backend, spool).ok().map(Arc::new)
+    Ok(Some(Arc::new(StorageManager::new(backend, spool)?)))
 }
 
 use std::path::PathBuf;
@@ -54,6 +57,85 @@ use mahoquot_types::Strategy;
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
+
+fn prepare_storage(
+    mgr: &mahoquot_registry::store::StorageManager,
+    config: &mut GatewayConfig,
+) -> anyhow::Result<()> {
+    if mgr.backend().get("config/config.yaml")?.is_none() && config.config_path.exists() {
+        let bytes = std::fs::read(&config.config_path)?;
+        mgr.put("config/config.yaml", &bytes)?;
+    }
+    if mgr.list("auths")?.is_empty() && config.auth_dir.exists() {
+        for entry in std::fs::read_dir(&config.auth_dir)? {
+            let path = entry?.path();
+            if path.is_file() {
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default();
+                if name.ends_with(".json") && !name.starts_with('.') {
+                    let bytes = std::fs::read(&path)?;
+                    mahoquot_gateway::account::save_account_to_store(mgr, name, &bytes)?;
+                }
+            }
+        }
+    }
+    mgr.sync_all_to_spool()?;
+    std::fs::create_dir_all(mgr.auth_dir())?;
+    config.auth_dir = mgr.auth_dir();
+    if mgr.config_path().exists() {
+        config.config_path = mgr.config_path();
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod storage_startup_tests {
+    use super::*;
+    use mahoquot_registry::store::{StorageBackend, StorageManager, StoreError};
+
+    struct FailedBackend;
+    impl StorageBackend for FailedBackend {
+        fn get(&self, _: &str) -> Result<Option<Vec<u8>>, StoreError> {
+            Err(StoreError::Unavailable("fixture unavailable".into()))
+        }
+        fn put(&self, _: &str, _: &[u8]) -> Result<(), StoreError> {
+            panic!("failed read must not seed the backend")
+        }
+        fn delete(&self, _: &str) -> Result<(), StoreError> {
+            panic!("startup must not delete credentials")
+        }
+        fn list(&self, _: &str) -> Result<Vec<String>, StoreError> {
+            Err(StoreError::Unavailable("fixture unavailable".into()))
+        }
+    }
+
+    #[test]
+    fn unavailable_store_aborts_before_config_or_auth_projection_changes() {
+        let root = std::env::temp_dir().join(format!("storage-startup-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("auth")).unwrap();
+        let mut config = GatewayConfig {
+            auth_dir: root.join("auth"),
+            config_path: root.join("config.yaml"),
+            ..Default::default()
+        };
+        std::fs::write(&config.config_path, b"api-keys: [fixture]").unwrap();
+        let original_auth = config.auth_dir.clone();
+        let original_config = config.config_path.clone();
+        let store = StorageManager::new(Arc::new(FailedBackend), root.join("spool")).unwrap();
+        let result = prepare_storage(&store, &mut config);
+        assert!(result.is_err());
+        assert_eq!(config.auth_dir, original_auth);
+        assert_eq!(config.config_path, original_config);
+        assert_eq!(
+            std::fs::read(config.config_path).unwrap(),
+            b"api-keys: [fixture]"
+        );
+        assert!(!store.auth_dir().exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -377,14 +459,18 @@ async fn main() -> anyhow::Result<()> {
             json,
             service_type,
         }) => {
-            let browser = mahoquot_gateway::discovery::RealBrowser::new();
-            let discovered = browser
-                .browse_with_timeout(
-                    &service_type,
-                    mahoquot_gateway::discovery::DEFAULT_DOMAIN,
-                    std::time::Duration::from_secs(timeout.max(1)),
-                )
-                .unwrap_or_default();
+            let browse_type = service_type.clone();
+            let discovered = tokio::task::spawn_blocking(move || {
+                let isolation = mahoquot_gateway::discovery::IsolatedDiscovery::from_env()?;
+                mahoquot_gateway::discovery::RealBrowser::with_isolation(isolation)
+                    .browse_with_timeout(
+                        &browse_type,
+                        mahoquot_gateway::discovery::DEFAULT_DOMAIN,
+                        std::time::Duration::from_secs(timeout.max(1)),
+                    )
+            })
+            .await?
+            .map_err(anyhow::Error::msg)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&discovered)?);
             } else if discovered.is_empty() {
@@ -454,42 +540,10 @@ async fn main() -> anyhow::Result<()> {
     let storage_mgr = if std::env::var("HOME_JWT").is_ok_and(|jwt| !jwt.trim().is_empty()) {
         None
     } else {
-        init_storage_manager(&config.auth_dir)
+        tokio::task::block_in_place(|| init_storage_manager(&config.auth_dir))?
     };
     if let Some(ref mgr) = storage_mgr {
-        // If the backend has no config yet, seed from initial config_path if present
-        if mgr.get("config/config.yaml").ok().flatten().is_none() && config.config_path.exists() {
-            if let Ok(bytes) = std::fs::read(&config.config_path) {
-                let _ = mgr.put("config/config.yaml", &bytes);
-            }
-        }
-        // If the backend has no auth files yet, seed from initial auth_dir
-        if mgr.list("auths").map(|l| l.is_empty()).unwrap_or(false) && config.auth_dir.exists() {
-            if let Ok(entries) = std::fs::read_dir(&config.auth_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_file() {
-                        let name = path
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or_default();
-                        if name.ends_with(".json") && !name.starts_with('.') {
-                            if let Ok(bytes) = std::fs::read(&path) {
-                                let _ = mahoquot_gateway::account::save_account_to_store(
-                                    mgr, name, &bytes,
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        let _ = mgr.sync_all_to_spool();
-        config.auth_dir = mgr.auth_dir();
-        let _ = std::fs::create_dir_all(&config.auth_dir);
-        if mgr.config_path().exists() {
-            config.config_path = mgr.config_path();
-        }
+        tokio::task::block_in_place(|| prepare_storage(mgr, &mut config))?;
     }
     let mut home_sync_worker = None;
     if let Ok(jwt) = std::env::var("HOME_JWT") {
@@ -563,39 +617,59 @@ async fn main() -> anyhow::Result<()> {
         state.settings.set_storage_manager(Arc::clone(mgr));
     }
 
-    // Start discovery advertisement if enabled in settings
-    let mut discovery_mgr = mahoquot_gateway::discovery::DiscoveryManager::real();
-    let discovery_cfg = if let Ok(content) = std::fs::read_to_string(&config.config_path) {
-        if let Ok(val) = serde_yaml::from_str::<serde_json::Value>(&content) {
-            if let Some(disc) = val.get("discovery") {
-                serde_json::from_value::<mahoquot_gateway::discovery::DiscoveryConfig>(disc.clone())
-                    .unwrap_or_default()
-            } else {
-                mahoquot_gateway::discovery::DiscoveryConfig::default()
-            }
-        } else {
-            mahoquot_gateway::discovery::DiscoveryConfig::default()
-        }
-    } else {
-        mahoquot_gateway::discovery::DiscoveryConfig::default()
-    };
-
-    if discovery_cfg.enabled {
-        let ifaces = mahoquot_gateway::discovery::query_system_interfaces();
-        discovery_mgr.apply_config(
-            &discovery_cfg,
-            Some(&bind_addr),
-            config.port,
-            false,
-            &ifaces,
-            Some(&config.auth_dir),
-        );
-    }
+    // Bind fallible async listener resources before creating an advertiser.
     let listener = TcpListener::bind((bind_addr.as_str(), config.port)).await?;
     let attempts = state.api_keys.management_attempts();
     let listener = ProtocolListener::new(listener, &state.settings)
         .await?
         .with_management_context(Arc::clone(&state.settings), attempts);
+    let discovery_bind = bind_addr.clone();
+    let discovery_port = config.port;
+    let discovery_auth = config.auth_dir.clone();
+    let discovery_path = config.config_path.clone();
+    let mut discovery_mgr = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let isolation = mahoquot_gateway::discovery::IsolatedDiscovery::from_env()
+            .map_err(anyhow::Error::msg)?;
+        let isolated_discovery = isolation.is_some();
+        let mut discovery_mgr =
+            mahoquot_gateway::discovery::DiscoveryManager::with_isolation(isolation);
+        let discovery_cfg = if let Ok(content) = std::fs::read_to_string(&discovery_path) {
+            if let Ok(val) = serde_yaml::from_str::<serde_json::Value>(&content) {
+                if let Some(disc) = val.get("discovery") {
+                    serde_json::from_value::<mahoquot_gateway::discovery::DiscoveryConfig>(
+                        disc.clone(),
+                    )
+                    .unwrap_or_default()
+                } else {
+                    mahoquot_gateway::discovery::DiscoveryConfig::default()
+                }
+            } else {
+                mahoquot_gateway::discovery::DiscoveryConfig::default()
+            }
+        } else {
+            mahoquot_gateway::discovery::DiscoveryConfig::default()
+        };
+
+        if discovery_cfg.enabled {
+            let ifaces = mahoquot_gateway::discovery::query_system_interfaces();
+            let applied = discovery_mgr.apply_config(
+                &discovery_cfg,
+                Some(&discovery_bind),
+                discovery_port,
+                false,
+                &ifaces,
+                Some(&discovery_auth),
+            );
+            if isolated_discovery && !applied {
+                anyhow::bail!(
+                    "isolated discovery startup failed: {:?}",
+                    discovery_mgr.last_error()
+                );
+            }
+        }
+        Ok(discovery_mgr)
+    })
+    .await??;
     mahoquot_gateway::warmup::spawn_warmup_loop(state.clone(), std::time::Duration::from_secs(15));
     // Resume each Cline account's 24h token budget from the durable history
     // so a restart does not hand back a partially spent budget.
@@ -647,7 +721,7 @@ async fn main() -> anyhow::Result<()> {
     catalog_refresh.shutdown().await;
     cline_catalog.shutdown().await;
     flush_worker.shutdown().await;
-    discovery_mgr.shutdown();
+    let discovery_result = tokio::task::spawn_blocking(move || discovery_mgr.shutdown()).await;
     // Final snapshot before the process exits, so a replay that arrived inside
     // the coalescing window is not lost.
     state.signature_ledger.shutdown();
@@ -657,5 +731,14 @@ async fn main() -> anyhow::Result<()> {
     {
         let _ = state.signature_ledger.flush_blocking();
     }
-    result
+    let discovery_result = discovery_result
+        .map_err(anyhow::Error::from)
+        .and_then(|value| value.map_err(anyhow::Error::msg));
+    match (result, discovery_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(server), Err(discovery)) => Err(anyhow::anyhow!(
+            "server: {server}; discovery cleanup: {discovery}"
+        )),
+    }
 }

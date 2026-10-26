@@ -604,12 +604,14 @@ fn gemini_to_openai_inner(
     }
 
     // 2. Contents
+    let mut pending_calls: Vec<(String, String)> = Vec::new();
     if let Some(contents) = req.get("contents").and_then(Value::as_array) {
         for turn in contents {
             let role_str = turn.get("role").and_then(Value::as_str).unwrap_or("user");
             let is_model = role_str == "model" || role_str == "assistant";
 
             let mut text_parts = Vec::new();
+            let mut media_parts = Vec::new();
             let mut reasoning_parts = Vec::new();
             let mut reasoning_sig: Option<String> = None;
             let mut tool_calls = Vec::new();
@@ -617,6 +619,41 @@ fn gemini_to_openai_inner(
 
             if let Some(parts) = turn.get("parts").and_then(Value::as_array) {
                 for part in parts {
+                    if let Some(media) = part.get("inlineData").or_else(|| part.get("inline_data"))
+                    {
+                        let mime = media
+                            .get("mimeType")
+                            .or_else(|| media.get("mime_type"))
+                            .and_then(Value::as_str)
+                            .ok_or("inline media requires mimeType")?;
+                        if !mime.starts_with("image/") || is_model {
+                            return Err("unsupported Gemini media in conversation".into());
+                        }
+                        let data = media
+                            .get("data")
+                            .and_then(Value::as_str)
+                            .ok_or("inline media requires data")?;
+                        media_parts.push(json!({"type":"image_url","image_url":{"url":format!("data:{mime};base64,{data}")}}));
+                    }
+                    if let Some(media) = part.get("fileData").or_else(|| part.get("file_data")) {
+                        let mime = media
+                            .get("mimeType")
+                            .or_else(|| media.get("mime_type"))
+                            .and_then(Value::as_str)
+                            .ok_or("file media requires mimeType")?;
+                        let uri = media
+                            .get("fileUri")
+                            .or_else(|| media.get("file_uri"))
+                            .and_then(Value::as_str)
+                            .ok_or("file media requires fileUri")?;
+                        if !mime.starts_with("image/")
+                            || is_model
+                            || !(uri.starts_with("https://") || uri.starts_with("http://"))
+                        {
+                            return Err("unsupported Gemini file media".into());
+                        }
+                        media_parts.push(json!({"type":"image_url","image_url":{"url":uri}}));
+                    }
                     if let Some(sig) = part
                         .get("thoughtSignature")
                         .or_else(|| part.get("thought_signature"))
@@ -629,6 +666,7 @@ fn gemini_to_openai_inner(
                             reasoning_parts.push(text.to_string());
                         } else {
                             text_parts.push(text.to_string());
+                            media_parts.push(json!({"type":"text","text":text}));
                         }
                     }
                     if let Some(call) = part
@@ -646,6 +684,7 @@ fn gemini_to_openai_inner(
                         if let (Some(replay), Some(sig)) = (replay, reasoning_sig.as_ref()) {
                             replay.remember(&call_id, name, &args.to_string(), sig);
                         }
+                        pending_calls.push((name.to_string(), call_id.clone()));
                         tool_calls.push(json!({
                             "id": call_id,
                             "type": "function",
@@ -665,9 +704,26 @@ fn gemini_to_openai_inner(
                             .get("id")
                             .and_then(Value::as_str)
                             .filter(|id| !id.is_empty());
-                        let call_id = explicit_id
-                            .map(str::to_string)
-                            .unwrap_or_else(|| signature_ledger::synthetic_call_id(name));
+                        let call_id = if let Some(id) = explicit_id {
+                            if let Some(index) =
+                                pending_calls.iter().position(|(_, call_id)| call_id == id)
+                            {
+                                pending_calls.remove(index);
+                            }
+                            id.to_string()
+                        } else {
+                            let matches: Vec<usize> = pending_calls
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(index, (call_name, _))| {
+                                    (call_name == name).then_some(index)
+                                })
+                                .collect();
+                            if matches.len() != 1 {
+                                return Err("Gemini functionResponse requires an unambiguous pending call or explicit id".into());
+                            }
+                            pending_calls.remove(matches[0]).1
+                        };
                         tool_results.push(json!({
                             "role": "tool",
                             "tool_call_id": call_id,
@@ -695,7 +751,9 @@ fn gemini_to_openai_inner(
                 }
                 out_messages.push(Value::Object(m));
             } else {
-                if !text_parts.is_empty() {
+                if media_parts.iter().any(|part| part["type"] == "image_url") {
+                    out_messages.push(json!({"role":"user","content":media_parts}));
+                } else if !text_parts.is_empty() {
                     out_messages.push(json!({
                         "role": "user",
                         "content": text_parts.join("")
@@ -1103,7 +1161,8 @@ fn openai_to_gemini_inner(
                     sanitize_claude_schema_for_gemini(&mut parameters)
                         .map_err(|error| format!("tools[{index}].function.parameters: {error}"))?;
                 } else {
-                    sanitize_gemini_schema(&mut parameters);
+                    sanitize_gemini_schema(&mut parameters)
+                        .map_err(|error| format!("tools[{index}].function.parameters: {error}"))?;
                 }
                 Ok(json!({
                     "name": f.get("name").and_then(Value::as_str).unwrap_or(""),
@@ -1144,26 +1203,17 @@ const GEMINI_UNSUPPORTED_SCHEMA_KEYS: &[&str] = &[
     "maxProperties",
 ];
 
-fn sanitize_gemini_schema(value: &mut Value) {
-    match value {
-        Value::Object(map) => {
-            for key in GEMINI_UNSUPPORTED_SCHEMA_KEYS {
-                map.remove(*key);
-            }
-            if let Some(one) = map.remove("oneOf") {
-                map.entry("anyOf").or_insert(one);
-            }
-            for child in map.values_mut() {
-                sanitize_gemini_schema(child);
-            }
+fn sanitize_gemini_schema(value: &mut Value) -> Result<(), String> {
+    if let Value::Object(map) = value {
+        for key in GEMINI_UNSUPPORTED_SCHEMA_KEYS {
+            map.remove(*key);
         }
-        Value::Array(items) => {
-            for item in items {
-                sanitize_gemini_schema(item);
-            }
+        if let Some(one) = map.remove("oneOf") {
+            map.entry("anyOf").or_insert(one);
         }
-        _ => {}
+        super::tool_schema::visit_schema_children(map, &mut sanitize_gemini_schema)?;
     }
+    Ok(())
 }
 
 // Unlike the legacy Gemini JSON walk, visit only schema positions: a tool may
@@ -2505,6 +2555,24 @@ mod signature_tests {
         assert_eq!(safety.len(), 5);
         for s in safety {
             assert_eq!(s["threshold"], "BLOCK_NONE");
+        }
+    }
+
+    #[test]
+    fn malformed_tool_schema_returns_error_without_panicking() {
+        for parameters in [
+            json!({"type": "object", "properties": []}),
+            json!({"type": "object", "anyOf": {}}),
+            json!({"type": "object", "properties": {"nested": {"allOf": {}}}}),
+        ] {
+            let body = json!({
+                "model": "gemini-3-flash",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"type": "function", "function": {
+                    "name": "test", "parameters": parameters
+                }}]
+            });
+            assert!(openai_to_gemini(&body).is_err());
         }
     }
 

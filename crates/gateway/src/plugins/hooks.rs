@@ -535,19 +535,27 @@ impl PluginHookRegistry {
 
     pub fn intercept_stream_chunk(
         &self,
-        mut req: StreamChunkInterceptRequest,
+        req: StreamChunkInterceptRequest,
+    ) -> StreamChunkInterceptResponse {
+        let plugins = self.host.list_plugins();
+        self.intercept_stream_chunk_for_plugins(req, plugins)
+    }
+
+    fn intercept_stream_chunk_for_plugins(
+        &self,
+        req: StreamChunkInterceptRequest,
+        plugins: Vec<std::sync::Arc<LoadedPlugin>>,
     ) -> StreamChunkInterceptResponse {
         let mut final_resp = StreamChunkInterceptResponse {
             headers: req.response_headers.clone(),
             body: req.body.clone(),
             ..Default::default()
         };
-
-        let plugins = self.host.list_plugins();
         for p in plugins {
             if !has_capability(&p, "stream_chunk_interceptor") {
                 continue;
             }
+            let mut req = req.clone();
             if req.chunk_index >= 0 {
                 if p.schema_version >= SCHEMA_VERSION_STREAM_CHUNK_OMIT_REQUEST_BODY {
                     req.original_request = Vec::new();
@@ -655,4 +663,93 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, ()> {
     base64::engine::general_purpose::STANDARD
         .decode(s)
         .map_err(|_| ())
+}
+
+#[cfg(test)]
+mod review_plugins_tests {
+    use super::*;
+    use crate::plugins::loader::PluginClient;
+    use serde_json::json;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::{Arc, Mutex};
+
+    struct Recorder(u32, Mutex<Vec<StreamChunkInterceptRequest>>);
+    impl PluginClient for Recorder {
+        fn call(&self, method: &str, request: &[u8]) -> Result<Vec<u8>, PluginError> {
+            let value = if method == METHOD_PLUGIN_REGISTER {
+                json!({"schema_version": self.0, "capabilities": {"stream_chunk_interceptor": true}})
+            } else {
+                self.1
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::from_slice(request).unwrap());
+                json!({"body": [7]})
+            };
+            Ok(serde_json::to_vec(&Envelope::success(value)).unwrap())
+        }
+        fn shutdown(&self) {}
+    }
+
+    #[test]
+    fn review_plugins_mixed_schema_stream_views_are_independent() {
+        let host = Arc::new(PluginHost::new(Arc::new(|_, _, _| Ok(vec![]))));
+        let clients: Vec<_> = [6, 2, 4]
+            .into_iter()
+            .map(|schema| Arc::new(Recorder(schema, Mutex::new(vec![]))))
+            .collect();
+        let plugins = clients
+            .iter()
+            .map(|client| {
+                host.register_plugin_client(
+                    &format!("schema-{}", client.0),
+                    std::path::Path::new("fixture"),
+                    "1",
+                    client.clone(),
+                    Arc::new(AtomicUsize::new(0)),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let hooks = PluginHookRegistry::new(host);
+        for chunk_index in [0, -1] {
+            let request: StreamChunkInterceptRequest = serde_json::from_value(json!({
+                "original_request": [1], "request_body": [2], "history_chunks": [[3]], "body": [4], "chunk_index": chunk_index
+            })).unwrap();
+            assert_eq!(
+                hooks
+                    .intercept_stream_chunk_for_plugins(request, plugins.clone())
+                    .body,
+                vec![7]
+            );
+            for client in &clients {
+                let mut calls = client.1.lock().unwrap();
+                let received = calls.pop().unwrap();
+                assert_eq!(
+                    received.original_request,
+                    if chunk_index >= 0 && client.0 >= 3 {
+                        vec![]
+                    } else {
+                        vec![1]
+                    }
+                );
+                assert_eq!(
+                    received.request_body,
+                    if chunk_index >= 0 && client.0 >= 3 {
+                        vec![]
+                    } else {
+                        vec![2]
+                    }
+                );
+                assert_eq!(
+                    received.history_chunks,
+                    if chunk_index >= 0 && client.0 >= 5 {
+                        vec![]
+                    } else {
+                        vec![vec![3]]
+                    }
+                );
+                assert_eq!(received.body, vec![4]);
+            }
+        }
+    }
 }

@@ -512,10 +512,16 @@ async fn test_t8_truncated_upstream_stream_is_closed_for_the_client() {
     );
     let chunks = sse_payloads(&body);
     assert_eq!(
-        chunks.last().unwrap()["choices"][0]["finish_reason"],
-        "stop",
-        "client must receive a terminal finish_reason"
+        chunks
+            .iter()
+            .filter(|chunk| chunk.get("error").is_some())
+            .count(),
+        1,
+        "truncation must produce exactly one error"
     );
+    assert!(chunks
+        .iter()
+        .all(|chunk| chunk["choices"][0]["finish_reason"].is_null()));
     let text: String = chunks
         .iter()
         .filter_map(|c| c["choices"][0]["delta"]["content"].as_str())

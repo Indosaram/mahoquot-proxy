@@ -30,6 +30,7 @@ struct VideoBinding {
     account_id: String,
     provider: String,
     model: String,
+    requested_model: String,
     expires_at: Instant,
 }
 
@@ -39,7 +40,13 @@ fn video_bindings() -> &'static RwLock<HashMap<String, VideoBinding>> {
     BINDINGS.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-async fn bind_video(id: &str, caller_key: Option<&str>, member: &AccountMember, model: &str) {
+async fn bind_video(
+    id: &str,
+    caller_key: Option<&str>,
+    member: &AccountMember,
+    model: &str,
+    requested_model: &str,
+) {
     let mut bindings = video_bindings().write().await;
     bindings.retain(|_, value| value.expires_at > Instant::now());
     bindings.insert(
@@ -49,6 +56,7 @@ async fn bind_video(id: &str, caller_key: Option<&str>, member: &AccountMember, 
             account_id: member.id().to_owned(),
             provider: member.provider_name().to_owned(),
             model: model.to_owned(),
+            requested_model: requested_model.to_owned(),
             expires_at: Instant::now() + VIDEO_BINDING_TTL,
         },
     );
@@ -115,21 +123,10 @@ fn video_upstream_path(path: &str) -> &'static str {
 
 async fn video_request(
     state: Arc<AppState>,
-    auth: ResolvedAuth,
-    requested_model: String,
+    member: Arc<AccountMember>,
     body: Value,
     path: String,
-    method: reqwest::Method,
-    bind_created: bool,
 ) -> Response {
-    let (member, mapped) = match select(&state, &auth, &requested_model, ModelCapability::Video) {
-        Ok(selected) => selected,
-        Err(response) => return unsupported_video_error(&state, &requested_model, response),
-    };
-    let mut payload = body;
-    if method == reqwest::Method::POST {
-        payload["model"] = json!(mapped);
-    }
     let (url, headers) = target(&member, false, &path);
     let client = match state.try_client_for_member(&member) {
         Ok(client) => client,
@@ -137,10 +134,10 @@ async fn video_request(
     };
     let activity = member.begin_activity();
     let mut request = client
-        .request(method, url)
+        .get(url)
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::ACCEPT, "application/json")
-        .json(&payload);
+        .json(&body);
     for (name, value) in headers {
         if crate::wsrelay::safe_header(&name) {
             request = request.header(name, value);
@@ -170,14 +167,7 @@ async fn video_request(
         Ok(value) if value.is_object() => value,
         _ => return error(StatusCode::BAD_GATEWAY, "invalid_media_response"),
     };
-    if bind_created {
-        let Some(id) = video_id(&result).map(str::to_owned) else {
-            return error(StatusCode::BAD_GATEWAY, "video_id_missing");
-        };
-        bind_video(&id, auth.key_identifier.as_deref(), &member, &mapped).await;
-    } else {
-        video_status(&mut result);
-    }
+    video_status(&mut result);
     let mut response = (status, axum::Json(result)).into_response();
     for name in [header::RETRY_AFTER] {
         if let Some(value) = source_headers.get(&name) {
@@ -304,7 +294,14 @@ pub async fn videos(
     let Some(id) = video_id(&result).map(str::to_owned) else {
         return error(StatusCode::BAD_GATEWAY, "video_id_missing");
     };
-    bind_video(&id, auth.key_identifier.as_deref(), &member, &mapped).await;
+    bind_video(
+        &id,
+        auth.key_identifier.as_deref(),
+        &member,
+        &mapped,
+        &model,
+    )
+    .await;
     if result.get("id").is_none() {
         result["id"] = json!(id);
     }
@@ -331,26 +328,16 @@ pub async fn videos_by_id(
     if binding.caller_key.is_some() && binding.caller_key != auth.key_identifier {
         return error(StatusCode::NOT_FOUND, "video_not_found");
     }
-    let model = binding.model.clone();
-    let (member, _) = match select(&state, &auth, &model, ModelCapability::Video) {
+    let (member, _) = match select_bound_video(&state, &auth, &binding) {
         Ok(selected) => selected,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     if member.id() != binding.account_id || member.provider_name() != binding.provider {
         return error(StatusCode::NOT_FOUND, "video_not_found");
     }
     let mut body = json!({"request_id": id});
     let path = format!("/videos/{}", urlencoding::encode(&id));
-    let response = video_request(
-        state,
-        auth,
-        model,
-        body.take(),
-        path,
-        reqwest::Method::GET,
-        false,
-    )
-    .await;
+    let response = video_request(state, member, body.take(), path).await;
     response
 }
 
@@ -393,10 +380,9 @@ pub async fn openai_videos(
     if binding.caller_key.is_some() && binding.caller_key != auth.key_identifier {
         return error(StatusCode::NOT_FOUND, "video_not_found");
     }
-    let model = binding.model.clone();
-    let (member, _) = match select(&state, &auth, &model, ModelCapability::Video) {
+    let (member, _) = match select_bound_video(&state, &auth, &binding) {
         Ok(selected) => selected,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     if member.id() != binding.account_id || member.provider_name() != binding.provider {
         return error(StatusCode::NOT_FOUND, "video_not_found");
@@ -479,12 +465,9 @@ pub async fn openai_videos(
         .unwrap_or_default();
     video_request(
         state,
-        auth,
-        model,
+        member,
         json!({"request_id": id}),
-        format!("/videos/{id}{query}"),
-        reqwest::Method::GET,
-        false,
+        format!("/videos/{}{query}", urlencoding::encode(&id)),
     )
     .await
 }
@@ -518,6 +501,34 @@ fn select(
     model: &str,
     capability: ModelCapability,
 ) -> Result<(Arc<AccountMember>, String), Response> {
+    select_member(state, auth, model, capability, None).map_err(|response| *response)
+}
+
+fn select_bound_video(
+    state: &AppState,
+    auth: &ResolvedAuth,
+    binding: &VideoBinding,
+) -> Result<(Arc<AccountMember>, String), Box<Response>> {
+    let selected = select_member(
+        state,
+        auth,
+        &binding.requested_model,
+        ModelCapability::Video,
+        Some(&binding.account_id),
+    )?;
+    if selected.0.provider_name() != binding.provider || selected.1 != binding.model {
+        return Err(Box::new(error(StatusCode::NOT_FOUND, "video_not_found")));
+    }
+    Ok(selected)
+}
+
+fn select_member(
+    state: &AppState,
+    auth: &ResolvedAuth,
+    model: &str,
+    capability: ModelCapability,
+    bound_account: Option<&str>,
+) -> Result<(Arc<AccountMember>, String), Box<Response>> {
     let pool = state.pool.load_full();
     let resolved = if capability == ModelCapability::Audio {
         crate::relay::resolve_model(&pool, model)
@@ -528,14 +539,17 @@ fn select(
     };
     if let Some(scope) = auth.identity.scoped() {
         if !crate::models_route::allow_list_admits(&scope.allowed_models, model) {
-            return Err(error(StatusCode::FORBIDDEN, "model_not_allowed"));
+            return Err(Box::new(error(StatusCode::FORBIDDEN, "model_not_allowed")));
         }
         if state
             .scoped_keys
             .get(&scope.key_identifier)
             .is_some_and(|entry| entry.is_exhausted())
         {
-            return Err(error(StatusCode::TOO_MANY_REQUESTS, "token_quota_exceeded"));
+            return Err(Box::new(error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "token_quota_exceeded",
+            )));
         }
     }
     let settings = state.settings.current();
@@ -586,12 +600,16 @@ fn select(
         .iter()
         .map(|member| member.clone() as Arc<dyn PoolMember>)
         .collect();
-    let member = state
-        .router
-        .select(&candidates, &SessionHint { affinity_key: None })
-        .and_then(|index| accounts.get(index))
-        .cloned()
-        .ok_or_else(|| error(StatusCode::SERVICE_UNAVAILABLE, "media_account_unavailable"))?;
+    let member = if let Some(id) = bound_account {
+        accounts.iter().find(|member| member.id() == id).cloned()
+    } else {
+        state
+            .router
+            .select(&candidates, &SessionHint { affinity_key: None })
+            .and_then(|index| accounts.get(index))
+            .cloned()
+    }
+    .ok_or_else(|| error(StatusCode::SERVICE_UNAVAILABLE, "media_account_unavailable"))?;
     let mapped = resolved
         .eligible_bindings
         .iter()
@@ -1043,6 +1061,7 @@ mod tests {
             Some("caller_a"),
             &member,
             "grok-imagine-video",
+            "grok-imagine-video",
         )
         .await;
         let bound = bound_video("vid_test_123").await.expect("bound entry");
@@ -1068,6 +1087,7 @@ mod tests {
             "vid_isolated",
             Some("caller_one"),
             &member,
+            "grok-imagine-video",
             "grok-imagine-video",
         )
         .await;

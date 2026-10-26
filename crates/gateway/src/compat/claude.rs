@@ -12,6 +12,7 @@ fn strip_custom_prefix(name: &str) -> &str {
 #[derive(Default)]
 pub struct AnthropicDecoder {
     started: bool,
+    terminated: bool,
     input_tokens: u64,
     output_tokens: u64,
     cache_read_tokens: u64,
@@ -19,6 +20,11 @@ pub struct AnthropicDecoder {
     cache_read_tokens_known: bool,
     cache_write_tokens_known: bool,
     next_tool_index: u64,
+    /// Upstream content-block index of each client `tool_use` -> its output index.
+    tool_blocks: std::collections::HashMap<u64, u64>,
+    /// Upstream content-block index of each `server_tool_use` -> (id, input JSON).
+    /// The upstream runs these itself, so they never become client tool calls.
+    server_blocks: std::collections::HashMap<u64, (String, String)>,
     diagnostics: StreamDiagnostics,
 }
 
@@ -53,8 +59,12 @@ impl AnthropicDecoder {
         let Ok(value) = serde_json::from_slice::<Value>(frame) else {
             return;
         };
+        if self.terminated && value["type"] != "message_start" {
+            return;
+        }
         match value.get("type").and_then(Value::as_str) {
             Some("message_start") => {
+                *self = Self::default();
                 self.started = true;
                 let usage = &value["message"]["usage"];
                 self.input_tokens = usage["input_tokens"].as_u64().unwrap_or(0);
@@ -68,6 +78,8 @@ impl AnthropicDecoder {
                     message_id: value["message"]["id"].as_str().map(str::to_string),
                     ..StreamDiagnostics::default()
                 };
+                self.tool_blocks.clear();
+                self.server_blocks.clear();
                 out.push(CodexEvent::Created {
                     response_id: value["message"]["id"]
                         .as_str()
@@ -75,8 +87,33 @@ impl AnthropicDecoder {
                         .to_string(),
                 });
             }
+            Some("content_block_start") if value["content_block"]["type"] == "server_tool_use" => {
+                if let Some(index) = value["index"].as_u64() {
+                    let id = value["content_block"]["id"].as_str().unwrap_or_default();
+                    self.server_blocks
+                        .insert(index, (id.to_string(), String::new()));
+                }
+            }
+            Some("content_block_start")
+                if value["content_block"]["type"] == "web_search_tool_result" =>
+            {
+                let block = &value["content_block"];
+                let query = self
+                    .server_blocks
+                    .values()
+                    .find(|(id, _)| block["tool_use_id"].as_str() == Some(id.as_str()))
+                    .and_then(|(_, input)| serde_json::from_str::<Value>(input).ok())
+                    .and_then(|input| input["query"].as_str().map(str::to_string));
+                if let Some(text) = web_search_result_text(block, query.as_deref()) {
+                    self.diagnostics.text_deltas += 1;
+                    out.push(CodexEvent::TextDelta(text));
+                }
+            }
             Some("content_block_start") if value["content_block"]["type"] == "tool_use" => {
                 self.diagnostics.tool_calls += 1;
+                if let Some(index) = value["index"].as_u64() {
+                    self.tool_blocks.insert(index, self.next_tool_index);
+                }
                 out.push(CodexEvent::ToolCallBegin {
                     output_index: self.next_tool_index,
                     call_id: value["content_block"]["id"]
@@ -115,9 +152,23 @@ impl AnthropicDecoder {
                     }
                 }
                 Some("input_json_delta") => {
-                    if let Some(delta) = value["delta"]["partial_json"].as_str() {
+                    let Some(delta) = value["delta"]["partial_json"].as_str() else {
+                        return;
+                    };
+                    let index = value["index"].as_u64();
+                    if let Some((_, input)) = index.and_then(|i| self.server_blocks.get_mut(&i)) {
+                        input.push_str(delta);
+                        return;
+                    }
+                    // Arguments belong only to a client tool_use whose start was
+                    // seen; an orphan delta would surface as a nameless tool call.
+                    let output_index = match index {
+                        Some(i) => self.tool_blocks.get(&i).copied(),
+                        None => self.next_tool_index.checked_sub(1),
+                    };
+                    if let Some(output_index) = output_index {
                         out.push(CodexEvent::ToolArgsDelta {
-                            output_index: self.next_tool_index.saturating_sub(1),
+                            output_index,
                             delta: delta.to_string(),
                         });
                     }
@@ -152,6 +203,7 @@ impl AnthropicDecoder {
             }
             Some("message_stop") => {
                 self.started = false;
+                self.terminated = true;
                 if !self.diagnostics.has_visible_output() {
                     let d = &self.diagnostics;
                     tracing::warn!(
@@ -176,12 +228,15 @@ impl AnthropicDecoder {
                     }),
                 });
             }
-            Some("error") => out.push(CodexEvent::Failed {
-                message: value["error"]["message"]
-                    .as_str()
-                    .unwrap_or("Anthropic upstream error")
-                    .to_string(),
-            }),
+            Some("error") => {
+                self.terminated = true;
+                out.push(CodexEvent::Failed {
+                    message: value["error"]["message"]
+                        .as_str()
+                        .unwrap_or("Anthropic upstream error")
+                        .to_string(),
+                });
+            }
             _ => {}
         }
     }
@@ -191,9 +246,12 @@ impl AnthropicDecoder {
     }
 
     pub fn finish(&mut self, out: &mut Vec<CodexEvent>) {
-        if self.started {
+        if !self.terminated {
+            self.terminated = true;
             self.started = false;
-            out.push(CodexEvent::Completed { usage: None });
+            out.push(CodexEvent::Failed {
+                message: "Anthropic stream ended before message_stop".into(),
+            });
         }
     }
 }
@@ -941,6 +999,33 @@ pub fn apply_prompt_cache_breakpoints(body: &mut Value) {
     }
 }
 
+/// Upstream-executed web search surfaced as visible text: the query and the
+/// result titles/URLs, so the answer that follows keeps its provenance. The
+/// client never receives it as a tool call it would have to execute.
+fn web_search_result_text(block: &Value, query: Option<&str>) -> Option<String> {
+    let mut text = match query {
+        Some(query) => format!("\n[web_search: {query}]\n"),
+        None => "\n[web_search]\n".to_string(),
+    };
+    match &block["content"] {
+        Value::Array(results) => {
+            for result in results {
+                let Some(url) = result["url"].as_str() else {
+                    continue;
+                };
+                let title = result["title"].as_str().unwrap_or(url);
+                text.push_str(&format!("- [{title}]({url})\n"));
+            }
+        }
+        error => {
+            let code = error["error_code"].as_str()?;
+            text.push_str(&format!("- error: {code}\n"));
+        }
+    }
+    text.push('\n');
+    Some(text)
+}
+
 fn anthropic_tool_name(name: &str) -> String {
     const BUILTINS: [&str; 4] = ["web_search", "code_execution", "text_editor", "computer"];
     if name.starts_with("custom_") || BUILTINS.contains(&name) {
@@ -958,8 +1043,17 @@ pub fn anthropic_json_to_openai(body: &Value, model: &str, created: i64) -> Valu
         .unwrap_or_default();
     let text = content
         .iter()
-        .filter(|block| block["type"] == "text")
-        .filter_map(|block| block["text"].as_str())
+        .filter_map(|block| match block["type"].as_str() {
+            Some("text") => block["text"].as_str().map(str::to_string),
+            Some("web_search_tool_result") => {
+                let query = content
+                    .iter()
+                    .find(|b| b["type"] == "server_tool_use" && b["id"] == block["tool_use_id"])
+                    .and_then(|b| b["input"]["query"].as_str());
+                web_search_result_text(block, query)
+            }
+            _ => None,
+        })
         .collect::<Vec<_>>()
         .join("");
     let reasoning = content
@@ -1335,6 +1429,9 @@ impl AnthropicStreamRenderer {
     }
 
     pub fn render(&mut self, event: CodexEvent) -> Vec<bytes::Bytes> {
+        if self.terminated {
+            return Vec::new();
+        }
         let mut out = Vec::new();
         self.ensure_started(&mut out);
         match event {
@@ -1429,6 +1526,9 @@ impl AnthropicStreamRenderer {
                 self.terminated = true;
             }
             CodexEvent::Failed { message } => {
+                self.close_thinking(&mut out);
+                self.close_text(&mut out);
+                self.close_open_tools(&mut out);
                 out.push(Self::frame(
                     "error",
                     json!({"type":"error","error":{"type":"api_error","message":message}}),
@@ -1459,7 +1559,9 @@ impl AnthropicStreamRenderer {
         if self.terminated {
             return Vec::new();
         }
-        self.render(CodexEvent::Completed { usage: None })
+        self.render(CodexEvent::Failed {
+            message: "upstream stream ended before completion".into(),
+        })
     }
 
     pub fn terminated(&self) -> bool {
@@ -2013,6 +2115,112 @@ mod contract_tests {
                 ..StreamDiagnostics::default()
             }
         );
+    }
+
+    #[test]
+    fn server_web_search_never_surfaces_as_a_client_tool_call() {
+        // CCAPI streams the server tool block's start before its arguments;
+        // the block runs upstream, so the client must see only text.
+        let mut decoder = ClaudeDecoder::new();
+        let mut events = Vec::new();
+        for frame in [
+            json!({"type":"message_start","message":{"id":"msg_ws","usage":{}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","id":"srvtoolu_1","name":"web_search","input":{}}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"query\": \"rust"}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":" stable\"}"}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"web_search_tool_result","tool_use_id":"srvtoolu_1","content":[{"type":"web_search_result","title":"Rust 1.99.1","url":"https://blog.rust-lang.org/"}]}}),
+            json!({"type":"content_block_stop","index":1}),
+            json!({"type":"content_block_start","index":2,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":"1.99.1"}}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}),
+            json!({"type":"message_stop"}),
+        ] {
+            decoder.decode(frame.to_string().as_bytes(), &mut events);
+        }
+        assert!(!events.iter().any(|e| matches!(
+            e,
+            CodexEvent::ToolCallBegin { .. } | CodexEvent::ToolArgsDelta { .. }
+        )));
+        let text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                CodexEvent::TextDelta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(text.contains("[web_search: rust stable]"));
+        assert!(text.contains("[Rust 1.99.1](https://blog.rust-lang.org/)"));
+        assert!(text.ends_with("1.99.1"));
+
+        let mut chat = super::super::render::ChunkRenderer::new("m".into(), 1, false);
+        let frames: Vec<u8> = events
+            .into_iter()
+            .flat_map(|e| chat.render(e))
+            .flat_map(|b| b.to_vec())
+            .collect();
+        let raw = String::from_utf8(frames).unwrap();
+        assert!(!raw.contains("tool_calls"));
+        assert!(raw.contains("\"finish_reason\":\"stop\""));
+    }
+
+    #[test]
+    fn client_tool_args_follow_their_block_after_a_server_tool() {
+        let mut decoder = ClaudeDecoder::new();
+        let mut events = Vec::new();
+        for frame in [
+            json!({"type":"message_start","message":{"id":"msg_mix","usage":{}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_a","name":"custom_lookup","input":{}}}),
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"server_tool_use","id":"srvtoolu_b","name":"web_search","input":{}}}),
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{}"}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"k\":1}"}}),
+            // An argument delta for a block whose start never arrived.
+            json!({"type":"content_block_delta","index":7,"delta":{"type":"input_json_delta","partial_json":"{}"}}),
+        ] {
+            decoder.decode(frame.to_string().as_bytes(), &mut events);
+        }
+        let tool_events: Vec<_> = events
+            .into_iter()
+            .filter(|e| !matches!(e, CodexEvent::Created { .. }))
+            .collect();
+        assert_eq!(
+            tool_events,
+            vec![
+                CodexEvent::ToolCallBegin {
+                    output_index: 0,
+                    call_id: "toolu_a".into(),
+                    name: "lookup".into(),
+                },
+                CodexEvent::ToolArgsDelta {
+                    output_index: 0,
+                    delta: "{\"k\":1}".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn non_stream_web_search_result_becomes_text_not_a_tool_call() {
+        let out = anthropic_json_to_openai(
+            &json!({
+                "stop_reason":"end_turn",
+                "content":[
+                    {"type":"server_tool_use","id":"srvtoolu_1","name":"web_search","input":{"query":"q"}},
+                    {"type":"web_search_tool_result","tool_use_id":"srvtoolu_1","content":{"type":"web_search_tool_result_error","error_code":"max_uses_exceeded"}},
+                    {"type":"text","text":"answer"}
+                ],
+                "usage":{"input_tokens":1,"output_tokens":1}
+            }),
+            "m",
+            1,
+        );
+        let message = &out["choices"][0]["message"];
+        assert!(message.get("tool_calls").is_none());
+        assert_eq!(
+            message["content"],
+            "\n[web_search: q]\n- error: max_uses_exceeded\n\nanswer"
+        );
+        assert_eq!(out["choices"][0]["finish_reason"], "stop");
     }
 
     #[test]

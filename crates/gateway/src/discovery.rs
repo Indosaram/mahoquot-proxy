@@ -284,7 +284,10 @@ pub fn format_instance_name(custom_name: &str, instance_id: &str) -> String {
     if base.is_empty() || base.eq_ignore_ascii_case(&default_full) {
         return default_full;
     }
-    if base.len() >= suffix.len() && base[base.len() - suffix.len()..].eq_ignore_ascii_case(&suffix)
+    if base.len() >= suffix.len()
+        && base
+            .get(base.len() - suffix.len()..)
+            .is_some_and(|tail| tail.eq_ignore_ascii_case(&suffix))
     {
         base = base[..base.len() - suffix.len()].trim().to_string();
     }
@@ -979,15 +982,22 @@ pub fn encode_dns_name(name: &str) -> Vec<u8> {
 }
 
 pub fn decode_dns_name(buf: &[u8], offset: usize) -> (String, usize) {
+    decode_dns_name_checked(buf, offset).unwrap_or_else(|| (String::new(), offset))
+}
+
+fn decode_dns_name_checked(buf: &[u8], offset: usize) -> Option<(String, usize)> {
     let mut labels: Vec<String> = Vec::new();
     let mut curr = offset;
     let mut jumped = false;
     let mut next_offset = None;
-    let mut steps = 0;
+    let mut visited = Vec::new();
 
-    while curr < buf.len() && steps < 128 {
-        steps += 1;
-        let len = buf[curr] as usize;
+    loop {
+        if visited.len() >= 128 || visited.contains(&curr) {
+            return None;
+        }
+        visited.push(curr);
+        let len = *buf.get(curr)? as usize;
         if len == 0 {
             if !jumped {
                 next_offset = Some(curr + 1);
@@ -996,9 +1006,12 @@ pub fn decode_dns_name(buf: &[u8], offset: usize) -> (String, usize) {
         }
         if (len & 0xc0) == 0xc0 {
             if curr + 1 >= buf.len() {
-                break;
+                return None;
             }
             let ptr = ((len & 0x3f) << 8) | (buf[curr + 1] as usize);
+            if ptr >= buf.len() {
+                return None;
+            }
             if !jumped {
                 next_offset = Some(curr + 2);
             }
@@ -1006,9 +1019,12 @@ pub fn decode_dns_name(buf: &[u8], offset: usize) -> (String, usize) {
             curr = ptr;
             continue;
         }
+        if len & 0xc0 != 0 {
+            return None;
+        }
         curr += 1;
         if curr + len > buf.len() {
-            break;
+            return None;
         }
         let label = String::from_utf8_lossy(&buf[curr..curr + len]).to_string();
         labels.push(label);
@@ -1016,7 +1032,7 @@ pub fn decode_dns_name(buf: &[u8], offset: usize) -> (String, usize) {
     }
 
     let end_offset = next_offset.unwrap_or(curr);
-    (labels.join("."), end_offset)
+    Some((labels.join("."), end_offset))
 }
 
 #[derive(Debug, Clone)]
@@ -1060,7 +1076,7 @@ pub fn parse_dns_packet(buf: &[u8]) -> Option<DnsMessage> {
         if offset >= buf.len() {
             break;
         }
-        let (name, next) = decode_dns_name(buf, offset);
+        let (name, next) = decode_dns_name_checked(buf, offset)?;
         offset = next;
         if offset + 4 > buf.len() {
             break;
@@ -1081,7 +1097,7 @@ pub fn parse_dns_packet(buf: &[u8]) -> Option<DnsMessage> {
         if offset >= buf.len() {
             break;
         }
-        let (name, next) = decode_dns_name(buf, offset);
+        let (name, next) = decode_dns_name_checked(buf, offset)?;
         offset = next;
         if offset + 10 > buf.len() {
             break;
@@ -1099,7 +1115,23 @@ pub fn parse_dns_packet(buf: &[u8]) -> Option<DnsMessage> {
         if offset + rdlen > buf.len() {
             break;
         }
-        let rdata = buf[offset..offset + rdlen].to_vec();
+        // Compression pointers are relative to the packet, not the RDATA slice.
+        // Store expanded names so existing record consumers remain self-contained.
+        let rdata = if rtype == 12 || rtype == 33 {
+            let prefix_len = if rtype == 33 { 6 } else { 0 };
+            if rdlen <= prefix_len {
+                return None;
+            }
+            let (target, end) = decode_dns_name_checked(buf, offset + prefix_len)?;
+            if end != offset + rdlen {
+                return None;
+            }
+            let mut data = buf[offset..offset + prefix_len].to_vec();
+            data.extend_from_slice(&encode_dns_name(&target));
+            data
+        } else {
+            buf[offset..offset + rdlen].to_vec()
+        };
         offset += rdlen;
         answers.push(DnsRecord {
             name,
@@ -1290,7 +1322,6 @@ pub fn create_multicast_listen_socket() -> std::io::Result<UdpSocket> {
 
         let sock = unsafe { UdpSocket::from_raw_fd(fd) };
         sock.set_nonblocking(true)?;
-        sock.join_multicast_v4(&MDNS_IPV4_MULTICAST, &Ipv4Addr::UNSPECIFIED)?;
         let _ = sock.set_multicast_loop_v4(true);
         let _ = sock.set_multicast_ttl_v4(255);
         Ok(sock)
@@ -1300,7 +1331,6 @@ pub fn create_multicast_listen_socket() -> std::io::Result<UdpSocket> {
     {
         let sock = UdpSocket::bind(("0.0.0.0", MDNS_PORT))?;
         sock.set_nonblocking(true)?;
-        sock.join_multicast_v4(&MDNS_IPV4_MULTICAST, &Ipv4Addr::UNSPECIFIED)?;
         let _ = sock.set_multicast_loop_v4(true);
         let _ = sock.set_multicast_ttl_v4(255);
         Ok(sock)
@@ -1365,6 +1395,22 @@ pub fn join_and_send_multicast_v4(sock: &UdpSocket, payload: &[u8], interfaces: 
     }
 }
 
+fn send_multicast_checked(
+    sock: &UdpSocket,
+    payload: &[u8],
+    interfaces: &[Ipv4Addr],
+) -> Result<(), String> {
+    let dest = SocketAddr::new(IpAddr::V4(MDNS_IPV4_MULTICAST), MDNS_PORT);
+    if interfaces.is_empty() {
+        sock.send_to(payload, dest).map_err(|e| e.to_string())?;
+    }
+    for addr in interfaces {
+        set_multicast_if_v4(sock, *addr).map_err(|e| e.to_string())?;
+        sock.send_to(payload, dest).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 pub fn create_multicast_query_socket() -> std::io::Result<UdpSocket> {
     #[cfg(unix)]
     {
@@ -1410,7 +1456,6 @@ pub fn create_multicast_query_socket() -> std::io::Result<UdpSocket> {
 
         let sock = unsafe { UdpSocket::from_raw_fd(fd) };
         sock.set_nonblocking(true)?;
-        sock.join_multicast_v4(&MDNS_IPV4_MULTICAST, &Ipv4Addr::UNSPECIFIED)?;
         let _ = sock.set_multicast_loop_v4(true);
         let _ = sock.set_multicast_ttl_v4(255);
         Ok(sock)
@@ -1420,25 +1465,183 @@ pub fn create_multicast_query_socket() -> std::io::Result<UdpSocket> {
     {
         let sock = UdpSocket::bind("0.0.0.0:0")?;
         sock.set_nonblocking(true)?;
-        sock.join_multicast_v4(&MDNS_IPV4_MULTICAST, &Ipv4Addr::UNSPECIFIED)?;
         let _ = sock.set_multicast_loop_v4(true);
         let _ = sock.set_multicast_ttl_v4(255);
         Ok(sock)
     }
 }
 
+#[derive(Clone)]
+pub struct IsolatedDiscovery {
+    pub directory: PathBuf,
+    pub run_id: String,
+    directory_identity: (u64, u64),
+    _directory_handle: Arc<std::fs::File>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct IsolatedRecord {
+    run_id: String,
+    service: DiscoveredService,
+}
+
+fn file_identity(metadata: &std::fs::Metadata) -> Result<(u64, u64), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok((metadata.dev(), metadata.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        Err("isolated discovery requires Unix file identity".into())
+    }
+}
+
+impl IsolatedDiscovery {
+    pub fn from_env() -> Result<Option<Self>, String> {
+        match (
+            std::env::var_os("MAHOQUOT_QA_DISCOVERY_DIR"),
+            std::env::var("MAHOQUOT_QA_DISCOVERY_RUN"),
+        ) {
+            (None, Err(std::env::VarError::NotPresent)) => Ok(None),
+            (Some(directory), Ok(run_id)) => Self::new(PathBuf::from(directory), run_id).map(Some),
+            _ => Err("isolated discovery requires directory and run token together".into()),
+        }
+    }
+
+    pub fn new(directory: PathBuf, run_id: String) -> Result<Self, String> {
+        if !directory.is_absolute()
+            || run_id.is_empty()
+            || !run_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return Err("invalid isolated discovery configuration".into());
+        }
+        let metadata = std::fs::symlink_metadata(&directory).map_err(|e| e.to_string())?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err("isolated discovery requires an existing private directory".into());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.mode() & 0o077 != 0 || metadata.uid() != unsafe { libc::geteuid() } {
+                return Err("isolated discovery directory must be owned and mode 0700".into());
+            }
+        }
+        let directory = std::fs::canonicalize(directory).map_err(|e| e.to_string())?;
+        let directory_identity = file_identity(&metadata)?;
+        if file_identity(&std::fs::metadata(&directory).map_err(|e| e.to_string())?)?
+            != directory_identity
+        {
+            return Err("isolated directory changed during resolution".into());
+        }
+        let directory_handle = std::fs::File::open(&directory).map_err(|e| e.to_string())?;
+        if file_identity(&directory_handle.metadata().map_err(|e| e.to_string())?)?
+            != directory_identity
+        {
+            return Err("isolated directory changed before ownership".into());
+        }
+        Ok(Self {
+            directory,
+            run_id,
+            directory_identity,
+            _directory_handle: Arc::new(directory_handle),
+        })
+    }
+
+    fn record_path(&self) -> PathBuf {
+        self.directory.join("service.json")
+    }
+
+    fn validate_directory(&self) -> Result<(), String> {
+        let metadata = std::fs::symlink_metadata(&self.directory).map_err(|e| e.to_string())?;
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || file_identity(&metadata)? != self.directory_identity
+        {
+            return Err("isolated directory replaced".into());
+        }
+        Ok(())
+    }
+
+    fn open_record(&self) -> Result<std::fs::File, String> {
+        self.validate_directory()?;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let file = options
+            .open(self.record_path())
+            .map_err(|e| e.to_string())?;
+        if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+            return Err("discovery record is not regular".into());
+        }
+        Ok(file)
+    }
+}
+
 pub struct RealAdvertiser {
+    isolation: Option<IsolatedDiscovery>,
+    responder: Option<std::thread::JoinHandle<()>>,
+    completion: Option<Mutex<std::sync::mpsc::Receiver<Result<(), String>>>>,
     active_spec: Option<ServiceSpec>,
     active_file: Option<PathBuf>,
-    stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    active_identity: Option<(u64, u64)>,
+    owned_record: Option<std::fs::File>,
+    wake: Arc<(Mutex<bool>, std::sync::Condvar)>,
 }
 
 impl RealAdvertiser {
+    fn request_stop(&self) {
+        *self.wake.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.wake.1.notify_all();
+    }
+
+    fn finish_responder(&mut self, timeout: Duration) -> Result<(), String> {
+        let Some(completion) = &self.completion else {
+            return Ok(());
+        };
+        let result = match completion
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .recv_timeout(timeout)
+        {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                return Err("discovery responder completion timed out; ownership retained".into())
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err("discovery responder disconnected without completion".into())
+            }
+        };
+        self.completion = None;
+        if let Some(handle) = self.responder.take() {
+            handle
+                .join()
+                .map_err(|_| "discovery responder panicked".to_string())?;
+        }
+        result
+    }
+
     pub fn new() -> Self {
+        Self::with_isolation(None)
+    }
+
+    pub fn with_isolation(isolation: Option<IsolatedDiscovery>) -> Self {
         Self {
+            isolation,
+            responder: None,
+            completion: None,
             active_spec: None,
             active_file: None,
-            stop_tx: None,
+            active_identity: None,
+            owned_record: None,
+            wake: Arc::new((Mutex::new(false), std::sync::Condvar::new())),
         }
     }
 }
@@ -1520,6 +1723,41 @@ impl Advertiser for RealAdvertiser {
             raw_txt: parsed_txt,
         };
 
+        if let Some(isolation) = &self.isolation {
+            if spec.advertised_ips != ["127.0.0.1"] {
+                return Err("isolated discovery requires exact IPv4 loopback bind".into());
+            }
+            isolation.validate_directory()?;
+            let path = isolation.record_path();
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .map_err(|e| e.to_string())?;
+            self.active_identity =
+                Some(file_identity(&file.metadata().map_err(|e| e.to_string())?)?);
+            self.active_file = Some(path);
+            self.owned_record = Some(file.try_clone().map_err(|e| e.to_string())?);
+            self.active_spec = Some(spec);
+            use std::io::Write;
+            let envelope = IsolatedRecord {
+                run_id: isolation.run_id.clone(),
+                service: svc.clone(),
+            };
+            file.write_all(
+                serde_json::to_string(&envelope)
+                    .map_err(|e| e.to_string())?
+                    .as_bytes(),
+            )
+            .map_err(|e| e.to_string())?;
+            file.sync_all().map_err(|e| e.to_string())?;
+            println!(
+                "QA_DISCOVERY_REGISTERED {}",
+                serde_json::json!({"run_id": isolation.run_id, "service": svc})
+            );
+            return Ok(());
+        }
+
         // File discovery is only an explicit test fallback. Production discovery
         // must work across hosts and therefore uses multicast DNS-SD only.
         let file_path = if std::env::var("MAHOQUOT_DISCOVERY_FILE_FALLBACK").as_deref() == Ok("1") {
@@ -1541,113 +1779,147 @@ impl Advertiser for RealAdvertiser {
         };
 
         // Start real mDNS multicast responder loop
-        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+        self.wake = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let wake = Arc::clone(&self.wake);
         let instance_name = spec.instance_name.clone();
         let service_type = spec.service_type.clone();
         let domain = spec.domain.clone();
         let port = spec.port;
         let text_records = spec.text_records.clone();
 
-        std::thread::spawn(move || {
-            let socket = match create_multicast_listen_socket() {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("mDNS responder could not bind multicast socket: {e}");
-                    return;
+        let (completion_tx, completion_rx) = std::sync::mpsc::channel();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        self.completion = Some(Mutex::new(completion_rx));
+        self.responder = Some(std::thread::spawn(move || {
+            let result = (|| -> Result<(), String> {
+                let socket = create_multicast_listen_socket().map_err(|e| e.to_string())?;
+
+                let mut responder_ifaces = ipv4.clone();
+                if !responder_ifaces.contains(&Ipv4Addr::LOCALHOST) {
+                    responder_ifaces.push(Ipv4Addr::LOCALHOST);
                 }
-            };
-
-            let mut responder_ifaces = ipv4.clone();
-            if !responder_ifaces.contains(&Ipv4Addr::LOCALHOST) {
-                responder_ifaces.push(Ipv4Addr::LOCALHOST);
-            }
-            for addr in &responder_ifaces {
-                let _ = socket.join_multicast_v4(&MDNS_IPV4_MULTICAST, addr);
-            }
-
-            // Send initial unsolicited announcement (TTL 120)
-            let announcement = build_mdns_response(
-                &instance_name,
-                &service_type,
-                &domain,
-                port,
-                &ipv4,
-                &ipv6,
-                &text_records,
-                120,
-            );
-            join_and_send_multicast_v4(&socket, &announcement, &responder_ifaces);
-
-            let s_type_query = service_type.trim_matches('.');
-            let mut buf = [0u8; 4096];
-
-            loop {
-                // Check if stopped
-                if stop_rx.try_recv().is_ok() {
-                    // Send goodbye packet (TTL 0)
-                    let goodbye = build_mdns_response(
-                        &instance_name,
-                        &service_type,
-                        &domain,
-                        port,
-                        &ipv4,
-                        &ipv6,
-                        &text_records,
-                        0,
-                    );
-                    join_and_send_multicast_v4(&socket, &goodbye, &responder_ifaces);
-                    break;
+                for addr in &responder_ifaces {
+                    socket
+                        .join_multicast_v4(&MDNS_IPV4_MULTICAST, addr)
+                        .map_err(|e| e.to_string())?;
                 }
 
-                match socket.recv_from(&mut buf) {
-                    Ok((n, src)) => {
-                        if let Some(msg) = parse_dns_packet(&buf[..n]) {
-                            // Check if this is a query for our service
-                            let matches_query =
-                                msg.questions.iter().any(|q| q.name.contains(s_type_query));
-                            if matches_query {
-                                let resp = build_mdns_response(
-                                    &instance_name,
-                                    &service_type,
-                                    &domain,
-                                    port,
-                                    &ipv4,
-                                    &ipv6,
-                                    &text_records,
-                                    120,
-                                );
-                                // Multicast reply according to RFC 6762
-                                join_and_send_multicast_v4(&socket, &resp, &responder_ifaces);
-                                // Also unicast reply directly to querier
-                                let _ = socket.send_to(&resp, src);
+                // Send initial unsolicited announcement (TTL 120)
+                let announcement = build_mdns_response(
+                    &instance_name,
+                    &service_type,
+                    &domain,
+                    port,
+                    &ipv4,
+                    &ipv6,
+                    &text_records,
+                    120,
+                );
+                send_multicast_checked(&socket, &announcement, &responder_ifaces)?;
+                ready_tx
+                    .send(())
+                    .map_err(|e| format!("discovery readiness: {e}"))?;
+
+                let s_type_query = service_type.trim_matches('.');
+                let mut buf = [0u8; 4096];
+
+                loop {
+                    // Check if stopped
+                    if *wake.0.lock().unwrap_or_else(|e| e.into_inner()) {
+                        // Send goodbye packet (TTL 0)
+                        let goodbye = build_mdns_response(
+                            &instance_name,
+                            &service_type,
+                            &domain,
+                            port,
+                            &ipv4,
+                            &ipv6,
+                            &text_records,
+                            0,
+                        );
+                        send_multicast_checked(&socket, &goodbye, &responder_ifaces)?;
+                        break;
+                    }
+
+                    match socket.recv_from(&mut buf) {
+                        Ok((n, src)) => {
+                            if let Some(msg) = parse_dns_packet(&buf[..n]) {
+                                // Check if this is a query for our service
+                                let matches_query =
+                                    msg.questions.iter().any(|q| q.name.contains(s_type_query));
+                                if matches_query {
+                                    let resp = build_mdns_response(
+                                        &instance_name,
+                                        &service_type,
+                                        &domain,
+                                        port,
+                                        &ipv4,
+                                        &ipv6,
+                                        &text_records,
+                                        120,
+                                    );
+                                    // Multicast reply according to RFC 6762
+                                    send_multicast_checked(&socket, &resp, &responder_ifaces)?;
+                                    socket.send_to(&resp, src).map_err(|e| e.to_string())?;
+                                }
                             }
                         }
-                    }
-                    Err(ref e)
-                        if e.kind() == std::io::ErrorKind::WouldBlock
-                            || e.kind() == std::io::ErrorKind::TimedOut =>
-                    {
-                        std::thread::sleep(Duration::from_millis(50));
-                    }
-                    Err(_) => {
-                        std::thread::sleep(Duration::from_millis(50));
+                        Err(ref e)
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                || e.kind() == std::io::ErrorKind::TimedOut =>
+                        {
+                            let stop = wake.0.lock().unwrap_or_else(|e| e.into_inner());
+                            let _wait = wake
+                                .1
+                                .wait_timeout_while(stop, Duration::from_millis(50), |stop| !*stop)
+                                .unwrap_or_else(|e| e.into_inner());
+                        }
+                        Err(error) => return Err(format!("discovery receive: {error}")),
                     }
                 }
+                Ok(())
+            })();
+            if let Err(error) = completion_tx.send(result) {
+                tracing::error!("discovery completion receiver lost: {error}");
             }
-        });
+        }));
 
         self.active_spec = Some(spec);
         self.active_file = file_path;
-        self.stop_tx = Some(stop_tx);
+        ready_rx
+            .recv_timeout(Duration::from_secs(3))
+            .map_err(|e| format!("discovery startup acknowledgement: {e}"))?;
         Ok(())
     }
 
     fn stop(&mut self) -> Result<(), String> {
-        if let Some(tx) = self.stop_tx.take() {
-            let _ = tx.send(());
+        self.request_stop();
+        self.finish_responder(Duration::from_secs(3))?;
+        if let Some(path) = &self.active_file {
+            if let Some(isolation) = &self.isolation {
+                let file = isolation.open_record()?;
+                if Some(file_identity(&file.metadata().map_err(|e| e.to_string())?)?)
+                    != self.active_identity
+                {
+                    return Err("owned discovery record replaced".into());
+                }
+            }
+            std::fs::remove_file(path).map_err(|e| format!("discovery removal: {e}"))?;
+            self.active_file = None;
+            self.active_identity = None;
+            self.owned_record = None;
         }
-        if let Some(path) = self.active_file.take() {
-            let _ = std::fs::remove_file(path);
+        if let (Some(isolation), Some(spec)) = (&self.isolation, &self.active_spec) {
+            let txt = parse_txt_records(&spec.text_records);
+            println!(
+                "QA_DISCOVERY_DEREGISTERED {}",
+                serde_json::json!({
+                    "run_id": isolation.run_id, "instance_name": spec.instance_name,
+                    "instance_id": txt.get("instance_id"), "address": spec.advertised_ips[0],
+                    "port": spec.port, "service_type": spec.service_type, "domain": spec.domain,
+                    "responder_joined": true, "transport_removed": true
+                })
+            );
         }
         self.active_spec = None;
         Ok(())
@@ -1656,15 +1928,164 @@ impl Advertiser for RealAdvertiser {
 
 impl Drop for RealAdvertiser {
     fn drop(&mut self) {
-        let _ = self.stop();
+        if let Err(error) = self.stop() {
+            tracing::error!("discovery cleanup failed: {error}");
+        }
+        // The responder uses only nonblocking socket operations and an explicit
+        // condvar wake. Final destruction never drops/detaches a live handle.
+        self.request_stop();
+        if let Some(handle) = self.responder.take() {
+            if handle.join().is_err() {
+                tracing::error!("discovery responder panicked during final join");
+            }
+        }
     }
 }
 
-pub struct RealBrowser;
+fn merge_discovered_services(
+    msg: &DnsMessage,
+    s_type: &str,
+    dom: &str,
+    services_map: &mut HashMap<String, DiscoveredService>,
+) {
+    // Extract discovered services from answers
+    let mut instance_names = Vec::new();
+    let mut srv_map: HashMap<String, (u16, String)> = HashMap::new();
+    let mut txt_map: HashMap<String, Vec<String>> = HashMap::new();
+    let mut a_map: HashMap<String, Vec<Ipv4Addr>> = HashMap::new();
+    let mut aaaa_map: HashMap<String, Vec<Ipv6Addr>> = HashMap::new();
+
+    for rec in &msg.answers {
+        match rec.rtype {
+            12 => {
+                // PTR
+                let (target_inst, _) = decode_dns_name(&rec.rdata, 0);
+                if !target_inst.is_empty() {
+                    instance_names.push(target_inst);
+                }
+            }
+            33 => {
+                // SRV
+                if rec.rdata.len() >= 6 {
+                    let port = u16::from_be_bytes([rec.rdata[4], rec.rdata[5]]);
+                    let (host, _) = decode_dns_name(&rec.rdata, 6);
+                    srv_map.insert(rec.name.clone(), (port, host));
+                }
+            }
+            16 => {
+                // TXT
+                let mut txt_lines = Vec::new();
+                let mut pos = 0;
+                while pos < rec.rdata.len() {
+                    let len = rec.rdata[pos] as usize;
+                    pos += 1;
+                    if pos + len > rec.rdata.len() {
+                        break;
+                    }
+                    let s = String::from_utf8_lossy(&rec.rdata[pos..pos + len]).to_string();
+                    txt_lines.push(s);
+                    pos += len;
+                }
+                txt_map.insert(rec.name.clone(), txt_lines);
+            }
+            1 => {
+                // A
+                if rec.rdata.len() == 4 {
+                    let ip = Ipv4Addr::new(rec.rdata[0], rec.rdata[1], rec.rdata[2], rec.rdata[3]);
+                    a_map.entry(rec.name.clone()).or_default().push(ip);
+                }
+            }
+            28 if rec.rdata.len() == 16 => {
+                // AAAA
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(&rec.rdata[..16]);
+                let ip = Ipv6Addr::from(octets);
+                aaaa_map.entry(rec.name.clone()).or_default().push(ip);
+            }
+            _ => {}
+        }
+    }
+
+    // If we have SRV and/or TXT records directly
+    for (inst_fqdn, (port, host)) in &srv_map {
+        let short_name = inst_fqdn.split('.').next().unwrap_or(inst_fqdn).to_string();
+        let txt_lines = txt_map.get(inst_fqdn).cloned().unwrap_or_default();
+        let parsed_txt = parse_txt_records(&txt_lines);
+
+        let ipv4 = a_map.get(host).cloned().unwrap_or_default();
+        let ipv6 = aaaa_map.get(host).cloned().unwrap_or_default();
+
+        let mut endpoints = HashMap::new();
+        if let Some(v) = parsed_txt.get("api_openai") {
+            endpoints.insert("openai".into(), v.clone());
+        }
+        if let Some(v) = parsed_txt.get("api_anthropic") {
+            endpoints.insert("anthropic".into(), v.clone());
+        }
+        if let Some(v) = parsed_txt.get("api_gemini") {
+            endpoints.insert("gemini".into(), v.clone());
+        }
+
+        let host_str = if !ipv4.is_empty() {
+            ipv4[0].to_string()
+        } else {
+            host.clone()
+        };
+
+        let svc = DiscoveredService {
+            instance_name: short_name.clone(),
+            service_type: s_type.to_string(),
+            domain: dom.to_string(),
+            host: host_str,
+            port: *port,
+            ipv4,
+            ipv6,
+            protocols: parsed_txt
+                .get("protocols")
+                .map(|p| p.split(',').map(|s| s.trim().to_string()).collect())
+                .unwrap_or_default(),
+            features: parsed_txt
+                .get("features")
+                .map(|f| f.split(',').map(|s| s.trim().to_string()).collect())
+                .unwrap_or_default(),
+            product: parsed_txt
+                .get("product")
+                .cloned()
+                .unwrap_or_else(|| PRODUCT_CPA.into()),
+            auth_required: parsed_txt
+                .get("auth_required")
+                .map(|v| v == "true")
+                .unwrap_or(true),
+            auth_methods: parsed_txt
+                .get("auth_methods")
+                .map(|m| m.split(',').map(|s| s.trim().to_string()).collect())
+                .unwrap_or_default(),
+            endpoints,
+            node_role: parsed_txt
+                .get("node_role")
+                .cloned()
+                .unwrap_or_else(|| "standalone".into()),
+            version: parsed_txt
+                .get("version")
+                .cloned()
+                .unwrap_or_else(|| "1".into()),
+            raw_txt: parsed_txt,
+        };
+
+        services_map.insert(short_name, svc);
+    }
+}
+
+pub struct RealBrowser {
+    isolation: Option<IsolatedDiscovery>,
+}
 
 impl RealBrowser {
     pub fn new() -> Self {
-        Self
+        Self::with_isolation(None)
+    }
+    pub fn with_isolation(isolation: Option<IsolatedDiscovery>) -> Self {
+        Self { isolation }
     }
 }
 
@@ -1701,6 +2122,31 @@ impl RealBrowser {
             domain
         };
 
+        if let Some(isolation) = &self.isolation {
+            isolation.validate_directory()?;
+            let mut services = Vec::new();
+            for entry in std::fs::read_dir(&isolation.directory).map_err(|e| e.to_string())? {
+                let entry = entry.map_err(|e| e.to_string())?;
+                if entry.file_name() != "service.json" {
+                    return Err("unexpected isolated discovery entry".into());
+                }
+                use std::io::Read;
+                let mut file = isolation.open_record()?;
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+                let envelope: IsolatedRecord =
+                    serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+                if envelope.run_id != isolation.run_id {
+                    return Err("discovery run token mismatch".into());
+                }
+                let service = envelope.service;
+                if service.service_type == s_type && service.domain == dom {
+                    services.push(service);
+                }
+            }
+            return Ok(services);
+        }
+
         if let Ok(socket) = create_multicast_query_socket() {
             let query = build_mdns_query(s_type, dom);
             let query_ifaces = multicast_ipv4_interface_addrs(&query_system_interfaces());
@@ -1721,147 +2167,7 @@ impl RealBrowser {
                 match socket.recv_from(&mut buf) {
                     Ok((n, _src)) => {
                         if let Some(msg) = parse_dns_packet(&buf[..n]) {
-                            // Extract discovered services from answers
-                            let mut instance_names = Vec::new();
-                            let mut srv_map: HashMap<String, (u16, String)> = HashMap::new();
-                            let mut txt_map: HashMap<String, Vec<String>> = HashMap::new();
-                            let mut a_map: HashMap<String, Vec<Ipv4Addr>> = HashMap::new();
-                            let mut aaaa_map: HashMap<String, Vec<Ipv6Addr>> = HashMap::new();
-
-                            for rec in &msg.answers {
-                                match rec.rtype {
-                                    12 => {
-                                        // PTR
-                                        let (target_inst, _) = decode_dns_name(&rec.rdata, 0);
-                                        if !target_inst.is_empty() {
-                                            instance_names.push(target_inst);
-                                        }
-                                    }
-                                    33 => {
-                                        // SRV
-                                        if rec.rdata.len() >= 6 {
-                                            let port =
-                                                u16::from_be_bytes([rec.rdata[4], rec.rdata[5]]);
-                                            let (host, _) = decode_dns_name(&rec.rdata, 6);
-                                            srv_map.insert(rec.name.clone(), (port, host));
-                                        }
-                                    }
-                                    16 => {
-                                        // TXT
-                                        let mut txt_lines = Vec::new();
-                                        let mut pos = 0;
-                                        while pos < rec.rdata.len() {
-                                            let len = rec.rdata[pos] as usize;
-                                            pos += 1;
-                                            if pos + len > rec.rdata.len() {
-                                                break;
-                                            }
-                                            let s =
-                                                String::from_utf8_lossy(&rec.rdata[pos..pos + len])
-                                                    .to_string();
-                                            txt_lines.push(s);
-                                            pos += len;
-                                        }
-                                        txt_map.insert(rec.name.clone(), txt_lines);
-                                    }
-                                    1 => {
-                                        // A
-                                        if rec.rdata.len() == 4 {
-                                            let ip = Ipv4Addr::new(
-                                                rec.rdata[0],
-                                                rec.rdata[1],
-                                                rec.rdata[2],
-                                                rec.rdata[3],
-                                            );
-                                            a_map.entry(rec.name.clone()).or_default().push(ip);
-                                        }
-                                    }
-                                    28 if rec.rdata.len() == 16 => {
-                                        // AAAA
-                                        let mut octets = [0u8; 16];
-                                        octets.copy_from_slice(&rec.rdata[..16]);
-                                        let ip = Ipv6Addr::from(octets);
-                                        aaaa_map.entry(rec.name.clone()).or_default().push(ip);
-                                    }
-                                    _ => {}
-                                }
-                            }
-
-                            // If we have SRV and/or TXT records directly
-                            for (inst_fqdn, (port, host)) in &srv_map {
-                                let short_name =
-                                    inst_fqdn.split('.').next().unwrap_or(inst_fqdn).to_string();
-                                let txt_lines = txt_map.get(inst_fqdn).cloned().unwrap_or_default();
-                                let parsed_txt = parse_txt_records(&txt_lines);
-
-                                let ipv4 = a_map.get(host).cloned().unwrap_or_default();
-                                let ipv6 = aaaa_map.get(host).cloned().unwrap_or_default();
-
-                                let mut endpoints = HashMap::new();
-                                if let Some(v) = parsed_txt.get("api_openai") {
-                                    endpoints.insert("openai".into(), v.clone());
-                                }
-                                if let Some(v) = parsed_txt.get("api_anthropic") {
-                                    endpoints.insert("anthropic".into(), v.clone());
-                                }
-                                if let Some(v) = parsed_txt.get("api_gemini") {
-                                    endpoints.insert("gemini".into(), v.clone());
-                                }
-
-                                let host_str = if !ipv4.is_empty() {
-                                    ipv4[0].to_string()
-                                } else {
-                                    host.clone()
-                                };
-
-                                let svc = DiscoveredService {
-                                    instance_name: short_name.clone(),
-                                    service_type: s_type.to_string(),
-                                    domain: dom.to_string(),
-                                    host: host_str,
-                                    port: *port,
-                                    ipv4,
-                                    ipv6,
-                                    protocols: parsed_txt
-                                        .get("protocols")
-                                        .map(|p| {
-                                            p.split(',').map(|s| s.trim().to_string()).collect()
-                                        })
-                                        .unwrap_or_default(),
-                                    features: parsed_txt
-                                        .get("features")
-                                        .map(|f| {
-                                            f.split(',').map(|s| s.trim().to_string()).collect()
-                                        })
-                                        .unwrap_or_default(),
-                                    product: parsed_txt
-                                        .get("product")
-                                        .cloned()
-                                        .unwrap_or_else(|| PRODUCT_CPA.into()),
-                                    auth_required: parsed_txt
-                                        .get("auth_required")
-                                        .map(|v| v == "true")
-                                        .unwrap_or(true),
-                                    auth_methods: parsed_txt
-                                        .get("auth_methods")
-                                        .map(|m| {
-                                            m.split(',').map(|s| s.trim().to_string()).collect()
-                                        })
-                                        .unwrap_or_default(),
-                                    endpoints,
-                                    node_role: parsed_txt
-                                        .get("node_role")
-                                        .cloned()
-                                        .unwrap_or_else(|| "standalone".into()),
-                                    version: parsed_txt
-                                        .get("version")
-                                        .cloned()
-                                        .unwrap_or_else(|| "1".into()),
-                                    raw_txt: parsed_txt,
-                                };
-
-                                services_map.insert(short_name, svc);
-                            }
+                            merge_discovered_services(&msg, s_type, dom, &mut services_map);
                         }
                     }
                     Err(ref e)
@@ -1905,6 +2211,7 @@ impl RealBrowser {
 }
 
 pub struct DiscoveryManager {
+    isolation: Option<IsolatedDiscovery>,
     registry: Option<MockMdnsRegistry>,
     advertiser: Option<Box<dyn Advertiser>>,
     enabled: bool,
@@ -1915,6 +2222,7 @@ pub struct DiscoveryManager {
 impl DiscoveryManager {
     pub fn new(registry: MockMdnsRegistry) -> Self {
         Self {
+            isolation: None,
             registry: Some(registry),
             advertiser: None,
             enabled: false,
@@ -1924,7 +2232,12 @@ impl DiscoveryManager {
     }
 
     pub fn real() -> Self {
+        Self::with_isolation(None)
+    }
+
+    pub fn with_isolation(isolation: Option<IsolatedDiscovery>) -> Self {
         Self {
+            isolation,
             registry: None,
             advertiser: None,
             enabled: false,
@@ -1943,12 +2256,10 @@ impl DiscoveryManager {
         state_dir: Option<&Path>,
     ) -> bool {
         if !cfg.enabled {
-            if let Some(mut adv) = self.advertiser.take() {
-                let _ = adv.stop();
+            if let Err(error) = self.shutdown() {
+                self.last_error = Some(error);
+                return false;
             }
-            self.enabled = false;
-            self.last_spec = None;
-            self.last_error = None;
             return true;
         }
 
@@ -1962,8 +2273,9 @@ impl DiscoveryManager {
         ) {
             Ok(s) => s,
             Err(e) => {
-                if let Some(mut adv) = self.advertiser.take() {
-                    let _ = adv.stop();
+                if let Err(stop_error) = self.shutdown() {
+                    self.last_error = Some(format!("{e}; cleanup: {stop_error}"));
+                    return false;
                 }
                 self.enabled = false;
                 self.last_spec = None;
@@ -1976,19 +2288,26 @@ impl DiscoveryManager {
             return true;
         }
 
-        if let Some(mut adv) = self.advertiser.take() {
-            let _ = adv.stop();
+        if let Err(error) = self.shutdown() {
+            self.last_error = Some(error);
+            return false;
         }
 
         let mut adv: Box<dyn Advertiser> = if let Some(ref reg) = self.registry {
             Box::new(MockAdvertiser::new(reg.clone()))
         } else {
-            Box::new(RealAdvertiser::new())
+            Box::new(RealAdvertiser::with_isolation(self.isolation.clone()))
         };
 
         if let Err(e) = adv.start(spec.clone()) {
             self.enabled = false;
-            self.last_error = Some(e);
+            self.last_error = Some(match adv.stop() {
+                Ok(()) => e,
+                Err(cleanup) => format!("{e}; cleanup: {cleanup}"),
+            });
+            // Retain partial-start ownership so the caller's blocking shutdown
+            // path can retry cleanup; never detach it at this error boundary.
+            self.advertiser = Some(adv);
             return false;
         }
 
@@ -1999,13 +2318,15 @@ impl DiscoveryManager {
         true
     }
 
-    pub fn shutdown(&mut self) {
-        if let Some(mut adv) = self.advertiser.take() {
-            let _ = adv.stop();
+    pub fn shutdown(&mut self) -> Result<(), String> {
+        if let Some(adv) = self.advertiser.as_mut() {
+            adv.stop()?;
         }
+        self.advertiser = None;
         self.enabled = false;
         self.last_spec = None;
         self.last_error = None;
+        Ok(())
     }
 
     pub fn is_advertising(&self) -> bool {
@@ -2020,6 +2341,210 @@ impl DiscoveryManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn isolated_transport_roundtrip_and_strict_removal() {
+        let directory = std::env::temp_dir().join(format!("discovery-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let isolation = IsolatedDiscovery::new(directory.clone(), "unit-run".into()).unwrap();
+        let mut advertiser = RealAdvertiser::with_isolation(Some(isolation.clone()));
+        let spec = ServiceSpec {
+            instance_name: "qa-AB12".into(),
+            service_type: DEFAULT_SERVICE_TYPE.into(),
+            domain: DEFAULT_DOMAIN.into(),
+            port: 18840,
+            subtypes: vec![],
+            text_records: vec!["instance_id=AB12".into()],
+            interfaces: vec![],
+            advertised_ips: vec!["127.0.0.1".into()],
+        };
+        advertiser.start(spec.clone()).unwrap();
+        assert!(advertiser.responder.is_none());
+        let browser = RealBrowser::with_isolation(Some(isolation.clone()));
+        let found = browser
+            .browse(DEFAULT_SERVICE_TYPE, DEFAULT_DOMAIN)
+            .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].instance_name, spec.instance_name);
+        let other = RealBrowser::with_isolation(Some(
+            IsolatedDiscovery::new(directory.clone(), "wrong-run".into()).unwrap(),
+        ));
+        assert!(other.browse(DEFAULT_SERVICE_TYPE, DEFAULT_DOMAIN).is_err());
+        assert_eq!(found[0].port, spec.port);
+        advertiser.stop().unwrap();
+        assert!(browser
+            .browse(DEFAULT_SERVICE_TYPE, DEFAULT_DOMAIN)
+            .unwrap()
+            .is_empty());
+        std::fs::write(isolation.record_path(), "malformed").unwrap();
+        assert!(browser
+            .browse(DEFAULT_SERVICE_TYPE, DEFAULT_DOMAIN)
+            .is_err());
+        std::fs::remove_file(isolation.record_path()).unwrap();
+        advertiser.start(spec).unwrap();
+        let owned = directory.join("owned.backup");
+        std::fs::rename(isolation.record_path(), &owned).unwrap();
+        assert!(advertiser.stop().is_err());
+        std::fs::write(isolation.record_path(), "{}").unwrap();
+        assert!(advertiser.stop().is_err());
+        assert_eq!(
+            std::fs::read_to_string(isolation.record_path()).unwrap(),
+            "{}"
+        );
+        std::fs::remove_file(isolation.record_path()).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&owned, isolation.record_path()).unwrap();
+            assert!(isolation.open_record().is_err());
+            assert!(advertiser.stop().is_err());
+            std::fs::remove_file(isolation.record_path()).unwrap();
+        }
+        std::fs::rename(owned, isolation.record_path()).unwrap();
+        advertiser.stop().unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn responder_completion_errors_are_not_success() {
+        let mut advertiser = RealAdvertiser::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        advertiser.completion = Some(Mutex::new(rx));
+        advertiser.responder = Some(std::thread::spawn(move || {
+            tx.send(Err("goodbye failed".into())).unwrap();
+        }));
+        assert_eq!(advertiser.stop().unwrap_err(), "goodbye failed");
+        assert!(advertiser.responder.is_none());
+    }
+
+    #[test]
+    fn responder_panic_is_joined_and_timeout_retains_owner() {
+        let mut advertiser = RealAdvertiser::new();
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        advertiser.completion = Some(Mutex::new(rx));
+        advertiser.responder = Some(std::thread::spawn(move || {
+            let _tx = tx;
+            panic!("injected responder panic");
+        }));
+        assert!(advertiser.stop().unwrap_err().contains("panicked"));
+        assert!(advertiser.responder.is_none());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        advertiser.completion = Some(Mutex::new(rx));
+        advertiser.responder = Some(std::thread::spawn(move || {
+            blocked.recv().unwrap();
+            tx.send(Ok(())).unwrap();
+        }));
+        assert!(advertiser.finish_responder(Duration::ZERO).is_err());
+        assert!(advertiser.responder.is_some());
+        assert!(advertiser.completion.is_some());
+        release.send(()).unwrap();
+        advertiser.stop().unwrap();
+        assert!(advertiser.responder.is_none());
+    }
+
+    #[test]
+    fn final_destruction_wakes_and_joins_owned_responder() {
+        let mut advertiser = RealAdvertiser::new();
+        let wake = Arc::clone(&advertiser.wake);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (finished, observed) = std::sync::mpsc::channel();
+        advertiser.completion = Some(Mutex::new(rx));
+        advertiser.responder = Some(std::thread::spawn(move || {
+            let guard = wake.0.lock().unwrap();
+            let _guard = wake.1.wait_while(guard, |stop| !*stop).unwrap();
+            tx.send(Ok(())).unwrap();
+            finished.send(()).unwrap();
+        }));
+        drop(advertiser);
+        observed.try_recv().unwrap();
+    }
+
+    fn compressed_packet() -> (Vec<u8>, usize, usize) {
+        fn pointer(offset: usize) -> [u8; 2] {
+            (0xc000 | offset as u16).to_be_bytes()
+        }
+        fn record(packet: &mut Vec<u8>, owner: &[u8], kind: u16, data: &[u8]) -> usize {
+            packet.extend_from_slice(owner);
+            packet.extend_from_slice(&kind.to_be_bytes());
+            packet.extend_from_slice(&1u16.to_be_bytes());
+            packet.extend_from_slice(&120u32.to_be_bytes());
+            packet.extend_from_slice(&(data.len() as u16).to_be_bytes());
+            let offset = packet.len();
+            packet.extend_from_slice(data);
+            offset
+        }
+        let mut packet = build_mdns_query(DEFAULT_SERVICE_TYPE, DEFAULT_DOMAIN);
+        packet[6..8].copy_from_slice(&3u16.to_be_bytes());
+        let mut instance = vec![4, b'n', b'o', b'd', b'e'];
+        instance.extend_from_slice(&pointer(12));
+        let ptr_offset = record(&mut packet, &pointer(12), 12, &instance);
+        let host_offset = packet.len();
+        record(
+            &mut packet,
+            &encode_dns_name("host.local"),
+            1,
+            &[127, 0, 0, 7],
+        );
+        let mut srv = vec![0, 0, 0, 0];
+        srv.extend_from_slice(&18840u16.to_be_bytes());
+        srv.extend_from_slice(&pointer(host_offset));
+        let srv_offset = record(&mut packet, &pointer(ptr_offset), 33, &srv);
+        (packet, ptr_offset, srv_offset + 6)
+    }
+
+    #[test]
+    fn mdns_compressed_rdata_resolves_packet_offsets() {
+        let (packet, _, _) = compressed_packet();
+        let msg = parse_dns_packet(&packet).unwrap();
+        let instance = format!(
+            "node.{}.{}",
+            DEFAULT_SERVICE_TYPE,
+            DEFAULT_DOMAIN.trim_matches('.')
+        );
+        assert_eq!(decode_dns_name(&msg.answers[0].rdata, 0).0, instance);
+        assert_eq!(decode_dns_name(&msg.answers[2].rdata, 6).0, "host.local");
+        let mut services = HashMap::new();
+        merge_discovered_services(&msg, DEFAULT_SERVICE_TYPE, DEFAULT_DOMAIN, &mut services);
+        let service = services.get("node").unwrap();
+        assert_eq!(service.port, 18840);
+        assert_eq!(service.host, "127.0.0.7");
+        assert_eq!(service.ipv4, vec![Ipv4Addr::new(127, 0, 0, 7)]);
+    }
+
+    #[test]
+    fn mdns_rejects_invalid_compression_and_rdata_bounds() {
+        let (packet, ptr_offset, srv_target) = compressed_packet();
+        for target in [ptr_offset, srv_target] {
+            for pointer in [0xffffu16, 0xc000 | target as u16] {
+                let mut bad = packet.clone();
+                bad[target..target + 2].copy_from_slice(&pointer.to_be_bytes());
+                assert!(parse_dns_packet(&bad).is_none());
+            }
+        }
+        let mut bad = packet;
+        bad[srv_target] = 4;
+        assert!(parse_dns_packet(&bad).is_none());
+    }
+
+    #[test]
+    fn unicode_instance_name_suffix_and_byte_budget() {
+        assert_eq!(format_instance_name("ééé", "8F3B"), "ééé-8F3B");
+        for unit in ["é", "界", "😀"] {
+            for count in 1..=70 {
+                let name = unit.repeat(count);
+                let got = format_instance_name(&name, "8f3b");
+                assert_eq!(got, format!("{}-8F3B", truncate_runes_to(&name, 58)));
+                assert!(got.len() <= 63);
+                assert_eq!(format_instance_name(&got, "8F3B"), got);
+            }
+        }
+        assert_eq!(format_instance_name("ééé-8f3b", "8F3B"), "ééé-8F3B");
+    }
 
     #[test]
     fn test_format_instance_name_default_and_custom() {

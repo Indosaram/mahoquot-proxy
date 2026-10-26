@@ -54,9 +54,20 @@ pub struct RealtimeSecret {
     pub member_id: Option<String>,
 }
 
-#[derive(Default)]
 pub struct RealtimeStore {
     secrets: RwLock<HashMap<String, RealtimeSecret>>,
+    // Private dependency: HTTP callers and process configuration cannot alter
+    // credential time. Tests replace both clocks on their own isolated store.
+    clock: Arc<dyn Fn() -> (Instant, u64) + Send + Sync>,
+}
+
+impl Default for RealtimeStore {
+    fn default() -> Self {
+        Self {
+            secrets: RwLock::new(HashMap::new()),
+            clock: Arc::new(|| (Instant::now(), now_unix())),
+        }
+    }
 }
 
 impl RealtimeStore {
@@ -69,8 +80,8 @@ impl RealtimeStore {
         lifetime_secs: u64,
     ) -> Result<(String, u64), &'static str> {
         let lifetime = lifetime_secs.clamp(MIN_EPHEMERAL_TTL_SECS, MAX_EPHEMERAL_TTL_SECS);
-        let now = Instant::now();
-        let expires_at = now_unix().saturating_add(lifetime);
+        let (now, unix) = (self.clock)();
+        let expires_at = unix.saturating_add(lifetime);
         let mut secrets = self.secrets.write().await;
         secrets.retain(|_, secret| secret.expires_instant > now);
         if secrets.len() >= MAX_SECRETS {
@@ -103,7 +114,7 @@ impl RealtimeStore {
         if !value.starts_with("ek_") {
             return None;
         }
-        let now = Instant::now();
+        let (now, _) = (self.clock)();
         let mut secrets = self.secrets.write().await;
         secrets.retain(|_, secret| secret.expires_instant > now);
         secrets.get(value).cloned()
@@ -199,6 +210,202 @@ pub fn legacy_session(body: &Value, secret: String, expires_at: u64) -> Value {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn http_minted_secret_expires_through_full_router() {
+        use axum::{
+            body::Body,
+            http::{Request, StatusCode},
+        };
+        use http_body_util::BodyExt;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use tower::ServiceExt;
+
+        struct Directory(std::path::PathBuf);
+        impl Drop for Directory {
+            fn drop(&mut self) {
+                std::fs::remove_dir_all(&self.0).expect("remove isolated realtime fixture");
+            }
+        }
+        let directory = Directory(std::env::temp_dir().join(token("realtime-router-", 16)));
+        std::fs::create_dir(&directory.0).unwrap();
+        std::fs::write(
+            directory.0.join("codex-expiry.json"),
+            json!({
+                "type": "plus", "identity_slug": "expiry-router", "account_id": "fixture-account",
+                "access_token": "fixture-token", "email": "expiry@example.invalid",
+                "expired": "2099-01-01T00:00:00Z", "id_token": "fixture-id",
+                "refresh_token": "fixture-refresh", "last_refresh": "2098-01-01T00:00:00Z",
+                "models": ["gpt-realtime"]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let config_path = directory.0.join("config.yaml");
+        std::fs::write(&config_path, "logging-to-file: false\n").unwrap();
+        let config = crate::config::GatewayConfig {
+            auth_dir: directory.0.clone(),
+            config_path,
+            api_keys: crate::inbound::ApiKeys::new(vec!["issuer-key".into()]),
+            auth_refresh_enabled: false,
+            ..crate::config::GatewayConfig::default()
+        };
+        let elapsed = Arc::new(AtomicU64::new(0));
+        let controlled = elapsed.clone();
+        let origin = Instant::now();
+        let mut state = crate::state::AppState::new(&config).unwrap();
+        state.realtime = Arc::new(RealtimeStore {
+            secrets: RwLock::new(HashMap::new()),
+            clock: Arc::new(move || {
+                let seconds = controlled.load(Ordering::SeqCst);
+                (origin + Duration::from_secs(seconds), 1_000 + seconds)
+            }),
+        });
+        let app = crate::routes::create_app(Arc::new(state));
+        let request = |path: &str, key: &str, body: &str| {
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("authorization", format!("Bearer {key}"))
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let minted = app
+            .clone()
+            .oneshot(request(
+                "/v1/realtime/client_secrets",
+                "issuer-key",
+                r#"{"session":{"model":"gpt-realtime"},"expires_after":1}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(minted.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&minted.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["expires_at"], 1_010); // Production minimum remains ten seconds.
+        let secret = body["value"].as_str().unwrap();
+        assert!(secret.starts_with("ek_"));
+        let path = "/v1/realtime/calls/expiry-router-missing/hangup";
+        // A missing call reaches the actual handler only after successful auth.
+        assert_eq!(
+            app.clone()
+                .oneshot(request(path, secret, "{}"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        elapsed.store(9, Ordering::SeqCst);
+        assert_eq!(
+            app.clone()
+                .oneshot(request(path, secret, "{}"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        elapsed.store(10, Ordering::SeqCst);
+        assert_eq!(
+            app.clone()
+                .oneshot(request(path, secret, "{}"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        // Issuer remains valid at the same instant; it is the minted secret that expired.
+        assert_eq!(
+            app.oneshot(request(path, "issuer-key", "{}"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn minted_secret_expires_at_exact_monotonic_deadline() {
+        use axum::{
+            body::Body,
+            http::{Request, StatusCode},
+            middleware,
+            routing::post,
+            Extension, Router,
+        };
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use tower::ServiceExt;
+        let elapsed = Arc::new(AtomicU64::new(0));
+        let clock_elapsed = elapsed.clone();
+        let origin = Instant::now();
+        let store = Arc::new(RealtimeStore {
+            secrets: RwLock::new(HashMap::new()),
+            clock: Arc::new(move || {
+                let seconds = clock_elapsed.load(Ordering::SeqCst);
+                (origin + Duration::from_secs(seconds), 1_000 + seconds)
+            }),
+        });
+        let app = Router::new()
+            .route(
+                "/v1/realtime/calls",
+                post(|| async { StatusCode::NO_CONTENT }),
+            )
+            .layer(middleware::from_fn_with_state(
+                Arc::new(crate::inbound::ApiKeys::new(vec!["issuer-key".into()])),
+                crate::inbound::require_api_key,
+            ))
+            .layer(Extension(store.clone()));
+        let authenticate = |value: &str| {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/v1/realtime/calls")
+                .header("authorization", format!("Bearer {value}"))
+                .body(Body::empty())
+                .unwrap();
+            app.clone().oneshot(request)
+        };
+        let (value, expiry) = store
+            .mint("issuer".into(), "gpt-realtime".into(), None, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(expiry, 1_010);
+        let issued = store
+            .lookup(&value)
+            .await
+            .expect("minted credential accepted");
+        assert_eq!(issued.issuer, "issuer");
+        assert_eq!(issued.model, "gpt-realtime");
+        assert_eq!(
+            authenticate(&value).await.unwrap().status(),
+            StatusCode::NO_CONTENT
+        );
+        elapsed.store(9, Ordering::SeqCst);
+        assert!(store.lookup(&value).await.is_some());
+        assert_eq!(
+            authenticate(&value).await.unwrap().status(),
+            StatusCode::NO_CONTENT
+        );
+        elapsed.store(10, Ordering::SeqCst);
+        // Authentication itself must expire it; do not pre-prune with lookup.
+        assert_eq!(
+            authenticate(&value).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert!(!store.secrets.read().await.contains_key(&value));
+        elapsed.store(11, Ordering::SeqCst);
+        assert!(store.lookup(&value).await.is_none());
+        let (fresh, _) = store
+            .mint("issuer".into(), "gpt-realtime".into(), None, None, 10)
+            .await
+            .unwrap();
+        assert_ne!(fresh, value);
+        assert!(store.lookup(&fresh).await.is_some());
+        assert_eq!(
+            authenticate(&fresh).await.unwrap().status(),
+            StatusCode::NO_CONTENT
+        );
+    }
+
     #[test]
     fn sdp_is_rejected_before_session() {
         let v = validate_offer(&json!({})).expect("missing sdp");
@@ -258,13 +465,17 @@ mod tests {
 
     #[tokio::test]
     async fn store_binds_issuer_and_clamps_lifetime() {
-        let store = RealtimeStore::default();
+        let origin = Instant::now();
+        let store = RealtimeStore {
+            secrets: RwLock::new(HashMap::new()),
+            clock: Arc::new(move || (origin, 1_000)),
+        };
         let (secret, expiry) = store
             .mint("issuer".into(), "gpt-realtime".into(), None, None, 1)
             .await
             .unwrap();
         assert!(secret.starts_with("ek_"));
-        assert_eq!(expiry, now_unix() + MIN_EPHEMERAL_TTL_SECS);
+        assert_eq!(expiry, 1_000 + MIN_EPHEMERAL_TTL_SECS);
         assert_eq!(store.lookup(&secret).await.unwrap().issuer, "issuer");
     }
 }

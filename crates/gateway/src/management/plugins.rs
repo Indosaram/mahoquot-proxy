@@ -25,6 +25,137 @@ fn json_status(status: StatusCode, body: Value) -> Response {
     (status, Json(body)).into_response()
 }
 
+fn config_error(error: impl std::fmt::Display) -> crate::plugins::abi::PluginError {
+    crate::plugins::abi::PluginError {
+        code: "plugin_config_failed".into(),
+        message: error.to_string(),
+        retryable: false,
+        http_status: Some(500),
+    }
+}
+
+fn persist_config(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().expect("config has parent");
+    std::fs::create_dir_all(parent)?;
+    let temp = parent.join(format!(".plugin-config-{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temp, path)
+    })();
+    if result.is_err() {
+        if let Err(error) = std::fs::remove_file(&temp) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(error);
+            }
+        }
+    }
+    result
+}
+
+fn update_plugin_config(
+    path: &Path,
+    value: &Value,
+    transition: impl FnOnce() -> Result<(), crate::plugins::abi::PluginError>,
+) -> Result<(), crate::plugins::abi::PluginError> {
+    let previous = match std::fs::read(path) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(config_error(e)),
+    };
+    persist_config(
+        path,
+        &serde_json::to_vec_pretty(value).map_err(config_error)?,
+    )
+    .map_err(config_error)?;
+    if let Err(error) = transition() {
+        let rollback = match previous {
+            Some(bytes) => persist_config(path, &bytes),
+            None => std::fs::remove_file(path),
+        };
+        rollback.map_err(|rollback| {
+            config_error(format!("{}; rollback failed: {rollback}", error.message))
+        })?;
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn plugin_error_response(error: crate::plugins::abi::PluginError) -> Response {
+    json_status(
+        StatusCode::from_u16(error.http_status.unwrap_or(500))
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        json!({"error": error.code, "message": error.message}),
+    )
+}
+
+#[cfg(test)]
+mod review_plugins_tests {
+    use super::*;
+
+    struct Root(PathBuf);
+    impl Drop for Root {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    #[test]
+    fn review_plugins_config_failure_blocks_transition_and_rolls_back() {
+        let root =
+            Root(std::env::temp_dir().join(format!("plugin-config-{}", uuid::Uuid::new_v4())));
+        std::fs::create_dir(&root.0).unwrap();
+        let path = root.0.join("fixture.config.json");
+        std::fs::create_dir(&path).unwrap();
+        let error = update_plugin_config(&path, &json!({"enabled": false}), || {
+            panic!("must not transition after failed persistence")
+        })
+        .unwrap_err();
+        assert_eq!(
+            plugin_error_response(error).status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert!(path.is_dir());
+        std::fs::remove_dir(&path).unwrap();
+        let previous = b"{\"enabled\":true,\"config\":{\"keep\":1}}";
+        std::fs::write(&path, previous).unwrap();
+        let error = update_plugin_config(&path, &json!({"enabled": false}), || {
+            assert_eq!(
+                serde_json::from_slice::<Value>(&std::fs::read(&path).unwrap()).unwrap()["enabled"],
+                false
+            );
+            Err(crate::plugins::abi::PluginError {
+                code: "plugin_busy".into(),
+                message: "busy".into(),
+                retryable: true,
+                http_status: Some(409),
+            })
+        })
+        .unwrap_err();
+        assert_eq!(plugin_error_response(error).status(), StatusCode::CONFLICT);
+        assert_eq!(std::fs::read(&path).unwrap(), previous);
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            update_plugin_config(&path, &json!({"config": {}}), || Err(config_error(
+                "rejected"
+            )))
+            .is_err()
+        );
+        assert!(!path.exists());
+        update_plugin_config(&path, &json!({"enabled": true}), || Ok(())).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&std::fs::read(&path).unwrap()).unwrap(),
+            json!({"enabled": true})
+        );
+        assert_eq!(std::fs::read_dir(&root.0).unwrap().count(), 1);
+    }
+}
+
 fn not_installed(_id: &str) -> Response {
     json_status(
         StatusCode::NOT_FOUND,
@@ -336,32 +467,24 @@ async fn patch_plugin_enabled(
         .and_then(|c| serde_json::from_str(&c).ok())
         .unwrap_or_else(|| json!({}));
 
-    if let Some(obj) = cfg.as_object_mut() {
-        obj.insert("enabled".to_string(), json!(enabled));
-    }
-    let _ = std::fs::create_dir_all(&plugins_dir);
-    let _ = std::fs::write(
-        &cfg_path,
-        serde_json::to_vec_pretty(&cfg).unwrap_or_default(),
-    );
-
-    // Enabling loads the installed library into the live host (Task 30);
-    // disabling unloads it after quiescence. A load failure is reported.
-    if let Some(host) = state.plugin_host() {
-        if enabled && host.get_plugin(&id).is_none() {
-            if let Some(path) = installed_library(&id, &plugins_dir) {
-                if let Err(err) = host.load_plugin(&id, &path, "local") {
-                    let status = StatusCode::from_u16(err.http_status.unwrap_or(500))
-                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                    return json_status(
-                        status,
-                        json!({ "error": err.code, "message": err.message }),
-                    );
-                }
+    let Some(obj) = cfg.as_object_mut() else {
+        return plugin_error_response(config_error("stored plugin config must be an object"));
+    };
+    obj.insert("enabled".to_string(), json!(enabled));
+    let result = update_plugin_config(&cfg_path, &cfg, || {
+        if let Some(host) = state.plugin_host() {
+            if enabled && host.get_plugin(&id).is_none() {
+                let path = installed_library(&id, &plugins_dir)
+                    .ok_or_else(|| config_error("installed library not found"))?;
+                host.load_plugin(&id, &path, "local")?;
+            } else if !enabled {
+                host.try_unload_plugin(&id)?;
             }
-        } else if !enabled {
-            let _ = host.unload_plugin(&id);
         }
+        Ok(())
+    });
+    if let Err(error) = result {
+        return plugin_error_response(error);
     }
 
     json_status(
@@ -429,24 +552,24 @@ async fn write_plugin_config(
     };
 
     let cfg_path = plugins_dir.join(format!("{id}.config.json"));
-    let _ = std::fs::create_dir_all(&plugins_dir);
-    let _ = std::fs::write(
-        &cfg_path,
-        serde_json::to_vec_pretty(&parsed).unwrap_or_default(),
-    );
-
-    // A loaded plugin is reconfigured live through the ABI; its response
-    // buffer is freed by the plugin's own deallocator.
-    if let Some(plugin) = state.plugin_host().and_then(|host| host.get_plugin(&id)) {
-        let payload = serde_json::to_vec(&json!({ "config": parsed })).unwrap_or_default();
-        if let Err(err) = plugin
-            .client
-            .call(crate::plugins::abi::METHOD_PLUGIN_RECONFIGURE, &payload)
-        {
-            let status = StatusCode::from_u16(err.http_status.unwrap_or(500))
-                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-            return json_status(status, json!({ "error": err.code, "message": err.message }));
+    let result = update_plugin_config(&cfg_path, &parsed, || {
+        if let Some(plugin) = state.plugin_host().and_then(|host| host.get_plugin(&id)) {
+            let payload = serde_json::to_vec(&json!({ "config": parsed })).unwrap_or_default();
+            let bytes = plugin
+                .client
+                .call(crate::plugins::abi::METHOD_PLUGIN_RECONFIGURE, &payload)?;
+            let envelope: crate::plugins::abi::Envelope =
+                serde_json::from_slice(&bytes).map_err(config_error)?;
+            if !envelope.ok {
+                return Err(envelope
+                    .error
+                    .unwrap_or_else(|| config_error("reconfiguration rejected")));
+            }
         }
+        Ok(())
+    });
+    if let Err(error) = result {
+        return plugin_error_response(error);
     }
 
     json_status(StatusCode::OK, json!({ "status": "ok", "id": id }))

@@ -1876,6 +1876,7 @@ pub fn load_runtime(raw: &str) -> Result<Settings, ConfigError> {
 }
 
 pub fn redact(mut root: Value) -> Value {
+    remove(&mut root, &["management", "secret-key"]);
     if let Some(servers) = root
         .pointer_mut(&pointer(ICE))
         .and_then(Value::as_array_mut)
@@ -1889,7 +1890,17 @@ pub fn redact(mut root: Value) -> Value {
     }
     root
 }
-fn preserve_turn(root: &mut Value, before: &Value) {
+/// An omitted management secret in a PUT means unchanged. Explicit values
+/// (including an empty string) and DELETE retain their ordinary semantics.
+pub fn preserve_management_secret(root: &mut Value, before: &Value) -> Result<(), ConfigError> {
+    if node(root, "management.secret-key").is_none() {
+        if let Some(secret) = node(before, "management.secret-key") {
+            set(root, &["management", "secret-key"], secret.clone())?;
+        }
+    }
+    Ok(())
+}
+pub(crate) fn preserve_turn(root: &mut Value, before: &Value) {
     let Some(old) = node(before, ICE).and_then(Value::as_array) else {
         return;
     };
@@ -2010,6 +2021,9 @@ pub fn edit(
     }
     normalize_aliases(&mut root)?;
     strip_auth_indexes(&mut root);
+    if !matches!(mutation, Mutation::Delete) {
+        preserve_management_secret(&mut root, before)?;
+    }
     validate(&root)?;
     for field in REVISIONS {
         if node(before, field) != node(&root, field) {
@@ -2850,6 +2864,7 @@ fn valid_duration(raw: &str) -> bool {
 }
 fn local_leaf(path: &str) -> bool {
     [
+        "omo-profile",
         "model-catalog",
         "warmup",
         "proxy-providers",
@@ -2911,6 +2926,11 @@ fn structural(path: &str) -> bool {
             .any(|(_, current)| current.starts_with(&format!("{path}.")))
 }
 fn validate_tree(value: &Value, path: &str) -> Result<(), ConfigError> {
+    if path == "omo-profile" {
+        serde_json::from_value::<Option<crate::management::settings::OmoProfile>>(value.clone())
+            .map_err(|error| ConfigError::InvalidConfig(error.to_string()))?;
+        return Ok(());
+    }
     if local_leaf(path) {
         return Ok(());
     }
@@ -3094,6 +3114,42 @@ fn strip_auth_indexes(root: &mut Value) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn management_secret_omission_preserves_but_explicit_edits_apply() {
+        let before = normalize(json!({"management":{"secret-key":"stored"}})).unwrap();
+        let view = redact(before.clone());
+        assert!(view.pointer("/management/secret-key").is_none());
+        let roundtrip = edit(&before, "", Mutation::Put, Some(view), true).unwrap();
+        assert_eq!(
+            runtime(&roundtrip).unwrap().remote_management.secret_key,
+            "stored"
+        );
+        for value in [json!("replacement"), json!("")] {
+            let next = edit(
+                &before,
+                "management/secret-key",
+                Mutation::Put,
+                Some(value.clone()),
+                true,
+            )
+            .unwrap();
+            assert_eq!(next.pointer("/management/secret-key"), Some(&value));
+        }
+        let deleted = edit(
+            &before,
+            "management/secret-key",
+            Mutation::Delete,
+            None,
+            true,
+        )
+        .unwrap();
+        assert!(runtime(&deleted)
+            .unwrap()
+            .remote_management
+            .secret_key
+            .is_empty());
+    }
 
     #[test]
     fn present_zero_false_and_empty_win_over_legacy() {

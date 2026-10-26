@@ -2,13 +2,144 @@ use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 use crate::plugins::abi::*;
 
 pub trait PluginClient: Send + Sync {
     fn call(&self, method: &str, request: &[u8]) -> Result<Vec<u8>, PluginError>;
     fn shutdown(&self);
+    fn try_shutdown(&self) -> Result<(), PluginError> {
+        self.shutdown();
+        Ok(())
+    }
+}
+
+fn plugin_busy() -> PluginError {
+    PluginError {
+        code: "plugin_busy".into(),
+        message: "plugin is draining or quiescing; retry unload".into(),
+        retryable: true,
+        http_status: Some(409),
+    }
+}
+
+#[derive(Default)]
+struct ClientLifecycle {
+    closing: bool,
+    active: usize,
+    quiescing: bool,
+    quiesced: Option<Result<(), PluginError>>,
+    stopped: bool,
+}
+
+struct ManagedClient {
+    inner: Arc<dyn PluginClient>,
+    lifecycle: Arc<(Mutex<ClientLifecycle>, Condvar)>,
+    unloading: Mutex<()>,
+}
+
+impl ManagedClient {
+    fn new(inner: Arc<dyn PluginClient>) -> Self {
+        Self {
+            inner,
+            lifecycle: Arc::new((Mutex::new(ClientLifecycle::default()), Condvar::new())),
+            unloading: Mutex::new(()),
+        }
+    }
+}
+
+impl PluginClient for ManagedClient {
+    fn call(&self, method: &str, request: &[u8]) -> Result<Vec<u8>, PluginError> {
+        {
+            let mut state = self.lifecycle.0.lock().unwrap();
+            if state.closing {
+                return Err(plugin_busy());
+            }
+            state.active += 1;
+        }
+        struct Admission<'a>(&'a ManagedClient);
+        impl Drop for Admission<'_> {
+            fn drop(&mut self) {
+                let mut state = self.0.lifecycle.0.lock().unwrap();
+                state.active -= 1;
+                self.0.lifecycle.1.notify_all();
+            }
+        }
+        let _admission = Admission(self);
+        self.inner.call(method, request)
+    }
+
+    fn shutdown(&self) {
+        let _ = self.try_shutdown();
+    }
+
+    fn try_shutdown(&self) -> Result<(), PluginError> {
+        self.shutdown_with_timeout(std::time::Duration::from_secs(2))
+    }
+}
+
+impl ManagedClient {
+    fn shutdown_with_timeout(&self, timeout: std::time::Duration) -> Result<(), PluginError> {
+        let _unloading = self.unloading.try_lock().map_err(|_| plugin_busy())?;
+        let mut state = self.lifecycle.0.lock().unwrap();
+        if state.stopped {
+            return Ok(());
+        }
+        // Admission and closing share one lock. Busy calls keep both code and host context alive.
+        if state.active != 0 {
+            return Err(plugin_busy());
+        }
+        state.closing = true;
+        if !state.quiescing {
+            state.quiescing = true;
+            let inner = self.inner.clone();
+            let lifecycle = self.lifecycle.clone();
+            std::thread::spawn(move || {
+                let result = inner.call(METHOD_PLUGIN_QUIESCE, b"{}").and_then(|bytes| {
+                    let envelope: Envelope =
+                        serde_json::from_slice(&bytes).map_err(|e| PluginError {
+                            code: "invalid_quiesce_response".into(),
+                            message: e.to_string(),
+                            retryable: false,
+                            http_status: Some(502),
+                        })?;
+                    if envelope.ok {
+                        Ok(())
+                    } else {
+                        Err(envelope.error.unwrap_or_else(plugin_busy))
+                    }
+                });
+                let mut state = lifecycle.0.lock().unwrap();
+                state.quiesced = Some(result);
+                lifecycle.1.notify_all();
+            });
+        }
+        let (mut state, _) = self
+            .lifecycle
+            .1
+            .wait_timeout_while(state, timeout, |s| s.quiesced.is_none())
+            .unwrap();
+        match state.quiesced.as_ref() {
+            None => return Err(plugin_busy()),
+            Some(Err(error)) => {
+                let error = error.clone();
+                state.closing = false;
+                state.quiescing = false;
+                state.quiesced = None;
+                return Err(error);
+            }
+            Some(Ok(())) => {}
+        }
+        if state.stopped {
+            return Ok(());
+        }
+        // Claim shutdown under the lock, but never invoke native callbacks under it.
+        state.stopped = true;
+        drop(state);
+        self.inner.shutdown();
+        Ok(())
+    }
 }
 
 pub struct DynamicLibraryClient {
@@ -255,39 +386,27 @@ impl PluginHostInner {
         (self.host_callback_handler)(plugin_id, method, request)
     }
 
-    pub fn quiesce_plugin(&self, id: &str, timeout_ms: u64) -> bool {
-        let plugin = {
-            let loaded = self.loaded.read().unwrap();
-            loaded.get(id).cloned()
-        };
-        let plugin = match plugin {
-            Some(p) => p,
-            None => return true,
-        };
-
-        let _ = plugin.client.call(METHOD_PLUGIN_QUIESCE, b"{}");
-
-        let start = std::time::Instant::now();
-        let timeout = std::time::Duration::from_millis(timeout_ms);
-        while plugin.active_calls.load(Ordering::SeqCst) > 0 {
-            if start.elapsed() >= timeout {
-                return false;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        true
+    pub fn unload_plugin(&self, id: &str) -> bool {
+        self.try_unload_plugin(id).unwrap_or(false)
     }
 
-    pub fn unload_plugin(&self, id: &str) -> bool {
-        self.quiesce_plugin(id, 2000);
-        let mut loaded = self.loaded.write().unwrap();
-        if let Some(plugin) = loaded.remove(id) {
-            plugin.client.shutdown();
+    pub fn try_unload_plugin(&self, id: &str) -> Result<bool, PluginError> {
+        let plugin = self.loaded.read().unwrap().get(id).cloned();
+        if let Some(plugin) = plugin {
+            plugin.client.try_shutdown()?;
+            let mut loaded = self.loaded.write().unwrap();
+            if !loaded
+                .get(id)
+                .is_some_and(|current| Arc::ptr_eq(current, &plugin))
+            {
+                return Ok(false);
+            }
+            loaded.remove(id);
             let mut versions = self.active_versions.write().unwrap();
             versions.remove(id);
-            true
+            Ok(true)
         } else {
-            false
+            Ok(false)
         }
     }
 
@@ -355,6 +474,12 @@ impl PluginHost {
     pub fn unload_plugin(&self, id: &str) -> bool {
         self.inner.clear_load_error(id);
         self.inner.unload_plugin(id)
+    }
+
+    pub fn try_unload_plugin(&self, id: &str) -> Result<bool, PluginError> {
+        let result = self.inner.try_unload_plugin(id)?;
+        self.inner.clear_load_error(id);
+        Ok(result)
     }
 
     pub fn load_plugin(
@@ -509,6 +634,7 @@ impl PluginHost {
         client: Arc<dyn PluginClient>,
         active_calls: Arc<AtomicUsize>,
     ) -> Result<Arc<LoadedPlugin>, PluginError> {
+        let client: Arc<dyn PluginClient> = Arc::new(ManagedClient::new(client));
         let reg_bytes = client.call(METHOD_PLUGIN_REGISTER, b"{}")?;
         let reg_env: Envelope = serde_json::from_slice(&reg_bytes).map_err(|e| PluginError {
             code: "invalid_registration".to_string(),
@@ -623,5 +749,110 @@ pub fn load_plugins_from_directory(host: &PluginHost, dir: &Path) {
                 tracing::warn!(plugin = %id, path = %path.display(), error = %e.message, "failed to load plugin");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod review_plugins_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    struct BlockingClient {
+        entered: mpsc::Sender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+        block_method: &'static str,
+        stopped: AtomicBool,
+        reject: bool,
+    }
+
+    impl PluginClient for BlockingClient {
+        fn call(&self, method: &str, _: &[u8]) -> Result<Vec<u8>, PluginError> {
+            if method == self.block_method {
+                self.entered.send(()).unwrap();
+                self.release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+            }
+            let envelope = if self.reject && method == METHOD_PLUGIN_QUIESCE {
+                Envelope::error("refused", "not quiescent", Some(409))
+            } else {
+                Envelope::success(serde_json::json!({}))
+            };
+            Ok(serde_json::to_vec(&envelope).unwrap())
+        }
+        fn shutdown(&self) {
+            self.stopped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn fixture(
+        method: &'static str,
+        reject: bool,
+    ) -> (
+        Arc<ManagedClient>,
+        Arc<BlockingClient>,
+        mpsc::Receiver<()>,
+        mpsc::Sender<()>,
+    ) {
+        let (entered, received) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let inner = Arc::new(BlockingClient {
+            entered,
+            release: Mutex::new(released),
+            block_method: method,
+            stopped: AtomicBool::new(false),
+            reject,
+        });
+        (
+            Arc::new(ManagedClient::new(inner.clone())),
+            inner,
+            received,
+            release,
+        )
+    }
+
+    #[test]
+    fn review_plugins_active_call_prevents_shutdown() {
+        let (client, inner, entered, release) = fixture("work", false);
+        let worker = client.clone();
+        let call = std::thread::spawn(move || worker.call("work", b"{}"));
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(client.try_shutdown().unwrap_err().code, "plugin_busy");
+        assert!(!inner.stopped.load(Ordering::SeqCst));
+        release.send(()).unwrap();
+        call.join().unwrap().unwrap();
+        client.call("other", b"{}").unwrap();
+        client.try_shutdown().unwrap();
+        assert!(inner.stopped.load(Ordering::SeqCst));
+        assert!(client.call("work", b"{}").is_err());
+    }
+
+    #[test]
+    fn review_plugins_quiesce_timeout_retains_client_and_closes_admission() {
+        let (client, inner, entered, release) = fixture(METHOD_PLUGIN_QUIESCE, false);
+        assert_eq!(
+            client
+                .shutdown_with_timeout(Duration::ZERO)
+                .unwrap_err()
+                .code,
+            "plugin_busy"
+        );
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(!inner.stopped.load(Ordering::SeqCst));
+        assert!(client.call("work", b"{}").is_err());
+        release.send(()).unwrap();
+        client.try_shutdown().unwrap();
+        assert!(inner.stopped.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn review_plugins_rejected_quiesce_preserves_callable_client() {
+        let (client, inner, _, _) = fixture("never", true);
+        assert_eq!(client.try_shutdown().unwrap_err().code, "refused");
+        assert!(!inner.stopped.load(Ordering::SeqCst));
+        client.call("work", b"{}").unwrap();
     }
 }
