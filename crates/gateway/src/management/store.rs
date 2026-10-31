@@ -128,6 +128,7 @@ impl SettingsStore {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let settings = Settings::load(&self.path)?;
+        settings.validate_claude_egress()?;
         let active_snapshot = self.active_snapshot();
         let candidate_registry = settings.validate_against_registry(&active_snapshot)?;
 
@@ -187,6 +188,10 @@ impl SettingsStore {
     }
 
     fn validate_persist_publish(&self, next: Settings) -> Result<Arc<Settings>, SettingsError> {
+        // Checked here rather than in `validate_against_registry`, which the
+        // boot path also runs: a hand-edited bad entry at boot disables only
+        // that account instead of stopping the gateway.
+        next.validate_claude_egress()?;
         let active_snapshot = self.active_snapshot();
         let candidate_registry = next.validate_against_registry(&active_snapshot)?;
 

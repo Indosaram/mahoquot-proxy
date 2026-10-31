@@ -353,6 +353,15 @@ async fn main() -> anyhow::Result<()> {
         std::time::Duration::from_secs(10),
     );
     let app = create_app(state.clone());
+    // Claude API-key budgets are read from the request history; the affinity
+    // store keeps Claude sessions pinned across restarts.
+    let claude_budget_refresher =
+        mahoquot_gateway::claude_budget::BudgetTracker::spawn_refresher(Arc::clone(&state));
+    let claude_affinity_worker = mahoquot_gateway::affinity_store::AffinityStore::spawn_persistence(
+        Arc::clone(&state.claude_affinity),
+        std::time::Duration::from_secs(5),
+        Arc::new(tokio::sync::Notify::new()),
+    );
 
     let listener = TcpListener::bind((bind_addr.as_str(), config.port)).await?;
     info!(bind_addr = %bind_addr, port = config.port, "listening");
@@ -365,6 +374,15 @@ async fn main() -> anyhow::Result<()> {
     usage_poller.shutdown().await;
     catalog_refresh.shutdown().await;
     flush_worker.shutdown().await;
+    claude_budget_refresher.abort();
+    claude_affinity_worker.abort();
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    if let Err(error) = state.claude_affinity.flush_blocking(now_unix) {
+        warn!(%error, "failed to persist claude affinity at shutdown");
+    }
     // Final snapshot before the process exits, so a replay that arrived inside
     // the coalescing window is not lost.
     state.signature_ledger.shutdown();

@@ -78,6 +78,27 @@ impl Router {
         self.strategy.store(strategy_to_u8(strategy), Ordering::SeqCst);
     }
 
+    /// Record that `member_id` serves the session `affinity_key`, overriding
+    /// any in-memory binding. Used when a caller owns a durable binding that
+    /// must win over a rebind made during an earlier transient failover.
+    pub fn select_forced(&self, member_id: &str, affinity_key: Option<&str>) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !state.admits(member_id) {
+            return;
+        }
+        let seq = state.seq.wrapping_add(1);
+        state.seq = seq;
+        state.last_served.insert(member_id.to_string(), seq);
+        if let Some(key) = affinity_key {
+            state
+                .affinity
+                .insert(key.to_string(), (member_id.to_string(), seq));
+        }
+    }
+
     /// Index into `members` of the next member to serve, or None if none available.
     pub fn select(&self, members: &[Arc<dyn PoolMember>], hint: &SessionHint) -> Option<usize> {
         let now_unix_ms = match SystemTime::now().duration_since(UNIX_EPOCH) {
@@ -257,6 +278,27 @@ mod red_tests {
 
     fn pool(ids: &[(&str, Health)]) -> Vec<Arc<dyn PoolMember>> {
         ids.iter().map(|(i, h)| M::new(i, *h)).collect()
+    }
+
+    #[test]
+    fn a_forced_binding_overrides_the_in_memory_one() {
+        let p = pool(&[("a", Health::Available), ("b", Health::Available)]);
+        let r = Router::new(Strategy::FillFirst);
+        let hint = SessionHint {
+            affinity_key: Some("s1".into()),
+        };
+        assert_eq!(r.select(&p, &hint), Some(0), "fill-first binds s1 to a");
+        r.select_forced("b", Some("s1"));
+        assert_eq!(r.bound_affinity_member("s1").as_deref(), Some("b"));
+        assert_eq!(r.select(&p, &hint), Some(1), "the session now follows b");
+    }
+
+    #[test]
+    fn a_forced_binding_ignores_members_outside_the_pool() {
+        let r = Router::new(Strategy::FillFirst);
+        r.retain_members(&["a".to_string()].into_iter().collect());
+        r.select_forced("gone", Some("s1"));
+        assert_eq!(r.bound_affinity_member("s1"), None);
     }
 
     #[test]

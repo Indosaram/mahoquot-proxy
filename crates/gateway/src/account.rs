@@ -891,25 +891,18 @@ impl ProviderAccount {
             Self::Claude(a) => {
                 let mut headers = match &a.api_key {
                     Some(key) => vec![("x-api-key".to_string(), key.clone())],
-                    None => vec![
-                        (
+                    None => {
+                        let mut oauth = vec![(
                             "authorization".to_string(),
                             format!("Bearer {}", a.access_token),
-                        ),
-                        (
-                            "user-agent".to_string(),
-                            "@anthropic-ai/sdk/0.74.0".to_string(),
-                        ),
-                        ("x-app".to_string(), "cli".to_string()),
-                        ("x-stainless-lang".to_string(), "js".to_string()),
-                        (
-                            "x-stainless-package-version".to_string(),
-                            "0.74.0".to_string(),
-                        ),
-                        ("x-stainless-os".to_string(), "macos".to_string()),
-                        ("x-stainless-arch".to_string(), "arm64".to_string()),
-                        ("x-stainless-runtime".to_string(), "node".to_string()),
-                    ],
+                        )];
+                        oauth.extend(
+                            mahoquot_providers::claude::AGENT_SDK_IDENTITY_HEADERS
+                                .iter()
+                                .map(|(name, value)| (name.to_string(), value.to_string())),
+                        );
+                        oauth
+                    }
                 };
                 headers.extend(vec![
                     (

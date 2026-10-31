@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -98,7 +98,7 @@ pub fn is_supervision_needed(proxy_runtime: &ProxyRuntime) -> bool {
 
     #[cfg(target_os = "macos")]
     if let Ok(home) = std::env::var("HOME") {
-        let p = Path::new(&home).join("Library/LaunchAgents/ai.indo.global-egress.plist");
+        let p = std::path::Path::new(&home).join("Library/LaunchAgents/ai.indo.global-egress.plist");
         if p.is_file() {
             return true;
         }
@@ -126,7 +126,7 @@ pub async fn attempt_recovery() {
 async fn recover_macos() {
     let uid = get_current_uid().await.unwrap_or_else(|| "501".to_string());
     let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/indo".to_string());
-    let home_path = Path::new(&home);
+    let home_path = std::path::Path::new(&home);
 
     let egress_plist = home_path.join("Library/LaunchAgents/ai.indo.global-egress.plist");
     let watchdog_plist = home_path.join("Library/LaunchAgents/ai.indo.global-egress-watchdog.plist");
