@@ -1,0 +1,14 @@
+{
+  "name": "opencode-free-bridge",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun bridge.ts",
+    "fingerprint": "bun extract-fingerprint.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.9.0"
+  }
+}
