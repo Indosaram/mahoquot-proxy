@@ -1300,6 +1300,7 @@ async fn antigravity_oauth_flow(
             | ProviderAccount::Zcode(_)
             | ProviderAccount::Vertex(_)
             | ProviderAccount::Devin(_)
+            | ProviderAccount::OpenCode(_)
             | ProviderAccount::Generic(_) => false,
         }
     });

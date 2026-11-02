@@ -15,6 +15,7 @@ pub fn provider_id_for_kind(kind: ProviderKind) -> Option<ProviderId> {
         ProviderKind::Kiro => ProviderId::kiro(),
         ProviderKind::Vertex => ProviderId::vertex(),
         ProviderKind::Zcode => ProviderId::zcode(),
+        ProviderKind::OpenCode => ProviderId::opencode(),
         ProviderKind::Devin | ProviderKind::Generic => return None,
     };
     Some(id)
@@ -62,6 +63,7 @@ fn member_matches_provider_binding(
         ProviderKind::Vertex => provider_id.as_str() == "vertex",
         ProviderKind::Zcode => provider_id.as_str() == "zcode",
         ProviderKind::Devin => provider_id.as_str() == "devin",
+        ProviderKind::OpenCode => provider_id.as_str() == "opencode",
         ProviderKind::Generic => member.provider_name() == provider_id.as_str(),
     };
 
@@ -407,7 +409,10 @@ pub fn model_entries(providers: &[ProviderKind], env_override: Option<&str>) -> 
             ProviderKind::Zcode => "z-ai",
             ProviderKind::Kiro => "kiro",
             ProviderKind::Cursor => "cursor",
-            ProviderKind::Codex | ProviderKind::Devin | ProviderKind::Generic => continue,
+            ProviderKind::Codex
+            | ProviderKind::Devin
+            | ProviderKind::Generic
+            | ProviderKind::OpenCode => continue,
         };
         let contribution =
             mahoquot_registry::embedded_snapshot().contribution_for_provider(&provider_id);

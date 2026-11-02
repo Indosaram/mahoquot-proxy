@@ -117,6 +117,10 @@ impl ProviderId {
         Self("kiro".to_string())
     }
 
+    pub fn opencode() -> Self {
+        Self("opencode".to_string())
+    }
+
     pub fn vertex() -> Self {
         Self("vertex".to_string())
     }

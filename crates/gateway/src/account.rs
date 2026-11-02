@@ -137,6 +137,7 @@ pub enum ProviderKind {
     Zcode,
     Vertex,
     Devin,
+    OpenCode,
     Generic,
 }
 
@@ -150,6 +151,7 @@ pub enum ProviderAccount {
     Zcode(ZcodeAccount),
     Vertex(VertexAccount),
     Devin(mahoquot_providers::DevinAccount),
+    OpenCode(mahoquot_providers::OpenCodeAccount),
     Generic(GenericAccount),
 }
 
@@ -261,6 +263,7 @@ impl ProviderKind {
             ProviderKind::Vertex => {
                 mahoquot_providers::vertex::is_vertex_model_in_snapshot(snapshot, model)
             }
+            ProviderKind::OpenCode => true,
             ProviderKind::Devin => false,
             ProviderKind::Generic => true,
         }
@@ -275,6 +278,7 @@ impl ProviderKind {
             ProviderKind::Kiro => "kiro",
             ProviderKind::Zcode => "zcode",
             ProviderKind::Vertex => "google-vertex",
+            ProviderKind::OpenCode => "opencode",
             ProviderKind::Devin => "devin",
             ProviderKind::Generic => "generic",
         }
@@ -290,6 +294,7 @@ impl ProviderKind {
             "kiro" => Some(Self::Kiro),
             "zcode" => Some(Self::Zcode),
             "vertex" | "google-vertex" => Some(Self::Vertex),
+            "opencode" => Some(Self::OpenCode),
             "devin" => Some(Self::Devin),
             "meta" => Some(Self::Generic),
             "generic" => Some(Self::Generic),
@@ -791,6 +796,7 @@ impl ProviderAccount {
             Self::Kiro(_) => ProviderKind::Kiro,
             Self::Zcode(_) => ProviderKind::Zcode,
             Self::Vertex(_) => ProviderKind::Vertex,
+            Self::OpenCode(_) => ProviderKind::OpenCode,
             Self::Devin(_) => ProviderKind::Devin,
             Self::Generic(_) => ProviderKind::Generic,
         }
@@ -808,6 +814,7 @@ impl ProviderAccount {
             Self::Kiro(a) => a.access_token.clone(),
             Self::Zcode(a) => a.access_token.clone(),
             Self::Vertex(a) => a.access_token.clone(),
+            Self::OpenCode(a) => a.api_key.clone(),
             Self::Devin(a) => a.access_token.clone(),
             Self::Generic(a) => a.api_key.clone(),
         }
@@ -846,6 +853,7 @@ impl ProviderAccount {
             Self::Kiro(a) => a.refresh_token.clone(),
             Self::Zcode(a) => a.refresh_token.clone(),
             Self::Vertex(_) => String::new(),
+            Self::OpenCode(_) => String::new(),
             Self::Devin(_) => String::new(),
             Self::Generic(a) => a.refresh_token.clone(),
         }
@@ -876,6 +884,7 @@ impl ProviderAccount {
             Self::Generic(a) if a.provider == "cline" => expired_at_is_past(&a.expired, now_unix),
             Self::Generic(a) if a.provider == "meta" => a.api_key.is_empty(),
             Self::Vertex(a) => a.is_expired(now_unix),
+            Self::OpenCode(a) => a.is_expired(now_unix),
             Self::Devin(_) => false,
             // A MiMo Free account holds a bootstrap JWT rather than a pasted
             // key, so it expires and re-bootstraps like an OAuth credential.
@@ -1020,6 +1029,7 @@ impl ProviderAccount {
                 headers
             }
             Self::Vertex(a) => a.build_upstream_headers(),
+            Self::OpenCode(a) => a.build_upstream_headers(),
             Self::Devin(a) => vec![
                 (
                     "authorization".to_string(),
@@ -1104,6 +1114,7 @@ impl ProviderAccount {
         match self {
             Self::Antigravity(a) => Some(a.project_id.clone()),
             Self::Vertex(a) => Some(a.effective_project_id().to_string()),
+            Self::OpenCode(_) => None,
             Self::Generic(a) if !a.project_id.is_empty() => Some(a.project_id.clone()),
             _ => None,
         }
@@ -1154,6 +1165,7 @@ impl ProviderAccount {
             }
             Self::Generic(_) => mahoquot_providers::build_refresh_request(""),
             Self::Vertex(_) => mahoquot_providers::build_refresh_request(""),
+            Self::OpenCode(_) => mahoquot_providers::build_refresh_request(""),
             other => mahoquot_providers::build_refresh_request(&other.refresh_token()),
         }
     }
@@ -1710,6 +1722,9 @@ impl AccountMember {
             ProviderAccount::Antigravity(_) => "https://api.antigravity.dev".to_string(),
             ProviderAccount::Kiro(_) => "https://api.kiro.dev".to_string(),
             ProviderAccount::Vertex(_) => "https://api.vertex.dev".to_string(),
+            ProviderAccount::OpenCode(_) => {
+                mahoquot_providers::opencode::OPENCODE_UPSTREAM_BASE.to_string()
+            }
         }
     }
 
@@ -1865,6 +1880,7 @@ impl AccountMember {
             ProviderAccount::Kiro(a) => Some(a.email.clone()),
             ProviderAccount::Zcode(a) => Some(a.email.clone()),
             ProviderAccount::Vertex(a) => Some(a.email.clone()),
+            ProviderAccount::OpenCode(_) => None,
             ProviderAccount::Devin(a) => a.email.clone(),
             ProviderAccount::Generic(_) => None,
         }
@@ -1913,6 +1929,7 @@ impl AccountMember {
             ProviderAccount::Vertex(account) => account.disabled,
             ProviderAccount::Zcode(account) => account.disabled,
             ProviderAccount::Devin(account) => account.disabled,
+            ProviderAccount::OpenCode(account) => account.disabled,
             ProviderAccount::Codex(_) => false,
         }
     }
@@ -2721,6 +2738,7 @@ fn provider_account_from_value(
         ProviderKind::Kiro => ProviderAccount::Kiro(serde_json::from_value(value)?),
         ProviderKind::Zcode => ProviderAccount::Zcode(serde_json::from_value(value)?),
         ProviderKind::Vertex => ProviderAccount::Vertex(serde_json::from_value(value)?),
+        ProviderKind::OpenCode => ProviderAccount::OpenCode(serde_json::from_value(value)?),
         ProviderKind::Devin => ProviderAccount::Devin(serde_json::from_value(value)?),
         ProviderKind::Generic => {
             let value = if value.get("type").and_then(serde_json::Value::as_str) == Some("meta") {
@@ -2747,6 +2765,7 @@ fn set_identity_slug(account: &mut ProviderAccount, slug: String) {
         ProviderAccount::Kiro(a) => a.identity_slug = slug,
         ProviderAccount::Zcode(a) => a.identity_slug = slug,
         ProviderAccount::Vertex(a) => a.identity_slug = slug,
+        ProviderAccount::OpenCode(a) => a.identity_slug = slug,
         ProviderAccount::Devin(a) => a.identity_slug = slug,
         ProviderAccount::Generic(a) => a.identity_slug = slug,
     }
@@ -2761,6 +2780,7 @@ fn identity_slug_of(account: &ProviderAccount) -> &str {
         ProviderAccount::Kiro(a) => &a.identity_slug,
         ProviderAccount::Zcode(a) => &a.identity_slug,
         ProviderAccount::Vertex(a) => &a.identity_slug,
+        ProviderAccount::OpenCode(a) => &a.identity_slug,
         ProviderAccount::Devin(a) => &a.identity_slug,
         ProviderAccount::Generic(a) => &a.identity_slug,
     }
@@ -3068,7 +3088,8 @@ pub fn load_account_members(auth_dir: &Path) -> anyhow::Result<Vec<Arc<AccountMe
                 | ProviderKind::Cursor
                 | ProviderKind::Kiro
                 | ProviderKind::Zcode
-                | ProviderKind::Vertex => None,
+                | ProviderKind::Vertex
+                | ProviderKind::OpenCode => None,
             })
             .map(str::to_string);
 

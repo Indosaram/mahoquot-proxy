@@ -941,8 +941,8 @@
         "tools"
       ],
       "bindings": {
-        "opencode-go": {
-          "provider_id": "opencode-go",
+        "opencode": {
+          "provider_id": "opencode",
           "policy": "discovered",
           "source": "embedded_fallback",
           "capabilities": [
@@ -972,8 +972,8 @@
         "tools"
       ],
       "bindings": {
-        "opencode-go": {
-          "provider_id": "opencode-go",
+        "opencode": {
+          "provider_id": "opencode",
           "policy": "discovered",
           "source": "embedded_fallback",
           "capabilities": [
@@ -2017,8 +2017,8 @@
         "tools"
       ],
       "bindings": {
-        "opencode-go": {
-          "provider_id": "opencode-go",
+        "opencode": {
+          "provider_id": "opencode",
           "policy": "discovered",
           "source": "embedded_fallback",
           "capabilities": [
@@ -2065,8 +2065,8 @@
           },
           "priority": 100
         },
-        "opencode-go": {
-          "provider_id": "opencode-go",
+        "opencode": {
+          "provider_id": "opencode",
           "policy": "discovered",
           "source": "embedded_fallback",
           "capabilities": [
@@ -2113,8 +2113,8 @@
           },
           "priority": 100
         },
-        "opencode-go": {
-          "provider_id": "opencode-go",
+        "opencode": {
+          "provider_id": "opencode",
           "policy": "discovered",
           "source": "embedded_fallback",
           "capabilities": [
@@ -2161,8 +2161,8 @@
           },
           "priority": 100
         },
-        "opencode-go": {
-          "provider_id": "opencode-go",
+        "opencode": {
+          "provider_id": "opencode",
           "policy": "discovered",
           "source": "embedded_fallback",
           "capabilities": [
@@ -2771,8 +2771,8 @@
         "tools"
       ],
       "bindings": {
-        "opencode-go": {
-          "provider_id": "opencode-go",
+        "opencode": {
+          "provider_id": "opencode",
           "policy": "discovered",
           "source": "embedded_fallback",
           "capabilities": [
@@ -2802,8 +2802,8 @@
         "tools"
       ],
       "bindings": {
-        "opencode-go": {
-          "provider_id": "opencode-go",
+        "opencode": {
+          "provider_id": "opencode",
           "policy": "discovered",
           "source": "embedded_fallback",
           "capabilities": [
@@ -2912,8 +2912,8 @@
           },
           "priority": 100
         },
-        "opencode-go": {
-          "provider_id": "opencode-go",
+        "opencode": {
+          "provider_id": "opencode",
           "policy": "discovered",
           "source": "embedded_fallback",
           "capabilities": [
@@ -2961,8 +2961,8 @@
           },
           "priority": 100
         },
-        "opencode-go": {
-          "provider_id": "opencode-go",
+        "opencode": {
+          "provider_id": "opencode",
           "policy": "discovered",
           "source": "embedded_fallback",
           "capabilities": [
@@ -3010,8 +3010,8 @@
           },
           "priority": 100
         },
-        "opencode-go": {
-          "provider_id": "opencode-go",
+        "opencode": {
+          "provider_id": "opencode",
           "policy": "discovered",
           "source": "embedded_fallback",
           "capabilities": [
@@ -3300,8 +3300,8 @@
         "tools"
       ],
       "bindings": {
-        "opencode-go": {
-          "provider_id": "opencode-go",
+        "opencode": {
+          "provider_id": "opencode",
           "policy": "discovered",
           "source": "embedded_fallback",
           "capabilities": [
@@ -3331,8 +3331,8 @@
         "tools"
       ],
       "bindings": {
-        "opencode-go": {
-          "provider_id": "opencode-go",
+        "opencode": {
+          "provider_id": "opencode",
           "policy": "discovered",
           "source": "embedded_fallback",
           "capabilities": [
@@ -3362,8 +3362,8 @@
         "tools"
       ],
       "bindings": {
-        "opencode-go": {
-          "provider_id": "opencode-go",
+        "opencode": {
+          "provider_id": "opencode",
           "policy": "discovered",
           "source": "embedded_fallback",
           "capabilities": [
@@ -3393,8 +3393,8 @@
         "tools"
       ],
       "bindings": {
-        "opencode-go": {
-          "provider_id": "opencode-go",
+        "opencode": {
+          "provider_id": "opencode",
           "policy": "discovered",
           "source": "embedded_fallback",
           "capabilities": [
@@ -3424,8 +3424,8 @@
         "tools"
       ],
       "bindings": {
-        "opencode-go": {
-          "provider_id": "opencode-go",
+        "opencode": {
+          "provider_id": "opencode",
           "policy": "discovered",
           "source": "embedded_fallback",
           "capabilities": [
@@ -3455,8 +3455,8 @@
         "tools"
       ],
       "bindings": {
-        "opencode-go": {
-          "provider_id": "opencode-go",
+        "opencode": {
+          "provider_id": "opencode",
           "policy": "discovered",
           "source": "embedded_fallback",
           "capabilities": [
@@ -3486,8 +3486,8 @@
         "tools"
       ],
       "bindings": {
-        "opencode-go": {
-          "provider_id": "opencode-go",
+        "opencode": {
+          "provider_id": "opencode",
           "policy": "discovered",
           "source": "embedded_fallback",
           "capabilities": [
@@ -3579,8 +3579,8 @@
         "tools"
       ],
       "bindings": {
-        "opencode-go": {
-          "provider_id": "opencode-go",
+        "opencode": {
+          "provider_id": "opencode",
           "policy": "discovered",
           "source": "embedded_fallback",
           "capabilities": [
@@ -3641,8 +3641,8 @@
         "tools"
       ],
       "bindings": {
-        "opencode-go": {
-          "provider_id": "opencode-go",
+        "opencode": {
+          "provider_id": "opencode",
           "policy": "discovered",
           "source": "embedded_fallback",
           "capabilities": [
@@ -3689,8 +3689,8 @@
           },
           "priority": 100
         },
-        "opencode-go": {
-          "provider_id": "opencode-go",
+        "opencode": {
+          "provider_id": "opencode",
           "policy": "discovered",
           "source": "embedded_fallback",
           "capabilities": [
@@ -3737,8 +3737,8 @@
           },
           "priority": 100
         },
-        "opencode-go": {
-          "provider_id": "opencode-go",
+        "opencode": {
+          "provider_id": "opencode",
           "policy": "discovered",
           "source": "embedded_fallback",
           "capabilities": [
@@ -3990,7 +3990,7 @@
     "kiro": "closed",
     "nous": "discovered",
     "opencode-free": "discovered",
-    "opencode-go": "discovered",
+    "opencode": "discovered",
     "opencode-zen": "discovered",
     "qwen": "discovered",
     "vertex": "closed",

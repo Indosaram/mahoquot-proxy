@@ -44,6 +44,9 @@ pub fn build_provider_url(
         ProviderKind::Devin => upstream_override
             .map(|base| base.trim_end_matches('/').to_string())
             .unwrap_or_else(|| mahoquot_providers::devin::DEVIN_DEFAULT_API_SERVER_URL.to_string()),
+        ProviderKind::OpenCode => upstream_override
+            .map(|base| base.trim_end_matches('/').to_string())
+            .unwrap_or_else(|| mahoquot_providers::opencode::OPENCODE_UPSTREAM_BASE.to_string()),
     };
 
     join_provider_path(upstream_override.unwrap_or(&base), req_path)

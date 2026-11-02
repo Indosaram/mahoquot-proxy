@@ -14,6 +14,8 @@ pub mod cursor;
 pub mod devin;
 pub mod kiro;
 pub mod mimo;
+pub mod opencode;
+pub use opencode::OpenCodeAccount;
 pub mod refresh;
 pub mod refresh_exec;
 pub mod vertex;

@@ -338,6 +338,7 @@ async fn refresh_account_usage_inner(
         }
         ProviderKind::Zcode => refresh_zcode_usage(state, member).await,
         ProviderKind::Vertex => Err(QuotaError::Unsupported),
+        ProviderKind::OpenCode => Ok(()),
         ProviderKind::Devin => Err(QuotaError::Unsupported),
         ProviderKind::Generic => refresh_generic_usage(state, member).await,
     }
