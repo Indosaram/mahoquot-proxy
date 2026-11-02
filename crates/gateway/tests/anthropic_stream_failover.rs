@@ -154,10 +154,27 @@ async fn spent_streaming_accounts_are_skipped_until_a_serving_account_is_found()
 }
 
 #[tokio::test]
-async fn request_not_allowed_stream_denials_cool_down_and_walk_past_max_failover_without_poisoning_session_affinity(
-) {
-    // Given: three accounts returning HTTP 200 + SSE "Request not allowed"
-    // before one serving account, with max_failover=2 and an explicit session id.
+async fn stream_permission_denial_preserves_403_with_bounded_failover() {
+    permission_denial_preserves_account_state(true, false).await;
+}
+
+#[tokio::test]
+async fn http_permission_denial_preserves_403_with_bounded_failover() {
+    permission_denial_preserves_account_state(false, false).await;
+}
+
+#[tokio::test]
+async fn stream_permission_denial_reaches_serving_peer() {
+    permission_denial_preserves_account_state(true, true).await;
+}
+
+#[tokio::test]
+async fn http_permission_denial_reaches_serving_peer() {
+    permission_denial_preserves_account_state(false, true).await;
+}
+
+async fn permission_denial_preserves_account_state(stream_error: bool, serving_peer: bool) {
+    // Given: permission-denied accounts, max_failover=2 and an explicit session id.
     let mut listener = None;
     for port in 18840..=18899 {
         match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
@@ -185,13 +202,25 @@ async fn request_not_allowed_stream_denials_cool_down_and_walk_past_max_failover
                     .unwrap_or("")
                     .to_string();
                 observed.lock().unwrap().push(auth.clone());
+                let serves = serving_peer && auth.ends_with("account-1");
+                if !stream_error && !serves {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        [("content-type", "application/json")],
+                        json!({"error":{"type":"permission_error","code":"permission_denied","message":"Request not allowed"}}).to_string(),
+                    );
+                }
                 let start = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"fixture\",\"role\":\"assistant\",\"content\":[]}}\n\n";
-                let result = if !auth.ends_with("account-3") {
+                let result = if !serves {
                     "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"permission_error\",\"message\":\"Request not allowed\"}}\n\n"
                 } else {
                     "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"served-by-account-3\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
                 };
-                ([("content-type", "text/event-stream")], format!("{start}{result}"))
+                (
+                    StatusCode::OK,
+                    [("content-type", "text/event-stream")],
+                    format!("{start}{result}"),
+                )
             }
         }),
     );
@@ -224,9 +253,14 @@ async fn request_not_allowed_stream_denials_cool_down_and_walk_past_max_failover
         .unwrap(),
     );
     let app = create_app(Arc::clone(&state));
-    let mut finalizer = state.subscribe_finalizer("account-3");
-
-    // When: turn 1 with x-session-id hits the 3 denied accounts and reaches account-3.
+    let mut finalizer = state.subscribe_finalizer("account-1");
+    if !stream_error {
+        state
+            .settings
+            .mutate(|settings| settings.request_retry = 3)
+            .unwrap();
+    }
+    // When: a request encounters an unscoped permission denial.
     let response = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         app.clone().oneshot(
@@ -245,7 +279,14 @@ async fn request_not_allowed_stream_denials_cool_down_and_walk_past_max_failover
     .await
     .unwrap()
     .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.status(),
+        if serving_peer {
+            StatusCode::OK
+        } else {
+            StatusCode::FORBIDDEN
+        }
+    );
     let body = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         response.into_body().collect(),
@@ -254,23 +295,27 @@ async fn request_not_allowed_stream_denials_cool_down_and_walk_past_max_failover
     .unwrap()
     .unwrap()
     .to_bytes();
-    let text = String::from_utf8(body.to_vec()).unwrap();
-    assert!(text.contains("served-by-account-3"), "{text}");
-    tokio::time::timeout(std::time::Duration::from_secs(10), finalizer.recv())
-        .await
-        .unwrap()
-        .expect("turn 1 finalized");
-
-    // And: even if the denied accounts' cooldowns are cleared before turn 2,
-    // session affinity stays bound to the account that actually succeeded (claude-3),
-    // never to a failed earlier candidate.
+    if serving_peer {
+        assert!(String::from_utf8_lossy(&body).contains("served-by-account-3"));
+        tokio::time::timeout(std::time::Duration::from_secs(10), finalizer.recv())
+            .await
+            .unwrap()
+            .unwrap();
+    } else {
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["code"], "permission_denied");
+    }
+    assert_eq!(
+        *seen_tokens.lock().unwrap(),
+        vec!["Bearer tok-account-0", "Bearer tok-account-1"]
+    );
+    // Then: no account is cooled down or disabled by a request-level denial.
     for member in state.pool.load().members.iter() {
-        if member.id != "account-3" {
-            member.set_health(Health::Available);
-        }
+        assert!(matches!(member.health(), Health::Available));
+        assert!(member.usage_snapshot().primary.used_percent.is_none());
     }
     seen_tokens.lock().unwrap().clear();
-    let mut finalizer2 = state.subscribe_finalizer("account-3");
+    let mut finalizer = state.subscribe_finalizer("account-1");
 
     let response2 = tokio::time::timeout(
         std::time::Duration::from_secs(10),
@@ -290,7 +335,14 @@ async fn request_not_allowed_stream_denials_cool_down_and_walk_past_max_failover
     .await
     .unwrap()
     .unwrap();
-    assert_eq!(response2.status(), StatusCode::OK);
+    assert_eq!(
+        response2.status(),
+        if serving_peer {
+            StatusCode::OK
+        } else {
+            StatusCode::FORBIDDEN
+        }
+    );
     let _ = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         response2.into_body().collect(),
@@ -298,13 +350,16 @@ async fn request_not_allowed_stream_denials_cool_down_and_walk_past_max_failover
     .await
     .unwrap()
     .unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(10), finalizer2.recv())
-        .await
-        .unwrap()
-        .expect("turn 2 finalized");
-
+    if serving_peer {
+        tokio::time::timeout(std::time::Duration::from_secs(10), finalizer.recv())
+            .await
+            .unwrap()
+            .unwrap();
+    }
     let turn2_tokens = seen_tokens.lock().unwrap().clone();
-    assert_eq!(turn2_tokens, vec!["Bearer tok-account-3".to_string()]);
+    assert_eq!(turn2_tokens.len(), if serving_peer { 1 } else { 2 });
+    let unique: std::collections::BTreeSet<_> = turn2_tokens.iter().collect();
+    assert_eq!(unique.len(), turn2_tokens.len());
 
     server.abort();
     let _ = server.await;

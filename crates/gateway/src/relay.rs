@@ -3323,6 +3323,7 @@ fn member_provider_id(member: &AccountMember) -> Option<ProviderId> {
         crate::account::ProviderKind::Zcode => ProviderId::zcode(),
         crate::account::ProviderKind::Vertex => ProviderId::vertex(),
         crate::account::ProviderKind::Devin => ProviderId::devin(),
+        crate::account::ProviderKind::OpenCode => ProviderId::opencode(),
         crate::account::ProviderKind::Generic => {
             ProviderId::canonical(member.provider_name()).ok()?
         }
@@ -3795,6 +3796,7 @@ fn capture_usage(member: &AccountMember, headers: &HeaderMap) {
     let usage = match member.kind() {
         crate::account::ProviderKind::Claude => parse_claude_headers(&map, now),
         crate::account::ProviderKind::Devin => crate::usage::AccountUsage::default(),
+        crate::account::ProviderKind::OpenCode => crate::usage::AccountUsage::default(),
         _ => parse_codex_headers(&map, now),
     };
     if usage.observed_at_unix.is_some() {
@@ -5610,6 +5612,7 @@ pub async fn handle_relay(
     // attempt onto a distinct account even when session affinity binds the
     // router to the failing one.
     let mut attempted: Vec<usize> = Vec::new();
+    let mut permission_denied_accounts: Vec<usize> = Vec::new();
     let mut retry_round = 0usize;
     let mut round_attempts = 0usize;
     let mut round_retryable = false;
@@ -5639,7 +5642,9 @@ pub async fn handle_relay(
     // repetition. Cooldown waiting never changes the network timeout policy.
     let mut failover_budget = 0usize;
     loop {
-        if retry_limit == 0 && failover_budget >= max_attempts {
+        if (retry_limit == 0 && failover_budget >= max_attempts)
+            || permission_denied_accounts.len() >= max_attempts
+        {
             break;
         }
         let now_ms = SystemTime::now()
@@ -5653,6 +5658,9 @@ pub async fn handle_relay(
         // is what pushed reset times forward and batched them.
         eligible = initial_eligible.clone();
         eligible.retain(|&idx| {
+            if permission_denied_accounts.contains(&idx) {
+                return false;
+            }
             let Some(member) = pool.members.get(idx) else {
                 return false;
             };
@@ -5709,6 +5717,7 @@ pub async fn handle_relay(
                 }
                 let wait_deadlines = initial_eligible
                     .iter()
+                    .filter(|index| !permission_denied_accounts.contains(index))
                     .filter_map(|&index| pool.members.get(index))
                     .filter(|member| {
                         retry_round_allows(member, retry_round + 1, settings.request_retry)
@@ -6276,17 +6285,24 @@ pub async fn handle_relay(
                     // log. A persistent banner would just linger on accounts
                     // that recover moments later.
 
-                    if matches!(code, "resource_exhausted" | "permission_denied") {
+                    let claude_permission_denied = code == "permission_denied"
+                        && member.kind() == crate::account::ProviderKind::Claude;
+                    if code == "resource_exhausted"
+                        || (code == "permission_denied" && !claude_permission_denied)
+                    {
                         let now_ms = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
                             .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
                             .unwrap_or(0);
-                        member.set_health(Health::Cooldown {
-                            until_unix_ms: cooldown_deadline_ms(now_ms, 300),
-                        });
+                        bench_exhausted_quota(
+                            &member,
+                            plan.model.as_deref(),
+                            cooldown_deadline_ms(now_ms, 300),
+                            crate::account::BenchKind::RateLimited,
+                        );
                     } else if code == "unauthenticated" {
                         member.set_health(Health::AuthFailed);
-                    } else {
+                    } else if !claude_permission_denied {
                         state
                             .scheduler
                             .record_non_auth_failure(member.id(), &state.pool.load().members);
@@ -6300,6 +6316,15 @@ pub async fn handle_relay(
                                 .to_string(),
                         ),
                     });
+                    if claude_permission_denied {
+                        tracing::warn!(account = member.id(), model = ?plan.model, code, "upstream stream permission denied; excluding account for this request");
+                        permission_denied_accounts.push(chosen_idx);
+                        failover_budget += 1;
+                        if home_authoritative {
+                            break;
+                        }
+                        continue;
+                    }
                     if member.kind() == crate::account::ProviderKind::Devin
                         && (reason.contains("ended without EndStream")
                             || reason.contains("truncated")
@@ -6459,6 +6484,17 @@ pub async fn handle_relay(
 
         if status_code == 403 {
             member.record_fail();
+            if member.kind() == crate::account::ProviderKind::Claude {
+                tracing::warn!(account = member.id(), model = ?plan.model, "upstream HTTP permission denied; excluding account for this request");
+                last_failure = Some(failure);
+                permission_denied_accounts.push(chosen_idx);
+                failover_budget += 1;
+                round_retryable = false;
+                if home_authoritative {
+                    break;
+                }
+                continue;
+            }
             state
                 .scheduler
                 .record_non_auth_failure(member.id(), &state.pool.load().members);
