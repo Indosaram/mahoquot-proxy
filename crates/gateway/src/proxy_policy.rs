@@ -320,6 +320,15 @@ pub fn build_devin_discovery_client(
     build_devin_http_client(proxy_url)
 }
 
+/// `auth.x.ai` is not reachable through the egress proxy. Token refresh and
+/// authorization-code exchange for this provider must use the direct client
+/// even when inference traffic is proxied. A failed refresh otherwise leaves
+/// an expired access token that the quota poll reports as a permanent
+/// credential rejection.
+pub fn token_endpoint_bypasses_egress_proxy(provider: &str) -> bool {
+    provider.eq_ignore_ascii_case("xai")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -678,5 +687,14 @@ mod tests {
         // Pre-validation: invalid proxy URL causes build failure
         let bad_settings = settings_with("ftp://invalid-host", BTreeMap::new());
         assert!(ProxySnapshot::from_settings(&bad_settings).is_err());
+    }
+
+    #[test]
+    fn xai_token_endpoint_bypasses_the_egress_proxy() {
+        assert!(token_endpoint_bypasses_egress_proxy("xai"));
+        assert!(token_endpoint_bypasses_egress_proxy("XAI"));
+        assert!(!token_endpoint_bypasses_egress_proxy("claude"));
+        assert!(!token_endpoint_bypasses_egress_proxy("codex"));
+        assert!(!token_endpoint_bypasses_egress_proxy(""));
     }
 }

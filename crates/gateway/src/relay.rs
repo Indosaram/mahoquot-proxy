@@ -1092,8 +1092,16 @@ fn resolve_target(
     session_affinity: Option<&str>,
     state: &AppState,
 ) -> Result<UpstreamTarget, String> {
+    // Generic accounts keep the host on base_url. upstream_override is only a
+    // redirect; ignoring base_url posts xAI chat at a relative path and never
+    // reaches api.x.ai.
+    let stored_base = member.generic_base_url();
+    let upstream = crate::url::account_upstream_base(
+        member.upstream_override.as_deref(),
+        stored_base.as_deref(),
+    );
     if plan.mode == RelayMode::Image {
-        let base = member.upstream_override.as_deref().unwrap_or_default();
+        let base = upstream.unwrap_or_default();
         return Ok(UpstreamTarget {
             url: crate::url::join_provider_path(base, &plan.upstream_path),
             body: body_with_model(&plan.original_body, upstream_model),
@@ -1119,9 +1127,7 @@ fn resolve_target(
         }
         let wrapped = serde_json::json!({ "request": gemini });
         return Ok(UpstreamTarget {
-            url: crate::url::build_antigravity_count_tokens_url(
-                member.upstream_override.as_deref(),
-            ),
+            url: crate::url::build_antigravity_count_tokens_url(upstream),
             body: Bytes::from(wrapped.to_string()),
             protocol: compat::Protocol::Antigravity,
             headers: None,
@@ -1158,7 +1164,7 @@ fn resolve_target(
             let framed = compat::devin::frame_data(&wire);
             let url = crate::url::build_provider_url(
                 member.kind(),
-                member.upstream_override.as_deref(),
+                upstream,
                 "/exa.api_server_pb.ApiServerService/GetChatMessage",
             );
             return Ok(UpstreamTarget {
@@ -1203,7 +1209,7 @@ fn resolve_target(
         }
         let wrapped = crate::v1beta::wrap_for_antigravity(&model, &project, &inner);
         return Ok(UpstreamTarget {
-            url: crate::url::build_antigravity_url(member.upstream_override.as_deref()),
+            url: crate::url::build_antigravity_url(upstream),
             body: Bytes::from(wrapped.to_string()),
             protocol: compat::Protocol::Antigravity,
             headers: None,
@@ -1248,7 +1254,7 @@ fn resolve_target(
             let framed = compat::devin::frame_data(&wire);
             let url = crate::url::build_provider_url(
                 member.kind(),
-                member.upstream_override.as_deref(),
+                upstream,
                 "/exa.api_server_pb.ApiServerService/GetChatMessage",
             );
             return Ok(UpstreamTarget {
@@ -1288,11 +1294,7 @@ fn resolve_target(
                 "/v1/projects/{project}/locations/{location}/publishers/google/models/{model}:{action}"
             );
             return Ok(UpstreamTarget {
-                url: crate::url::build_provider_url(
-                    member.kind(),
-                    member.upstream_override.as_deref(),
-                    &path,
-                ),
+                url: crate::url::build_provider_url(member.kind(), upstream, &path),
                 body: Bytes::from({
                     let mut gemini = compat::gemini::openai_to_gemini(&openai)?;
                     apply_vertex_thinking(plan, model, &mut gemini)?;
@@ -1318,11 +1320,7 @@ fn resolve_target(
                 let body = compat::meta::prepare_request(&body, upstream_model)
                     .map_err(|error| error.to_string())?;
                 return Ok(UpstreamTarget {
-                    url: crate::url::build_provider_url(
-                        member.kind(),
-                        member.upstream_override.as_deref(),
-                        "/responses",
-                    ),
+                    url: crate::url::build_provider_url(member.kind(), upstream, "/responses"),
                     body: Bytes::from(body),
                     protocol: compat::Protocol::Codex,
                     headers: None,
@@ -1330,14 +1328,31 @@ fn resolve_target(
                 });
             }
             if adapter == "xai" {
-                let mut body = serde_json::from_slice::<serde_json::Value>(&plan.body)
+                // Chat clients must stay on chat completions. plan.body for that
+                // mode is a Codex translation, and api.x.ai rejects it on
+                // /v1/responses. The response is relayed verbatim, so the
+                // upstream wire has to match the client wire.
+                let chat = matches!(
+                    plan.mode,
+                    RelayMode::OpenAiCompat | RelayMode::LegacyCompletions
+                );
+                let raw = if chat {
+                    body_with_model(&plan.original_body, upstream_model)
+                } else {
+                    plan.body.clone()
+                };
+                let mut body = serde_json::from_slice::<serde_json::Value>(&raw)
                     .map_err(|error| format!("invalid xAI request body: {error}"))?;
                 compat::xai::normalize_request(&mut body);
                 return Ok(UpstreamTarget {
                     url: crate::url::build_provider_url(
                         member.kind(),
-                        member.upstream_override.as_deref(),
-                        "/v1/responses",
+                        upstream,
+                        if chat {
+                            "/v1/chat/completions"
+                        } else {
+                            "/v1/responses"
+                        },
                     ),
                     body: Bytes::from(body.to_string()),
                     protocol: compat::Protocol::Codex,
@@ -1364,7 +1379,7 @@ fn resolve_target(
                 return Ok(UpstreamTarget {
                     url: crate::url::build_provider_url(
                         member.kind(),
-                        member.upstream_override.as_deref(),
+                        upstream,
                         &format!("/v1/{}", format.path()),
                     ),
                     body: Bytes::from(body.to_string()),
@@ -1390,11 +1405,7 @@ fn resolve_target(
                 };
                 let path = format!("/v1beta/models/{model}:{action}");
                 return Ok(UpstreamTarget {
-                    url: crate::url::build_provider_url(
-                        member.kind(),
-                        member.upstream_override.as_deref(),
-                        &path,
-                    ),
+                    url: crate::url::build_provider_url(member.kind(), upstream, &path),
                     body: Bytes::from(compat::gemini::openai_to_gemini(&openai_body)?.to_string()),
                     protocol: compat::Protocol::Antigravity,
                     headers: None,
@@ -1403,11 +1414,7 @@ fn resolve_target(
             }
             if adapter == "anthropic" {
                 return Ok(UpstreamTarget {
-                    url: crate::url::build_provider_url(
-                        member.kind(),
-                        member.upstream_override.as_deref(),
-                        "/v1/messages",
-                    ),
+                    url: crate::url::build_provider_url(member.kind(), upstream, "/v1/messages"),
                     body: Bytes::from(
                         serde_json::to_vec(&compat::claude::openai_to_anthropic(&openai_body)?)
                             .map_err(|error| error.to_string())?,
@@ -1418,7 +1425,7 @@ fn resolve_target(
                 });
             }
             if adapter == "mimo-free" {
-                let endpoint = member.upstream_override.clone().unwrap_or_default();
+                let endpoint = upstream.unwrap_or("").to_string();
                 if !mahoquot_providers::is_mimo_endpoint(&endpoint) {
                     return Err(
                         "the mimo-free adapter only serves the canonical MiMo Free endpoint; use openai-chat for a custom one"
@@ -1436,11 +1443,7 @@ fn resolve_target(
                 });
             }
             if adapter == "openai-responses" || adapter == "azure-openai" {
-                let url = crate::url::build_provider_url(
-                    member.kind(),
-                    member.upstream_override.as_deref(),
-                    "/v1/responses",
-                );
+                let url = crate::url::build_provider_url(member.kind(), upstream, "/v1/responses");
                 // The catalog ships Azure's host as a {resource} template, so a
                 // request against an unedited base URL must fail loudly here
                 // rather than reach a nonexistent host.
@@ -1460,7 +1463,7 @@ fn resolve_target(
             return Ok(UpstreamTarget {
                 url: crate::url::build_provider_url(
                     member.kind(),
-                    member.upstream_override.as_deref(),
+                    upstream,
                     "/v1/chat/completions",
                 ),
                 body: body_with_model(&plan.original_body, upstream_model),
@@ -1475,7 +1478,7 @@ fn resolve_target(
             return Ok(UpstreamTarget {
                 url: crate::url::build_provider_url(
                     member.kind(),
-                    member.upstream_override.as_deref(),
+                    upstream,
                     "/agent.v1.AgentService/Run",
                 ),
                 body: Bytes::from(compat::cursor::openai_to_cursor_connect(&openai)?),
@@ -1489,7 +1492,7 @@ fn resolve_target(
                 .ok_or_else(|| "Kiro requires an OpenAI-shaped request".to_string())?;
             return Ok(UpstreamTarget {
                 url: mahoquot_providers::kiro_generate_url(
-                    member.upstream_override.as_deref(),
+                    upstream,
                     member
                         .kiro_region()
                         .as_deref()
@@ -1573,11 +1576,7 @@ fn resolve_target(
 
             let body = Bytes::from(serde_json::to_vec(&anthropic_val).map_err(|e| e.to_string())?);
             return Ok(UpstreamTarget {
-                url: crate::url::build_provider_url(
-                    member.kind(),
-                    member.upstream_override.as_deref(),
-                    "/v1/messages",
-                ),
+                url: crate::url::build_provider_url(member.kind(), upstream, "/v1/messages"),
                 body,
                 protocol: compat::Protocol::Anthropic,
                 headers: None,
@@ -1585,11 +1584,7 @@ fn resolve_target(
             });
         }
         return Ok(UpstreamTarget {
-            url: crate::url::build_provider_url(
-                member.kind(),
-                member.upstream_override.as_deref(),
-                &plan.upstream_path,
-            ),
+            url: crate::url::build_provider_url(member.kind(), upstream, &plan.upstream_path),
             body: body_with_model(&plan.body, upstream_model),
             protocol: compat::Protocol::Codex,
             headers: None,
@@ -1618,7 +1613,7 @@ fn resolve_target(
     };
 
     Ok(UpstreamTarget {
-        url: crate::url::build_antigravity_url(member.upstream_override.as_deref()),
+        url: crate::url::build_antigravity_url(upstream),
         body: Bytes::from(translated.to_string()),
         protocol: compat::Protocol::Antigravity,
         headers: None,
@@ -1761,6 +1756,9 @@ async fn send_upstream(
         }
     });
     strip_ingress_headers(&mut member_headers, headers);
+    let member_sets_content_type = member_headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("content-type"));
     for (name, val) in member_headers {
         req_builder = req_builder.header(name, val);
     }
@@ -1773,11 +1771,16 @@ async fn send_upstream(
         if let Some(accept) = accept {
             req_builder = req_builder.header(header::ACCEPT, accept);
         }
-        if let Some(ct) = headers
-            .get(header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-        {
-            req_builder = req_builder.header(header::CONTENT_TYPE.as_str(), ct);
+        // reqwest appends. x.ai's edge answers 415 when content-type is
+        // repeated, so a member header that already carries it must win alone.
+        if let Some(ct) = content_type_to_append(
+            member_sets_content_type,
+            headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            protocol,
+        ) {
+            req_builder = req_builder.header(header::CONTENT_TYPE, ct);
         }
     }
     let req_start = std::time::Instant::now();
@@ -4708,6 +4711,55 @@ const INGRESS_ROUTING_HEADERS: [&str; 12] = [
     "x-conversation-id",
     "anthropic-client-session",
 ];
+
+/// One content-type to add, or none when the member headers already have one.
+///
+/// `RequestBuilder::header` appends. x.ai's edge returns 415 `Expected request
+/// with Content-Type: application/json` when the same header is sent twice,
+/// even if both values are `application/json`.
+fn content_type_to_append<'a>(
+    member_sets_content_type: bool,
+    client_content_type: Option<&'a str>,
+    protocol: compat::Protocol,
+) -> Option<&'a str> {
+    if member_sets_content_type
+        || protocol == compat::Protocol::Cursor
+        || protocol == compat::Protocol::Devin
+    {
+        return None;
+    }
+    Some(
+        client_content_type
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("application/json"),
+    )
+}
+
+#[cfg(test)]
+mod content_type_append_tests {
+    use super::content_type_to_append;
+    use crate::compat::Protocol;
+
+    #[test]
+    fn member_content_type_is_not_duplicated() {
+        assert_eq!(
+            content_type_to_append(true, Some("application/json"), Protocol::Codex),
+            None
+        );
+    }
+
+    #[test]
+    fn missing_content_type_defaults_to_json() {
+        assert_eq!(
+            content_type_to_append(false, None, Protocol::Codex),
+            Some("application/json")
+        );
+        assert_eq!(
+            content_type_to_append(false, Some("text/plain"), Protocol::Codex),
+            Some("text/plain")
+        );
+    }
+}
 
 fn strip_ingress_headers(out: &mut Vec<(String, String)>, ingress: &HeaderMap) {
     out.retain(|(name, value)| {

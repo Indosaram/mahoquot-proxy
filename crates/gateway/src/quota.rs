@@ -384,11 +384,8 @@ async fn refresh_generic_usage(
     // Grok Chat, Build and the CLI; the Grok CLI's own usage view reads it from
     // the CLI chat proxy with the same OAuth bearer the relay uses.
     if provider.eq_ignore_ascii_case("xai") {
-        // The billing endpoint never refreshes on its own; an access token past
-        // its expiry would read as a permanent credential rejection.
-        if state.auth_refresh_enabled && member.is_expired(now_unix()) {
-            let _ = state.refresh_member(member, None).await;
-        }
+        // Billing never refreshes the OAuth grant. Swallowing a failed refresh
+        // made an expired access token look like a permanent rejection.
         let url = member
             .usage_override
             .as_deref()
@@ -397,10 +394,24 @@ async fn refresh_generic_usage(
         let client = state.try_client_for_member(member).map_err(|error| {
             QuotaError::Upstream(format!("proxy client construction failed: {error}"))
         })?;
-        return refresh_json_usage(member, &client, &url, |body, now| {
+        if state.auth_refresh_enabled && member.is_expired(now_unix()) {
+            state.refresh_member(member, None).await.map_err(|error| {
+                QuotaError::Upstream(format!("refresh failed: {error}"))
+            })?;
+        }
+        let used = member.access_token();
+        let parse = |body: &serde_json::Value, now: i64| {
             parse_xai_billing_credits(body, now).unwrap_or_default()
-        })
-        .await;
+        };
+        let first = refresh_json_usage(member, &client, &url, parse).await;
+        if state.auth_refresh_enabled && first.as_ref().is_err_and(credential_rejection) {
+            state
+                .refresh_member(member, Some(&used))
+                .await
+                .map_err(|error| QuotaError::Upstream(format!("refresh failed: {error}")))?;
+            return refresh_json_usage(member, &client, &url, parse).await;
+        }
+        return first;
     }
 
     let is_clinepass = provider.eq_ignore_ascii_case("cline-pass")
@@ -589,6 +600,14 @@ fn rejected_usage_error(status: reqwest::StatusCode, body: &str) -> QuotaError {
         QuotaError::Unauthorized
     } else {
         QuotaError::Upstream(format!("credentials rejected ({status}): {reason}"))
+    }
+}
+
+fn credential_rejection(error: &QuotaError) -> bool {
+    match error {
+        QuotaError::Unauthorized => true,
+        QuotaError::Upstream(message) => message.starts_with("credentials rejected"),
+        _ => false,
     }
 }
 
@@ -1707,5 +1726,17 @@ mod tests {
         );
         assert_eq!(poll_backoff_until(&state, "gone"), None);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn xai_credential_rejection_is_retried_as_a_refresh_not_a_permanent_block() {
+        assert!(credential_rejection(&QuotaError::Unauthorized));
+        assert!(credential_rejection(&QuotaError::Upstream(
+            "credentials rejected (401): Invalid or expired credentials".into()
+        )));
+        assert!(!credential_rejection(&QuotaError::Upstream(
+            "quota endpoint returned 500".into()
+        )));
+        assert!(!credential_rejection(&QuotaError::RateLimited));
     }
 }

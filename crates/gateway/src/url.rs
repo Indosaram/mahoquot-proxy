@@ -52,6 +52,22 @@ pub fn build_provider_url(
     join_provider_path(upstream_override.unwrap_or(&base), req_path)
 }
 
+/// Host for an account whose credential stores the endpoint on `base_url`.
+///
+/// `upstream_override` is a per-account redirect. Generic providers, including
+/// xAI, keep the real host on `base_url`. Using the override alone builds a
+/// relative `/v1/chat/completions` and the request never reaches the provider.
+pub fn account_upstream_base<'a>(
+    upstream_override: Option<&'a str>,
+    base_url: Option<&'a str>,
+) -> Option<&'a str> {
+    [upstream_override, base_url]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|url| !url.is_empty())
+}
+
 pub fn join_provider_path(base: &str, req_path: &str) -> String {
     let base = base.trim_end_matches('/');
     if base.ends_with("/chat/completions")
@@ -94,6 +110,27 @@ pub fn build_target_url(upstream_override: Option<&str>, req_path: &str) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generic_account_uses_base_url_when_the_override_is_absent() {
+        assert_eq!(
+            account_upstream_base(None, Some("https://api.x.ai/v1")),
+            Some("https://api.x.ai/v1")
+        );
+        assert_eq!(
+            account_upstream_base(Some("  "), Some("https://api.x.ai/v1")),
+            Some("https://api.x.ai/v1")
+        );
+        assert_eq!(
+            account_upstream_base(
+                Some("https://override.example/v1"),
+                Some("https://api.x.ai/v1")
+            ),
+            Some("https://override.example/v1")
+        );
+        assert_eq!(account_upstream_base(None, Some("")), None);
+        assert_eq!(account_upstream_base(None, None), None);
+    }
 
     #[test]
     fn generic_provider_paths_dedupe_v1_and_preserve_full_endpoints() {

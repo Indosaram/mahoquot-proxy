@@ -528,8 +528,10 @@ async fn exchange_xai_code(
     session: &mut OAuthSession,
     code: &str,
 ) -> Result<(), String> {
-    let response = state
-        .http_client()
+    // auth.x.ai is unreachable through the egress proxy. A proxied exchange
+    // fails closed and the desktop reports a successful callback anyway.
+    let client = state.direct_client();
+    let response = client
         .post(&session.token_url)
         .form(&[
             ("grant_type", "authorization_code"),
@@ -554,9 +556,7 @@ async fn exchange_xai_code(
         .get("email")
         .and_then(Value::as_str)
         .unwrap_or("xai-account");
-    let models =
-        fetch_credential_models(&state.http_client(), &session.poll_url, access_token, "xai")
-            .await?;
+    let models = fetch_credential_models(&client, &session.poll_url, access_token, "xai").await?;
     let credential = json!({
         "type":"generic", "provider":"xai", "label":email, "adapter":"openai-chat",
         "base_url":session.poll_url, "api_key":access_token, "auth_mode":"oauth",

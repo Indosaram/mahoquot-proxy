@@ -1442,11 +1442,17 @@ impl AppState {
         member: &AccountMember,
         presented_token: Option<&str>,
     ) -> Result<bool, mahoquot_providers::refresh_exec::RefreshError> {
-        let client = self.try_client_for_member(member).map_err(|error| {
-            mahoquot_providers::refresh_exec::RefreshError::Parse(format!(
-                "proxy client construction failed: {error}"
-            ))
-        })?;
+        let client = if crate::proxy_policy::token_endpoint_bypasses_egress_proxy(
+            &member.provider_name(),
+        ) {
+            self.direct_client()
+        } else {
+            self.try_client_for_member(member).map_err(|error| {
+                mahoquot_providers::refresh_exec::RefreshError::Parse(format!(
+                    "proxy client construction failed: {error}"
+                ))
+            })?
+        };
         let did_refresh = member
             .refresh_with_store(
                 &client,
