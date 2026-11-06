@@ -2565,6 +2565,68 @@ fn stream_response(resp: reqwest::Response, status_code: u16) -> Response {
         })
 }
 
+/// Passes an upstream body through untouched while observing which model the
+/// upstream says it served.
+///
+/// `/v1/responses` and `/backend-api/codex/responses` relay the upstream stream
+/// byte-for-byte, so the client already sees the upstream's own
+/// `response.model`. What the gateway previously lost was the record: every
+/// history row and log line attributes the turn to `usage_events.model`, which
+/// is the *requested* id. An upstream that answers one model with another (the
+/// Codex safety-buffering path) therefore left no trace at all.
+///
+/// The scan is bounded to the head of the stream and never delays a chunk: once
+/// the model is seen, or the budget is spent, the tap stops inspecting and only
+/// forwards.
+fn observe_served_model(
+    body: Body,
+    requested: String,
+    account: String,
+    provider: String,
+    substitutions: Arc<std::sync::atomic::AtomicU64>,
+) -> Body {
+    use futures::StreamExt;
+
+    const OBSERVE_BUDGET: usize = 16 * 1024;
+    let mut seen = 0usize;
+    let mut decided = false;
+    let mut head: Vec<u8> = Vec::new();
+    let tapped = body.into_data_stream().map(move |chunk| {
+        if !decided {
+            if let Ok(bytes) = &chunk {
+                if seen < OBSERVE_BUDGET {
+                    let take = bytes.len().min(OBSERVE_BUDGET - seen);
+                    head.extend_from_slice(&bytes[..take]);
+                    seen += take;
+                }
+                // A model mismatch is only decidable once a frame carrying
+                // `response.model` arrives. Clear the buffer at the budget so a
+                // stream that never names one cannot grow it unboundedly.
+                let served = compat::served_codex_model(&head);
+                if let Some(served) = served {
+                    decided = true;
+                    head.clear();
+                    if served != requested {
+                        substitutions.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(
+                            requested_model = %requested,
+                            served_model = %served,
+                            %account,
+                            %provider,
+                            "upstream served a different model than requested"
+                        );
+                    }
+                } else if seen >= OBSERVE_BUDGET {
+                    decided = true;
+                    head.clear();
+                }
+            }
+        }
+        chunk
+    });
+    Body::from_stream(tapped)
+}
+
 fn body_response(status: StatusCode, content_type: Option<&str>, body: Bytes) -> Response {
     let mut builder = Response::builder().status(status);
     if let Some(ct) = content_type {
@@ -4295,6 +4357,7 @@ async fn finish_success(
     status_code: u16,
     created: i64,
     session: compat::ProtocolSession,
+    upstream_model: &str,
 ) -> Result<Response, String> {
     let protocol = session.protocol;
     let content_type = content_type_of(&resp);
@@ -4332,7 +4395,26 @@ async fn finish_success(
         {
             return Err("upstream returned html instead of an api response".to_string());
         }
-        return Ok(stream_response(resp, status_code));
+        // The stream is relayed byte-for-byte; watch it for an upstream model
+        // substitution so the log records what actually ran.
+        let passthrough = stream_response(resp, status_code);
+        let (parts, body) = passthrough.into_parts();
+        let expected = if upstream_model.is_empty() {
+            plan.model.clone().unwrap_or_default()
+        } else {
+            upstream_model.to_string()
+        };
+        let body = match Some(expected).filter(|model| !model.is_empty()) {
+            Some(requested) => observe_served_model(
+                body,
+                requested,
+                member.id().to_string(),
+                member.provider_name(),
+                Arc::clone(&state.metrics.served_model_substitutions),
+            ),
+            None => body,
+        };
+        return Ok(Response::from_parts(parts, body));
     }
 
     if matches!(
@@ -4348,7 +4430,26 @@ async fn finish_success(
         {
             return Err("upstream returned html instead of an api response".to_string());
         }
-        return Ok(stream_response(resp, status_code));
+        // The stream is relayed byte-for-byte; watch it for an upstream model
+        // substitution so the log records what actually ran.
+        let passthrough = stream_response(resp, status_code);
+        let (parts, body) = passthrough.into_parts();
+        let expected = if upstream_model.is_empty() {
+            plan.model.clone().unwrap_or_default()
+        } else {
+            upstream_model.to_string()
+        };
+        let body = match Some(expected).filter(|model| !model.is_empty()) {
+            Some(requested) => observe_served_model(
+                body,
+                requested,
+                member.id().to_string(),
+                member.provider_name(),
+                Arc::clone(&state.metrics.served_model_substitutions),
+            ),
+            None => body,
+        };
+        return Ok(Response::from_parts(parts, body));
     }
 
     if content_type
@@ -4443,6 +4544,12 @@ async fn finish_success(
             ANTHROPIC_EMPTY_HOLD
         };
         compat::open_anthropic_stream(resp, hold).await?
+    } else if protocol == compat::Protocol::Codex && plan.client_stream {
+        // Codex-family upstreams can answer 200 with a well-formed stream that
+        // carries a role prelude, reasoning, and a terminal event but no text
+        // and no tool call. Holding the preamble lets that turn fail over
+        // instead of reaching the client as an empty response it must retry.
+        compat::open_codex_stream(resp, get_preflight_deadline(headers)).await?
     } else {
         compat::open_stream(resp, protocol).await?
     };
@@ -6148,6 +6255,7 @@ pub async fn handle_relay(
                     cursor_reply,
                     replay: target.replay,
                 },
+                upstream_model,
             )
             .await
             {
@@ -7040,6 +7148,7 @@ mod routing_tests {
                     cursor_reply: None,
                     replay: None,
                 },
+                "test",
             )
             .await;
             assert!(result.is_err());
@@ -8188,6 +8297,57 @@ mod codex_fast_mode_tests {
             let mut target = plan(compat::CODEX_PATH, original);
             apply_codex_fast_mode(&mut target);
             assert_eq!(target.body, Bytes::from(original.to_string()));
+        }
+    }
+}
+
+#[cfg(test)]
+mod served_model_tap_tests {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+
+    fn frame(model: &str) -> String {
+        format!(
+            "event: response.created\ndata: {{\"type\":\"response.created\",\"response\":{{\"id\":\"r\",\"model\":\"{model}\"}}}}\n\n"
+        )
+    }
+
+    /// Drives the real tap: the body must arrive byte-identical, and the counter
+    /// must move exactly when the upstream names a model other than the one the
+    /// gateway sent. This is the assertion the deployed counter rests on — the
+    /// unit tests on `served_codex_model` alone would pass even if the tap were
+    /// never wired in.
+    #[test]
+    fn tap_forwards_unchanged_and_counts_only_a_real_mismatch() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let original = Bytes::from(format!("{}{}", frame("gpt-6-luna"), frame("gpt-6-luna")));
+
+        for (upstream_model, expected_count) in
+            [("gpt-6-astra", 1u64), ("gpt-6-luna", 0u64)]
+        {
+            let counter = Arc::new(AtomicU64::new(0));
+            let body = Body::from(original.clone());
+            let tapped = observe_served_model(
+                body,
+                upstream_model.to_string(),
+                "acct".to_string(),
+                "codex".to_string(),
+                Arc::clone(&counter),
+            );
+            let forwarded = rt
+                .block_on(http_body_util::BodyExt::collect(tapped))
+                .expect("body collects")
+                .to_bytes();
+            assert_eq!(forwarded, original, "relay must not alter upstream bytes");
+            assert_eq!(
+                counter.load(Ordering::Relaxed),
+                expected_count,
+                "requested {upstream_model} against upstream luna"
+            );
         }
     }
 }

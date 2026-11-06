@@ -1,6 +1,7 @@
 use mahoquot_types::Health;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use crate::monitor::{LastError, TtftSnapshot};
 use crate::telemetry::TelemetryBucket;
@@ -23,6 +24,14 @@ pub struct RegistryRefreshMetrics {
 pub struct GatewayMetrics {
     pub served: AtomicU64,
     pub failed_over: AtomicU64,
+    /// Turns where the upstream's own envelope named a model other than the one
+    /// the gateway sent. The Codex backend does this deliberately through its
+    /// safety-buffering path; the count makes that visible without changing
+    /// routing.
+    ///
+    /// Held behind `Arc` because a relayed body outlives the request handler and
+    /// must be able to increment it from inside the response stream.
+    pub served_model_substitutions: Arc<AtomicU64>,
     pub exposed_errors: AtomicU64,
     pub exposed_client_errors: AtomicU64,
     pub history_dropped: AtomicU64,
@@ -144,6 +153,10 @@ pub struct AdminStatsResponse {
     pub in_flight: u64,
     pub served: u64,
     pub failed_over: u64,
+    /// Turns whose upstream envelope named a different model than the gateway
+    /// requested. See `GatewayMetrics::served_model_substitutions`.
+    #[serde(default)]
+    pub served_model_substitutions: u64,
     pub refreshed: u64,
     pub exposed_errors: u64,
     pub exposed_client_errors: u64,

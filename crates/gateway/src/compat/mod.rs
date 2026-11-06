@@ -317,6 +317,238 @@ async fn hold_anthropic_preamble(
     }
 }
 
+
+/// Upper bound on the Codex/OpenAI-compatible preamble buffered while looking
+/// for the first content-bearing event. A healthy turn emits its first text or
+/// tool call well below it; past the cap the stream is released unchanged so a
+/// reasoning-heavy turn never stalls behind a fixed buffer.
+const CODEX_PREAMBLE_CAP: usize = 32 * 1024;
+
+/// What the leading complete SSE frames of an OpenAI-shaped stream say.
+enum CodexPreamble {
+    /// Nothing content-bearing yet; more bytes are needed.
+    Pending,
+    /// Text, reasoning-free content, or a tool call arrived; the stream is served.
+    Served,
+    /// The upstream closed (or reported completion) without ever emitting
+    /// content. Callers fail over instead of handing the client an empty turn.
+    Empty,
+}
+
+fn codex_frame_has_content(value: &Value) -> Option<bool> {
+    if value.as_str() == Some("[DONE]") {
+        return Some(false);
+    }
+    if let Some(choices) = value.get("choices").and_then(Value::as_array) {
+        for choice in choices {
+            // Legacy completions put the text directly on the choice.
+            if choice
+                .get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.trim().is_empty())
+            {
+                return Some(true);
+            }
+            for holder in ["delta", "message"] {
+                let Some(part) = choice.get(holder) else {
+                    continue;
+                };
+                if part
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| !text.trim().is_empty())
+                {
+                    return Some(true);
+                }
+                // A refusal is an answer the user must see; never discard it.
+                if part
+                    .get("refusal")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| !text.trim().is_empty())
+                {
+                    return Some(true);
+                }
+                if part
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .is_some_and(|calls| !calls.is_empty())
+                {
+                    return Some(true);
+                }
+            }
+            if choice.get("finish_reason").is_some_and(|r| !r.is_null()) {
+                return Some(false);
+            }
+        }
+        return Some(false);
+    }
+    match value.get("type").and_then(Value::as_str) {
+        Some("response.output_text.delta") => Some(
+            value
+                .get("delta")
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.is_empty()),
+        ),
+        Some("response.output_item.added") => Some(
+            value
+                .pointer("/item/type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind == "function_call"),
+        ),
+        Some("response.function_call_arguments.delta") => Some(
+            value
+                .get("delta")
+                .and_then(Value::as_str)
+                .is_some_and(|delta| !delta.is_empty()),
+        ),
+        // Reasoning is deliberately not content: a stream that spends its whole
+        // turn thinking and then stops is the case this gate exists to catch.
+        Some("response.reasoning_summary_text.delta") | Some("response.reasoning_text.delta") => {
+            Some(false)
+        }
+        Some("response.created") | Some("response.in_progress") => Some(false),
+        // A completed turn normally carried its text as deltas. Trust the final
+        // document only as a rescue for an upstream that suppressed them.
+        Some("response.completed") => Some(
+            value
+                .pointer("/response/output")
+                .and_then(Value::as_array)
+                .is_some_and(|items| {
+                    items.iter().any(|item| {
+                        item.get("type").and_then(Value::as_str) == Some("function_call")
+                            || item
+                                .get("content")
+                                .and_then(Value::as_array)
+                                .is_some_and(|parts| {
+                                    parts.iter().any(|part| {
+                                        part.get("text")
+                                            .and_then(Value::as_str)
+                                            .is_some_and(|text| !text.trim().is_empty())
+                                    })
+                                })
+                    })
+                }),
+        ),
+        Some("response.incomplete") | Some("response.cancelled") => Some(false),
+        // An explicit error frame is the stream's answer: let it through so the
+        // existing classifier maps rate limits and auth failures as before
+        // instead of being flattened into an "empty response".
+        Some("error") | Some("response.failed") => Some(true),
+        _ => None,
+    }
+}
+
+fn classify_codex_preamble(buf: &[u8]) -> CodexPreamble {
+    let text = String::from_utf8_lossy(buf).replace("\r\n", "\n");
+    let mut frames: Vec<&str> = text.split("\n\n").collect();
+    // The trailing piece is an incomplete frame; judge it once its delimiter lands.
+    frames.pop();
+    let mut terminal = false;
+    for frame in frames {
+        let data: String = frame
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(str::trim_start)
+            .collect();
+        if data.trim().is_empty() {
+            continue;
+        }
+        let trimmed = data.trim();
+        if trimmed == "[DONE]" {
+            terminal = true;
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+            // Unparseable payloads are not evidence of content, but they are not
+            // evidence of an empty turn either: let the stream through.
+            return CodexPreamble::Served;
+        };
+        if codex_frame_has_content(&value) == Some(true) {
+            return CodexPreamble::Served;
+        }
+        if value
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| {
+                matches!(
+                    kind,
+                    "response.completed" | "response.incomplete" | "response.cancelled"
+                )
+            })
+        {
+            terminal = true;
+            continue;
+        }
+        if value
+            .get("choices")
+            .and_then(Value::as_array)
+            .is_some_and(|choices| {
+                choices
+                    .iter()
+                    .any(|c| c.get("finish_reason").is_some_and(|r| !r.is_null()))
+            })
+        {
+            terminal = true;
+        }
+    }
+    if terminal {
+        CodexPreamble::Empty
+    } else {
+        CodexPreamble::Pending
+    }
+}
+
+/// Opens an OpenAI-shaped stream, holding back its preamble until the first
+/// content-bearing event. Upstreams in this pool answer with HTTP 200 and a
+/// short, well-formed stream that carries a role prelude, reasoning deltas, and
+/// a terminal event but no text and no tool call. Relaying that verbatim makes
+/// the client consume an empty turn; surfacing `Err` before any byte is
+/// committed lets the relay fail over to another account instead. On deadline,
+/// cap, or a closed-but-content-bearing stream the buffered bytes are released
+/// unchanged.
+pub async fn open_codex_stream(
+    resp: reqwest::Response,
+    deadline: std::time::Duration,
+) -> Result<(Bytes, UpstreamStream), String> {
+    let (first, stream) = open_stream(resp, Protocol::Codex).await?;
+    hold_codex_preamble(first, stream, deadline).await
+}
+
+async fn hold_codex_preamble(
+    first: Bytes,
+    mut stream: UpstreamStream,
+    deadline: std::time::Duration,
+) -> Result<(Bytes, UpstreamStream), String> {
+    let until = tokio::time::Instant::now() + deadline;
+    let mut buf = bytes::BytesMut::from(&first[..]);
+    loop {
+        match classify_codex_preamble(&buf) {
+            CodexPreamble::Served => return Ok((buf.freeze(), stream)),
+            CodexPreamble::Empty => {
+                return Err(
+                    "empty_response: upstream stream ended without text or tool calls".to_string(),
+                )
+            }
+            CodexPreamble::Pending if buf.len() >= CODEX_PREAMBLE_CAP => {
+                return Ok((buf.freeze(), stream))
+            }
+            CodexPreamble::Pending => {}
+        }
+        match tokio::time::timeout_at(until, stream.next()).await {
+            Ok(Some(Ok(chunk))) => buf.extend_from_slice(&chunk),
+            Ok(Some(Err(err))) => return Err(err.to_string()),
+            // End of stream with nothing content-bearing: this turn is empty by
+            // construction, so fail over rather than commit it to the client.
+            Ok(None) => {
+                return Err(
+                    "empty_response: upstream stream ended without text or tool calls".to_string(),
+                )
+            }
+            Err(_) => return Ok((buf.freeze(), stream)),
+        }
+    }
+}
+
 pub async fn collect_stream(first: Bytes, mut stream: UpstreamStream) -> Result<Vec<u8>, String> {
     let mut raw = Vec::new();
     extend_nonstream_bounded(&mut raw, &first)?;
@@ -342,6 +574,45 @@ pub(crate) fn extend_nonstream_bounded(raw: &mut Vec<u8>, chunk: &[u8]) -> Resul
     }
     raw.extend_from_slice(chunk);
     Ok(())
+}
+
+/// The model id an upstream envelope declares as the one it actually served.
+///
+/// Codex answers `response.created`/`response.completed` with its own
+/// `response.model`, and that value is authoritative: the backend may answer a
+/// request for one id with a different one (its safety-buffering path answers
+/// `gpt-6-astra` with the faster `gpt-6-luna` surface and announces that plan in
+/// `x-codex-safety-buffering-faster-model`). Nothing in this gateway rewrites
+/// that field, so it is the only place a caller can learn that the id it asked
+/// for was not the id that ran.
+pub fn served_codex_model(buf: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(buf).ok()?;
+    for block in text.split("\n\n") {
+        for line in block.lines() {
+            let Some(data) = line.strip_prefix("data:") else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<Value>(data.trim()) else {
+                continue;
+            };
+            if !matches!(
+                value.get("type").and_then(Value::as_str),
+                Some("response.created" | "response.completed" | "response.in_progress")
+            ) {
+                continue;
+            }
+            if let Some(model) = value
+                .get("response")
+                .and_then(|response| response.get("model"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+            {
+                return Some(model.to_string());
+            }
+        }
+    }
+    None
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -947,6 +1218,46 @@ pub fn error_stream_body(message: &str) -> Body {
         buf.extend_from_slice(DONE_FRAME);
     }
     Body::from(buf)
+}
+
+#[cfg(test)]
+mod served_model_tests {
+    use super::served_codex_model;
+
+    fn frame(kind: &str, model: &str) -> String {
+        format!(
+            "event: {kind}\ndata: {{\"type\":\"{kind}\",\"response\":{{\"id\":\"resp_1\",\"model\":\"{model}\"}}}}\n\n"
+        )
+    }
+
+    #[test]
+    fn reads_the_model_the_upstream_declares_it_served() {
+        let stream = format!(
+            "{}{}",
+            frame("response.created", "gpt-6-luna"),
+            frame("response.completed", "gpt-6-luna")
+        );
+        assert_eq!(served_codex_model(stream.as_bytes()).as_deref(), Some("gpt-6-luna"));
+    }
+
+    /// The whole point of the tap: a request for one model answered by another
+    /// must be readable from the upstream's own envelope.
+    #[test]
+    fn reports_a_model_that_differs_from_the_requested_one() {
+        let stream = frame("response.created", "gpt-6-luna");
+        assert_ne!(
+            served_codex_model(stream.as_bytes()).as_deref(),
+            Some("gpt-6-astra")
+        );
+    }
+
+    #[test]
+    fn ignores_frames_that_do_not_carry_a_model() {
+        let stream = "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"OK\"}\n\n";
+        assert_eq!(served_codex_model(stream.as_bytes()), None);
+        assert_eq!(served_codex_model(b""), None);
+        assert_eq!(served_codex_model(b"not an event stream"), None);
+    }
 }
 
 #[cfg(test)]
