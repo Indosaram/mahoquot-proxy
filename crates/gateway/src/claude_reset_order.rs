@@ -20,10 +20,10 @@ pub fn is_claude_subscription(member: &AccountMember) -> bool {
     member.kind() == ProviderKind::Claude && member.relay_api_key().is_none()
 }
 
-fn active_five_hour_reset(member: &AccountMember, now_unix: i64) -> Option<i64> {
+fn active_weekly_reset(member: &AccountMember, now_unix: i64) -> Option<i64> {
     member
         .usage_snapshot()
-        .primary
+        .secondary
         .reset_at_unix
         .filter(|reset| *reset > now_unix)
 }
@@ -38,10 +38,10 @@ fn is_nearly_spent(member: &AccountMember, now_unix: i64) -> bool {
     })
 }
 
-/// Ranks Claude subscription accounts so the one whose active 5-hour window
-/// resets soonest comes first; accounts without an active window follow in pool
-/// order.
-pub fn rank_by_five_hour_reset(
+/// Ranks Claude subscription accounts so the one whose active weekly window
+/// resets soonest comes first; accounts without an active weekly window follow
+/// in pool order.
+pub fn rank_by_weekly_reset(
     members: &[Arc<AccountMember>],
     now_unix: i64,
 ) -> HashMap<String, usize> {
@@ -50,7 +50,7 @@ pub fn rank_by_five_hour_reset(
         .enumerate()
         .filter(|(_, member)| is_claude_subscription(member))
         .map(|(index, member)| {
-            let reset = active_five_hour_reset(member, now_unix).unwrap_or(i64::MAX);
+            let reset = active_weekly_reset(member, now_unix).unwrap_or(i64::MAX);
             (reset, index, member.id.as_str())
         })
         .collect();
@@ -79,12 +79,12 @@ impl ClaudeResetOrder {
                 return Arc::clone(ranks);
             }
         }
-        let ranks = Arc::new(rank_by_five_hour_reset(members, now_unix));
+        let ranks = Arc::new(rank_by_weekly_reset(members, now_unix));
         let next_check = now_unix.saturating_add(REFRESH_INTERVAL_SECS);
         let valid_until = members
             .iter()
             .filter(|member| is_claude_subscription(member))
-            .filter_map(|member| active_five_hour_reset(member, now_unix))
+            .filter_map(|member| active_weekly_reset(member, now_unix))
             .min()
             .map_or(next_check, |reset| reset.min(next_check));
         *cached = Some((valid_until, Arc::clone(&ranks)));
@@ -182,6 +182,28 @@ mod tests {
         });
     }
 
+    fn set_windows(
+        member: &AccountMember,
+        primary: (f64, Option<i64>),
+        weekly: (f64, Option<i64>),
+    ) {
+        member.set_usage(AccountUsage {
+            primary: QuotaWindow {
+                used_percent: Some(primary.0),
+                window_minutes: Some(300),
+                reset_at_unix: primary.1,
+                ..QuotaWindow::default()
+            },
+            secondary: QuotaWindow {
+                used_percent: Some(weekly.0),
+                window_minutes: Some(10_080),
+                reset_at_unix: weekly.1,
+                ..QuotaWindow::default()
+            },
+            ..AccountUsage::default()
+        });
+    }
+
     fn member<'a>(members: &'a [Arc<AccountMember>], slug: &str) -> &'a Arc<AccountMember> {
         members
             .iter()
@@ -190,7 +212,7 @@ mod tests {
     }
 
     fn reordered(members: &[Arc<AccountMember>], now: i64) -> Vec<String> {
-        let ranks = rank_by_five_hour_reset(members, now);
+        let ranks = rank_by_weekly_reset(members, now);
         let mut ordered: Vec<usize> = (0..members.len()).collect();
         reorder_claude_slots(&mut ordered, members, &ranks, now);
         ordered
@@ -200,7 +222,7 @@ mod tests {
     }
 
     #[test]
-    fn soonest_active_reset_leads_and_other_providers_keep_their_slots() {
+    fn soonest_weekly_reset_leads_and_other_providers_keep_their_slots() {
         let (state, auth_dir) = state(&[
             ("claude-late.json", "claude", "late"),
             ("codex-mid.json", "codex", "mid"),
@@ -209,9 +231,21 @@ mod tests {
         ]);
         let pool = state.pool.load_full();
         let members = &pool.members;
-        set_window(member(members, "late"), 10.0, Some(NOW + 4 * 3600));
-        set_window(member(members, "soon"), 10.0, Some(NOW + 20 * 60));
-        set_window(member(members, "idle"), 10.0, Some(NOW - 60));
+        set_windows(
+            member(members, "late"),
+            (10.0, None),
+            (10.0, Some(NOW + 4 * 3600)),
+        );
+        set_windows(
+            member(members, "soon"),
+            (10.0, None),
+            (10.0, Some(NOW + 20 * 60)),
+        );
+        set_windows(
+            member(members, "idle"),
+            (10.0, None),
+            (10.0, Some(NOW - 60)),
+        );
 
         let before: Vec<String> = members.iter().map(|member| member.id.clone()).collect();
         let after = reordered(members, NOW);
@@ -236,13 +270,17 @@ mod tests {
         let members = &pool.members;
         let first = member(members, "first");
         let second = member(members, "second");
-        set_window(first, 10.0, Some(NOW + 3600));
-        set_window(second, 10.0, Some(NOW + 7200));
+        set_windows(first, (10.0, None), (10.0, Some(NOW + 3600)));
+        set_windows(second, (10.0, None), (10.0, Some(NOW + 7200)));
 
         let order = ClaudeResetOrder::default();
         assert_eq!(order.ranks(members, NOW).get(&first.id), Some(&0));
 
-        set_window(second, 10.0, Some(NOW + REFRESH_INTERVAL_SECS + 60));
+        set_windows(
+            second,
+            (10.0, None),
+            (10.0, Some(NOW + REFRESH_INTERVAL_SECS + 60)),
+        );
         let within = order.ranks(members, NOW + REFRESH_INTERVAL_SECS - 1);
         assert_eq!(
             within.get(&first.id),
@@ -270,8 +308,8 @@ mod tests {
         let members = &pool.members;
         let first = member(members, "first");
         let second = member(members, "second");
-        set_window(first, 70.0, Some(NOW + 600));
-        set_window(second, 30.0, Some(NOW + 3600));
+        set_windows(first, (10.0, None), (70.0, Some(NOW + 600)));
+        set_windows(second, (10.0, None), (30.0, Some(NOW + 3600)));
 
         let order = ClaudeResetOrder::default();
         assert_eq!(order.ranks(members, NOW).get(&first.id), Some(&0));
@@ -283,6 +321,34 @@ mod tests {
             Some(&0),
             "a window that reset must not keep the top slot until the 30-minute check"
         );
+
+        std::fs::remove_dir_all(auth_dir).ok();
+    }
+
+    #[test]
+    fn five_hour_reset_does_not_decide_the_weekly_order() {
+        let (state, auth_dir) = state(&[
+            ("claude-short-soon.json", "claude", "short-soon"),
+            ("claude-weekly-soon.json", "claude", "weekly-soon"),
+        ]);
+        let pool = state.pool.load_full();
+        let members = &pool.members;
+        // The 5-hour window resets first on the pool-first account; the weekly
+        // window is what must decide the order.
+        set_windows(
+            member(members, "short-soon"),
+            (10.0, Some(NOW + 60)),
+            (10.0, Some(NOW + 7 * 3600)),
+        );
+        set_windows(
+            member(members, "weekly-soon"),
+            (10.0, Some(NOW + 7 * 3600)),
+            (10.0, Some(NOW + 600)),
+        );
+
+        let after = reordered(members, NOW);
+        assert!(after[0].contains("weekly-soon"), "{after:?}");
+        assert!(after[1].contains("short-soon"), "{after:?}");
 
         std::fs::remove_dir_all(auth_dir).ok();
     }

@@ -37,11 +37,13 @@ http-body-util = "0.1"
 http = "1"
 bytes = "1"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# Insertion order is wire order: the Antigravity envelope must serialize in
+# protobuf declaration order, and serde_json otherwise sorts object keys.
+serde_json = { version = "1", features = ["preserve_order"] }
 serde_yaml = "0.9"
 toml = { version = "0.8", default-features = false, features = ["parse"] }
 arc-swap = "1"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json", "socks"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json", "socks", "http2"] }
 anyhow = "1"
 thiserror = "2"
 tracing = "0.1"

@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use serde_json::{json, Map, Value};
 
 use super::events::{CodexEvent, Usage};
@@ -268,7 +269,6 @@ pub fn anthropic_to_openai(body: &Value) -> Result<Value, String> {
         .ok_or_else(|| "missing messages".to_string())?;
 
     let mut out_messages: Vec<Value> = Vec::new();
-
     if let Some(system) = body.get("system") {
         if let Some(text) = system_to_text(system) {
             if !text.is_empty() {
@@ -279,6 +279,18 @@ pub fn anthropic_to_openai(body: &Value) -> Result<Value, String> {
 
     for msg in messages {
         let role = msg.get("role").and_then(Value::as_str).unwrap_or("user");
+        // Anthropic's cache-preserving per-message effort switch, relayed to
+        // the OpenAI wire as the marker `configuration_update` consumes.
+        if matches!(role, "system" | "developer") {
+            if let Some(effort) = msg.pointer("/output_config/effort").and_then(Value::as_str) {
+                out_messages.push(json!({
+                    "role": "system",
+                    "content": "",
+                    "x_effort_update": effort,
+                }));
+                continue;
+            }
+        }
         let content = msg.get("content");
 
         let mut text_parts: Vec<String> = Vec::new();
@@ -510,6 +522,65 @@ pub fn anthropic_to_openai(body: &Value) -> Result<Value, String> {
     Ok(Value::Object(out))
 }
 
+/// Claude models that accept the `mid-conversation-output-config-2026-07-01`
+/// beta: `output_config.effort` on a `role: "system"` message placed partway
+/// through the history. Mirrors the documented support list; everything else
+/// must take the top-level effort (which does invalidate the message cache).
+pub fn supports_mid_conversation_effort(model: &str) -> bool {
+    let model = model.rsplit('/').next().unwrap_or(model);
+    const SUPPORTED: [&str; 6] = [
+        "claude-fable-5-1",
+        "claude-mythos-5-1",
+        "claude-opus-5-5",
+        "claude-opus-5",
+        "claude-sonnet-5-5",
+        "claude-haiku-5-5",
+    ];
+    SUPPORTED.iter().any(|base| {
+        if model == *base {
+            return true;
+        }
+        // A variant suffix (`-high`, `-medium`, …) is the same model; a longer
+        // numeric tail (`-50`) is a different id and must not match.
+        const VARIANTS: [&str; 7] = ["high", "medium", "low", "xhigh", "minimal", "max", "none"];
+        model
+            .strip_prefix(base)
+            .and_then(|rest| rest.strip_prefix('-'))
+            .is_some_and(|tail| VARIANTS.contains(&tail))
+    })
+}
+
+/// Beta that unlocks per-message `output_config.effort`. Without it the
+/// upstream rejects `messages.N.output_config` outright.
+pub const MID_CONVERSATION_EFFORT_BETA: &str = "mid-conversation-output-config-2026-07-01";
+
+/// True when the translated body carries a mid-conversation effort message, so
+/// the caller knows the beta header must ride along.
+pub fn uses_mid_conversation_effort(body: &Value) -> bool {
+    body.get("messages")
+        .and_then(Value::as_array)
+        .is_some_and(|messages| {
+            messages.iter().any(|message| {
+                message.get("role").and_then(Value::as_str) == Some("system")
+                    && message.get("output_config").is_some()
+            })
+        })
+}
+
+/// Same check on the already-encoded upstream body.
+///
+/// Every Anthropic request passes here, so a byte scan rejects the common case
+/// before paying for a full deserialize.
+pub fn uses_mid_conversation_effort_bytes(raw: &[u8]) -> bool {
+    const NEEDLE: &[u8] = b"\"output_config\"";
+    if !raw.windows(NEEDLE.len()).any(|window| window == NEEDLE) {
+        return false;
+    }
+    serde_json::from_slice::<Value>(raw)
+        .map(|body| uses_mid_conversation_effort(&body))
+        .unwrap_or(false)
+}
+
 /// Applies a requested thinking mode (model suffix or reasoning effort) to an
 /// Anthropic request `result` per the catalog capability. Shared by the
 /// OpenAI->Anthropic translation and native `/v1/messages` passthrough, so a
@@ -635,12 +706,35 @@ pub fn openai_to_anthropic_with_capability(
         .ok_or_else(|| "missing messages".to_string())?;
     let mut system = Vec::new();
     let mut out: Vec<Value> = Vec::new();
+    // Beta-gated per-message effort only exists for these models; elsewhere the
+    // switch is folded into the top-level `output_config` instead of emitting a
+    // message the upstream would reject.
+    let per_message_effort = supports_mid_conversation_effort(model);
+    let mut unsupported_effort: Option<String> = None;
     for message in messages {
         let role = message
             .get("role")
             .and_then(Value::as_str)
             .unwrap_or("user");
         if role == "system" || role == "developer" {
+            if let Some(effort) = message.get("x_effort_update").and_then(Value::as_str) {
+                if !per_message_effort {
+                    unsupported_effort = Some(effort.to_string());
+                    continue;
+                }
+                // Cache-preserving effort switch: Anthropic renders a mid-stream
+                // `role: system` message instead of rewriting the top-level
+                // `output_config`, so every earlier block stays inside the
+                // cached prefix. Only emitted when the client itself asked for
+                // it with a `configuration_update` input item.
+                let entry = json!({
+                    "role": "system",
+                    "content": [],
+                    "output_config": {"effort": effort},
+                });
+                out.push(entry);
+                continue;
+            }
             if let Some(text) = message.get("content").and_then(content_text) {
                 let mut block = json!({"type": "text", "text": text});
                 if let Some(cache_control) = message.get("cache_control").filter(|c| c.is_object())
@@ -813,6 +907,11 @@ pub fn openai_to_anthropic_with_capability(
         result["tool_choice"] = choice;
     }
     let thinking_enabled = apply_thinking_mode(raw_model, body, capability, &mut result)?;
+    if let Some(effort) = unsupported_effort {
+        // This model has no per-message switch; the client's latest requested
+        // effort still wins, at the documented cost of the message cache.
+        result["output_config"] = json!({"effort": effort});
+    }
 
     for key in ["temperature", "top_p", "stop_sequences"] {
         if let Some(value) = body.get(key) {
@@ -970,7 +1069,14 @@ pub fn apply_prompt_cache_breakpoints(body: &mut Value) {
     let Some(message) = body
         .get_mut("messages")
         .and_then(Value::as_array_mut)
-        .and_then(|messages| messages.last_mut())
+        .and_then(|messages| {
+            // A trailing effort directive is an instruction, not cached content:
+            // the breakpoint belongs on the last real turn before it.
+            messages
+                .iter_mut()
+                .rev()
+                .find(|message| message.get("output_config").is_none())
+        })
     else {
         return;
     };
@@ -1567,6 +1673,18 @@ impl AnthropicStreamRenderer {
     pub fn terminated(&self) -> bool {
         self.terminated
     }
+
+    pub fn tick(&mut self) -> Bytes {
+        if self.terminated {
+            return Bytes::new();
+        }
+        let mut out = Vec::new();
+        self.ensure_started(&mut out);
+        out.push(Bytes::from_static(
+            b"event: ping\ndata: {\"type\":\"ping\"}\n\n",
+        ));
+        out.concat().into()
+    }
 }
 
 #[cfg(test)]
@@ -1603,6 +1721,114 @@ mod contract_tests {
                 "new instruction"
             );
         }
+    }
+
+    #[test]
+    fn mid_conversation_effort_emits_a_system_message_for_supported_models() {
+        let body = json!({
+            "model": "claude-opus-5-5",
+            "messages": [
+                {"role": "user", "content": "question"},
+                {"role": "assistant", "content": "answer"},
+                {"role": "system", "content": "", "x_effort_update": "high"},
+                {"role": "user", "content": "follow up"},
+            ],
+        });
+        let out = openai_to_anthropic(&body).unwrap();
+        let messages = out["messages"].as_array().unwrap();
+        // The top-level effort is untouched: the switch rides in-band so the
+        // cached history prefix survives.
+        assert!(out.get("output_config").is_none());
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[2]["role"], "system");
+        assert_eq!(messages[2]["content"], json!([]));
+        assert_eq!(messages[2]["output_config"]["effort"], "high");
+        assert!(uses_mid_conversation_effort(&out));
+    }
+
+    #[test]
+    fn mid_conversation_effort_without_a_supported_model_uses_top_level_effort() {
+        let body = json!({
+            "model": "claude-sonnet-4-5-2",
+            "messages": [
+                {"role": "user", "content": "question"},
+                {"role": "system", "content": "", "x_effort_update": "high"},
+                {"role": "user", "content": "follow up"},
+            ],
+        });
+        let out = openai_to_anthropic(&body).unwrap();
+        assert_eq!(out["output_config"]["effort"], "high");
+        assert!(
+            !uses_mid_conversation_effort(&out),
+            "no beta-gated message may reach an unsupported model"
+        );
+        assert!(out["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|message| message["role"] != "system"));
+    }
+
+    #[test]
+    fn mid_conversation_effort_model_gate_matches_documented_ids() {
+        for model in [
+            "claude-fable-5-1",
+            "claude-mythos-5-1",
+            "claude-opus-5-5",
+            "claude-opus-5",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+            "anthropic/claude-opus-5-5",
+        ] {
+            assert!(supports_mid_conversation_effort(model), "{model}");
+        }
+        for model in [
+            "claude-opus-5-50",
+            "claude-sonnet-4-5-2",
+            "claude-haiku-4-5-2",
+            "gpt-6-astra",
+        ] {
+            assert!(!supports_mid_conversation_effort(model), "{model}");
+        }
+    }
+
+    #[test]
+    fn byte_scan_matches_the_parsed_check() {
+        let with_effort = json!({
+            "messages": [
+                {"role": "user", "content": "q"},
+                {"role": "system", "content": [], "output_config": {"effort": "high"}},
+            ],
+        });
+        assert!(uses_mid_conversation_effort_bytes(
+            with_effort.to_string().as_bytes()
+        ));
+        let without_effort = json!({
+            "messages": [{"role": "user", "content": "q"}],
+            "output_config": {"effort": "high"},
+        });
+        assert!(!uses_mid_conversation_effort_bytes(
+            without_effort.to_string().as_bytes()
+        ));
+        assert!(!uses_mid_conversation_effort_bytes(b"not json"));
+    }
+
+    #[test]
+    fn cache_breakpoint_lands_before_a_trailing_effort_message() {
+        let mut body = json!({
+            "messages": [
+                {"role": "user", "content": "question"},
+                {"role": "assistant", "content": [{"type": "text", "text": "answer"}]},
+                {"role": "system", "content": [], "output_config": {"effort": "high"}},
+            ],
+        });
+        apply_prompt_cache_breakpoints(&mut body);
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(
+            messages[1]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        assert!(messages[2].get("cache_control").is_none());
     }
 
     #[test]

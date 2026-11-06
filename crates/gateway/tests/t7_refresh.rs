@@ -555,12 +555,13 @@ async fn test_t7_concurrent_reactive_401_single_flight_refresh() {
             }
         }),
     );
-    let oauth_listener = tokio::net::TcpListener::bind("127.0.0.1:18885")
-        .await
-        .unwrap();
-    let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:18886")
-        .await
-        .unwrap();
+    // Port 0 lets the OS assign a free port for each run. A fixed port is
+    // shared with every other test binary cargo runs in parallel, so binding it
+    // makes the suite fail depending on scheduling rather than on the code.
+    let oauth_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let oauth_port = oauth_listener.local_addr().unwrap().port();
+    let upstream_port = upstream_listener.local_addr().unwrap().port();
     let dir = unique_temp_dir("qgw-reactive-singleflight");
     std::fs::write(
         dir.join("codex-reactive.json"),
@@ -568,7 +569,7 @@ async fn test_t7_concurrent_reactive_401_single_flight_refresh() {
             "type":"plus", "identity_slug":"reactive", "access_token":"reactive-stale",
             "refresh_token":"stale-r", "account_id":"reactive", "email":"reactive@example.invalid",
             "id_token":"stale-i", "last_refresh":"", "expired":"2099-01-01T00:00:00Z",
-            "upstream_override":"http://127.0.0.1:18886"
+            "upstream_override": format!("http://127.0.0.1:{upstream_port}")
         })
         .to_string(),
     )
@@ -579,7 +580,7 @@ async fn test_t7_concurrent_reactive_401_single_flight_refresh() {
         AppState::new(&GatewayConfig {
             auth_dir: dir.clone(),
             config_path,
-            refresh_url: "http://127.0.0.1:18885/oauth/token".into(),
+            refresh_url: format!("http://127.0.0.1:{oauth_port}/oauth/token"),
             auth_refresh_enabled: true,
             ..Default::default()
         })

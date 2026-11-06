@@ -258,6 +258,10 @@ pub fn build_http_client(proxy_url: Option<&str>) -> anyhow::Result<reqwest::Cli
         validate_proxy_url_candidate(url)?;
     }
     let mut builder = reqwest::Client::builder()
+        // The native client negotiates HTTP/2 over ALPN. An HTTP/1.1-only
+        // gateway reaches the same endpoints with a different transport shape,
+        // which is observable upstream even when the request body matches.
+        .http2_adaptive_window(true)
         .tcp_nodelay(true)
         .pool_idle_timeout(std::time::Duration::from_secs(90))
         .pool_max_idle_per_host(32)
@@ -608,6 +612,43 @@ mod tests {
                 "sticky session should preserve exit IP across requests"
             );
         }
+    }
+
+    /// Drives a real TLS handshake against a local listener and asserts the
+    /// client offers HTTP/2 in ALPN. `https_only` and an unknown certificate
+    /// are the point: the ClientHello is what matters, not a completed request.
+    #[tokio::test]
+    async fn the_outbound_client_offers_http2_in_alpn() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        let recorded = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0u8; 8192];
+            let n = socket.read(&mut buf).await.unwrap_or(0);
+            buf.truncate(n);
+            buf
+        });
+
+        let client = build_http_client(None).expect("client");
+        let _ = client
+            .get(format!("https://127.0.0.1:{}/", addr.port()))
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await;
+
+        let hello = recorded.await.expect("clienthello");
+        assert!(!hello.is_empty(), "client did not attempt a TLS handshake");
+        // The ALPN extension lists protocol names as length-prefixed bytes.
+        assert!(
+            hello.windows(3).any(|w| w == [0x02, b'h', b'2']),
+            "ClientHello does not offer h2: {:?}",
+            &hello[..hello.len().min(200)]
+        );
     }
 
     #[test]

@@ -448,7 +448,8 @@ pub async fn handle(
                 "Antigravity account missing project_id",
             );
         };
-        crate::v1beta::wrap_for_antigravity(&model, &project, &business)
+        let labels = crate::v1beta::labels_for(&member, &model, model.starts_with("claude-"));
+        crate::v1beta::wrap_for_antigravity_with_labels(&model, &project, &business, &labels)
     };
     let activity = member.begin_activity();
     let started = Instant::now();

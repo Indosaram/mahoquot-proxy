@@ -1270,16 +1270,17 @@ fn openai_to_antigravity_inner(
     // Anthropic. Keep this repair out of native Gemini and non-Claude models.
     let request = openai_to_gemini_inner(body, model.starts_with("claude-"), replay)?;
 
-    // The envelope carries the client-identity fields the real Antigravity
-    // client sends; CLIProxyAPI and OpenCodex both mirror them.
-    Ok(json!({
-        "model": model,
-        "userAgent": "antigravity",
-        "requestType": "agent",
-        "project": project_id,
-        "requestId": format!("agent-{}", uuid::Uuid::new_v4()),
-        "request": request,
-    }))
+    // Same wrapper the native Gemini path uses, so the two ingresses cannot
+    // drift on userAgent, requestType, or the computeRequestID slash form.
+    Ok(crate::v1beta::wrap_for_antigravity(
+        model, project_id, &request,
+    ))
+}
+
+pub fn openai_request_uses_claude(body: &Value) -> bool {
+    body.get("model")
+        .and_then(Value::as_str)
+        .is_some_and(|model| model.starts_with("claude-"))
 }
 
 pub fn gemini_json_to_openai(body: &Value, model: &str, created: i64) -> Value {
@@ -2126,6 +2127,12 @@ mod signature_tests {
             openai_to_antigravity_with_replay(&body, "project-1", &replay).expect("translate");
         assert_eq!(out["request"]["sessionId"], "session-antigravity");
         assert_eq!(out["project"], "project-1");
+        assert_eq!(out["userAgent"], "antigravity");
+        assert_eq!(out["requestType"], crate::v1beta::ANTIGRAVITY_REQUEST_TYPE);
+        let id = out["requestId"].as_str().unwrap();
+        let (label, rest) = id.split_once('/').unwrap();
+        assert_eq!(label, crate::v1beta::ANTIGRAVITY_REQUEST_TYPE);
+        assert_eq!(rest.split('/').count(), 4, "{id}");
         assert!(out.get("sessionId").is_none());
         assert!(
             openai_to_antigravity(&body, "project-1").expect("translate")["request"]

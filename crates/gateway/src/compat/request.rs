@@ -55,12 +55,11 @@ pub fn openai_to_codex_with_cache_key(
         .and_then(Value::as_array)
         .ok_or(TranslateError::Missing("messages"))?;
 
-    let (instructions, input) = split_messages(messages);
+    let (instructions, mut input) = split_messages(messages);
 
     let mut out = Map::new();
     out.insert("model".into(), Value::String(model.clone()));
     out.insert("instructions".into(), Value::String(instructions));
-    out.insert("input".into(), Value::Array(input));
     out.insert("stream".into(), Value::Bool(true));
     out.insert("store".into(), Value::Bool(false));
     if let Some(key) = prompt_cache_key
@@ -73,7 +72,7 @@ pub fn openai_to_codex_with_cache_key(
     // Thinking / reasoning effort resolution per canonical thinking pipeline:
     // Suffix takes precedence over body parameters.
     // Canonical Codex chat translation defaults omitted effort to medium.
-    let resolved_effort = if let Some(suffix) = suffix_opt {
+    let mut resolved_effort = if let Some(suffix) = suffix_opt {
         Some(normalize_thinking_level(suffix)?)
     } else if let Some(effort) = obj.get("reasoning_effort") {
         let effort_str = effort.as_str().ok_or_else(|| {
@@ -112,11 +111,33 @@ pub fn openai_to_codex_with_cache_key(
         }
     }
 
+    // A mid-conversation effort item only exists on the models that document
+    // it. Older Codex models would reject the item, so there the update is
+    // folded back into the request-level effort (losing the cached prefix, the
+    // same cost as any other top-level effort change).
+    let supports_update = supports_configuration_update(&model);
+    let mut last_update: Option<String> = None;
+    if !supports_update {
+        input.retain(|item| {
+            if item.get("type").and_then(Value::as_str) == Some("configuration_update") {
+                last_update = item
+                    .pointer("/reasoning/effort")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                return false;
+            }
+            true
+        });
+        if let Some(effort) = last_update {
+            resolved_effort = Some(normalize_thinking_level(&effort)?);
+        }
+    }
+    out.insert("input".into(), Value::Array(input));
+
     out.insert(
         "reasoning".into(),
         json!({ "effort": resolved_effort.as_deref().unwrap_or("medium") }),
     );
-
     if let Some(tools) = obj.get("tools").and_then(Value::as_array) {
         let mapped = map_tools(tools);
         if !mapped.is_empty() {
@@ -219,6 +240,18 @@ fn split_messages(messages: &[Value]) -> (String, Vec<Value>) {
     for msg in messages {
         match msg.get("role").and_then(Value::as_str).unwrap_or("user") {
             "system" | "developer" => {
+                if let Some(effort) = msg.get("x_effort_update").and_then(Value::as_str) {
+                    // Cache-preserving effort switch on the Codex wire: an
+                    // appended `configuration_update` item changes the effort
+                    // without rewriting the top-level `reasoning` field, which
+                    // re-renders the hidden system prompt and drops the whole
+                    // cached prefix.
+                    input.push(json!({
+                        "type": "configuration_update",
+                        "reasoning": {"effort": effort},
+                    }));
+                    continue;
+                }
                 let text = flatten_text(msg.get("content"));
                 if !text.is_empty() {
                     if !instructions.is_empty() {
@@ -407,6 +440,28 @@ pub fn parse_model_suffix(model: &str) -> Result<(&str, Option<&str>), Translate
         )));
     }
     Ok((model, None))
+}
+
+/// GPT-6 and later accept an appended `configuration_update` input item that
+/// changes reasoning effort without rewriting the hidden instruction prefix,
+/// which is what keeps the prompt cache warm across an effort switch. Earlier
+/// models have no such item and must take the request-level effort instead.
+pub fn supports_configuration_update(model: &str) -> bool {
+    let model = model.rsplit('/').next().unwrap_or(model);
+    let model = model.split('(').next().unwrap_or(model);
+    let Some(rest) = model.strip_prefix("gpt-") else {
+        return false;
+    };
+    let version: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    version
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .parse::<u32>()
+        .is_ok_and(|major| major >= 6)
 }
 
 pub fn normalize_thinking_level(raw: &str) -> Result<String, TranslateError> {
@@ -742,6 +797,58 @@ mod prompt_cache_key_tests {
         let translated = openai_to_codex(&serde_json::to_vec(&body).unwrap()).unwrap();
         let val: Value = serde_json::from_slice(&translated.body).unwrap();
         assert_eq!(val["reasoning"]["effort"], "medium");
+    }
+
+    #[test]
+    fn effort_marker_becomes_a_configuration_update_item() {
+        let body = serde_json::json!({
+            "model": "gpt-6-astra",
+            "reasoning": {"effort": "low"},
+            "messages": [
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "answer"},
+                {"role": "system", "content": "", "x_effort_update": "high"},
+                {"role": "user", "content": "second"}
+            ]
+        });
+        let translated = openai_to_codex(&serde_json::to_vec(&body).unwrap()).unwrap();
+        let val: Value = serde_json::from_slice(&translated.body).unwrap();
+        // Request-level effort must stay at the value the cached prefix was
+        // built with; the update rides in `input` instead.
+        assert_eq!(val["reasoning"]["effort"], "low");
+        assert_eq!(val["instructions"], "");
+        let input = val["input"].as_array().unwrap();
+        let update = input
+            .iter()
+            .find(|item| item["type"] == "configuration_update")
+            .expect("configuration_update item");
+        assert_eq!(update["reasoning"]["effort"], "high");
+        // Position is preserved: the update sits after the prior turn.
+        assert_eq!(input.len(), 4);
+        assert_eq!(input[2]["type"], "configuration_update");
+        assert_eq!(input[3]["role"], "user");
+    }
+
+    #[test]
+    fn unsupported_model_folds_the_update_into_the_request_effort() {
+        let body = serde_json::json!({
+            "model": "gpt-5-sol",
+            "reasoning": {"effort": "low"},
+            "messages": [
+                {"role": "user", "content": "first"},
+                {"role": "system", "content": "", "x_effort_update": "high"},
+                {"role": "user", "content": "second"}
+            ]
+        });
+        let translated = openai_to_codex(&serde_json::to_vec(&body).unwrap()).unwrap();
+        let val: Value = serde_json::from_slice(&translated.body).unwrap();
+        // No `configuration_update` item exists before GPT-6, so the update
+        // must land on the request-level effort or it would be dropped.
+        assert_eq!(val["reasoning"]["effort"], "high");
+        let input = val["input"].as_array().unwrap();
+        assert!(input
+            .iter()
+            .all(|item| item["type"] != "configuration_update"));
     }
 
     #[test]

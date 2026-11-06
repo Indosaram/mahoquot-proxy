@@ -15,6 +15,10 @@ use tower::ServiceExt;
 
 #[tokio::test]
 async fn invalid_callback_stays_open_until_a_successful_exchange() {
+    // The callback listener binds a provider-fixed port; shift it so this test
+    // never collides with a real tunnel or another agent's forwarded port.
+    const PORT_OFFSET: u16 = 3000;
+    let callback_port = 54545 + PORT_OFFSET;
     let mut listener = None;
     for port in 18840..=18899 {
         if let Ok(bound) = tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
@@ -43,6 +47,7 @@ async fn invalid_callback_stays_open_until_a_successful_exchange() {
             auth_dir: auth_dir.clone(),
             config_path: auth_dir.join("config.yaml"),
             auth_refresh_enabled: false,
+            oauth_callback_port_offset: PORT_OFFSET,
             ..GatewayConfig::default()
         })
         .unwrap(),
@@ -66,7 +71,7 @@ async fn invalid_callback_stays_open_until_a_successful_exchange() {
         .build()
         .unwrap();
     let invalid_state = client
-        .get("http://127.0.0.1:54545/callback")
+        .get(format!("http://127.0.0.1:{callback_port}/callback"))
         .query(&[("state", "wrong-state"), ("code", "invalid-code")])
         .send()
         .await
@@ -75,7 +80,7 @@ async fn invalid_callback_stays_open_until_a_successful_exchange() {
     invalid_state.bytes().await.unwrap();
     assert_eq!(hits.load(Ordering::SeqCst), 0);
     let invalid_code = client
-        .get("http://127.0.0.1:54545/callback")
+        .get(format!("http://127.0.0.1:{callback_port}/callback"))
         .query(&[("state", session), ("code", "invalid-code")])
         .send()
         .await
@@ -83,7 +88,7 @@ async fn invalid_callback_stays_open_until_a_successful_exchange() {
     assert_eq!(invalid_code.status(), StatusCode::BAD_REQUEST);
     invalid_code.bytes().await.unwrap();
     let success = client
-        .get("http://127.0.0.1:54545/callback")
+        .get(format!("http://127.0.0.1:{callback_port}/callback"))
         .query(&[("state", session), ("code", "valid-code")])
         .send()
         .await

@@ -1,6 +1,8 @@
 pub mod claude;
 pub mod cursor;
-mod cursor_proto;
+pub mod cursor_proto;
+pub mod exec_bridge;
+pub mod exec_ops;
 pub mod devin;
 pub mod devin_proto;
 pub mod meta;
@@ -87,6 +89,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use axum::body::Body;
+
+const STREAM_IDLE_TICK: std::time::Duration = std::time::Duration::from_secs(15);
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use serde_json::{json, Value};
@@ -524,6 +528,7 @@ struct TranslateState {
     renderer: StreamRenderer,
     pending: VecDeque<Bytes>,
     drained: bool,
+    last_emit: std::time::Instant,
 }
 
 /// Streaming surfaces differ per client protocol: OpenAI chunk objects versus
@@ -560,6 +565,20 @@ impl StreamRenderer {
             Self::Gemini(r) => r.terminated(),
             Self::Anthropic(r) => r.terminated(),
             Self::Responses(r) => r.terminated(),
+        }
+    }
+
+    fn open(&mut self) -> Vec<Bytes> {
+        match self {
+            Self::OpenAi(renderer) => renderer.open(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn tick(&mut self) -> Bytes {
+        match self {
+            Self::Anthropic(renderer) => renderer.tick(),
+            _ => Bytes::new(),
         }
     }
 }
@@ -608,11 +627,15 @@ pub fn streaming_body(params: StreamingBodyParams) -> Body {
         renderer,
         pending: VecDeque::new(),
         drained: false,
+        last_emit: std::time::Instant::now(),
     };
     let mut events = Vec::new();
     state.parser.push(&first, &mut events);
     for event in events {
         handle_stream_event(event, &mut state, upstream_capture.as_ref());
+    }
+    if session.protocol == Protocol::Cursor && state.pending.is_empty() {
+        state.pending.extend(state.renderer.open());
     }
 
     Body::from_stream(futures::stream::unfold(
@@ -620,6 +643,9 @@ pub fn streaming_body(params: StreamingBodyParams) -> Body {
         |(mut state, upstream_capture, devin_outcome)| async move {
             loop {
                 if let Some(frame) = state.pending.pop_front() {
+                    if !frame.is_empty() {
+                        state.last_emit = std::time::Instant::now();
+                    }
                     return Some((
                         Ok::<Bytes, std::io::Error>(frame),
                         (state, upstream_capture, devin_outcome),
@@ -629,7 +655,26 @@ pub fn streaming_body(params: StreamingBodyParams) -> Body {
                     capture_devin_outcome(&state.parser, devin_outcome.as_ref());
                     return None;
                 }
-                match state.upstream.next().await {
+                if state.last_emit.elapsed() >= STREAM_IDLE_TICK {
+                    let frame = state.renderer.tick();
+                    state.last_emit = std::time::Instant::now();
+                    if !frame.is_empty() {
+                        state.pending.push_back(frame);
+                    }
+                    continue;
+                }
+                let next = match tokio::time::timeout(STREAM_IDLE_TICK, state.upstream.next()).await {
+                    Ok(item) => item,
+                    Err(_) => {
+                        let frame = state.renderer.tick();
+                        state.last_emit = std::time::Instant::now();
+                        if !frame.is_empty() {
+                            state.pending.push_back(frame);
+                        }
+                        continue;
+                    }
+                };
+                match next {
                     Some(Ok(chunk)) => {
                         let mut events = Vec::new();
                         state.parser.push(&chunk, &mut events);

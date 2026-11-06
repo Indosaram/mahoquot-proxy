@@ -48,8 +48,11 @@ fn relay_identity_uses_endpoint_hosts_not_account_names_or_url_paths() {
 
 #[tokio::test]
 async fn anthropic_oauth_reports_unavailable_callback_listener() {
+    // Shift the callback port set so occupying it cannot collide with a real
+    // tunnel on the production port.
+    const PORT_OFFSET: u16 = 4000;
     // Given: the fixed redirect port is occupied before authorization starts.
-    let _occupied = tokio::net::TcpListener::bind("127.0.0.1:54545")
+    let _occupied = tokio::net::TcpListener::bind(("127.0.0.1", 54545 + PORT_OFFSET))
         .await
         .unwrap();
     let auth_dir = common::unique_temp_dir("proxy-oauth-bind");
@@ -58,6 +61,7 @@ async fn anthropic_oauth_reports_unavailable_callback_listener() {
             auth_dir: auth_dir.clone(),
             config_path: auth_dir.join("config.yaml"),
             auth_refresh_enabled: false,
+            oauth_callback_port_offset: PORT_OFFSET,
             ..GatewayConfig::default()
         })
         .unwrap(),

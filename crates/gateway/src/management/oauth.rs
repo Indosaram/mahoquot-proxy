@@ -748,9 +748,17 @@ fn callback_port(provider: &str) -> u16 {
     }
 }
 
+/// The port actually bound for `provider` under `offset`.
+fn callback_port_with_offset(provider: &str, offset: u16) -> u16 {
+    callback_port(provider).saturating_add(offset)
+}
+
 /// Binds the provider's callback port on loopback.
-async fn bind_callback_listener(provider: &str) -> std::io::Result<tokio::net::TcpListener> {
-    tokio::net::TcpListener::bind(("127.0.0.1", callback_port(provider))).await
+async fn bind_callback_listener(
+    provider: &str,
+    offset: u16,
+) -> std::io::Result<tokio::net::TcpListener> {
+    tokio::net::TcpListener::bind(("127.0.0.1", callback_port_with_offset(provider, offset))).await
 }
 
 /// Spawns a callback listener task that exits on the first of the OAuth
@@ -2373,14 +2381,14 @@ async fn anthropic_auth_url_handler(
 ) -> Response {
     let (url, state, session) = create_anthropic_auth_url(&params);
     let listener = if !params.contains_key("redirect_uri") {
-        let listener = match bind_callback_listener("anthropic").await {
+        let listener = match bind_callback_listener("anthropic", app_state.oauth_callback_port_offset).await {
             Ok(listener) => listener,
             Err(error) => {
                 return json_status(
                     StatusCode::CONFLICT,
                     json!({
                         "status": "error",
-                        "error": format!("Anthropic callback port {} is unavailable: {error}", callback_port("anthropic"))
+                        "error": format!("Anthropic callback port {} is unavailable: {error}", callback_port_with_offset("anthropic", app_state.oauth_callback_port_offset))
                     }),
                 );
             }
@@ -2561,14 +2569,14 @@ async fn antigravity_auth_url_handler(
 ) -> Response {
     let (url, state, session) = create_antigravity_auth_url(&params);
     let listener = if !params.contains_key("redirect_uri") {
-        let listener = match bind_callback_listener("antigravity").await {
+        let listener = match bind_callback_listener("antigravity", app_state.oauth_callback_port_offset).await {
             Ok(listener) => listener,
             Err(error) => {
                 return json_status(
                     StatusCode::CONFLICT,
                     json!({
                         "status": "error",
-                        "error": format!("Antigravity callback port {} is unavailable: {error}", callback_port("antigravity"))
+                        "error": format!("Antigravity callback port {} is unavailable: {error}", callback_port_with_offset("antigravity", app_state.oauth_callback_port_offset))
                     }),
                 );
             }
@@ -2637,14 +2645,14 @@ async fn codex_auth_url_handler(
 ) -> Response {
     let (url, state, session) = create_codex_auth_url(&params);
     let listener = if !params.contains_key("redirect_uri") {
-        let listener = match bind_callback_listener("codex").await {
+        let listener = match bind_callback_listener("codex", app_state.oauth_callback_port_offset).await {
             Ok(listener) => listener,
             Err(error) => {
                 return json_status(
                     StatusCode::CONFLICT,
                     json!({
                         "status": "error",
-                        "error": format!("Codex callback port {} is unavailable: {error}", callback_port("codex"))
+                        "error": format!("Codex callback port {} is unavailable: {error}", callback_port_with_offset("codex", app_state.oauth_callback_port_offset))
                     }),
                 );
             }
@@ -2694,14 +2702,14 @@ async fn command_code_auth_url_handler(
 ) -> Response {
     let (url, state, session) = create_command_code_auth_url(&params);
     let listener = if !params.contains_key("redirect_uri") && !params.contains_key("callback") {
-        let listener = match bind_callback_listener("command-code").await {
+        let listener = match bind_callback_listener("command-code", app_state.oauth_callback_port_offset).await {
             Ok(listener) => listener,
             Err(error) => {
                 return json_status(
                     StatusCode::CONFLICT,
                     json!({
                         "status": "error",
-                        "error": format!("Command Code callback port {} is unavailable: {error}", callback_port("command-code"))
+                        "error": format!("Command Code callback port {} is unavailable: {error}", callback_port_with_offset("command-code", app_state.oauth_callback_port_offset))
                     }),
                 )
             }

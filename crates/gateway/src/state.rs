@@ -933,6 +933,9 @@ pub struct AppState {
     /// gateway (config/env-resolved at startup; tests inject directly).
     pub captcha_config_url: Option<String>,
     pub captcha_solver_bin: Option<PathBuf>,
+    /// Added to each provider's fixed OAuth callback port (production 0; tests
+    /// shift the set into a free range).
+    pub oauth_callback_port_offset: u16,
     /// Verify params are single-use — challenge solves serialize on this gate
     /// (per-state, never a global static).
     pub captcha_solve_gate: tokio::sync::Mutex<()>,
@@ -1048,6 +1051,7 @@ impl AppState {
         let auth_refresh_enabled = config.auth_refresh_enabled;
         let captcha_config_url = config.captcha_config_url.clone();
         let captcha_solver_bin = config.captcha_solver_bin.clone();
+        let oauth_callback_port_offset = config.oauth_callback_port_offset;
         let captcha_solve_gate = tokio::sync::Mutex::new(());
         let settings = Arc::new(SettingsStore::load_or(
             config.config_path.clone(),
@@ -1244,6 +1248,7 @@ impl AppState {
             auth_refresh_enabled,
             captcha_config_url,
             captcha_solver_bin,
+            oauth_callback_port_offset,
             captcha_solve_gate,
             refreshed: AtomicU64::new(0),
             max_failover: if config.max_failover == 0 {
@@ -1442,17 +1447,16 @@ impl AppState {
         member: &AccountMember,
         presented_token: Option<&str>,
     ) -> Result<bool, mahoquot_providers::refresh_exec::RefreshError> {
-        let client = if crate::proxy_policy::token_endpoint_bypasses_egress_proxy(
-            &member.provider_name(),
-        ) {
-            self.direct_client()
-        } else {
-            self.try_client_for_member(member).map_err(|error| {
-                mahoquot_providers::refresh_exec::RefreshError::Parse(format!(
-                    "proxy client construction failed: {error}"
-                ))
-            })?
-        };
+        let client =
+            if crate::proxy_policy::token_endpoint_bypasses_egress_proxy(&member.provider_name()) {
+                self.direct_client()
+            } else {
+                self.try_client_for_member(member).map_err(|error| {
+                    mahoquot_providers::refresh_exec::RefreshError::Parse(format!(
+                        "proxy client construction failed: {error}"
+                    ))
+                })?
+            };
         let did_refresh = member
             .refresh_with_store(
                 &client,

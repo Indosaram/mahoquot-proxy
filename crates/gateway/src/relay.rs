@@ -1007,13 +1007,34 @@ fn body_with_model(body: &Bytes, model: &str) -> Bytes {
 
 fn openai_body_with_model(plan: &RelayPlan, model: &str) -> Option<serde_json::Value> {
     let mut body = plan.openai_body.clone()?;
-    // Internal translation marker (Anthropic tool_result origin); it never
-    // leaves the gateway.
+    // Internal translation markers never leave the gateway. A mid-conversation
+    // effort update is folded back into the ordinary `reasoning.effort` field:
+    // providers consuming this body have no `configuration_update` item, and
+    // their effort settings live outside the prompt prefix anyway.
+    let mut effort_update: Option<String> = None;
     if let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        messages.retain(|message| {
+            if let Some(effort) = message
+                .get("x_effort_update")
+                .and_then(serde_json::Value::as_str)
+            {
+                effort_update = Some(effort.to_string());
+                return false;
+            }
+            true
+        });
         for message in messages {
             if let Some(object) = message.as_object_mut() {
                 object.remove("x_anthropic_tool_result");
             }
+        }
+    }
+    if let Some(effort) = effort_update {
+        if let Some(object) = body.as_object_mut() {
+            object.insert(
+                "reasoning".to_string(),
+                serde_json::json!({"effort": effort}),
+            );
         }
     }
     if let Some(object) = body.as_object_mut() {
@@ -1042,10 +1063,32 @@ fn openai_body_with_model_keep_suffix(plan: &RelayPlan, model: &str) -> Option<s
         Some(suffix)
             if compat::request::parse_model_suffix(model).is_ok_and(|(_, s)| s.is_none()) =>
         {
-            openai_body_with_model(plan, &format!("{model}({suffix})"))
+            anthropic_openai_body(plan, &format!("{model}({suffix})"))
         }
-        _ => openai_body_with_model(plan, model),
+        _ => anthropic_openai_body(plan, model),
     }
+}
+
+/// The OpenAI-shaped body for a Claude upstream. Unlike the general helper this
+/// keeps the mid-conversation effort marker: `openai_to_anthropic` turns it into
+/// the beta-gated `role: "system"` effort message that preserves the cache.
+fn anthropic_openai_body(plan: &RelayPlan, model: &str) -> Option<serde_json::Value> {
+    let mut body = plan.openai_body.clone()?;
+    if let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        for message in messages {
+            if let Some(object) = message.as_object_mut() {
+                object.remove("x_anthropic_tool_result");
+            }
+        }
+    }
+    if let Some(object) = body.as_object_mut() {
+        object.insert(
+            "model".to_string(),
+            serde_json::Value::String(model.to_string()),
+        );
+    }
+    normalize_developer_role(&mut body);
+    Some(body)
 }
 
 /// Stable CLIProxyAPI-compatible session id: `-` + a 63-bit suffix of
@@ -1207,7 +1250,10 @@ fn resolve_target(
                 obj.insert("sessionId".to_string(), serde_json::json!(session_id));
             }
         }
-        let wrapped = crate::v1beta::wrap_for_antigravity(&model, &project, &inner);
+        // Claude-ness follows the model identity; the step count is separate.
+        let labels = crate::v1beta::labels_for(member, &model, model.starts_with("claude-"));
+        let wrapped =
+            crate::v1beta::wrap_for_antigravity_with_labels(&model, &project, &inner, &labels);
         return Ok(UpstreamTarget {
             url: crate::url::build_antigravity_url(upstream),
             body: Bytes::from(wrapped.to_string()),
@@ -1611,6 +1657,14 @@ fn resolve_target(
         Some(replay) => compat::openai_to_antigravity_with_replay(&openai_body, &project, replay)?,
         None => compat::openai_to_antigravity(&openai_body, &project)?,
     };
+    // The enum and vendor flags describe the upstream model, so they are
+    // looked up by the catalog key rather than derived from the name.
+    let translated = crate::v1beta::apply_catalog_labels(
+        translated,
+        member,
+        upstream_model,
+        compat::gemini::openai_request_uses_claude(&openai_body),
+    );
 
     Ok(UpstreamTarget {
         url: crate::url::build_antigravity_url(upstream),
@@ -1715,6 +1769,19 @@ async fn send_upstream(
         } else if member.kind() == crate::account::ProviderKind::Claude {
             member_headers.push(("anthropic-beta".to_string(), client_beta.to_string()));
         }
+    }
+
+    // The translated body may itself require a beta: a per-message
+    // `output_config.effort` (the cache-preserving effort switch) is rejected
+    // outright by Anthropic unless this header rides along, and the client
+    // never sent it because the gateway synthesized the message.
+    if protocol == compat::Protocol::Anthropic
+        && compat::claude::uses_mid_conversation_effort_bytes(body_bytes)
+    {
+        merge_beta_header(
+            &mut member_headers,
+            compat::claude::MID_CONVERSATION_EFFORT_BETA,
+        );
     }
 
     // ChatGPT-backend prompt-cache affinity rides the session_id HEADER (codex
@@ -4758,6 +4825,22 @@ mod content_type_append_tests {
             content_type_to_append(false, Some("text/plain"), Protocol::Codex),
             Some("text/plain")
         );
+    }
+}
+
+/// Merges one beta flag into a header list, keeping the existing order.
+fn merge_beta_header(headers: &mut Vec<(String, String)>, beta: &str) {
+    match headers
+        .iter_mut()
+        .find(|(name, _)| name.eq_ignore_ascii_case("anthropic-beta"))
+    {
+        Some((_, value)) => {
+            if !value.split(',').any(|existing| existing.trim() == beta) {
+                value.push(',');
+                value.push_str(beta);
+            }
+        }
+        None => headers.push(("anthropic-beta".to_string(), beta.to_string())),
     }
 }
 

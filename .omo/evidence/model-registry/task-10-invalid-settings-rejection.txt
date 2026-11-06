@@ -9,8 +9,8 @@ Model resolution for 'flash-next': canonical_id = 'gemini-next-flash-high' (OK)
 [SCENARIO 2 - CYCLIC ALIAS REJECTION]
 Status: 400 Bad Request
 Response: {"error":"alias cycle detected for 'cycle-a': [ModelId(\"cycle-a\"), ModelId(\"cycle-b\"), ModelId(\"cycle-a\")]"}
-Pool generation before cycle: 2
-Pool generation after cycle: 2
+Pool generation before cycle: 3
+Pool generation after cycle: 3
 Atomic generation non-mutation confirmed.
 
 [SCENARIO 3 - UNKNOWN TARGET REJECTION]

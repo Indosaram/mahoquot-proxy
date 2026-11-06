@@ -328,6 +328,10 @@ impl ServeArgs {
                 .ok()
                 .map(PathBuf::from)
                 .filter(|value| !value.as_os_str().is_empty()),
+            oauth_callback_port_offset: std::env::var("MAHOQUOT_OAUTH_CALLBACK_PORT_OFFSET")
+                .ok()
+                .and_then(|value| value.parse::<u16>().ok())
+                .unwrap_or(mahoquot_gateway::config::DEFAULT_OAUTH_CALLBACK_PORT_OFFSET),
         })
     }
 }
@@ -443,6 +447,11 @@ fn run_accounts(auth_dir: PathBuf) -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if let Ok(address) = std::env::var("MAHOQUOT_EXEC_SERVER") {
+        if !address.trim().is_empty() {
+            return Ok(mahoquot_gateway::compat::exec_bridge::serve(address.trim()).await?);
+        }
+    }
     // Both aws-lc-rs and ring are compiled into rustls through dependencies,
     // so rustls cannot pick a process default on its own; libraries that use
     // the default (webrtc DTLS for realtime media) would panic. Install the

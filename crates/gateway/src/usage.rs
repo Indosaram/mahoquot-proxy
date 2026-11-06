@@ -75,6 +75,21 @@ pub struct ModelAvailability {
     pub available_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credits_would_enable: Option<bool>,
+    /// The upstream's own enum for this catalog entry (`ModelDetails.model`),
+    /// e.g. `MODEL_PLACEHOLDER_M320`. The client echoes it back in the request
+    /// `labels.model_enum`, so it must be the catalog's value for the exact
+    /// variant id, never a value derived from the model name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_enum: Option<String>,
+    /// Vendor reported by the catalog (`api_provider`/`model_provider`). Used
+    /// to set the `used_claude*` and `used_non_gemini_model` request labels
+    /// without hardcoding model ids.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -1236,6 +1251,122 @@ pub fn zcode_balances_usage(balances: &[ZcodeBalanceEntry], now_unix: i64) -> Ac
     }
 }
 
+/// Coding-plan monitor payload from `GET /api/monitor/usage/quota/limit`.
+///
+/// `percentage` is consumption, the same orientation as every other provider.
+/// Reset times arrive as unix milliseconds. A body with no measured limit is
+/// not a snapshot, so the caller keeps the previous one instead of painting 0%.
+pub fn parse_coding_plan_quota(body: &serde_json::Value, now_unix: i64) -> AccountUsage {
+    let data = body.get("data").unwrap_or(body);
+    let Some(limits) = data.get("limits").and_then(|value| value.as_array()) else {
+        return AccountUsage::default();
+    };
+    let mut tokens = Vec::new();
+    let mut tools = Vec::new();
+    for limit in limits {
+        let Some(used) = coding_plan_used_percent(limit) else {
+            continue;
+        };
+        let kind = limit
+            .get("type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let unit = json_i64(limit.get("unit")).unwrap_or(0);
+        let number = json_i64(limit.get("number")).unwrap_or(0);
+        let (label, window) = coding_plan_limit_label(kind, unit, number);
+        let bucket = QuotaBucket {
+            display_name: Some(label),
+            window,
+            used_percent: Some((used.clamp(0.0, 100.0) * 100.0).round() / 100.0),
+            reset_at_unix: limit
+                .get("nextResetTime")
+                .or_else(|| limit.get("next_reset_time"))
+                .and_then(coding_plan_reset_unix),
+            ..QuotaBucket::default()
+        };
+        if kind.eq_ignore_ascii_case("TIME_LIMIT") {
+            tools.push(bucket);
+        } else {
+            tokens.push(bucket);
+        }
+    }
+    tokens.append(&mut tools);
+    if tokens.is_empty() {
+        return AccountUsage::default();
+    }
+    AccountUsage {
+        plan_type: data
+            .get("level")
+            .or_else(|| data.get("plan"))
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        groups: vec![QuotaGroup {
+            display_name: Some("GLM Coding Plan".to_string()),
+            buckets: tokens,
+            models: None,
+        }],
+        observed_at_unix: Some(now_unix),
+        ..AccountUsage::default()
+    }
+}
+
+fn coding_plan_limit_label(kind: &str, unit: i64, number: i64) -> (String, Option<String>) {
+    if kind.eq_ignore_ascii_case("TIME_LIMIT") {
+        return ("Tools".to_string(), None);
+    }
+    match (unit, number) {
+        (3, 5) => ("5h".to_string(), Some("5h".to_string())),
+        (6, 1) => ("Week".to_string(), Some("week".to_string())),
+        _ => {
+            let name = if kind.is_empty() {
+                "Quota".to_string()
+            } else {
+                kind.to_string()
+            };
+            (name, None)
+        }
+    }
+}
+
+fn coding_plan_used_percent(limit: &serde_json::Value) -> Option<f64> {
+    if let Some(percent) =
+        json_f64(limit.get("percentage")).or_else(|| json_f64(limit.get("percent")))
+    {
+        return Some(percent);
+    }
+    json_f64(limit.get("remaining")).map(|remaining| 100.0 - remaining)
+}
+
+fn coding_plan_reset_unix(value: &serde_json::Value) -> Option<i64> {
+    let raw = value
+        .as_i64()
+        .or_else(|| value.as_f64().map(|number| number as i64))?;
+    if raw <= 0 {
+        return None;
+    }
+    Some(if raw > 1_000_000_000_000 {
+        raw / 1000
+    } else {
+        raw
+    })
+}
+
+fn json_f64(value: Option<&serde_json::Value>) -> Option<f64> {
+    value.and_then(|value| {
+        value
+            .as_f64()
+            .or_else(|| value.as_i64().map(|number| number as f64))
+    })
+}
+
+fn json_i64(value: Option<&serde_json::Value>) -> Option<i64> {
+    value.and_then(|value| {
+        value
+            .as_i64()
+            .or_else(|| value.as_f64().map(|number| number as i64))
+    })
+}
+
 /// Seconds until the window resets, preferring the absolute timestamp because
 /// the relative value ages as the snapshot sits in memory.
 pub fn seconds_until_reset(
@@ -1560,6 +1691,7 @@ impl WhamUsage {
                             available: v.available,
                             available_at: v.available_at,
                             credits_would_enable: v.credits_would_enable,
+                            ..Default::default()
                         },
                     )
                 })
@@ -3761,6 +3893,7 @@ mod tests {
                         available: Some(true),
                         available_at: None,
                         credits_would_enable: Some(false),
+                        ..Default::default()
                     },
                 );
                 map
@@ -4196,5 +4329,77 @@ mod tests {
         let usage = wham.into_account_usage(1_000);
         assert_eq!(usage.overage_limit_reached, Some(true));
         assert!(usage.is_codex_hard_limit_reached());
+    }
+}
+
+#[cfg(test)]
+mod coding_plan_quota_tests {
+    use super::*;
+
+    #[test]
+    fn monitor_payload_reports_five_hour_usage_and_keeps_tools_second() {
+        let body = serde_json::json!({
+            "code": 200,
+            "data": {
+                "level": "lite",
+                "limits": [
+                    {
+                        "type": "TIME_LIMIT",
+                        "unit": 5,
+                        "number": 1,
+                        "percentage": 1,
+                        "remaining": 99,
+                        "nextResetTime": 1796050452998i64
+                    },
+                    {
+                        "type": "TOKENS_LIMIT",
+                        "unit": 3,
+                        "number": 5,
+                        "percentage": 22,
+                        "nextResetTime": 1793774115449i64
+                    }
+                ]
+            }
+        });
+        let usage = parse_coding_plan_quota(&body, 1_700_000_000);
+        assert_eq!(usage.plan_type.as_deref(), Some("lite"));
+        assert_eq!(usage.observed_at_unix, Some(1_700_000_000));
+        let buckets = &usage.groups[0].buckets;
+        assert_eq!(buckets.len(), 2);
+        assert_eq!(buckets[0].display_name.as_deref(), Some("5h"));
+        assert_eq!(buckets[0].window.as_deref(), Some("5h"));
+        assert_eq!(buckets[0].used_percent, Some(22.0));
+        assert_eq!(buckets[0].reset_at_unix, Some(1_793_774_115));
+        assert_eq!(buckets[1].display_name.as_deref(), Some("Tools"));
+        assert_eq!(buckets[1].used_percent, Some(1.0));
+        assert_eq!(buckets[1].reset_at_unix, Some(1_796_050_452));
+    }
+
+    #[test]
+    fn weekly_credit_window_is_labeled_and_remaining_derives_used_percent() {
+        let body = serde_json::json!({
+            "data": {
+                "limits": [{
+                    "type": "CREDIT_LIMIT",
+                    "unit": 6,
+                    "number": 1,
+                    "remaining": 40,
+                    "nextResetTime": 1_800_000_000
+                }]
+            }
+        });
+        let usage = parse_coding_plan_quota(&body, 10);
+        let bucket = &usage.groups[0].buckets[0];
+        assert_eq!(bucket.display_name.as_deref(), Some("Week"));
+        assert_eq!(bucket.used_percent, Some(60.0));
+        assert_eq!(bucket.reset_at_unix, Some(1_800_000_000));
+    }
+
+    #[test]
+    fn an_unmeasured_monitor_payload_is_not_a_snapshot() {
+        let body = serde_json::json!({"code": 200, "data": {"limits": []}});
+        let usage = parse_coding_plan_quota(&body, 1);
+        assert!(usage.observed_at_unix.is_none());
+        assert!(usage.groups.is_empty());
     }
 }

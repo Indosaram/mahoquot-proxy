@@ -23,6 +23,11 @@ pub fn should_warn_for_unauthenticated_bind(bind_addr: &str, api_keys_empty: boo
     !is_loopback
 }
 
+/// Added to each provider's fixed loopback callback port. Production uses 0 so
+/// the official ports are unchanged; tests shift the whole set into a free range
+/// so the suite does not depend on a port the host may already be forwarding.
+pub const DEFAULT_OAUTH_CALLBACK_PORT_OFFSET: u16 = 0;
+
 #[derive(Debug, Clone)]
 pub struct GatewayConfig {
     pub port: u16,
@@ -48,6 +53,10 @@ pub struct GatewayConfig {
     /// relays steering a different plan origin). Falls back to
     /// `ZCODE_CAPTCHA_CONFIG_URL`, then the official client config URL.
     pub captcha_config_url: Option<String>,
+    /// Base for the browser-redirect OAuth callback ports. Production uses the
+    /// provider-fixed loopback ports; tests point this at a free range so the
+    /// suite never depends on a port the host may already be forwarding.
+    pub oauth_callback_port_offset: u16,
     /// Vendored captcha solver sidecar override. Falls back to
     /// `MAHOQUOT_CAPTCHA_SOLVER_BIN`, then the binary staged next to the
     /// gateway executable.
@@ -73,6 +82,7 @@ impl Default for GatewayConfig {
             history_batch_size: 64,
             max_concurrent_inference: crate::state::MAX_CONCURRENT_INFERENCE_REQUESTS,
             captcha_config_url: None,
+            oauth_callback_port_offset: DEFAULT_OAUTH_CALLBACK_PORT_OFFSET,
             captcha_solver_bin: None,
         }
     }
@@ -141,6 +151,10 @@ impl GatewayConfig {
         let captcha_config_url = std::env::var("ZCODE_CAPTCHA_CONFIG_URL")
             .ok()
             .filter(|value| !value.trim().is_empty());
+        let oauth_callback_port_offset = std::env::var("MAHOQUOT_OAUTH_CALLBACK_PORT_OFFSET")
+            .ok()
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(DEFAULT_OAUTH_CALLBACK_PORT_OFFSET);
         let captcha_solver_bin = std::env::var("MAHOQUOT_CAPTCHA_SOLVER_BIN")
             .ok()
             .map(PathBuf::from)
@@ -166,6 +180,7 @@ impl GatewayConfig {
             max_concurrent_inference,
             captcha_config_url,
             captcha_solver_bin,
+            oauth_callback_port_offset,
         })
     }
 

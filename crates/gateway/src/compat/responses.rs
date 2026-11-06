@@ -492,6 +492,25 @@ pub fn responses_to_openai(req: &Value) -> Result<Value, ResponsesError> {
                         }
                         messages.push(tool_msg);
                     }
+                    Some("configuration_update") => {
+                        // Documented cache-preserving effort switch: the item
+                        // carries no message content, only the new level. It is
+                        // forwarded as an effort marker so the provider adapter
+                        // (codex item or Anthropic effort-only system message)
+                        // can keep every earlier block inside the cached prefix.
+                        if let Some(effort) = item
+                            .pointer("/reasoning/effort")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                        {
+                            messages.push(json!({
+                                "role": "system",
+                                "content": "",
+                                "x_effort_update": effort,
+                            }));
+                        }
+                    }
                     _ => {
                         // Regular message turn
                         let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
@@ -1281,6 +1300,34 @@ impl ResponsesStreamRenderer {
 
     pub fn into_response(self) -> Value {
         self.current_response()
+    }
+}
+
+#[cfg(test)]
+mod effort_cache_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn configuration_update_becomes_an_effort_marker() {
+        let req = json!({
+            "model": "claude-opus-5-5",
+            "input": [
+                {"role": "user", "content": "a"},
+                {"role": "assistant", "content": "b"},
+                {"type": "configuration_update", "reasoning": {"effort": "high"}},
+                {"role": "user", "content": "c"}
+            ]
+        });
+        let chat = responses_to_openai(&req).expect("valid conversion");
+        let messages = chat["messages"].as_array().expect("messages array");
+        let marker = messages
+            .iter()
+            .find(|message| message.get("x_effort_update").is_some())
+            .expect("effort marker message");
+        assert_eq!(marker["role"], "system");
+        assert_eq!(marker["x_effort_update"], "high");
+        assert_eq!(messages.len(), 4);
     }
 }
 

@@ -1712,6 +1712,27 @@ impl AccountMember {
         usage.model_availability.clone()
     }
 
+    /// Catalog facts the Antigravity request labels need for `model`.
+    ///
+    /// The catalog is keyed by variant id (`gemini-3.8-flash-low`), and each
+    /// variant maps to its own enum, so an exact lookup is the only correct
+    /// one; a prefix or family match would report another variant's enum.
+    pub fn antigravity_catalog_entry(
+        &self,
+        model: &str,
+    ) -> Option<crate::usage::ModelAvailability> {
+        if self.kind() != ProviderKind::Antigravity {
+            return None;
+        }
+        let stripped = model.strip_prefix("antigravity/").unwrap_or(model);
+        let usage = self.usage.read().unwrap_or_else(|p| p.into_inner());
+        let discovered = usage.model_availability.as_ref()?;
+        discovered
+            .get(model)
+            .or_else(|| discovered.get(stripped))
+            .cloned()
+    }
+
     pub fn supports_antigravity_model(&self, model: &str) -> bool {
         if self.kind() != ProviderKind::Antigravity || self.is_manually_disabled() {
             return false;

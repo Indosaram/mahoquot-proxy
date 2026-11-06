@@ -344,13 +344,39 @@ async fn refresh_account_usage_inner(
     }
 }
 
-/// Generic accounts expose no per-provider quota API, except two hardcoded
-/// adapters: ClinePass (a `cline-pass` account on the canonical Cline
-/// endpoint reports the three subscription windows from `usage-limits`) and
-/// InferX (a prepaid marketplace whose `/v1/balance` reports a wallet in
-/// microcredits). Both authenticate with the account's own API key as bearer
-/// auth. Everything else stays Unsupported so the UI renders "unknown"
-/// instead of a fake 0%.
+/// Generic accounts expose no per-provider quota API, except hardcoded
+/// adapters: Z.AI / Zhipu coding-plan keys (`/api/monitor/usage/quota/limit`),
+/// ClinePass, InferX, and xAI. Everything else stays Unsupported so the UI
+/// renders "unknown" instead of a fake 0%.
+fn coding_plan_quota_url(provider: &str, base: &str) -> Option<String> {
+    let origin = coding_plan_origin(base)
+        .or_else(|| coding_plan_default_origin(provider).map(str::to_string))?;
+    Some(format!("{origin}/api/monitor/usage/quota/limit"))
+}
+
+fn coding_plan_origin(base: &str) -> Option<String> {
+    let trimmed = base.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let url = reqwest::Url::parse(trimmed).ok()?;
+    let host = url.host_str()?.to_ascii_lowercase();
+    if host == "api.z.ai" || host == "open.bigmodel.cn" {
+        return Some(format!("{}://{host}", url.scheme()));
+    }
+    None
+}
+
+fn coding_plan_default_origin(provider: &str) -> Option<&'static str> {
+    match provider.to_ascii_lowercase().as_str() {
+        "zai" | "glm" => Some("https://api.z.ai"),
+        "zhipu-bigmodel" | "zhipu-bigmodel-coding" => Some("https://open.bigmodel.cn"),
+        _ => None,
+    }
+}
+
+/// Generic accounts expose no per-provider quota API, except the adapters
+/// above. Authentication is the account's own API key.
 async fn refresh_generic_usage(
     state: &AppState,
     member: &Arc<AccountMember>,
@@ -395,9 +421,10 @@ async fn refresh_generic_usage(
             QuotaError::Upstream(format!("proxy client construction failed: {error}"))
         })?;
         if state.auth_refresh_enabled && member.is_expired(now_unix()) {
-            state.refresh_member(member, None).await.map_err(|error| {
-                QuotaError::Upstream(format!("refresh failed: {error}"))
-            })?;
+            state
+                .refresh_member(member, None)
+                .await
+                .map_err(|error| QuotaError::Upstream(format!("refresh failed: {error}")))?;
         }
         let used = member.access_token();
         let parse = |body: &serde_json::Value, now: i64| {
@@ -412,6 +439,20 @@ async fn refresh_generic_usage(
             return refresh_json_usage(member, &client, &url, parse).await;
         }
         return first;
+    }
+
+    let quota_base = member
+        .usage_override
+        .clone()
+        .or_else(|| member.upstream_override.clone())
+        .or_else(|| member.generic_base_url())
+        .unwrap_or_default();
+    if let Some(url) = coding_plan_quota_url(&provider, &quota_base) {
+        let client = state.try_client_for_member(member).map_err(|error| {
+            QuotaError::Upstream(format!("proxy client construction failed: {error}"))
+        })?;
+        return refresh_json_usage(member, &client, &url, crate::usage::parse_coding_plan_quota)
+            .await;
     }
 
     let is_clinepass = provider.eq_ignore_ascii_case("cline-pass")
@@ -997,13 +1038,28 @@ async fn try_antigravity_quota(
             if let Ok(models_data) = resp.json::<serde_json::Value>().await {
                 let mut models_map = std::collections::BTreeMap::new();
                 if let Some(models_obj) = models_data.get("models").and_then(|v| v.as_object()) {
-                    for model_id in models_obj.keys() {
+                    for (model_id, details) in models_obj {
+                        let text = |key: &str| {
+                            details
+                                .get(key)
+                                .and_then(|v| v.as_str())
+                                .filter(|v| !v.is_empty())
+                                .map(str::to_string)
+                        };
                         models_map.insert(
                             model_id.clone(),
                             crate::usage::ModelAvailability {
                                 available: Some(true),
                                 available_at: None,
                                 credits_would_enable: None,
+                                // `ModelDetails.model` is the enum the client
+                                // echoes in `labels.model_enum`. Keeping it
+                                // keyed by the variant id is what makes the
+                                // lookup variant-accurate.
+                                model_enum: text("model"),
+                                api_provider: text("apiProvider"),
+                                model_provider: text("modelProvider"),
+                                display_name: text("displayName"),
                             },
                         );
                     }
@@ -1738,5 +1794,22 @@ mod tests {
             "quota endpoint returned 500".into()
         )));
         assert!(!credential_rejection(&QuotaError::RateLimited));
+    }
+
+    #[test]
+    fn coding_plan_quota_url_follows_the_account_origin() {
+        assert_eq!(
+            coding_plan_quota_url(
+                "zhipu-bigmodel-coding",
+                "https://open.bigmodel.cn/api/coding/paas/v4"
+            )
+            .as_deref(),
+            Some("https://open.bigmodel.cn/api/monitor/usage/quota/limit")
+        );
+        assert_eq!(
+            coding_plan_quota_url("zai", "").as_deref(),
+            Some("https://api.z.ai/api/monitor/usage/quota/limit")
+        );
+        assert!(coding_plan_quota_url("openrouter", "https://openrouter.ai/api/v1").is_none());
     }
 }
