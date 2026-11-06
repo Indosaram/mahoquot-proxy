@@ -854,24 +854,38 @@ mod tests {
 
     #[test]
     fn entries_track_loaded_providers() {
+        // Counts come from the catalog, not from a literal: a hardcoded number
+        // turns every catalog addition (gemini-4-argon did exactly this) into a
+        // red test and tempts whoever hits it into editing the expectation
+        // instead of the code.
+        let antigravity_ids = mahoquot_registry::embedded_snapshot()
+            .contribution_for_provider(&mahoquot_registry::ProviderId::antigravity())
+            .model_ids()
+            .len();
+        assert!(antigravity_ids > 0, "the catalog must list Antigravity models");
+
         let codex_only = model_entries(&[ProviderKind::Codex], None);
-        assert_eq!(codex_only.len(), 9);
+        assert_eq!(codex_only.len(), DEFAULT_MODELS.len());
         assert!(codex_only.iter().all(|e| e.owned_by == "openai"));
 
         let ag_only = model_entries(&[ProviderKind::Antigravity], None);
-        assert_eq!(ag_only.len(), 18);
+        assert_eq!(ag_only.len(), antigravity_ids);
         assert!(ag_only.iter().any(|e| e.id == "gemini-3.7-flash-high"));
         assert!(ag_only.iter().any(|e| e.id == "gemini-3.8-flash-high"));
         assert!(ag_only.iter().all(|e| e.owned_by == "google"));
 
         let both = model_entries(&[ProviderKind::Codex, ProviderKind::Antigravity], None);
-        assert_eq!(both.len(), 27);
+        assert_eq!(both.len(), DEFAULT_MODELS.len() + antigravity_ids);
 
         assert!(model_entries(&[], None).is_empty());
     }
 
     #[test]
     fn env_override_scopes_codex_only() {
+        let antigravity_ids = mahoquot_registry::embedded_snapshot()
+            .contribution_for_provider(&mahoquot_registry::ProviderId::antigravity())
+            .model_ids()
+            .len();
         let entries = model_entries(
             &[ProviderKind::Codex, ProviderKind::Antigravity],
             Some("gpt-x, gpt-y"),
@@ -881,7 +895,7 @@ mod tests {
         assert_eq!(codex[0].id, "gpt-x");
         assert_eq!(
             entries.iter().filter(|e| e.owned_by == "google").count(),
-            18
+            antigravity_ids
         );
     }
 

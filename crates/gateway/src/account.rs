@@ -704,6 +704,39 @@ mod provider_kind_contract_tests {
     }
 
     #[test]
+    fn successful_refresh_lifts_the_auth_failure_bench() {
+        let member = AccountMember::for_test(ProviderAccount::Codex(CodexAccount {
+            email: "test@example.com".to_string(),
+            ..Default::default()
+        }));
+
+        // A rejected refresh benches the account for re-authentication.
+        member.set_health(Health::AuthFailed);
+        assert_eq!(member.health(), Health::AuthFailed);
+
+        // Rotating the credential back into a working state must make the
+        // account routable again, or the refresh accomplishes nothing.
+        assert!(member.clear_auth_failure());
+        assert_eq!(member.health(), Health::Available);
+
+        // Idempotent: clearing an already-healthy account is a no-op.
+        assert!(!member.clear_auth_failure());
+        assert_eq!(member.health(), Health::Available);
+    }
+
+    #[test]
+    fn successful_refresh_never_overrides_an_operator_disable() {
+        let member = AccountMember::for_test(ProviderAccount::Codex(CodexAccount {
+            email: "test@example.com".to_string(),
+            ..Default::default()
+        }));
+        member.set_health(Health::Disabled);
+
+        assert!(!member.clear_auth_failure());
+        assert_eq!(member.health(), Health::Disabled);
+    }
+
+    #[test]
     fn group_cooldowns_survive_a_credential_rescan() {
         let account = AntigravityAccount {
             email: "test@example.com".to_string(),
@@ -1411,6 +1444,38 @@ impl AccountMember {
             return true;
         }
         false
+    }
+
+    /// Clear the auth-failure bench after the credential refreshed successfully.
+    ///
+    /// `AuthFailed` is otherwise only reverted by a process restart, so an
+    /// account whose token was rotated back into a working state stayed
+    /// unroutable forever and the rotation accomplished nothing observable.
+    /// `Disabled` is an operator decision and is never cleared here.
+    pub fn clear_auth_failure(&self) -> bool {
+        let mut guard = self
+            .health
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if matches!(*guard, Health::AuthFailed) {
+            *guard = Health::Available;
+            return true;
+        }
+        false
+    }
+
+    /// Whether the account is benched pending re-authentication.
+    ///
+    /// A rejected refresh grant is terminal, so retrying it on a timer cannot
+    /// succeed and only risks the identity provider locking the client out.
+    pub fn is_auth_failed(&self) -> bool {
+        matches!(
+            *self
+                .health
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            Health::AuthFailed
+        )
     }
 
     pub fn cline_trackers(&self) -> &crate::cline_usage::ClineTrackers {
@@ -2556,6 +2621,7 @@ impl AccountMember {
         if let Err(e) = self.reload_from_file() {
             return Err(RefreshError::Parse(e.to_string()));
         }
+        self.clear_auth_failure();
         Ok(true)
     }
 }

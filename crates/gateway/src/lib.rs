@@ -17,6 +17,7 @@ pub mod metrics;
 pub mod models_route;
 pub mod monitor;
 pub mod plan_captcha;
+pub mod pre_expiry_refresh;
 pub mod proxy_policy;
 pub mod quota;
 pub mod realtime;

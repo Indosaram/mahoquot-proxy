@@ -700,6 +700,11 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&state),
         mahoquot_gateway::registry::catalog_refresh_check_interval(),
     );
+    // Rotates OAuth credentials ahead of expiry. Every other refresh trigger is
+    // reactive, so an identity provider that expires its refresh token with the
+    // access token turns the first post-expiry attempt into a terminal failure.
+    let pre_expiry_refresh =
+        mahoquot_gateway::pre_expiry_refresh::spawn_from_env(Arc::clone(&state));
     mahoquot_gateway::egress_supervisor::spawn_egress_supervisor(
         state.clone(),
         std::time::Duration::from_secs(10),
@@ -720,6 +725,7 @@ async fn main() -> anyhow::Result<()> {
     usage_poller.shutdown().await;
     catalog_refresh.shutdown().await;
     cline_catalog.shutdown().await;
+    pre_expiry_refresh.shutdown().await;
     flush_worker.shutdown().await;
     let discovery_result = tokio::task::spawn_blocking(move || discovery_mgr.shutdown()).await;
     // Final snapshot before the process exits, so a replay that arrived inside
