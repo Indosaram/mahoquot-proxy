@@ -39,6 +39,8 @@ type ActiveIds = BTreeSet<String>;
 struct WarmupInner {
     active: Option<ActiveIds>,
     entries: HashMap<String, WarmupHistoryEntry>,
+    /// Unix times of the probes sent per account in the last 24 hours.
+    probe_log: HashMap<String, std::collections::VecDeque<i64>>,
     flights: HashMap<String, FlightEntry>,
     /// Monotonic tag handed to each new flight so a stale completion can never
     /// remove a flight registered after a prune (or a prune + re-add).
@@ -59,6 +61,8 @@ impl WarmupInner {
     }
 }
 
+const PROBE_LOG_WINDOW_SECS: i64 = 24 * 3600;
+
 pub struct WarmupRunner {
     inner: Mutex<WarmupInner>,
     limit: tokio::sync::Semaphore,
@@ -69,6 +73,7 @@ impl Default for WarmupRunner {
             inner: Mutex::new(WarmupInner {
                 active: None,
                 entries: HashMap::new(),
+                probe_log: HashMap::new(),
                 flights: HashMap::new(),
                 flight_generation: 0,
             }),
@@ -85,6 +90,7 @@ impl WarmupRunner {
         inner.active = Some(active.clone());
         let before_history = inner.entries.len();
         inner.entries.retain(|id, _| active.contains(id));
+        inner.probe_log.retain(|id, _| active.contains(id));
         let before_flights = inner.flights.len();
         inner.flights.retain(|id, _| active.contains(id));
         (before_history - inner.entries.len()) + (before_flights - inner.flights.len())
@@ -98,8 +104,23 @@ impl WarmupRunner {
         if !inner.admits(id) {
             return false;
         }
+        let at_unix = record.1;
+        let log = inner.probe_log.entry(id.to_string()).or_default();
+        log.push_back(at_unix);
+        while log.front().is_some_and(|t| *t <= at_unix - PROBE_LOG_WINDOW_SECS) {
+            log.pop_front();
+        }
         inner.entries.insert(id.to_string(), record);
         true
+    }
+    /// Probes sent for `id` in the 24 hours before `now_unix`.
+    pub fn probes_last_24h(&self, id: &str, now_unix: i64) -> usize {
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner.probe_log.get(id).map_or(0, |log| {
+            log.iter()
+                .filter(|t| **t > now_unix - PROBE_LOG_WINDOW_SECS)
+                .count()
+        })
     }
     /// Removes the flight registered under `id`, but only while it is still the
     /// exact generation its creator published. A prune (or a prune followed by a
@@ -198,6 +219,15 @@ fn eligibility(state: &AppState, m: &AccountMember, model: &str) -> Option<&'sta
     }
     if m.is_manually_disabled() {
         return Some("disabled");
+    }
+    if m.provider_name() == "claude"
+        && state
+            .settings
+            .current()
+            .claude_suspected_accounts
+            .contains_key(&m.id)
+    {
+        return Some("suspected");
     }
     let health = m.health();
     let group_derived = matches!(health, Health::Cooldown { until_unix_ms } if m.provider_name() == "antigravity" && m.group_cooldowns.read().unwrap_or_else(|p|p.into_inner()).values().any(|deadline| *deadline == until_unix_ms));
@@ -406,7 +436,67 @@ fn due_at(state: &AppState, m: &AccountMember, time: tokio::time::Instant) -> bo
         return false;
     }
     let (window_active, _) = resolve_window_state(state, m, model, now());
-    !window_active
+    if window_active {
+        return false;
+    }
+    if m.provider_name() == "claude" {
+        let reset_unix = m.usage_snapshot().primary.reset_at_unix;
+        let local_hour = local_hour_now();
+        return claude_probe_due(state, m, reset_unix, now(), local_hour);
+    }
+    true
+}
+
+/// Quiet hours (local time) when no Claude probe goes out.
+const CLAUDE_QUIET_HOURS: std::ops::Range<u32> = 1..8;
+const CLAUDE_JITTER_MIN_SECS: i64 = 180;
+const CLAUDE_JITTER_SPAN_SECS: u64 = 1320;
+
+/// Delay after a reset before an account's probe, fixed per account and
+/// window so a restart gives the same answer and accounts never line up.
+pub fn claude_probe_jitter_secs(account_id: &str, reset_unix: i64) -> i64 {
+    let material = format!("{account_id}{reset_unix}");
+    let spread = crate::affinity_store::fnv1a64(material.as_bytes()) % CLAUDE_JITTER_SPAN_SECS;
+    CLAUDE_JITTER_MIN_SECS + spread as i64
+}
+
+/// W3 gate for a Claude OAuth probe. The anchor is the reset the poller
+/// reported, read directly: `is_quota_window_active` drops past resets.
+/// - unknown reset: skipped until the poller reports one;
+/// - reset in the future: the window is live, refused upstream of here;
+/// - elapsed reset: due from `reset + jitter`, once per window.
+fn claude_probe_due(
+    state: &AppState,
+    m: &AccountMember,
+    reset_unix: Option<i64>,
+    now_unix: i64,
+    local_hour: u32,
+) -> bool {
+    let Some(reset_unix) = reset_unix.filter(|reset| *reset > 0) else {
+        return false;
+    };
+    if reset_unix > now_unix || CLAUDE_QUIET_HOURS.contains(&local_hour) {
+        return false;
+    }
+    if now_unix < reset_unix + claude_probe_jitter_secs(&m.id, reset_unix) {
+        return false;
+    }
+    let probed_this_window = state
+        .warmup
+        .inner
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .entries
+        .get(&m.id)
+        .is_some_and(|(_, at_unix, result)| {
+            *at_unix >= reset_unix && result.as_ref().is_some_and(|r| r.ok)
+        });
+    !probed_this_window
+}
+
+fn local_hour_now() -> u32 {
+    use chrono::Timelike;
+    chrono::Local::now().hour()
 }
 type WarmupRequest = (String, Value, Vec<(String, String)>);
 fn warmup_request(m: &AccountMember, model: &str) -> Option<WarmupRequest> {
@@ -453,10 +543,10 @@ fn warmup_request(m: &AccountMember, model: &str) -> Option<WarmupRequest> {
             ),
             json!({
                 "model": model,
-                "max_tokens": 1,
+                "max_tokens": 16,
                 "stream": true,
                 "system": [{"type":"text","text":crate::compat::claude::CLAUDE_CODE_SYSTEM_INSTRUCTION}],
-                "messages": [{"role":"user","content":"."}]
+                "messages": [{"role":"user","content":"Hi"}]
             }),
             headers,
         )),
@@ -1000,7 +1090,8 @@ mod tests {
         assert!(supported(&oauth));
         let (url, body, headers) = warmup_request(&oauth, "claude-haiku-5-5").unwrap();
         assert!(url.ends_with("/v1/messages"));
-        assert_eq!(body["max_tokens"], 1);
+        assert_eq!(body["max_tokens"], 16);
+        assert_eq!(body["messages"][0]["content"], "Hi");
         assert_eq!(body["model"], "claude-haiku-5-5");
         assert!(headers.iter().any(|(k, _)| k == "anthropic-beta"));
         assert!(!headers
@@ -1019,6 +1110,92 @@ mod tests {
         let spent = b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\"}}\n\n";
         assert!(!validate(spent, "claude"));
     }
+    fn claude_test_state() -> (Arc<AppState>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("warmup-claude-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = Arc::new(
+            AppState::new(&crate::config::GatewayConfig {
+                auth_dir: dir.clone(),
+                config_path: dir.join("config.yaml"),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        (state, dir)
+    }
+
+    fn claude_oauth(id: &str) -> AccountMember {
+        AccountMember::for_test_with_id(id, ProviderAccount::Claude(Default::default()))
+    }
+
+    #[test]
+    fn claude_probe_follows_the_reset_jitter_and_quiet_hours() {
+        let (state, dir) = claude_test_state();
+        let member = claude_oauth("claude-a");
+        // The empty test pool activates an allowlist without this account.
+        state.warmup.inner.lock().unwrap().active = None;
+        let reset = 1_800_000_000;
+        let jitter = claude_probe_jitter_secs("claude-a", reset);
+        let day = 12;
+        // (c) unknown reset: wait for the poller.
+        assert!(!claude_probe_due(&state, &member, None, reset + 5_000, day));
+        // (a) reset still ahead: the window is live.
+        assert!(!claude_probe_due(&state, &member, Some(reset), reset - 1, day));
+        // (b) elapsed reset: nothing before the jitter, one probe at it.
+        assert!(!claude_probe_due(&state, &member, Some(reset), reset + jitter - 1, day));
+        assert!(claude_probe_due(&state, &member, Some(reset), reset + jitter, day));
+        // Quiet hours hold the probe even when it is due.
+        assert!(!claude_probe_due(&state, &member, Some(reset), reset + jitter, 3));
+        // A successful probe in this window ends it until the next reset.
+        let mut ok = result(&member, "ok");
+        ok.ok = true;
+        state.warmup.record_probe(
+            &member.id,
+            (tokio::time::Instant::now(), reset + jitter, Some(ok)),
+        );
+        assert!(!claude_probe_due(&state, &member, Some(reset), reset + jitter + 60, day));
+        let next = reset + 18_000;
+        let next_jitter = claude_probe_jitter_secs("claude-a", next);
+        assert!(claude_probe_due(&state, &member, Some(next), next + next_jitter, day));
+        assert_eq!(state.warmup.probes_last_24h(&member.id, reset + jitter + 60), 1);
+        assert_eq!(state.warmup.probes_last_24h(&member.id, reset + jitter + 86_400), 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn claude_probe_jitter_is_fixed_bounded_and_per_account() {
+        let reset = 1_800_000_000;
+        let a = claude_probe_jitter_secs("claude-a", reset);
+        assert_eq!(a, claude_probe_jitter_secs("claude-a", reset));
+        assert_ne!(a, claude_probe_jitter_secs("claude-b", reset));
+        for id in ["claude-a", "claude-b", "claude-c", "claude-d"] {
+            for offset in 0..50 {
+                let jitter = claude_probe_jitter_secs(id, reset + offset * 18_000);
+                assert!((180..1500).contains(&jitter), "{id}: {jitter}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_suspected_claude_account_is_not_probed() {
+        let (state, dir) = claude_test_state();
+        let member = claude_oauth("claude-s");
+        state
+            .settings
+            .mutate(|document| {
+                document.claude_suspected_accounts.insert(
+                    "claude-s".into(),
+                    crate::management::settings::SuspectedAccount {
+                        reason: "organization has been disabled".into(),
+                        at_unix: 1,
+                    },
+                );
+            })
+            .unwrap();
+        assert_eq!(eligibility(&state, &member, "claude-haiku-5-5"), Some("suspected"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn warmup_done_only_is_not_success() {
         assert!(!validate(b"data: [DONE]\n\n", "codex"));

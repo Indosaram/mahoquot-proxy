@@ -1,5 +1,8 @@
 pub mod account;
+pub mod affinity_store;
 pub mod capability;
+pub mod claude_budget;
+pub mod claude_denial;
 pub mod claude_prefix_watch;
 pub mod claude_reset_order;
 pub mod cline_catalog;

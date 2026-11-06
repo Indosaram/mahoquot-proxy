@@ -238,6 +238,7 @@ impl SettingsStore {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let settings = Settings::load(&self.path)?;
+        settings.validate_claude_egress()?;
         let document = SettingsDocument::new(settings, &self.auth_dir_fallback);
         document.effective.validate_proxy_settings()?;
         let proxy_snapshot = crate::proxy_policy::ProxySnapshot::from_settings(&document.effective)
@@ -301,6 +302,10 @@ impl SettingsStore {
                 ))
             })?;
             document.effective.validate_proxy_settings()?;
+            // Checked here rather than in `validate_against_registry`, which the
+            // boot path also runs: a hand-edited bad entry at boot disables only
+            // that account instead of stopping the gateway.
+            document.effective.validate_claude_egress()?;
             let active_snapshot = self.active_snapshot();
             let candidate_registry = document
                 .effective
@@ -383,6 +388,7 @@ impl SettingsStore {
             ))
         })?;
         let document = SettingsDocument::new(next, &self.auth_dir_fallback);
+        document.effective.validate_claude_egress()?;
         let candidate_registry = document
             .effective
             .validate_against_registry(&self.active_snapshot())?;

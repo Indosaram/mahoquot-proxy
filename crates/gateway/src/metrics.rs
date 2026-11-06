@@ -104,6 +104,26 @@ pub struct AccountStats {
     pub discovery: Option<AccountDiscoveryMetadata>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credits_after_limit: Option<bool>,
+    /// Claude OAuth/API-key safety state; absent for every other provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude: Option<ClaudeAccountSafety>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ClaudeAccountSafety {
+    /// `oauth_first` | `api_key_first` | `api_key_only`.
+    pub route_mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suspected_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suspected_at_unix: Option<i64>,
+    /// Sessions durably pinned to this account.
+    pub affinity_bindings: usize,
+    /// Warmup probes sent in the last 24 hours.
+    pub probes_24h: usize,
+    /// Host of the per-account egress proxy, never the full URL.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub egress_host: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

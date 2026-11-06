@@ -943,6 +943,16 @@ pub struct AppState {
     pub scheduler: crate::scheduler::SchedulerRegistry,
     pub claude_reset_order: crate::claude_reset_order::ClaudeResetOrder,
     pub claude_prefix_watch: crate::claude_prefix_watch::ClaudePrefixWatch,
+    /// W0: cached monthly usage of budgeted Claude API-key accounts.
+    pub claude_budgets: crate::claude_budget::BudgetTracker,
+    /// W1: recent plain denials per Claude account, for promotion.
+    pub claude_denials: crate::claude_denial::DeniedTracker,
+    /// W2: durable Claude OAuth session -> account bindings.
+    pub claude_affinity: Arc<crate::affinity_store::AffinityStore>,
+    /// W5: prebuilt per-account egress clients, rebuilt on every published
+    /// settings document. A configured account whose entry did not build maps
+    /// to `None` and is never served.
+    pub claude_egress_clients: Arc<arc_swap::ArcSwap<ClaudeEgressClients>>,
     pub history: crate::request_history::HistoryService,
     pub signature_ledger: Arc<crate::compat::signature_ledger::SignatureLedger>,
     pub telemetry: Arc<TelemetryStore>,
@@ -979,6 +989,37 @@ pub struct AppState {
     pub lcp: std::sync::Mutex<mahoquot_router::lcp::Matcher>,
     /// Explicit/inherited session bindings with wall-clock TTL (Task 13).
     pub session_bindings: std::sync::Mutex<std::collections::HashMap<String, (String, i64)>>,
+}
+
+/// Prebuilt egress clients keyed by Claude account id. `None` marks an entry
+/// that did not build (a hand-edited settings file): that account must not be
+/// served rather than leave from the host's own IP.
+#[derive(Debug, Default)]
+pub struct ClaudeEgressClients {
+    clients: std::collections::HashMap<String, Option<reqwest::Client>>,
+}
+
+impl ClaudeEgressClients {
+    pub fn build(entries: &std::collections::BTreeMap<String, String>) -> Self {
+        let clients = entries
+            .iter()
+            .map(|(account, url)| {
+                let client = crate::proxy_policy::build_http_client(Some(url));
+                if client.is_err() {
+                    tracing::warn!(
+                        account = %account,
+                        "claude-account-egress entry does not build; account will not be served"
+                    );
+                }
+                (account.clone(), client.ok())
+            })
+            .collect();
+        Self { clients }
+    }
+
+    pub fn get(&self, account: &str) -> Option<&Option<reqwest::Client>> {
+        self.clients.get(account)
+    }
 }
 
 pub(crate) fn adopt_runtime_state(target: &AccountMember, previous: &Arc<AccountMember>) {
@@ -1080,6 +1121,15 @@ impl AppState {
         settings.set_proxy_publisher(Arc::new(move |new_snapshot| {
             proxy_pub.store(new_snapshot);
             proxy_clients_pub.clear();
+        }));
+        let claude_egress_clients = Arc::new(arc_swap::ArcSwap::from_pointee(
+            ClaudeEgressClients::build(&initial_settings.claude_account_egress),
+        ));
+        let claude_egress_obs = Arc::clone(&claude_egress_clients);
+        settings.add_observer(Arc::new(move |published| {
+            claude_egress_obs.store(Arc::new(ClaudeEgressClients::build(
+                &published.claude_account_egress,
+            )));
         }));
         let scoped_keys = Arc::new(ScopedKeyTracker::new(&settings.current().scoped_api_keys));
         // Every published settings document rebuilds the index, so a key that
@@ -1213,6 +1263,20 @@ impl AppState {
             scheduler,
             claude_reset_order: crate::claude_reset_order::ClaudeResetOrder::default(),
             claude_prefix_watch: crate::claude_prefix_watch::ClaudePrefixWatch::default(),
+            claude_budgets: crate::claude_budget::BudgetTracker::default(),
+            claude_denials: crate::claude_denial::DeniedTracker::default(),
+            claude_affinity: Arc::new(if config.auth_dir.as_os_str().is_empty() {
+                crate::affinity_store::AffinityStore::in_memory()
+            } else {
+                crate::affinity_store::AffinityStore::load(
+                    config.auth_dir.join(crate::affinity_store::STORE_FILE),
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0),
+                )
+            }),
+            claude_egress_clients,
             history,
             signature_ledger,
             telemetry,
@@ -1496,11 +1560,47 @@ impl AppState {
         &self,
         member: &AccountMember,
     ) -> Result<reqwest::Client, crate::proxy_policy::ProxyClientBuildError> {
+        if member.kind() == crate::account::ProviderKind::Claude {
+            if let Some(Some(client)) = self.claude_egress_clients.load().get(member.id()) {
+                return Ok(client.clone());
+            }
+        }
         let now_unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
         self.try_client_for_member_at(member, now_unix)
+    }
+
+    /// True when the account has an egress entry that failed to build. Such
+    /// an account is not served at all rather than sent out direct.
+    pub fn claude_egress_invalid(&self, member: &AccountMember) -> bool {
+        member.kind() == crate::account::ProviderKind::Claude
+            && matches!(self.claude_egress_clients.load().get(member.id()), Some(None))
+    }
+
+    /// W6 visibility for one Claude account. Only the egress host is exposed:
+    /// a proxy URL may carry credentials.
+    fn claude_account_safety(
+        &self,
+        member: &AccountMember,
+        affinity_counts: &std::collections::HashMap<String, usize>,
+        now_unix: i64,
+    ) -> crate::metrics::ClaudeAccountSafety {
+        let settings = self.settings.current();
+        let suspected = settings.claude_suspected_accounts.get(member.id());
+        crate::metrics::ClaudeAccountSafety {
+            route_mode: settings.claude_route_mode.as_str().to_string(),
+            suspected_reason: suspected.map(|s| s.reason.clone()),
+            suspected_at_unix: suspected.map(|s| s.at_unix),
+            affinity_bindings: affinity_counts.get(member.id()).copied().unwrap_or(0),
+            probes_24h: self.warmup.probes_last_24h(member.id(), now_unix),
+            egress_host: settings
+                .claude_account_egress
+                .get(member.id())
+                .and_then(|url| reqwest::Url::parse(url).ok())
+                .and_then(|url| url.host_str().map(str::to_string)),
+        }
     }
 
     pub fn try_client_for_member_at(
@@ -1827,6 +1927,7 @@ impl AppState {
                 )
             })
             .collect();
+        let affinity_counts = self.claude_affinity.counts(now_ms / 1000);
 
         let accounts = self
             .pool
@@ -1954,6 +2055,9 @@ impl AppState {
                     } else {
                         None
                     },
+                    claude: (m.kind() == crate::account::ProviderKind::Claude
+                        && !m.is_nekos_relay())
+                    .then(|| self.claude_account_safety(m, &affinity_counts, now_ms / 1000)),
                 }
             })
             .collect();

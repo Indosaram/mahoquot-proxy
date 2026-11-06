@@ -749,6 +749,123 @@ struct OutcomeRecord<'a> {
     token_usage: Option<crate::usage::ResponseTokenUsage>,
 }
 
+/// Request-scoped fields a terminal Claude denial needs to log its outcome.
+struct OutcomeContext<'a> {
+    event_id: &'a str,
+    occurred_at_ms: i64,
+    plan: &'a RelayPlan,
+    key_identifier: Option<&'a str>,
+    session: Option<&'a str>,
+    scoped_entry: Option<&'a crate::state::ScopedKeyEntry>,
+    started: std::time::Instant,
+    fast: bool,
+}
+
+fn is_claude_member(member: &AccountMember) -> bool {
+    member.kind() == crate::account::ProviderKind::Claude && !member.is_nekos_relay()
+}
+
+fn rebuild_response(failure: FinalFailure) -> reqwest::Response {
+    let mut builder = http::Response::builder().status(failure.status);
+    if let Some(content_type) = failure.content_type {
+        builder = builder.header(header::CONTENT_TYPE, content_type);
+    }
+    builder
+        .body(failure.body)
+        .map(reqwest::Response::from)
+        .unwrap_or_else(|_| reqwest::Response::from(http::Response::new(Bytes::new())))
+}
+
+/// Record the denial on the account. Enforcement (or a second plain denial
+/// inside the window) adds the account to the persisted suspected list, which
+/// only an operator clears.
+async fn handle_claude_denial(
+    state: &AppState,
+    member: &AccountMember,
+    status: u16,
+    message: &str,
+    denial: crate::claude_denial::Denial,
+) {
+    member.record_fail();
+    let now = now_unix_secs();
+    let promote = match denial {
+        crate::claude_denial::Denial::Enforcement => true,
+        crate::claude_denial::Denial::Denied => state.claude_denials.record(member.id(), now),
+        crate::claude_denial::Denial::Other => false,
+    };
+    if !promote {
+        state
+            .monitor
+            .record_error(member.id(), status, "claude permission denial");
+        return;
+    }
+    let reason = crate::claude_denial::enforcement_reason(status, message);
+    state
+        .monitor
+        .record_error(member.id(), status, &format!("suspected enforcement: {reason}"));
+    tracing::warn!(account = %member.id(), %reason, "claude account benched as suspected");
+    let account = member.id().to_string();
+    let settings = Arc::clone(&state.settings);
+    let result = tokio::task::spawn_blocking(move || {
+        settings.mutate(|document| {
+            document.claude_suspected_accounts.insert(
+                account,
+                crate::management::settings::SuspectedAccount {
+                    reason,
+                    at_unix: now,
+                },
+            );
+        })
+    })
+    .await;
+    match result {
+        Ok(Err(err)) => tracing::warn!("failed to persist suspected claude account: {err}"),
+        Err(err) => tracing::warn!("suspected claude account persistence task failed: {err}"),
+        Ok(Ok(_)) => {}
+    }
+}
+
+/// A Claude denial ends the request on this account: the client gets the
+/// upstream answer and no other account sees the request.
+async fn finish_claude_denial(
+    state: &AppState,
+    member: &AccountMember,
+    failure: FinalFailure,
+    ctx: OutcomeContext<'_>,
+) -> Response {
+    state
+        .metrics
+        .exposed_client_errors
+        .fetch_add(1, Ordering::Relaxed);
+    record_request_outcome(
+        state,
+        OutcomeRecord {
+            event_id: ctx.event_id,
+            occurred_at_ms: ctx.occurred_at_ms,
+            provider: member.provider_name(),
+            account: Some(member.id()),
+            model: ctx.plan.model.as_deref(),
+            key_identifier: ctx.key_identifier,
+            session: ctx.session,
+            scoped_entry: ctx.scoped_entry,
+            status: failure.status.as_u16(),
+            success: false,
+            elapsed_ms: ctx.started.elapsed().as_millis() as u64,
+            bytes_in: ctx.plan.original_body.len(),
+            bytes_out: failure.body.len() as u64,
+            tokens: None,
+            fast: ctx.fast,
+            token_usage: None,
+        },
+    )
+    .await;
+    body_response(
+        failure.status,
+        failure.content_type.as_deref(),
+        failure.body,
+    )
+}
+
 async fn record_request_outcome(state: &AppState, record: OutcomeRecord<'_>) {
     let timestamp = now_unix_secs();
     // The tier is injected into the codex wire document, which only a codex
@@ -1542,8 +1659,23 @@ fn resolve_target(
                 && !member.is_nekos_relay()
                 && member.relay_api_key().is_none()
             {
-                compat::claude::ensure_claude_code_system_instruction(&mut anthropic_val);
-                compat::claude::apply_prompt_cache_breakpoints(&mut anthropic_val);
+                // W4: with cloaking off the body keeps the caller's own system
+                // and cache layout; only the shared identity headers remain.
+                if !state.settings.current().disable_claude_cloak_mode {
+                    compat::claude::ensure_claude_code_system_instruction(&mut anthropic_val);
+                    compat::claude::apply_prompt_cache_breakpoints(&mut anthropic_val);
+                }
+                // The account, not the caller, owns this field upstream; a
+                // caller value would tie one client identity to many accounts.
+                if let Some(metadata) = anthropic_val
+                    .get_mut("metadata")
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    metadata.remove("user_id");
+                }
+                // Prefix drift is observed even with cloaking off: the watch
+                // compares what this account is about to send against what the
+                // same session sent last turn.
                 if let Some(session) = session_affinity {
                     if let Some(found) = state.claude_prefix_watch.observe(session, &anthropic_val)
                     {
@@ -1671,6 +1803,36 @@ impl UpstreamSendError {
     }
 }
 
+/// Claude OAuth headers with the gateway's client identity removed: keeps
+/// auth, version and content headers, narrows `anthropic-beta` to the OAuth
+/// flag (client betas are merged afterwards), and passes the client's own
+/// identity headers through when it sent any.
+fn uncloaked_claude_headers(
+    member_headers: Vec<(String, String)>,
+    client_headers: &HeaderMap,
+) -> Vec<(String, String)> {
+    let mut kept: Vec<(String, String)> = member_headers
+        .into_iter()
+        .filter(|(name, _)| {
+            matches!(
+                name.as_str(),
+                "authorization" | "anthropic-version" | "content-type"
+            )
+        })
+        .collect();
+    kept.push(("anthropic-beta".to_string(), "oauth-2025-04-20".to_string()));
+    for (name, value) in client_headers {
+        let name = name.as_str();
+        if !(name == "user-agent" || name == "x-app" || name.starts_with("x-stainless-")) {
+            continue;
+        }
+        if let Ok(value) = value.to_str() {
+            kept.push((name.to_string(), value.to_string()));
+        }
+    }
+    kept
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn send_upstream(
     state: &AppState,
@@ -1696,6 +1858,18 @@ async fn send_upstream(
     } else {
         member.build_upstream_headers()
     };
+
+    // W4: with cloaking off a Claude OAuth request carries no gateway-chosen
+    // identity: only auth, version, the OAuth beta, and whatever identity the
+    // client itself sent.
+    if custom_headers.is_none()
+        && member.kind() == crate::account::ProviderKind::Claude
+        && !member.is_nekos_relay()
+        && member.relay_api_key().is_none()
+        && state.settings.current().disable_claude_cloak_mode
+    {
+        member_headers = uncloaked_claude_headers(member_headers, headers);
+    }
 
     // If client provided anthropic-beta headers, merge them with member headers
     // so client-requested beta features (e.g. prompt-caching, output-128k) are preserved.
@@ -3617,7 +3791,7 @@ fn eligible_indices(
                 {
                     return false;
                 }
-                true
+                claude_member_routable(state, member)
             })
             .map(|(index, _)| index)
             .collect();
@@ -3675,6 +3849,9 @@ fn eligible_indices(
         {
             continue;
         }
+        if !claude_member_routable(state, member) {
+            continue;
+        }
         match prefix {
             Some(ModelPrefix::Anthropic) => {
                 if member.kind() != crate::account::ProviderKind::Claude || member.is_nekos_relay()
@@ -3728,7 +3905,149 @@ fn eligible_indices(
         &ranks,
         now_ms / 1000,
     );
+    if state.settings.current().claude_route_mode
+        == crate::management::settings::ClaudeRouteMode::ApiKeyFirst
+    {
+        prefer_claude_api_keys(&mut ordered, &pool.members);
+    }
     ordered
+}
+
+/// Claude-only gates shared by every eligibility path: a suspected account
+/// (W1), an API-key account over its monthly budget (W0), OAuth accounts
+/// under `api_key_only` (W0), and an account whose egress did not build (W5).
+pub(crate) fn claude_member_routable(state: &AppState, member: &AccountMember) -> bool {
+    if member.kind() != crate::account::ProviderKind::Claude || member.is_nekos_relay() {
+        return true;
+    }
+    let settings = state.settings.current();
+    if settings.claude_suspected_accounts.contains_key(member.id()) {
+        return false;
+    }
+    if state.claude_egress_invalid(member) {
+        return false;
+    }
+    if member.relay_api_key().is_some() {
+        return !state
+            .claude_budgets
+            .is_over(&settings.claude_api_key_budgets, member.id());
+    }
+    settings.claude_route_mode != crate::management::settings::ClaudeRouteMode::ApiKeyOnly
+}
+
+fn is_claude_oauth(member: &AccountMember) -> bool {
+    member.kind() == crate::account::ProviderKind::Claude
+        && !member.is_nekos_relay()
+        && member.relay_api_key().is_none()
+}
+
+/// A Claude bound cooldown at most this long holds the session (429) rather
+/// than moving it to an account without its prompt cache.
+const BOUND_COOLDOWN_HOLD_MS: i64 = 120_000;
+
+fn route_serves_claude(route: Option<&ResolvedRoute>) -> bool {
+    route.is_none_or(|route| {
+        route
+            .provider_classes
+            .iter()
+            .any(|p| p.binding.provider_id == mahoquot_registry::ProviderId::claude())
+    })
+}
+
+enum BoundMember {
+    Eligible,
+    ShortCooldown { retry_after_secs: i64 },
+    Unusable,
+}
+
+/// Where the durable binding stands for this request. The bound account must
+/// be a Claude OAuth member that passes this request's model and key scope;
+/// a plain-429 cooldown ending within two minutes holds the session.
+#[allow(clippy::too_many_arguments)]
+fn bound_member_state(
+    pool: &crate::state::PoolSnapshot,
+    route: Option<&ResolvedRoute>,
+    requested_model: Option<&str>,
+    bound_id: &str,
+    eligible: &[usize],
+    api_key_binding: Option<&crate::management::settings::ApiKeyBinding>,
+    scoped_key: Option<&crate::management::settings::ScopedApiKey>,
+    state: &AppState,
+    now_ms: i64,
+) -> BoundMember {
+    let Some(index) = pool.members.iter().position(|m| m.id() == bound_id) else {
+        return BoundMember::Unusable;
+    };
+    let member = &pool.members[index];
+    if !is_claude_oauth(member) {
+        return BoundMember::Unusable;
+    }
+    if eligible.contains(&index) {
+        return BoundMember::Eligible;
+    }
+    let Health::Cooldown { until_unix_ms } = member.health() else {
+        return BoundMember::Unusable;
+    };
+    let remaining_ms = until_unix_ms - now_ms;
+    if remaining_ms <= 0 || remaining_ms > BOUND_COOLDOWN_HOLD_MS {
+        return BoundMember::Unusable;
+    }
+    // Same request filters, health aside: the binding counts only if the
+    // account would serve this request once its cooldown ends.
+    if !member_matches_api_key_binding(member, api_key_binding)
+        || !crate::models_route::member_matches_scope(member, scoped_key)
+        || !claude_member_routable(state, member)
+        || member
+            .usage_snapshot()
+            .is_claude_included_quota_exhausted(now_ms / 1000)
+    {
+        return BoundMember::Unusable;
+    }
+    if let Some(route) = route {
+        let model = requested_model.unwrap_or(&route.canonical_model);
+        let declared = route.provider_classes.iter().any(|provider| {
+            member_provider_id(member).as_ref() == Some(&provider.binding.provider_id)
+                && account_declares_binding_model(
+                    pool,
+                    member,
+                    model,
+                    &route.canonical_model,
+                    provider,
+                )
+        });
+        if !declared || !member.group_available(&route.canonical_model, until_unix_ms) {
+            return BoundMember::Unusable;
+        }
+    }
+    BoundMember::ShortCooldown {
+        retry_after_secs: (remaining_ms + 999) / 1000,
+    }
+}
+
+fn is_claude_api_key(member: &AccountMember) -> bool {
+    member.kind() == crate::account::ProviderKind::Claude
+        && !member.is_nekos_relay()
+        && member.relay_api_key().is_some()
+}
+
+/// Within the slots Claude members occupy, move API-key members ahead of
+/// OAuth members, stable inside each group. Other providers keep their slots.
+fn prefer_claude_api_keys(ordered: &mut [usize], members: &[Arc<AccountMember>]) {
+    let slots: Vec<usize> = ordered
+        .iter()
+        .enumerate()
+        .filter(|(_, index)| {
+            members
+                .get(**index)
+                .is_some_and(|m| is_claude_oauth(m) || is_claude_api_key(m))
+        })
+        .map(|(slot, _)| slot)
+        .collect();
+    let mut claude: Vec<usize> = slots.iter().map(|slot| ordered[*slot]).collect();
+    claude.sort_by_key(|index| !is_claude_api_key(&members[*index]));
+    for (slot, index) in slots.into_iter().zip(claude) {
+        ordered[slot] = index;
+    }
 }
 
 pub(crate) fn eligible_account_ids_for_model(
@@ -5254,6 +5573,13 @@ fn scoped_affinity_key(
 }
 
 fn affinity_key(headers: &HeaderMap) -> Option<String> {
+    affinity_header(headers, false)
+}
+
+/// The session header chain. `claude_only` drops `x-client-request-id`: it is
+/// a per-request id for Claude callers, so binding on it pins nothing and
+/// would fill the durable store with one-shot keys.
+fn affinity_header(headers: &HeaderMap, claude_only: bool) -> Option<String> {
     for name in [
         "x-claude-code-session-id",
         "session_id",
@@ -5269,6 +5595,9 @@ fn affinity_key(headers: &HeaderMap) -> Option<String> {
         "x-conversation-id",
         "anthropic-client-session",
     ] {
+        if claude_only && name == "x-client-request-id" {
+            continue;
+        }
         if let Some(v) = headers.get(name).and_then(|v| v.to_str().ok()) {
             let v = v.trim();
             if !v.is_empty() {
@@ -5279,7 +5608,57 @@ fn affinity_key(headers: &HeaderMap) -> Option<String> {
     None
 }
 
+/// The session key chain used for routing (`affinity_key`, then the body
+/// fallbacks), minus `x-client-request-id` on Claude-only routes.
+fn routing_affinity_key(headers: &HeaderMap, body: &[u8], claude_only: bool) -> Option<String> {
+    affinity_header(headers, claude_only)
+        .or_else(|| body_affinity_key(body))
+        .or_else(|| body_prefix_affinity_key(body))
+}
+
+/// Stable digest of the same chain for the durable Claude store. The
+/// `DefaultHasher` keys are not stable across builds, so the body fallbacks are
+/// re-hashed from their original bytes with FNV-1a.
+fn durable_affinity_digest(headers: &HeaderMap, body: &[u8], claude_only: bool) -> Option<u64> {
+    use crate::affinity_store::digest;
+    if let Some(value) = affinity_header(headers, claude_only) {
+        return Some(digest("header", value.as_bytes()));
+    }
+    match body_affinity_material(body) {
+        Some(BodyAffinity::Id(id)) => return Some(digest("body-id", id.as_bytes())),
+        Some(BodyAffinity::FirstUser(text)) => {
+            return Some(digest("first-user", text.as_bytes()))
+        }
+        None => {}
+    }
+    if body.len() < BODY_AFFINITY_MIN_BYTES {
+        return None;
+    }
+    Some(digest(
+        "body-prefix",
+        &body[..body.len().min(BODY_AFFINITY_HEAD_BYTES)],
+    ))
+}
+
+enum BodyAffinity {
+    /// An explicit conversation/thread/session id from the body.
+    Id(String),
+    /// The trimmed text of the first user message.
+    FirstUser(String),
+}
+
 fn body_affinity_key(body: &[u8]) -> Option<String> {
+    match body_affinity_material(body)? {
+        BodyAffinity::Id(id) => Some(format!("body-id-{id}")),
+        BodyAffinity::FirstUser(text) => {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            hasher.write(text.as_bytes());
+            Some(format!("body-first-user-{:016x}", hasher.finish()))
+        }
+    }
+}
+
+fn body_affinity_material(body: &[u8]) -> Option<BodyAffinity> {
     let value: serde_json::Value = serde_json::from_slice(body).ok()?;
     let obj = value.as_object()?;
 
@@ -5307,7 +5686,7 @@ fn body_affinity_key(body: &[u8]) -> Option<String> {
         "session-id",
     ] {
         if let Some(v) = obj.get(field).and_then(extract_val) {
-            return Some(format!("body-id-{v}"));
+            return Some(BodyAffinity::Id(v));
         }
     }
 
@@ -5321,7 +5700,7 @@ fn body_affinity_key(body: &[u8]) -> Option<String> {
             "session-id",
         ] {
             if let Some(v) = metadata.get(field).and_then(extract_val) {
-                return Some(format!("body-id-{v}"));
+                return Some(BodyAffinity::Id(v));
             }
         }
     }
@@ -5330,7 +5709,7 @@ fn body_affinity_key(body: &[u8]) -> Option<String> {
         let user = user.trim();
         if user.starts_with("session_") || user.starts_with("conv_") || user.starts_with("thread_")
         {
-            return Some(format!("body-id-{user}"));
+            return Some(BodyAffinity::Id(user.to_string()));
         }
     }
 
@@ -5343,18 +5722,14 @@ fn body_affinity_key(body: &[u8]) -> Option<String> {
                 if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
                     let trimmed = content.trim();
                     if !trimmed.is_empty() {
-                        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                        hasher.write(trimmed.as_bytes());
-                        return Some(format!("body-first-user-{:016x}", hasher.finish()));
+                        return Some(BodyAffinity::FirstUser(trimmed.to_string()));
                     }
                 } else if let Some(parts) = msg.get("content").and_then(|c| c.as_array()) {
                     for part in parts {
                         if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
                             let trimmed = text.trim();
                             if !trimmed.is_empty() {
-                                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                                hasher.write(trimmed.as_bytes());
-                                return Some(format!("body-first-user-{:016x}", hasher.finish()));
+                                return Some(BodyAffinity::FirstUser(trimmed.to_string()));
                             }
                         }
                     }
@@ -5676,6 +6051,60 @@ pub async fn handle_relay(
         &state,
     );
     let initial_eligible = eligible.clone();
+
+    // W2: the durable Claude OAuth binding is consulted before the empty-pool
+    // exits, so a bound account in a short cooldown answers 429 instead of
+    // the request moving (and re-writing its prompt cache) elsewhere.
+    let claude_only = route.as_ref().is_some_and(|route| {
+        !route.provider_classes.is_empty()
+            && route
+                .provider_classes
+                .iter()
+                .all(|p| p.binding.provider_id == mahoquot_registry::ProviderId::claude())
+    });
+    let durable_key = (state.settings.current().claude_route_mode
+        != crate::management::settings::ClaudeRouteMode::ApiKeyOnly
+        && route_serves_claude(route.as_ref()))
+    .then(|| durable_affinity_digest(headers, &plan.original_body, claude_only))
+    .flatten();
+    let mut durable_bound: Option<String> = None;
+    if let Some(key) = durable_key {
+        if let Some(bound_id) = state.claude_affinity.get(key, created) {
+            match bound_member_state(
+                &pool,
+                route.as_ref(),
+                plan.model.as_deref(),
+                &bound_id,
+                &eligible,
+                binding.as_ref(),
+                scoped_key.as_deref(),
+                &state,
+                now_ms,
+            ) {
+                BoundMember::Eligible => {
+                    if let Some(pos) = eligible
+                        .iter()
+                        .position(|&idx| pool.members.get(idx).is_some_and(|m| m.id() == bound_id))
+                    {
+                        let idx = eligible.remove(pos);
+                        eligible.insert(0, idx);
+                    }
+                    durable_bound = Some(bound_id);
+                }
+                BoundMember::ShortCooldown { retry_after_secs } => {
+                    let mut response = json_error(
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "the account serving this session is cooling down; retry shortly",
+                    );
+                    if let Ok(value) = HeaderValue::from_str(&retry_after_secs.to_string()) {
+                        response.headers_mut().insert(header::RETRY_AFTER, value);
+                    }
+                    return response;
+                }
+                BoundMember::Unusable => {}
+            }
+        }
+    }
     if eligible.is_empty() && scoped_key.is_some() {
         return json_error(
             StatusCode::FORBIDDEN,
@@ -5722,11 +6151,11 @@ pub async fn handle_relay(
     // happened to answer with a buffered HTTP failure: transport and
     // proactive-refresh failures end an attempt without an HTTP response.
     let mut last_attempted: Option<(String, String)> = None;
-    let affinity = affinity_key(headers)
-        .or_else(|| body_affinity_key(plan.original_body.as_ref()))
-        .or_else(|| body_prefix_affinity_key(plan.original_body.as_ref()));
-    let affinity_session = affinity.as_deref().map(session_digest);
-    let session = affinity_session.clone().or_else(|| {
+    let affinity = routing_affinity_key(headers, plan.original_body.as_ref(), claude_only);
+    let session = affinity.as_deref().map(session_digest).or_else(|| {
+        // Mirror the ledger's identity chain: a caller with no session
+        // header still anchors on its first user message, and the history
+        // row must carry the same label the ledger entries are keyed on.
         let value: serde_json::Value = serde_json::from_slice(&plan.original_body).ok()?;
         body_session_anchor(&value).map(|anchor| session_digest(&anchor))
     });
@@ -5766,6 +6195,11 @@ pub async fn handle_relay(
             })
         },
     };
+    // The durable binding wins over any in-memory rebind left by an earlier
+    // one-off failover.
+    if let Some(bound_id) = durable_bound.as_deref() {
+        state.router.select_forced(bound_id, affinity.as_deref());
+    }
     // Accounts already tried in this request. 5xx and transport failures leave
     // health untouched (per contract), so exclusion is what forces the next
     // attempt onto a distinct account even when session affinity binds the
@@ -6186,6 +6620,42 @@ pub async fn handle_relay(
 
         let mut status_code = resp.status().as_u16();
 
+        // W1: a Claude denial is classified before anything else may act on it
+        // (refresh, failover), so an enforcement signal never reaches another
+        // account. Non-denials are rebuilt unchanged for the existing flow.
+        if is_claude_member(&member) && matches!(status_code, 400 | 401 | 403) {
+            let failure = extract_failure(resp, status_code).await;
+            let message = String::from_utf8_lossy(&failure.body);
+            let is_model_rejection = plan.model.is_some()
+                && is_account_scoped_model_rejection(status_code, &failure.body);
+            let denial = if is_model_rejection {
+                crate::claude_denial::Denial::Other
+            } else {
+                crate::claude_denial::classify(status_code, &message)
+            };
+            if denial != crate::claude_denial::Denial::Other {
+                handle_claude_denial(&state, &member, status_code, &message, denial).await;
+                return finish_claude_denial(
+                    &state,
+                    &member,
+                    failure,
+                    OutcomeContext {
+                        event_id: &event_id,
+                        occurred_at_ms,
+                        plan: &plan,
+                        key_identifier: key_identifier.as_deref(),
+                        session: session.as_deref(),
+                        scoped_entry: scoped_entry.as_deref(),
+                        started: request_started,
+                        fast,
+                    },
+                )
+                .await;
+            }
+            resp = rebuild_response(failure);
+            status_code = resp.status().as_u16();
+        }
+
         // Only a 401 earns the refresh-and-replay: a 403 carries a valid
         // credential that was merely denied (workspace/entitlement/model), so
         // refreshing it changes nothing (opencodex #1789, 1fa0f6aad).
@@ -6260,6 +6730,19 @@ pub async fn handle_relay(
             .await
             {
                 Ok(mut response) => {
+                    if let Some(key) = durable_key.filter(|_| is_claude_oauth(&member)) {
+                        match durable_bound.as_deref() {
+                            // A one-off failover serves this turn only; the
+                            // next turn goes back to the bound account.
+                            Some(bound_id) if bound_id != member.id() => {
+                                state.router.select_forced(bound_id, affinity.as_deref());
+                            }
+                            _ => {
+                                state.claude_affinity.put(key, member.id(), now_unix);
+                                state.router.select_forced(member.id(), affinity.as_deref());
+                            }
+                        }
+                    }
                     if let Some(h) = hierarchy.as_mut() {
                         h.bind(&state, member.id(), now_ms);
                     }
@@ -6438,6 +6921,45 @@ pub async fn handle_relay(
                             (StatusCode::BAD_GATEWAY, "unknown", reason.as_str())
                         };
 
+                    // W1, early-SSE path: the upstream said 200 and then sent
+                    // an `error` event. Classify with the mapped status; the
+                    // client gets the same JSON failure body as before, never
+                    // a retry on another account.
+                    if is_claude_member(&member)
+                        && matches!(code, "permission_denied" | "unauthenticated")
+                    {
+                        let sse_status = if code == "permission_denied" { 403 } else { 401 };
+                        let denial = crate::claude_denial::classify(sse_status, description);
+                        if denial != crate::claude_denial::Denial::Other {
+                            handle_claude_denial(&state, &member, sse_status, description, denial)
+                                .await;
+                            let failure = FinalFailure {
+                                status: mapped_status,
+                                content_type: Some("application/json".to_string()),
+                                body: Bytes::from(
+                                    serde_json::json!({"error": {"message": description, "type": "upstream_error", "code": code}})
+                                        .to_string(),
+                                ),
+                            };
+                            return finish_claude_denial(
+                                &state,
+                                &member,
+                                failure,
+                                OutcomeContext {
+                                    event_id: &event_id,
+                                    occurred_at_ms,
+                                    plan: &plan,
+                                    key_identifier: key_identifier.as_deref(),
+                                    session: session.as_deref(),
+                                    scoped_entry: scoped_entry.as_deref(),
+                                    started: request_started,
+                                    fast,
+                                },
+                            )
+                            .await;
+                        }
+                    }
+
                     member.record_fail();
                     state.metrics.failed_over.fetch_add(1, Ordering::Relaxed);
                     // Stream protocol anomalies are transport-class noise; the
@@ -6565,7 +7087,9 @@ pub async fn handle_relay(
             continue;
         }
 
-        if (500..=504).contains(&status_code) {
+        if (500..=504).contains(&status_code)
+            || (status_code == 529 && is_claude_member(&member))
+        {
             // Contract: ServerError leaves health unchanged. The account is
             // excluded from this request's remaining attempts, but a transient
             // upstream 5xx never benches it for other requests — and never
@@ -7156,6 +7680,139 @@ mod routing_tests {
         }
     }
 
+    #[test]
+    fn client_request_id_is_a_session_key_only_outside_claude_routes() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-client-request-id", HeaderValue::from_static("req-9"));
+        assert_eq!(
+            routing_affinity_key(&headers, b"{}", false).as_deref(),
+            Some("req-9")
+        );
+        assert_eq!(routing_affinity_key(&headers, b"{}", true), None);
+        assert_eq!(durable_affinity_digest(&headers, b"{}", true), None);
+        assert!(durable_affinity_digest(&headers, b"{}", false).is_some());
+    }
+
+    #[test]
+    fn the_durable_digest_is_stable_and_separates_key_kinds() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-claude-code-session-id",
+            HeaderValue::from_static("abc"),
+        );
+        let header_digest = durable_affinity_digest(&headers, b"{}", true).unwrap();
+        assert_eq!(
+            header_digest,
+            crate::affinity_store::digest("header", b"abc")
+        );
+        let body = br#"{"messages":[{"role":"user","content":"  abc  "}]}"#;
+        let body_digest = durable_affinity_digest(&HeaderMap::new(), body, true).unwrap();
+        assert_eq!(
+            body_digest,
+            crate::affinity_store::digest("first-user", b"abc")
+        );
+        assert_ne!(header_digest, body_digest);
+    }
+
+    fn route_mode_pool() -> (AppState, std::path::PathBuf) {
+        let claude = |slug: &str, api_key: bool| {
+            let key = if api_key {
+                r#""api_key":"sk-ant-api","#
+            } else {
+                ""
+            };
+            format!(
+                r#"{{{key}"type":"claude","identity_slug":"{slug}","access_token":"t","refresh_token":"r","expired":"2099-01-01T00:00:00Z"}}"#
+            )
+        };
+        state_with_credentials(
+            "route-mode",
+            &[
+                ("claude-o1.json", claude("o1", false)),
+                ("claude-o2.json", claude("o2", false)),
+                ("claude-k1.json", claude("k1", true)),
+                ("claude-k2.json", claude("k2", true)),
+                ("codex-c1.json", credential("codex")),
+            ],
+        )
+    }
+
+    fn ids(pool: &crate::state::PoolSnapshot, indices: &[usize]) -> Vec<String> {
+        indices
+            .iter()
+            .map(|i| pool.members[*i].id().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn claude_route_modes_order_and_filter_claude_members_only() {
+        use crate::management::settings::ClaudeRouteMode;
+        let (state, auth_dir) = route_mode_pool();
+        let pool = state.pool.load_full();
+        let all = |state: &AppState| {
+            ids(
+                &pool,
+                &eligible_indices(&pool, None, None, 0, None, None, state),
+            )
+        };
+        let claude_ids = |list: &[String]| -> Vec<String> {
+            list.iter().filter(|id| *id != "codex").cloned().collect()
+        };
+
+        let oauth_first = all(&state);
+        assert_eq!(oauth_first.len(), 5);
+
+        state
+            .settings
+            .mutate(|d| d.claude_route_mode = ClaudeRouteMode::ApiKeyOnly)
+            .unwrap();
+        let only = all(&state);
+        assert!(!only.iter().any(|id| id == "o1" || id == "o2"), "{only:?}");
+        assert!(only.iter().any(|id| id == "codex"), "codex unaffected: {only:?}");
+        assert_eq!(only.len(), 3);
+
+        let model = "claude-sonnet-4-5-20250929";
+        let route = resolve_route(&pool, Some(model), None).ok().flatten();
+        state
+            .settings
+            .mutate(|d| d.claude_route_mode = ClaudeRouteMode::ApiKeyFirst)
+            .unwrap();
+        let first = ids(
+            &pool,
+            &eligible_indices(&pool, route.as_ref(), Some(model), 0, None, None, &state),
+        );
+        let claude_first = claude_ids(&first);
+        assert_eq!(&claude_first[..2], &["k1".to_string(), "k2".to_string()], "{first:?}");
+        let oauth_tail: Vec<_> = claude_first[2..].to_vec();
+        assert_eq!(oauth_tail.len(), 2);
+        assert!(oauth_tail.iter().all(|id| id.starts_with('o')));
+
+        let _ = std::fs::remove_dir_all(auth_dir);
+    }
+
+    #[test]
+    fn an_api_key_member_over_budget_is_skipped() {
+        let (state, auth_dir) = route_mode_pool();
+        let pool = state.pool.load_full();
+        state
+            .settings
+            .mutate(|d| {
+                d.claude_api_key_budgets.insert("k1".into(), 100);
+                d.claude_api_key_budgets.insert("k2".into(), 100);
+            })
+            .unwrap();
+        let budgets = state.settings.current().claude_api_key_budgets.clone();
+        state.claude_budgets.refresh_with(&budgets, |account| {
+            Ok::<u64, String>(if account == "k1" { 100 } else { 99 })
+        });
+        let list = ids(
+            &pool,
+            &eligible_indices(&pool, None, None, 0, None, None, &state),
+        );
+        assert!(!list.iter().any(|id| id == "k1"), "{list:?}");
+        assert!(list.iter().any(|id| id == "k2"), "{list:?}");
+        let _ = std::fs::remove_dir_all(auth_dir);
+    }
     #[test]
     fn body_affinity_key_extracts_expected_fields() {
         // Top-level fields
