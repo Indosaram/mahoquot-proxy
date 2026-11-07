@@ -891,6 +891,17 @@ pub fn parse_cursor_usage_summary(body: &serde_json::Value, now_unix: i64) -> Ac
     let usage = body
         .get("individualUsage")
         .or_else(|| body.get("individual_usage"));
+    let plan = usage.and_then(|usage| usage.get("plan"));
+    // Cursor meters two pools independently and reports each as its own percentage:
+    // `autoPercentUsed` for the auto router and `apiPercentUsed` for named models. The
+    // plan's limit/remaining only covers the combined total, so a total-only bucket hides
+    // an exhausted named pool behind a healthy percentage - exactly the state that makes
+    // `cursor/claude-opus-5.5` fail while `cursor/auto` keeps working.
+    for (key, label) in [("autoPercentUsed", "Auto"), ("apiPercentUsed", "Named")] {
+        if let Some(percent) = plan.and_then(|plan| plan.get(key)).and_then(|v| v.as_f64()) {
+            buckets.push(usage_bucket(label, percent, reset_at_unix, now_unix));
+        }
+    }
     for (key, label) in [("plan", "Plan"), ("onDemand", "On-Demand")] {
         let value = usage.and_then(|usage| usage.get(key));
         if !value

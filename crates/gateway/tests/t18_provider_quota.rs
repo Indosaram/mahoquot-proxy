@@ -52,7 +52,15 @@ fn cursor_and_kiro_quota_payloads_normalize_to_account_usage() {
     );
     assert_eq!(cursor.plan_type.as_deref(), Some("pro"));
     assert_eq!(cursor.observed_at_unix, Some(1_800_000_000));
+    assert_eq!(
+        cursor.groups[0].buckets[0].display_name.as_deref(),
+        Some("Plan")
+    );
     assert_eq!(cursor.groups[0].buckets[0].used_percent, Some(75.0));
+    assert_eq!(
+        cursor.groups[0].buckets[1].display_name.as_deref(),
+        Some("On-Demand")
+    );
     assert_eq!(cursor.groups[0].buckets[1].used_percent, Some(20.0));
     assert_eq!(
         cursor.groups[0].buckets[0].reset_at_unix,
@@ -653,4 +661,41 @@ fn quota_refresh_failure_records_error_without_discarding_last_valid_snapshot() 
     assert_eq!(snapshot.plan_type.as_deref(), Some("plus"));
 
     std::fs::remove_dir_all(auth_dir).ok();
+}
+
+/// Cursor reports the auto and named pools separately. A live ultra account can sit at 3%
+/// total while its named pool is fully spent, which is why `cursor/auto` answers and
+/// `cursor/claude-opus-5.5` is rejected. The total must not hide that split.
+#[test]
+fn cursor_quota_separates_auto_and_named_pools() {
+    let usage = parse_cursor_usage_summary(
+        &serde_json::json!({
+            "membershipType": "ultra",
+            "billingCycleEnd": "2026-11-16T16:48:30Z",
+            "individualUsage": {
+                "plan": {
+                    "enabled": true,
+                    "used": 10258,
+                    "limit": 40000,
+                    "remaining": 29742,
+                    "autoPercentUsed": 0.07666666666666667,
+                    "apiPercentUsed": 100,
+                    "totalPercentUsed": 3.309032258064516
+                },
+                "onDemand": { "enabled": false }
+            }
+        }),
+        1_800_000_000,
+    );
+    let buckets = &usage.groups[0].buckets;
+    let by_name = |name: &str| {
+        buckets
+            .iter()
+            .find(|bucket| bucket.display_name.as_deref() == Some(name))
+            .unwrap_or_else(|| panic!("missing {name} bucket"))
+            .used_percent
+    };
+    assert_eq!(by_name("Named"), Some(100.0));
+    assert_eq!(by_name("Auto"), Some(0.08));
+    assert_eq!(by_name("Plan"), Some(25.64));
 }
