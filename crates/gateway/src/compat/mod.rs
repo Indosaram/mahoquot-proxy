@@ -577,6 +577,7 @@ impl StreamRenderer {
 
     fn tick(&mut self) -> Bytes {
         match self {
+            Self::OpenAi(renderer) => renderer.tick(),
             Self::Anthropic(renderer) => renderer.tick(),
             _ => Bytes::new(),
         }
