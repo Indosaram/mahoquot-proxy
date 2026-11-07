@@ -320,6 +320,26 @@ impl ChunkRenderer {
         out
     }
 
+    /// Keepalive for a quiet upstream on the `chat.completion.chunk` path.
+    ///
+    /// Only the Anthropic renderer emitted a keepalive, so `/v1/chat/completions`
+    /// callers sat in byte silence for the whole thinking phase of a long turn.
+    /// Clients that bound provider silence (mhc cancels after an idle timeout)
+    /// killed the request even though the upstream was healthy.
+    ///
+    /// The frame still carries a real `choices[0].delta` because mhc only re-arms
+    /// its idle bound on a public event, not on SSE comments: an empty delta is
+    /// classified as progress and deliberately does not reset the timer.
+    pub fn tick(&mut self) -> Bytes {
+        if self.terminated {
+            return Bytes::new();
+        }
+        let mut out = Vec::new();
+        self.role_prelude(&mut out);
+        out.push(self.chunk(json!({}), None));
+        out.concat().into()
+    }
+
     pub fn render(&mut self, event: CodexEvent) -> Vec<Bytes> {
         if self.terminated {
             return Vec::new();
@@ -920,5 +940,47 @@ mod open_frame_tests {
         assert!(frame.starts_with("data: "), "not an SSE frame: {frame}");
         assert!(frame.contains("\"role\":\"assistant\""), "no role: {frame}");
         assert!(renderer.open().is_empty(), "role chunk repeated");
+    }
+
+    #[test]
+    fn tick_keeps_a_chat_stream_alive_without_terminating_it() {
+        // A long thinking phase upstream sends no events at all. Before the
+        // tick existed the chat path emitted nothing either, so clients that
+        // bound provider silence cancelled a healthy request (mhc's 5m idle
+        // guard produced `status: 499` at the gateway).
+        let mut renderer = ChunkRenderer::new("cursor/claude-opus-5.5".to_string(), 7, false);
+        let first = renderer.tick();
+        let frame = String::from_utf8_lossy(&first);
+        assert!(frame.starts_with("data: "), "not an SSE frame: {frame}");
+        assert!(
+            frame.contains("\"object\":\"chat.completion.chunk\""),
+            "keepalive must stay a chat chunk: {frame}"
+        );
+        assert!(
+            frame.contains("\"choices\""),
+            "keepalive must carry a choice so clients re-arm their idle bound: {frame}"
+        );
+        assert!(
+            !renderer.terminated(),
+            "a keepalive must not end the stream"
+        );
+        // The first tick also carries the role prelude, later ticks must not.
+        let second = String::from_utf8_lossy(&renderer.tick()).into_owned();
+        assert!(second.starts_with("data: "), "not an SSE frame: {second}");
+        assert!(
+            !second.contains("\"role\":\"assistant\""),
+            "role chunk repeated by keepalive: {second}"
+        );
+    }
+
+    #[test]
+    fn tick_stops_once_the_stream_is_terminated() {
+        let mut renderer = ChunkRenderer::new("cursor/x".to_string(), 7, false);
+        renderer.render(CodexEvent::Completed { usage: None });
+        assert!(renderer.terminated());
+        assert!(
+            renderer.tick().is_empty(),
+            "a terminated stream must not emit keepalives"
+        );
     }
 }
