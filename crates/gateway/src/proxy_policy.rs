@@ -101,11 +101,12 @@ pub fn format_session_proxy_url(
 
     let username = if sticky {
         let sanitized = sanitize_session_id(member_id);
-        if ttl_secs > 0 {
-            let bucket = (now_unix + session_phase_offset(&sanitized, ttl_secs)) / ttl_secs;
-            format!("sess={sanitized}-b{bucket};any=1")
-        } else {
-            format!("sess={sanitized};any=1")
+        match ttl_secs {
+            0 => format!("sess={sanitized};any=1"),
+            ttl => {
+                let bucket = (now_unix + session_phase_offset(&sanitized, ttl)) / ttl;
+                format!("sess={sanitized}-b{bucket};any=1")
+            }
         }
     } else {
         "any=1".to_string()
@@ -166,7 +167,20 @@ pub fn sanitize_session_id(raw: &str) -> String {
 }
 
 pub fn build_http_client(proxy_url: Option<&str>) -> anyhow::Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder()
+    build_client_from(reqwest::Client::builder(), proxy_url)
+}
+
+/// For upstreams addressed with `accept-encoding: gzip, deflate, br, zstd`.
+pub fn build_decompressing_http_client(proxy_url: Option<&str>) -> anyhow::Result<reqwest::Client> {
+    let builder = reqwest::Client::builder().gzip(true).deflate(true).brotli(true).zstd(true);
+    build_client_from(builder, proxy_url)
+}
+
+fn build_client_from(
+    builder: reqwest::ClientBuilder,
+    proxy_url: Option<&str>,
+) -> anyhow::Result<reqwest::Client> {
+    let mut builder = builder
         .tcp_nodelay(true)
         .pool_idle_timeout(std::time::Duration::from_secs(90))
         .pool_max_idle_per_host(32)
@@ -483,5 +497,12 @@ mod tests {
             let ip2 = resp2.text().await.unwrap_or_default();
             assert_eq!(ip1, ip2, "sticky session should preserve exit IP across requests");
         }
+    }
+
+    #[test]
+    fn decompressing_client_builds_direct_and_proxied() {
+        assert!(build_decompressing_http_client(None).is_ok());
+        assert!(build_decompressing_http_client(Some("http://127.0.0.1:3128")).is_ok());
+        assert!(build_decompressing_http_client(Some("not-a-valid-url@@:")).is_err());
     }
 }

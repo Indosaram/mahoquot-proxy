@@ -349,80 +349,6 @@ async fn inference_admission(
     })
 }
 
-#[cfg(test)]
-mod permit_body_tests {
-    use super::*;
-    use http_body::Body as _;
-    use http_body::{Frame, SizeHint};
-    use std::convert::Infallible;
-    use std::task::{Context, Poll};
-
-    struct OneFrameThenEnd(bool);
-
-    impl http_body::Body for OneFrameThenEnd {
-        type Data = bytes::Bytes;
-        type Error = Infallible;
-
-        fn poll_frame(
-            mut self: std::pin::Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-            if self.0 {
-                Poll::Ready(None)
-            } else {
-                self.0 = true;
-                Poll::Ready(Some(Ok(Frame::data(bytes::Bytes::from_static(b"body")))))
-            }
-        }
-
-        fn is_end_stream(&self) -> bool {
-            self.0
-        }
-
-        fn size_hint(&self) -> SizeHint {
-            SizeHint::default()
-        }
-    }
-
-    #[test]
-    fn permit_is_released_at_eof_while_body_remains_alive() {
-        let gate = Arc::new(tokio::sync::Semaphore::new(1));
-        let permit = gate.clone().try_acquire_owned().unwrap();
-        let mut body = PermitBody {
-            inner: OneFrameThenEnd(false),
-            permit: std::cell::RefCell::new(Some(permit)),
-        };
-        let waker = futures::task::noop_waker();
-        let mut cx = Context::from_waker(&waker);
-
-        assert!(matches!(std::pin::Pin::new(&mut body).poll_frame(&mut cx), Poll::Ready(Some(Ok(_)))));
-        assert_eq!(gate.available_permits(), 0);
-        assert!(matches!(std::pin::Pin::new(&mut body).poll_frame(&mut cx), Poll::Ready(None)));
-        assert_eq!(gate.available_permits(), 1);
-        drop(body);
-        assert_eq!(gate.available_permits(), 1);
-    }
-
-    #[test]
-    fn permit_is_released_when_body_reports_end_stream() {
-        let gate = Arc::new(tokio::sync::Semaphore::new(1));
-        let permit = gate.clone().try_acquire_owned().unwrap();
-        let mut body = PermitBody {
-            inner: OneFrameThenEnd(true),
-            permit: std::cell::RefCell::new(Some(permit)),
-        };
-        let waker = futures::task::noop_waker();
-        let mut cx = Context::from_waker(&waker);
-
-        assert!(body.is_end_stream());
-        assert!(matches!(std::pin::Pin::new(&mut body).poll_frame(&mut cx), Poll::Ready(None)));
-        assert_eq!(gate.available_permits(), 1);
-        drop(body);
-        assert_eq!(gate.available_permits(), 1);
-    }
-
-}
-
 async fn healthz_handler() -> impl IntoResponse {
     Json(serde_json::json!({
         "status": "ok",
@@ -725,4 +651,77 @@ async fn codex_responses_handler(
         body,
     )
     .await
+}
+
+#[cfg(test)]
+mod permit_body_tests {
+    use super::*;
+    use http_body::Body as _;
+    use http_body::{Frame, SizeHint};
+    use std::convert::Infallible;
+    use std::task::{Context, Poll};
+
+    struct OneFrameThenEnd(bool);
+
+    impl http_body::Body for OneFrameThenEnd {
+        type Data = bytes::Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            if self.0 {
+                Poll::Ready(None)
+            } else {
+                self.0 = true;
+                Poll::Ready(Some(Ok(Frame::data(bytes::Bytes::from_static(b"body")))))
+            }
+        }
+
+        fn is_end_stream(&self) -> bool {
+            self.0
+        }
+
+        fn size_hint(&self) -> SizeHint {
+            SizeHint::default()
+        }
+    }
+
+    #[test]
+    fn permit_is_released_at_eof_while_body_remains_alive() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = gate.clone().try_acquire_owned().unwrap();
+        let mut body = PermitBody {
+            inner: OneFrameThenEnd(false),
+            permit: std::cell::RefCell::new(Some(permit)),
+        };
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(matches!(std::pin::Pin::new(&mut body).poll_frame(&mut cx), Poll::Ready(Some(Ok(_)))));
+        assert_eq!(gate.available_permits(), 0);
+        assert!(matches!(std::pin::Pin::new(&mut body).poll_frame(&mut cx), Poll::Ready(None)));
+        assert_eq!(gate.available_permits(), 1);
+        drop(body);
+        assert_eq!(gate.available_permits(), 1);
+    }
+
+    #[test]
+    fn permit_is_released_when_body_reports_end_stream() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = gate.clone().try_acquire_owned().unwrap();
+        let mut body = PermitBody {
+            inner: OneFrameThenEnd(true),
+            permit: std::cell::RefCell::new(Some(permit)),
+        };
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(body.is_end_stream());
+        assert!(matches!(std::pin::Pin::new(&mut body).poll_frame(&mut cx), Poll::Ready(None)));
+        assert_eq!(gate.available_permits(), 1);
+        drop(body);
+        assert_eq!(gate.available_permits(), 1);
+    }
 }

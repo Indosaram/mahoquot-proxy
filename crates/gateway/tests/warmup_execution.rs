@@ -265,9 +265,15 @@ async fn warmup_actual_http_validation_and_zero_hit_eligibility() {
         9000
     );
     cline.group_cooldowns.write().unwrap().clear();
-    cline.set_usage(Default::default());
+    // `set_usage` merges a snapshot without `refreshed_at_unix` into the old
+    // one (keeping its groups), so mark it as a fresh poll to really clear it.
+    cline.set_usage(mahoquot_gateway::usage::AccountUsage {
+        refreshed_at_unix: Some(usage.observed_at_unix.unwrap()),
+        ..Default::default()
+    });
     mode.store(6, Ordering::SeqCst);
-    assert!(warm_account(&state, &cline).await.ok);
+    let recovered = warm_account(&state, &cline).await;
+    assert!(recovered.ok, "{recovered:?}");
     mode.store(5, Ordering::SeqCst);
     std::fs::write(dir.join("antigravity-fixture.json"),json!({"type":"antigravity","identity_slug":"ag-fixture","access_token":"mock","refresh_token":"mock","email":"mock@example.com","expired":"2099-01-01T00:00:00Z","project_id":"mock-project","upstream_override":base}).to_string()).unwrap();
     state.rescan_pool().unwrap();

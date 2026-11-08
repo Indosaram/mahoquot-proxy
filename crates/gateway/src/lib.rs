@@ -3,6 +3,7 @@ pub mod affinity_store;
 pub mod capability;
 pub mod claude_budget;
 pub mod claude_denial;
+pub mod claude_wire;
 pub mod claude_reset_order;
 pub mod cline_usage;
 pub mod compat;

@@ -902,7 +902,11 @@ async fn assert_anthropic_native(kind: &str, model: &str) {
             .starts_with("You are ZCode"));
         assert_eq!(request.body["metadata"]["user_id"], "usr-42");
     } else {
-        assert_eq!(request.body["messages"][0]["content"], "ping");
+        // apply_prompt_cache_breakpoints marks the last message so the history
+        // is cached as one prefix; string content becomes a single text block.
+        let content = request.body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["text"], "ping");
+        assert_eq!(content[0]["cache_control"]["type"], "ephemeral");
     }
     assert!(
         request.body.get("input").is_none(),

@@ -139,7 +139,7 @@ fn matches_codex_model(
             return true;
         }
         if models
-            .split(|c| c == ',' || c == ' ')
+            .split([',', ' '])
             .any(|m| m.trim() == requested_model)
         {
             return true;
@@ -868,9 +868,25 @@ fn usage_bucket(
 
 pub fn parse_cursor_usage_summary(body: &serde_json::Value, now_unix: i64) -> AccountUsage {
     let mut buckets = Vec::new();
+    let reset_at_unix = body
+        .get("billingCycleEnd")
+        .or_else(|| body.get("billing_cycle_end"))
+        .and_then(|v| v.as_str())
+        .and_then(parse_rfc3339_unix);
     let usage = body
         .get("individualUsage")
         .or_else(|| body.get("individual_usage"));
+    let plan = usage.and_then(|usage| usage.get("plan"));
+    // Cursor meters two pools independently and reports each as its own percentage:
+    // autoPercentUsed for the auto router and apiPercentUsed for named models. The
+    // plan's limit/remaining only covers the combined total, so a total-only bucket hides
+    // an exhausted named pool behind a healthy percentage - exactly the state that makes
+    // cursor/claude-opus-5.5 fail while cursor/auto keeps working.
+    for (key, label) in [("autoPercentUsed", "Auto"), ("apiPercentUsed", "Named")] {
+        if let Some(percent) = plan.and_then(|plan| plan.get(key)).and_then(|v| v.as_f64()) {
+            buckets.push(usage_bucket(label, percent, reset_at_unix, now_unix));
+        }
+    }
     for (key, label) in [("plan", "Plan"), ("onDemand", "On-Demand")] {
         let value = usage.and_then(|usage| usage.get(key));
         if !value
@@ -893,7 +909,7 @@ pub fn parse_cursor_usage_summary(body: &serde_json::Value, now_unix: i64) -> Ac
         } else {
             0.0
         };
-        buckets.push(usage_bucket(label, used, None, now_unix));
+        buckets.push(usage_bucket(label, used, reset_at_unix, now_unix));
     }
     AccountUsage {
         plan_type: body
@@ -1018,6 +1034,62 @@ pub fn parse_clinepass_usage_summary(
         secondary: flat("weekly", 10_080),
         groups: vec![QuotaGroup {
             display_name: Some("ClinePass".to_string()),
+            models: None,
+            buckets,
+        }],
+        observed_at_unix: Some(now_unix),
+        ..Default::default()
+    })
+}
+
+/// SuperGrok / X Premium weekly credit pool from the Grok CLI chat proxy
+/// (`GET /v1/billing?format=credits`).
+///
+/// Contract: `{config:{currentPeriod:{type,start,end}, creditUsagePercent,
+/// productUsage:[{product, usagePercent?}]}}`. `creditUsagePercent` is already a
+/// percent and covers the whole shared pool; products that have not been used
+/// omit `usagePercent` and are reported as 0. A missing pool percent is a
+/// broken response and yields `None` rather than a fake 0%.
+pub fn parse_xai_billing_credits(
+    body: &serde_json::Value,
+    now_unix: i64,
+) -> Option<AccountUsage> {
+    let config = body.get("config")?;
+    let percent = config.get("creditUsagePercent").and_then(|v| v.as_f64())?;
+    let reset = config
+        .get("currentPeriod")
+        .and_then(|period| period.get("end"))
+        .or_else(|| config.get("billingPeriodEnd"))
+        .and_then(|v| v.as_str())
+        .and_then(parse_offset_datetime_unix);
+    let mut weekly = usage_bucket("Weekly", percent, reset, now_unix);
+    weekly.bucket_id = Some("weekly".to_string());
+    weekly.window = Some("weekly".to_string());
+    let mut buckets = vec![weekly];
+    for item in config
+        .get("productUsage")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+    {
+        let Some(product) = item.get("product").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let used = item.get("usagePercent").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let mut bucket = usage_bucket(product, used, reset, now_unix);
+        bucket.bucket_id = Some(product.to_string());
+        buckets.push(bucket);
+    }
+    Some(AccountUsage {
+        primary: QuotaWindow {
+            used_percent: buckets[0].used_percent,
+            window_minutes: Some(10_080),
+            reset_after_seconds: None,
+            reset_at_unix: reset,
+            limit_name: Some("Weekly".to_string()),
+        },
+        groups: vec![QuotaGroup {
+            display_name: Some("Grok".to_string()),
             models: None,
             buckets,
         }],
@@ -1794,11 +1866,11 @@ fn last_balanced_object(haystack: &[u8], key: &[u8]) -> Option<String> {
     let mut found = None;
     while let Some(pos) = find_sub(&haystack[start..], key) {
         let after = &haystack[start + pos + key.len()..];
-        let colon = after.iter().position(|b| *b != b' ').map_or(0, |p| p);
+        let colon = after.iter().position(|b| *b != b' ').unwrap_or(0);
         let after = &after[colon..];
         if after.first() == Some(&b':') {
             let after = &after[1..];
-            let brace = after.iter().position(|b| *b != b' ').map_or(0, |p| p);
+            let brace = after.iter().position(|b| *b != b' ').unwrap_or(0);
             let after = &after[brace..];
             if after.first() == Some(&b'{') {
                 if let Some(end) = balanced_end(after) {
@@ -3589,7 +3661,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn conversation_ids_never_become_model_availability() {
         let raw = r#"{"model_usage":{"gemini-3-flash":{"available":true},"chat_20706":{"available":true},"tab_flash_lite_preview":{"available":true}}}"#;
         let wham: WhamUsage = serde_json::from_str(raw).expect("deserializes");
@@ -3601,6 +3672,8 @@ mod tests {
         assert!(avail.contains_key("tab_flash_lite_preview"));
         assert!(!avail.contains_key("chat_20706"));
     }
+
+    #[test]
     fn parses_live_pro_wham_payload_with_chatpass_and_model_availability() {
         let raw = r#"{
           "rate_limit": {
@@ -3823,15 +3896,16 @@ mod tests {
     #[test]
     fn codex_exhaustion_handles_burst_and_overage() {
         let now = 1_000_000;
-        let mut u = AccountUsage::default();
-
         // Fresh burst window reading (<= 300s)
-        u.primary = QuotaWindow {
-            used_percent: Some(100.0),
-            reset_at_unix: None,
+        let mut u = AccountUsage {
+            primary: QuotaWindow {
+                used_percent: Some(100.0),
+                reset_at_unix: None,
+                ..Default::default()
+            },
+            observed_at_unix: Some(now - 100),
             ..Default::default()
         };
-        u.observed_at_unix = Some(now - 100);
         assert!(
             u.is_codex_included_quota_exhausted(None, now),
             "fresh burst 100% is exhausted"
@@ -3845,8 +3919,10 @@ mod tests {
         );
 
         // Explicit overage limit reached
-        let mut u_overage = AccountUsage::default();
-        u_overage.overage_limit_reached = Some(true);
+        let u_overage = AccountUsage {
+            overage_limit_reached: Some(true),
+            ..Default::default()
+        };
         assert!(
             u_overage.is_codex_hard_limit_reached(),
             "overage_limit_reached is hard limit"

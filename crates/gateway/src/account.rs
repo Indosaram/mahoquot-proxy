@@ -1085,7 +1085,7 @@ impl ProviderAccount {
             Self::Antigravity(a) => {
                 mahoquot_providers::build_antigravity_refresh_request(&a.refresh_token)
             }
-            Self::Claude(a) => mahoquot_providers::build_claude_refresh_request(&a.refresh_token),
+            Self::Claude(a) => mahoquot_providers::refresh::build_claude_refresh_request_with_scope(&a.refresh_token, None),
             Self::Cursor(a) => mahoquot_providers::build_cursor_refresh_request(&a.refresh_token),
             Self::Kiro(a) => match a.auth_mode {
                 mahoquot_providers::KiroAuthMode::Social => {
@@ -1241,6 +1241,7 @@ pub struct AccountMember {
     pub cline_trackers: crate::cline_usage::ClineTrackers,
     pub devin_catalog: arc_swap::ArcSwapOption<crate::devin_catalog::DevinAccountCatalogState>,
     pub devin_discovery_seq: Arc<AtomicU64>,
+    pub claude_device_id: String,
 }
 
 impl PoolMember for AccountMember {
@@ -1273,6 +1274,11 @@ impl AccountMember {
     }
 
     pub fn for_test_with_id(id: impl Into<String>, inner: ProviderAccount) -> Self {
+        let claude_device_id = if inner.kind() == ProviderKind::Claude {
+            generate_claude_device_id()
+        } else {
+            String::new()
+        };
         Self {
             id: id.into(),
             file_path: PathBuf::from("/dev/null"),
@@ -1293,7 +1299,22 @@ impl AccountMember {
             cline_trackers: crate::cline_usage::ClineTrackers::from_env(),
             devin_catalog: arc_swap::ArcSwapOption::empty(),
             devin_discovery_seq: Arc::new(AtomicU64::new(0)),
+            claude_device_id,
         }
+    }
+
+    pub fn for_test_with_claude_device_id(
+        id: impl Into<String>,
+        inner: ProviderAccount,
+        device_id: impl Into<String>,
+    ) -> Self {
+        let mut member = Self::for_test_with_id(id, inner);
+        member.claude_device_id = device_id.into();
+        member
+    }
+
+    pub fn claude_device_id(&self) -> &str {
+        &self.claude_device_id
     }
 
     pub fn begin_activity(self: &Arc<Self>) -> AccountActivity {
@@ -1639,6 +1660,7 @@ impl AccountMember {
             cline_trackers: self.cline_trackers.clone(),
             devin_catalog: arc_swap::ArcSwapOption::new(new_catalog),
             devin_discovery_seq: Arc::clone(&self.devin_discovery_seq),
+            claude_device_id: self.claude_device_id.clone(),
         }
     }
 
@@ -2526,6 +2548,76 @@ mod identity_tests {
         assert_eq!(members[0].id, "user@example.com");
         std::fs::remove_dir_all(dir).ok();
     }
+
+    #[test]
+    fn claude_device_id_validation_and_generation() {
+        let dev_id = generate_claude_device_id();
+        assert_eq!(dev_id.len(), 64);
+        assert!(is_valid_claude_device_id(&dev_id));
+        assert!(!is_valid_claude_device_id("too-short"));
+        assert!(!is_valid_claude_device_id(&"g".repeat(64)));
+    }
+
+    #[test]
+    fn claude_device_identities_storage_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("device-id-test-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(CLAUDE_DEVICE_IDENTITY_STORE);
+
+        let mut store = BTreeMap::new();
+        let dev1 = generate_claude_device_id();
+        let dev2 = generate_claude_device_id();
+        store.insert("acc1".to_string(), dev1.clone());
+        store.insert("acc2".to_string(), dev2.clone());
+
+        save_claude_device_identities(&path, &store).unwrap();
+        let loaded = load_claude_device_identities(&path).unwrap();
+        assert_eq!(loaded.get("acc1"), Some(&dev1));
+        assert_eq!(loaded.get("acc2"), Some(&dev2));
+        std::fs::remove_dir_all(dir).ok();
+    }
+}
+
+pub const CLAUDE_DEVICE_IDENTITY_STORE: &str = "claude-device-identity.json";
+
+pub fn is_valid_claude_device_id(s: &str) -> bool {
+    s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+pub fn generate_claude_device_id() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let mut s = String::with_capacity(64);
+    for b in bytes {
+        use std::fmt::Write;
+        let _ = write!(s, "{:02x}", b);
+    }
+    s
+}
+
+pub fn load_claude_device_identities(path: &Path) -> std::io::Result<BTreeMap<String, String>> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(error) => return Err(error),
+    };
+    serde_json::from_str(&content)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
+pub fn save_claude_device_identities(
+    path: &Path,
+    store: &BTreeMap<String, String>,
+) -> Result<(), std::io::Error> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    if !parent.as_os_str().is_empty() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string_pretty(store)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    write_credential_atomically(path, json.as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
 }
 
 /// The filename prefix is the reliable provider signal, not the `type` field:
@@ -2605,8 +2697,15 @@ pub fn load_account_members(auth_dir: &Path) -> anyhow::Result<Vec<Arc<AccountMe
     let files = list_all_auth_files(auth_dir)
         .map_err(|e| anyhow::anyhow!("failed to list auth files in {:?}: {}", auth_dir, e))?;
 
+    let identity_store_path = auth_dir.join(CLAUDE_DEVICE_IDENTITY_STORE);
+    let mut identity_store = load_claude_device_identities(&identity_store_path)?;
+    let mut identity_store_dirty = false;
+
     let mut members = Vec::with_capacity(files.len());
     for file_path in files {
+        if file_path == identity_store_path {
+            continue;
+        }
         let content = match std::fs::read_to_string(&file_path) {
             Ok(content) => content,
             Err(e) => {
@@ -2661,6 +2760,8 @@ pub fn load_account_members(auth_dir: &Path) -> anyhow::Result<Vec<Arc<AccountMe
             .and_then(|v| v.as_str())
             .map(str::to_string);
 
+        let credential_device_id = value.get("device_id").and_then(serde_json::Value::as_str).map(str::to_owned);
+        let credential_account_id = value.get("account_id").and_then(serde_json::Value::as_str).map(str::to_owned);
         let mut inner = match provider_account_from_value(kind, value) {
             Ok(inner) => inner,
             Err(e) => {
@@ -2751,6 +2852,38 @@ pub fn load_account_members(auth_dir: &Path) -> anyhow::Result<Vec<Arc<AccountMe
                 .to_string()
         };
 
+        let claude_device_id = if kind == ProviderKind::Claude {
+            let from_cred = credential_device_id.as_deref()
+                .filter(|s| is_valid_claude_device_id(s))
+                .map(str::to_string);
+
+            let from_store = identity_store
+                .get(&id)
+                .cloned()
+                .filter(|s| is_valid_claude_device_id(s))
+                .or_else(|| {
+                    credential_account_id.as_deref()
+                        .and_then(|acc| identity_store.get(acc).cloned())
+                        .filter(|s| is_valid_claude_device_id(s))
+                });
+
+            if let Some(dev_id) = from_cred.or(from_store) {
+                dev_id
+            } else {
+                let new_id = generate_claude_device_id();
+                identity_store.insert(id.clone(), new_id.clone());
+                if let Some(acc) = credential_account_id.as_deref() {
+                    if !acc.is_empty() {
+                        identity_store.insert(acc.to_string(), new_id.clone());
+                    }
+                }
+                identity_store_dirty = true;
+                new_id
+            }
+        } else {
+            String::new()
+        };
+
         members.push(Arc::new(AccountMember {
             id,
             file_path,
@@ -2775,7 +2908,12 @@ pub fn load_account_members(auth_dir: &Path) -> anyhow::Result<Vec<Arc<AccountMe
             cline_trackers: crate::cline_usage::ClineTrackers::from_env(),
             devin_catalog: arc_swap::ArcSwapOption::empty(),
             devin_discovery_seq: Arc::new(AtomicU64::new(0)),
+            claude_device_id,
         }));
+    }
+
+    if identity_store_dirty && !auth_dir.as_os_str().is_empty() {
+        save_claude_device_identities(&identity_store_path, &identity_store)?;
     }
 
     Ok(members)

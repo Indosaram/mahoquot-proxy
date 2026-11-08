@@ -196,7 +196,7 @@ fn test_complete_provider_blackout_rejection() {
     let (store, path) = temp_store("provider-blackout");
     let initial_yaml = std::fs::read_to_string(&path).expect("initial file exists");
 
-    // All 14 fallback-routable models for Antigravity in the active catalog
+    // All 18 fallback-routable models for Antigravity in the active catalog
     let all_ag_models = vec![
         "gemini-3.8-flash-high",
         "gemini-3.7-flash-high",
@@ -212,6 +212,10 @@ fn test_complete_provider_blackout_rejection() {
         "claude-sonnet-4-6",
         "claude-opus-4-6-thinking",
         "gpt-oss-120b-medium",
+        "gemini-4-argon",
+        "gemini-4-argon-high",
+        "gemini-4-argon-medium",
+        "gemini-4-argon-low",
     ];
 
     // Attempting to exclude 100% of Antigravity models without an explicit override
@@ -274,7 +278,7 @@ fn test_complete_provider_blackout_rejection() {
             .get("antigravity")
             .unwrap()
             .len(),
-        14
+        18
     );
 }
 

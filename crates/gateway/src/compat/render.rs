@@ -301,6 +301,12 @@ impl ChunkRenderer {
         }
     }
 
+    pub fn open(&mut self) -> Vec<Bytes> {
+        let mut out = Vec::new();
+        self.role_prelude(&mut out);
+        out
+    }
+
     pub fn render(&mut self, event: CodexEvent) -> Vec<Bytes> {
         if self.terminated {
             return Vec::new();
@@ -869,4 +875,20 @@ mod gemini_stream_tests {
         );
     }
 
+}
+
+#[cfg(test)]
+mod open_frame_tests {
+    use super::*;
+
+    #[test]
+    fn open_emits_role_chunk_once() {
+        let mut renderer = ChunkRenderer::new("cursor/x".to_string(), 7, false);
+        let first = renderer.open();
+        assert_eq!(first.len(), 1);
+        let frame = String::from_utf8_lossy(&first[0]);
+        assert!(frame.starts_with("data: "), "not an SSE frame: {frame}");
+        assert!(frame.contains("\"role\":\"assistant\""), "no role: {frame}");
+        assert!(renderer.open().is_empty(), "role chunk repeated");
+    }
 }

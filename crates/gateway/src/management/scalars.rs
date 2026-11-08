@@ -222,8 +222,10 @@ mod tests {
             serde_yaml::from_str("port: 18801\n").expect("a config written before the switch existed");
         assert!(!restored.codex_fast_mode);
 
-        let mut settings = Settings::default();
-        settings.codex_fast_mode = true;
+        let settings = Settings {
+            codex_fast_mode: true,
+            ..Settings::default()
+        };
         let yaml = serde_yaml::to_string(&settings).expect("serialize");
         assert!(yaml.contains("codex-fast-mode: true"), "{yaml}");
         assert!(

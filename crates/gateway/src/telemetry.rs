@@ -475,6 +475,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the test holds the store lock across awaits on purpose to block the worker's flush"
+    )]
     async fn flush_worker_shutdown_waits_for_a_blocked_flush_to_finish() {
         let dir = std::env::temp_dir().join(format!(
             "mahoquot-telemetry-blocked-flush-{}",

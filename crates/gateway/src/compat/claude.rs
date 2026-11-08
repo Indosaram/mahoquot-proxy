@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use serde_json::{json, Map, Value};
 
 use super::events::{CodexEvent, Usage};
@@ -1210,6 +1211,18 @@ impl AnthropicStreamRenderer {
 
     pub fn terminated(&self) -> bool {
         self.terminated
+    }
+
+    pub fn tick(&mut self) -> Bytes {
+        if self.terminated {
+            return Bytes::new();
+        }
+        let mut out = Vec::new();
+        self.ensure_started(&mut out);
+        out.push(Bytes::from_static(
+            b"event: ping\ndata: {\"type\":\"ping\"}\n\n",
+        ));
+        out.concat().into()
     }
 }
 

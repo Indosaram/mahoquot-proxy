@@ -7,7 +7,7 @@ use crate::account::{AccountMember, ProviderKind};
 use crate::state::AppState;
 use crate::usage::{
     parse_clinepass_usage_summary, parse_cursor_usage_summary, parse_inferx_balance,
-    parse_kiro_usage_summary,
+    parse_kiro_usage_summary, parse_xai_billing_credits,
     ResetCredit, WhamResetCreditList, WhamUsage,
 };
 
@@ -26,6 +26,8 @@ const KIRO_USAGE_URL: &str = "https://q.us-east-1.amazonaws.com/getUsageLimits?o
 /// ClinePass subscription quota. The account's own API key is the bearer
 /// credential; there is no local login file to read and no OAuth to refresh.
 const CLINEPASS_USAGE_URL: &str = "https://api.cline.bot/api/v1/users/me/plan/usage-limits";
+/// SuperGrok weekly credit pool, as shown by the Grok CLI's usage view.
+const XAI_USAGE_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
 /// Undocumented and version-dated: the endpoint is gated on this exact beta
 /// header, and a new date means the payload can change without notice.
 const CLAUDE_OAUTH_BETA: &str = "oauth-2025-04-20";
@@ -368,6 +370,22 @@ async fn refresh_generic_usage(
         let client = state.client_for_member(member);
         return refresh_json_usage(member, &client, &url, |body, now| {
             parse_inferx_balance(body, now).unwrap_or_default()
+        })
+        .await;
+    }
+
+    // xAI OAuth (SuperGrok / X Premium) accounts share one weekly pool across
+    // Grok Chat, Build and the CLI; the Grok CLI's own usage view reads it from
+    // the CLI chat proxy with the same OAuth bearer the relay uses.
+    if provider.eq_ignore_ascii_case("xai") {
+        let url = member
+            .usage_override
+            .as_deref()
+            .map(|base| format!("{}/v1/billing?format=credits", base.trim_end_matches('/')))
+            .unwrap_or_else(|| XAI_USAGE_URL.to_string());
+        let client = state.client_for_member(member);
+        return refresh_json_usage(member, &client, &url, |body, now| {
+            parse_xai_billing_credits(body, now).unwrap_or_default()
         })
         .await;
     }

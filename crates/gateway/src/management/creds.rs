@@ -1018,7 +1018,7 @@ async fn cline_import(State(state): State<Arc<AppState>>) -> Response {
         Ok(response) if response.status().is_success() => {
             match models_from_catalog("cline", response).await {
                 Ok(ids) => ids,
-                Err(rejection) => return rejection,
+                Err(rejection) => return *rejection,
             }
         }
         Ok(response) => {
@@ -1352,25 +1352,25 @@ pub(crate) fn model_ids_from_catalog(parsed: &Value) -> Vec<String> {
 async fn models_from_catalog(
     provider: &str,
     response: reqwest::Response,
-) -> Result<Vec<String>, Response> {
+) -> Result<Vec<String>, Box<Response>> {
     let body = response.bytes().await.map_err(|error| {
-        json_status(
+        Box::new(json_status(
             StatusCode::BAD_GATEWAY,
             json!({"error": format!("{provider} model catalog unreadable: {error}"), "status": "error"}),
-        )
+        ))
     })?;
     let parsed: Value = serde_json::from_slice(&body).map_err(|error| {
-        json_status(
+        Box::new(json_status(
             StatusCode::BAD_GATEWAY,
             json!({"error": format!("{provider} model catalog is not JSON: {error}"), "status": "error"}),
-        )
+        ))
     })?;
     let ids = model_ids_from_catalog(&parsed);
     if ids.is_empty() {
-        return Err(json_status(
+        return Err(Box::new(json_status(
             StatusCode::BAD_GATEWAY,
             json!({"error": format!("{provider} returned an empty model catalog"), "status": "error"}),
-        ));
+        )));
     }
     Ok(ids)
 }
@@ -1406,7 +1406,7 @@ async fn command_code_import(
         Ok(response) if response.status().is_success() => {
             match models_from_catalog("command-code", response).await {
                 Ok(ids) => ids,
-                Err(rejection) => return rejection,
+                Err(rejection) => return *rejection,
             }
         }
         Ok(response) => {

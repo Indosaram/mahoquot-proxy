@@ -8,9 +8,11 @@ pub const REFRESH_INTERVAL_SECS: i64 = 30 * 60;
 /// mid-conversation and rewrite its whole prompt cache on the next account.
 pub const NEW_SESSION_MIN_REMAINING_PERCENT: f64 = 10.0;
 
+type CachedRanks = Option<(i64, Arc<HashMap<String, usize>>)>;
+
 #[derive(Debug, Default)]
 pub struct ClaudeResetOrder {
-    cached: Mutex<Option<(i64, Arc<HashMap<String, usize>>)>>,
+    cached: Mutex<CachedRanks>,
 }
 
 pub fn is_claude_subscription(member: &AccountMember) -> bool {
@@ -25,6 +27,10 @@ fn active_five_hour_reset(member: &AccountMember, now_unix: i64) -> Option<i64> 
         .filter(|reset| *reset > now_unix)
 }
 
+#[expect(
+    clippy::let_and_return,
+    reason = "the binding ends the borrow of `usage` before it drops; returning the iterator chain directly fails E0597"
+)]
 fn is_nearly_spent(member: &AccountMember, now_unix: i64) -> bool {
     let usage = member.usage_snapshot();
     let nearly_spent = [&usage.primary, &usage.secondary]

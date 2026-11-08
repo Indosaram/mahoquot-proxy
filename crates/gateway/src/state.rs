@@ -384,6 +384,10 @@ pub struct AppState {
     /// Never proxied. Serves providers left out of an active `proxy-providers`
     /// allowlist, so a per-provider proxy cannot capture everyone else's egress.
     pub direct_client: reqwest::Client,
+    /// Direct api.anthropic.com Claude OAuth traffic: it advertises gzip/br/zstd
+    /// like Claude Code, so its responses must be decoded.
+    pub claude_direct_client: reqwest::Client,
+    pub claude_invalid_client: reqwest::Client,
     pub proxy_runtime: Arc<arc_swap::ArcSwap<crate::proxy_policy::ProxyRuntime>>,
     pub proxy_clients: Arc<ProxyClientCache>,
     pub metrics: Arc<GatewayMetrics>,
@@ -458,7 +462,7 @@ impl ClaudeEgressClients {
         let clients = entries
             .iter()
             .map(|(account, url)| {
-                let client = crate::proxy_policy::build_http_client(Some(url));
+                let client = crate::proxy_policy::build_decompressing_http_client(Some(url));
                 if client.is_err() {
                     tracing::warn!(
                         account = %account,
@@ -564,6 +568,10 @@ impl AppState {
         let http_client = crate::proxy_policy::build_http_client(base_proxy)
             .map_err(|e| anyhow::anyhow!("failed to build reqwest client: {}", e))?;
         let direct_client = crate::proxy_policy::build_http_client(None)
+            .map_err(|e| anyhow::anyhow!("failed to build reqwest client: {}", e))?;
+        let claude_direct_client = crate::proxy_policy::build_decompressing_http_client(None)
+            .map_err(|e| anyhow::anyhow!("failed to build reqwest client: {}", e))?;
+        let claude_invalid_client = crate::proxy_policy::build_decompressing_http_client(Some("http://127.0.0.1:0"))
             .map_err(|e| anyhow::anyhow!("failed to build reqwest client: {}", e))?;
         let devin_http_client = crate::proxy_policy::build_devin_http_client(base_proxy)
             .map_err(|e| anyhow::anyhow!("failed to build devin reqwest client: {}", e))?;
@@ -737,6 +745,8 @@ impl AppState {
             models_env: config.models_env.clone(),
             http_client,
             direct_client,
+            claude_direct_client,
+            claude_invalid_client,
             devin_http_client,
             devin_direct_client,
             proxy_runtime,
@@ -812,6 +822,9 @@ impl AppState {
                         let fresh = Arc::get_mut(&mut m).expect("freshly loaded account");
                         fresh.last_activity = previous_member.last_activity.clone();
                         fresh.active_requests = previous_member.active_requests.clone();
+                        if fresh.claude_device_id.is_empty() && !previous_member.claude_device_id.is_empty() {
+                            fresh.claude_device_id = previous_member.claude_device_id.clone();
+                        }
                     }
                     m
                 }
@@ -919,18 +932,97 @@ impl AppState {
 
     pub fn client_for_member(&self, member: &AccountMember) -> reqwest::Client {
         if member.kind() == crate::account::ProviderKind::Claude {
-            if let Some(Some(client)) = self.claude_egress_clients.load().get(member.id()) {
-                return client.clone();
+            if let Some(entry) = self.claude_egress_clients.load().get(member.id()) {
+                return match entry {
+                    Some(client) => client.clone(),
+                    None => {
+                        tracing::warn!(
+                            account = %member.id(),
+                            "claude-account-egress entry failed to build; refusing unproxied fallback"
+                        );
+                        self.claude_invalid_client.clone()
+                    }
+                };
+            }
+
+            let now_unix = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let runtime = self.proxy_runtime.load();
+            let configured_proxy = runtime
+                .session_proxy_url("claude", member.id(), now_unix)
+                .or_else(|| {
+                    if !runtime.scoped_routing_active() && !runtime.global_proxy_url.is_empty() {
+                        Some(runtime.global_proxy_url.clone())
+                    } else {
+                        None
+                    }
+                });
+
+            if let Some(proxy_url) = configured_proxy {
+                let cache_key = format!("claude|{}|{}", member.id(), proxy_url);
+                if let Some(client) = self.proxy_clients.get(&cache_key) {
+                    return client;
+                }
+                return match crate::proxy_policy::build_decompressing_http_client(Some(&proxy_url)) {
+                    Ok(client) => {
+                        let scope = format!("claude|{}|", member.id());
+                        self.proxy_clients
+                            .replace_scoped(cache_key, &scope, member.id(), client.clone());
+                        client
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            account = %member.id(),
+                            "failed to build Claude proxy client: {err}; refusing unproxied fallback"
+                        );
+                        self.claude_invalid_client.clone()
+                    }
+                };
+            }
+
+            if member.relay_api_key().is_none()
+                && crate::claude_wire::is_direct_base(member.upstream_override.as_deref())
+            {
+                return self.claude_direct_client.clone();
             }
         }
         self.client_for_target(&member.provider_name(), member.id())
     }
 
+    pub fn claude_device_id<'a>(&self, member: &'a AccountMember) -> &'a str {
+        member.claude_device_id()
+    }
+
+    pub fn claude_device_id_for_account(&self, account_id: &str) -> Option<String> {
+        self.find_member(account_id).map(|m| m.claude_device_id().to_string())
+    }
+
     /// True when the account has an egress entry that failed to build. Such
     /// an account is not served at all rather than sent out direct.
     pub fn claude_egress_invalid(&self, member: &AccountMember) -> bool {
-        member.kind() == crate::account::ProviderKind::Claude
-            && matches!(self.claude_egress_clients.load().get(member.id()), Some(None))
+        if member.kind() != crate::account::ProviderKind::Claude {
+            return false;
+        }
+        if matches!(self.claude_egress_clients.load().get(member.id()), Some(None)) {
+            return true;
+        }
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let runtime = self.proxy_runtime.load();
+        if let Some(proxy_url) = runtime.session_proxy_url("claude", member.id(), now_unix) {
+            if reqwest::Proxy::all(proxy_url.trim()).is_err() {
+                return true;
+            }
+        } else if !runtime.scoped_routing_active() && !runtime.global_proxy_url.is_empty() {
+            if reqwest::Proxy::all(runtime.global_proxy_url.trim()).is_err() {
+                return true;
+            }
+        }
+        false
     }
 
     /// W6 visibility for one Claude account. Only the egress host is exposed:
@@ -979,14 +1071,42 @@ impl AppState {
         now_unix: u64,
     ) -> reqwest::Client {
         let runtime = self.proxy_runtime.load();
+        let is_claude = provider_name.eq_ignore_ascii_case("claude")
+            || provider_name.eq_ignore_ascii_case("claude-code");
 
         let Some(proxy_url) = runtime.session_proxy_url(provider_name, member_id, now_unix) else {
             // Toggling a provider on at runtime must not retroactively proxy
             // the providers that were never opted in.
             return if runtime.scoped_routing_active() {
-                self.direct_client.clone()
+                if is_claude {
+                    self.claude_direct_client.clone()
+                } else {
+                    self.direct_client.clone()
+                }
             } else {
-                self.http_client.clone()
+                if is_claude {
+                    if !runtime.global_proxy_url.is_empty() {
+                        let cache_key = format!("{provider_name}|{member_id}|{}", runtime.global_proxy_url);
+                        if let Some(client) = self.proxy_clients.get(&cache_key) {
+                            return client;
+                        }
+                        match crate::proxy_policy::build_decompressing_http_client(Some(&runtime.global_proxy_url)) {
+                            Ok(client) => {
+                                let scope = format!("{provider_name}|{member_id}|");
+                                self.proxy_clients.replace_scoped(cache_key, &scope, member_id, client.clone());
+                                client
+                            }
+                            Err(err) => {
+                                tracing::warn!("failed to build Claude global proxy client: {err}; refusing unproxied fallback");
+                                self.claude_invalid_client.clone()
+                            }
+                        }
+                    } else {
+                        self.claude_direct_client.clone()
+                    }
+                } else {
+                    self.http_client.clone()
+                }
             };
         };
 
@@ -995,16 +1115,31 @@ impl AppState {
             return client;
         }
 
-        match crate::proxy_policy::build_http_client(Some(&proxy_url)) {
-            Ok(client) => {
-                let scope = format!("{provider_name}|{member_id}|");
-                self.proxy_clients
-                    .replace_scoped(cache_key, &scope, member_id, client.clone());
-                client
+        if is_claude {
+            match crate::proxy_policy::build_decompressing_http_client(Some(&proxy_url)) {
+                Ok(client) => {
+                    let scope = format!("{provider_name}|{member_id}|");
+                    self.proxy_clients
+                        .replace_scoped(cache_key, &scope, member_id, client.clone());
+                    client
+                }
+                Err(err) => {
+                    tracing::warn!("failed to build Claude proxy client: {err}; refusing unproxied fallback");
+                    self.claude_invalid_client.clone()
+                }
             }
-            Err(err) => {
-                tracing::warn!("failed to build proxy client ({proxy_url}): {err}; falling back to default client");
-                self.http_client.clone()
+        } else {
+            match crate::proxy_policy::build_http_client(Some(&proxy_url)) {
+                Ok(client) => {
+                    let scope = format!("{provider_name}|{member_id}|");
+                    self.proxy_clients
+                        .replace_scoped(cache_key, &scope, member_id, client.clone());
+                    client
+                }
+                Err(err) => {
+                    tracing::warn!("failed to build proxy client ({proxy_url}): {err}; falling back to default client");
+                    self.http_client.clone()
+                }
             }
         }
     }
@@ -1277,6 +1412,10 @@ impl AppState {
             in_flight: self.monitor.in_flight(),
             served: self.metrics.served.load(Ordering::Relaxed),
             failed_over: self.metrics.failed_over.load(Ordering::Relaxed),
+            served_model_substitutions: self
+                .metrics
+                .served_model_substitutions
+                .load(Ordering::Relaxed),
             refreshed: self.refreshed.load(Ordering::Relaxed),
             exposed_errors: self.metrics.exposed_errors.load(Ordering::Relaxed),
             exposed_client_errors: self.metrics.exposed_client_errors.load(Ordering::Relaxed),
@@ -1484,7 +1623,8 @@ mod stats_tests {
 #[cfg(test)]
 mod integration_tests {
     use super::*;
-    use crate::management::settings::ProviderProxyPolicy;
+    use std::collections::BTreeMap;
+    use crate::management::settings::{ProviderProxyPolicy, Settings};
     use crate::proxy_policy::ProxyRuntime;
 
     fn state_with_one_account() -> (Arc<AppState>, Arc<crate::account::AccountMember>) {
@@ -1643,5 +1783,35 @@ mod integration_tests {
             state.begin_devin_refresh("acct").is_some(),
             "dropping the guard must release the claim"
         );
+    }
+
+    #[test]
+    fn claude_client_selection_respects_provider_proxy_and_fallback_guard() {
+        let mut providers = BTreeMap::new();
+        providers.insert(
+            "claude".to_string(),
+            crate::management::settings::ProviderProxyPolicy {
+                enabled: true,
+                sticky: true,
+                ttl_secs: 600,
+                url: "http://127.0.0.1:3128".to_string(),
+            },
+        );
+        let settings = Settings {
+            proxy_url: String::new(),
+            proxy_providers: providers,
+            ..Settings::default()
+        };
+        let _runtime = Arc::new(arc_swap::ArcSwap::from_pointee(
+            crate::proxy_policy::ProxyRuntime::from_settings(&settings),
+        ));
+        let _direct = crate::proxy_policy::build_decompressing_http_client(None).unwrap();
+        let _invalid = crate::proxy_policy::build_decompressing_http_client(Some("http://127.0.0.1:0")).unwrap();
+
+        let member = AccountMember::for_test_with_id(
+            "claude-user",
+            crate::account::ProviderAccount::Claude(Default::default()),
+        );
+        assert!(crate::account::is_valid_claude_device_id(member.claude_device_id()));
     }
 }

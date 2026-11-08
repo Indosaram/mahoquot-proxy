@@ -48,6 +48,7 @@ fn url_encode(input: &str) -> String {
 struct MockAnthropicServerState {
     hit_count: Arc<AtomicUsize>,
     last_body: Arc<tokio::sync::Mutex<Option<Value>>>,
+    last_headers: Arc<tokio::sync::Mutex<Option<axum::http::HeaderMap>>>,
 }
 
 #[derive(Clone)]
@@ -187,6 +188,7 @@ async fn test_anthropic_oauth_flow_end_to_end() {
     let server_state = MockAnthropicServerState {
         hit_count: Arc::new(AtomicUsize::new(0)),
         last_body: Arc::new(tokio::sync::Mutex::new(None)),
+        last_headers: Arc::new(tokio::sync::Mutex::new(None)),
     };
     let s_clone = server_state.clone();
 
@@ -194,10 +196,11 @@ async fn test_anthropic_oauth_flow_end_to_end() {
         .route(
             "/v1/oauth/token",
             post(
-                move |State(s): State<MockAnthropicServerState>, body: String| async move {
+                move |State(s): State<MockAnthropicServerState>, headers: axum::http::HeaderMap, body: String| async move {
                     s.hit_count.fetch_add(1, Ordering::SeqCst);
                     let parsed: Value = serde_json::from_str(&body).unwrap();
                     *s.last_body.lock().await = Some(parsed);
+                    *s.last_headers.lock().await = Some(headers);
 
                     (
                         StatusCode::OK,
@@ -287,6 +290,16 @@ async fn test_anthropic_oauth_flow_end_to_end() {
     assert_eq!(last_body["grant_type"], "authorization_code");
     assert_eq!(last_body["code"], "anthropic_code_test_1");
     assert!(last_body["code_verifier"].as_str().unwrap().len() >= 40);
+
+    let last_headers = server_state.last_headers.lock().await.clone().unwrap();
+    assert_eq!(
+        last_headers.get("accept").and_then(|v| v.to_str().ok()),
+        Some("application/json, text/plain, */*")
+    );
+    assert_eq!(
+        last_headers.get("user-agent").and_then(|v| v.to_str().ok()),
+        Some("axios/1.15.2")
+    );
 
     // 5. Verify credential file was written and is compatible with ClaudeAccount loader
     let cred_file = auth_dir.join("claude-claude.test.user_anthropic.example.com.json");
@@ -514,6 +527,13 @@ async fn test_oauth_session_cancellation() {
     assert_eq!(cancel_json["status"], "ok");
 
     std::fs::remove_dir_all(&auth_dir).ok();
+}
+
+#[tokio::test]
+async fn test_anthropic_oauth_default_token_url_aligns_with_platform_claude() {
+    let params = std::collections::HashMap::new();
+    let (_, _, session) = mahoquot_gateway::management::oauth::create_anthropic_auth_url(&params);
+    assert_eq!(session.token_url, "https://platform.claude.com/v1/oauth/token");
 }
 
 #[derive(Clone)]

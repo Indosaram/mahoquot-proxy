@@ -540,7 +540,7 @@ mod tests {
     #[test]
     fn kiro_decoder_fails_when_the_json_buffer_exceeds_the_cap() {
         let mut payload = br#"{"content":""#.to_vec();
-        payload.extend(std::iter::repeat(b'a').take(MAX_KIRO_JSON_BUFFER_BYTES + 1));
+        payload.extend(std::iter::repeat_n(b'a', MAX_KIRO_JSON_BUFFER_BYTES + 1));
         assert!(payload.len() > MAX_KIRO_JSON_BUFFER_BYTES);
 
         let mut decoder = KiroDecoder::new();

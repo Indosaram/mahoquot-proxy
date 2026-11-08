@@ -30,7 +30,18 @@ fn relay_identity_uses_endpoint_hosts_not_account_names_or_url_paths() {
     assert!(member.supports_model("anthropic-claude-3-7-sonnet-20250219"));
     assert!(!member.supports_model("nekos-claude-3-7-sonnet-20250219"));
     member.usage_override = Some("https://claude.nekos.me".to_string());
-    assert!(member.is_nekos_relay());
+    // An OAuth account reaching a relay host is not a relay (1786e62); only a
+    // keyed relay account on a relay host is.
+    assert!(!member.is_nekos_relay());
+    let mut keyed = mahoquot_gateway::account::AccountMember::for_test_with_id(
+        "nekos-fan-ccapi",
+        mahoquot_gateway::account::ProviderAccount::Claude(mahoquot_providers::ClaudeAccount {
+            api_key: Some("relay-test-key".to_string()),
+            ..Default::default()
+        }),
+    );
+    keyed.usage_override = Some("https://claude.nekos.me".to_string());
+    assert!(keyed.is_nekos_relay());
 }
 
 #[tokio::test]

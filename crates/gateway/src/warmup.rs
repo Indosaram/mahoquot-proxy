@@ -446,6 +446,7 @@ fn due_at(state: &AppState, m: &AccountMember, time: tokio::time::Instant) -> bo
 const CLAUDE_QUIET_HOURS: std::ops::Range<u32> = 1..8;
 const CLAUDE_JITTER_MIN_SECS: i64 = 180;
 const CLAUDE_JITTER_SPAN_SECS: u64 = 1320;
+const CLAUDE_SESSION_WINDOW_SECS: i64 = 18_000;
 
 /// Delay after a reset before an account's probe, fixed per account and
 /// window so a restart gives the same answer and accounts never line up.
@@ -467,10 +468,31 @@ fn claude_probe_due(
     now_unix: i64,
     local_hour: u32,
 ) -> bool {
-    let Some(reset_unix) = reset_unix.filter(|reset| *reset > 0) else {
+    if CLAUDE_QUIET_HOURS.contains(&local_hour) {
         return false;
+    }
+    let Some(reset_unix) = reset_unix.filter(|reset| *reset > 0) else {
+        // No reset anchor. A polled 0% session means the window has never
+        // been opened, which is exactly what a probe is for; one successful
+        // probe per window length is enough until the poller reports a reset.
+        let unopened = m.usage_snapshot().primary.used_percent.is_some_and(|used| used <= 0.0);
+        if !unopened {
+            return false;
+        }
+        let probed_recently = state
+            .warmup
+            .inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entries
+            .get(&m.id)
+            .is_some_and(|(_, at_unix, result)| {
+                now_unix - *at_unix < CLAUDE_SESSION_WINDOW_SECS
+                    && result.as_ref().is_some_and(|r| r.ok)
+            });
+        return !probed_recently;
     };
-    if reset_unix > now_unix || CLAUDE_QUIET_HOURS.contains(&local_hour) {
+    if reset_unix > now_unix {
         return false;
     }
     if now_unix < reset_unix + claude_probe_jitter_secs(&m.id, reset_unix) {
@@ -943,6 +965,16 @@ pub fn status(state: &AppState) -> Value {
             Some(reason)
         } else if window_active {
             Some("window_active")
+        } else if m.provider_name() == "claude"
+            && !claude_probe_due(
+                state,
+                m,
+                m.usage_snapshot().primary.reset_at_unix,
+                current_now,
+                local_hour_now(),
+            )
+        {
+            Some("claude_schedule")
         } else {
             None
         };
@@ -1149,6 +1181,42 @@ mod tests {
         assert!(claude_probe_due(&state, &member, Some(next), next + next_jitter, day));
         assert_eq!(state.warmup.probes_last_24h(&member.id, reset + jitter + 60), 1);
         assert_eq!(state.warmup.probes_last_24h(&member.id, reset + jitter + 86_400), 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn claude_probe_opens_a_never_used_session_once() {
+        let (state, dir) = claude_test_state();
+        let member = claude_oauth("claude-u");
+        state.warmup.inner.lock().unwrap().active = None;
+        let now = 1_800_000_000;
+        let day = 12;
+        // Never polled: still waits for the poller.
+        assert!(!claude_probe_due(&state, &member, None, now, day));
+        // Polled at 0% with no reset: the session has never been opened.
+        let mut usage = member.usage_snapshot();
+        usage.primary.used_percent = Some(0.0);
+        member.set_usage(usage.clone());
+        assert!(claude_probe_due(&state, &member, None, now, day));
+        assert!(!claude_probe_due(&state, &member, None, now, 3));
+        // Usage without a reset is not an unopened window.
+        let mut used = usage.clone();
+        used.primary.used_percent = Some(12.0);
+        member.set_usage(used);
+        assert!(!claude_probe_due(&state, &member, None, now, day));
+        member.set_usage(usage);
+        // A failed probe does not end the attempt; a successful one does
+        // until a full session length has passed.
+        state.warmup.record_probe(
+            &member.id,
+            (tokio::time::Instant::now(), now, Some(result(&member, "boom"))),
+        );
+        assert!(claude_probe_due(&state, &member, None, now + 60, day));
+        let mut ok = result(&member, "ok");
+        ok.ok = true;
+        state.warmup.record_probe(&member.id, (tokio::time::Instant::now(), now + 60, Some(ok)));
+        assert!(!claude_probe_due(&state, &member, None, now + 120, day));
+        assert!(claude_probe_due(&state, &member, None, now + 60 + 18_000, day));
         let _ = std::fs::remove_dir_all(dir);
     }
 

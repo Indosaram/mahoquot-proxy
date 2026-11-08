@@ -347,14 +347,14 @@ async fn default_ceiling_admits_a_hundred_concurrent_inference_requests() {
             .unwrap();
         held.push(tokio::spawn(app.clone().oneshot(request)));
     }
-    for admitted in 0..BURST {
+    for (admitted, request) in held.iter().enumerate() {
         tokio::time::timeout(Duration::from_secs(5), polled.acquire())
             .await
             .expect("every request inside the ceiling must reach body extraction")
             .unwrap()
             .forget();
         assert!(
-            !held[admitted].is_finished(),
+            !request.is_finished(),
             "request {admitted} answered early instead of being admitted"
         );
     }

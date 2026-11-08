@@ -356,6 +356,15 @@ struct OutcomeContext<'a> {
     fast: bool,
 }
 
+/// A Claude OAuth account whose messages go to api.anthropic.com itself gets
+/// the full Claude Code wire profile; relays (ccapi) keep the legacy shape.
+fn is_direct_claude_oauth(member: &AccountMember, state: &AppState) -> bool {
+    member.kind() == crate::account::ProviderKind::Claude
+        && member.relay_api_key().is_none()
+        && !state.settings.current().disable_claude_cloak_mode
+        && crate::claude_wire::is_direct_base(member.upstream_override.as_deref())
+}
+
 fn is_claude_member(member: &AccountMember) -> bool {
     member.kind() == crate::account::ProviderKind::Claude && !member.is_nekos_relay()
 }
@@ -748,6 +757,7 @@ fn body_session_anchor(body: &serde_json::Value) -> Option<String> {
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_target(
     pool: &crate::state::PoolSnapshot,
     member: &AccountMember,
@@ -756,6 +766,7 @@ fn resolve_target(
     upstream_model: &str,
     session_affinity: Option<&str>,
     state: &AppState,
+    client_headers: &HeaderMap,
 ) -> Result<UpstreamTarget, String> {
     if plan.mode == RelayMode::Image {
         let base = member.upstream_override.as_deref().unwrap_or_default();
@@ -1116,6 +1127,7 @@ fn resolve_target(
             if member.kind() == crate::account::ProviderKind::Claude
                 && !member.is_nekos_relay()
                 && member.relay_api_key().is_none()
+                && !is_direct_claude_oauth(member, state)
             {
                 // W4: with cloaking off the body keeps the caller's own system
                 // and cache layout; only the shared identity headers remain.
@@ -1141,6 +1153,41 @@ fn resolve_target(
                     upstream_model,
                     user_id.as_deref(),
                 );
+            }
+
+            if is_direct_claude_oauth(member, state) {
+                let account_uuid = member.account_id().unwrap_or_default();
+                let wire_affinity = affinity_header(client_headers, true).or_else(|| {
+                    match body_affinity_material(&plan.original_body) {
+                        Some(BodyAffinity::Id(id)) => Some(id),
+                        Some(BodyAffinity::FirstUser(_)) | None => None,
+                    }
+                });
+                let mut wire = crate::claude_wire::build_with_headers(
+                    anthropic_val,
+                    &crate::claude_wire::Identity {
+                        account_key: member.id(),
+                        account_uuid: &account_uuid,
+                        session_affinity: wire_affinity.as_deref(),
+                        device_id: member.claude_device_id(),
+                    },
+                    Some(client_headers),
+                    crate::claude_wire::is_subagent(client_headers),
+                )?;
+                if plan.mode == RelayMode::Anthropic {
+                    crate::claude_wire::preserve_native_bytes(&mut wire, &plan.original_body)?;
+                }
+                let mut headers = wire.headers;
+                if let Some(auth) = headers.iter_mut().find(|(k, _)| k == "authorization") {
+                    auth.1 = format!("Bearer {}", member.access_token());
+                }
+                return Ok(UpstreamTarget {
+                    url: crate::claude_wire::messages_url(member.upstream_override.as_deref()),
+                    body: Bytes::from(wire.body),
+                    protocol: compat::Protocol::Anthropic,
+                    headers: Some(headers),
+                    replay: None,
+                });
             }
 
             let body = Bytes::from(serde_json::to_vec(&anthropic_val).map_err(|e| e.to_string())?);
@@ -1307,9 +1354,19 @@ async fn send_upstream(
         member_headers = uncloaked_claude_headers(member_headers, headers);
     }
 
+    // The direct Claude Code profile already folded the client's betas in and
+    // owns its full header set; nothing below may add to it.
+    let claude_direct = protocol == compat::Protocol::Anthropic
+        && custom_headers.is_some()
+        && is_direct_claude_oauth(member, state);
+
     // If client provided anthropic-beta headers, merge them with member headers
     // so client-requested beta features (e.g. prompt-caching, output-128k) are preserved.
-    if let Some(client_beta) = headers.get("anthropic-beta").and_then(|v| v.to_str().ok()) {
+    if let Some(client_beta) = headers
+        .get("anthropic-beta")
+        .and_then(|v| v.to_str().ok())
+        .filter(|_| !claude_direct)
+    {
         if let Some((_, val)) = member_headers
             .iter_mut()
             .find(|(k, _)| k == "anthropic-beta")
@@ -1365,6 +1422,9 @@ async fn send_upstream(
             solve_gate: &state.captcha_solve_gate,
         }
     });
+    let member_sets_content_type = member_headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("content-type"));
     for (name, val) in member_headers {
         req_builder = req_builder.header(name, val);
     }
@@ -1374,14 +1434,17 @@ async fn send_upstream(
             accept.unwrap_or(compat::devin::STREAM_CONTENT_TYPE),
         );
     } else {
-        if let Some(accept) = accept {
+        if let Some(accept) = accept.filter(|_| !claude_direct) {
             req_builder = req_builder.header(header::ACCEPT, accept);
         }
-        if let Some(ct) = headers
-            .get(header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-        {
-            req_builder = req_builder.header(header::CONTENT_TYPE.as_str(), ct);
+        if !member_sets_content_type && protocol != compat::Protocol::Cursor {
+            if let Some(ct) = headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .filter(|_| !claude_direct)
+            {
+                req_builder = req_builder.header(header::CONTENT_TYPE.as_str(), ct);
+            }
         }
     }
     let req_start = std::time::Instant::now();
@@ -2105,6 +2168,68 @@ fn stream_response(resp: reqwest::Response, status_code: u16) -> Response {
         .unwrap_or_else(|_| {
             (StatusCode::INTERNAL_SERVER_ERROR, "failed to build body").into_response()
         })
+}
+
+/// Passes an upstream body through untouched while observing which model the
+/// upstream says it served.
+///
+/// `/v1/responses` and `/backend-api/codex/responses` relay the upstream stream
+/// byte-for-byte, so the client already sees the upstream's own
+/// `response.model`. What the gateway previously lost was the record: every
+/// history row and log line attributes the turn to `usage_events.model`, which
+/// is the *requested* id. An upstream that answers one model with another (the
+/// Codex safety-buffering path) therefore left no trace at all.
+///
+/// The scan is bounded to the head of the stream and never delays a chunk: once
+/// the model is seen, or the budget is spent, the tap stops inspecting and only
+/// forwards.
+fn observe_served_model(
+    body: Body,
+    requested: String,
+    account: String,
+    provider: String,
+    substitutions: Arc<std::sync::atomic::AtomicU64>,
+) -> Body {
+    use futures::StreamExt;
+
+    const OBSERVE_BUDGET: usize = 16 * 1024;
+    let mut seen = 0usize;
+    let mut decided = false;
+    let mut head: Vec<u8> = Vec::new();
+    let tapped = body.into_data_stream().map(move |chunk| {
+        if !decided {
+            if let Ok(bytes) = &chunk {
+                if seen < OBSERVE_BUDGET {
+                    let take = bytes.len().min(OBSERVE_BUDGET - seen);
+                    head.extend_from_slice(&bytes[..take]);
+                    seen += take;
+                }
+                // A model mismatch is only decidable once a frame carrying
+                // `response.model` arrives. Clear the buffer at the budget so a
+                // stream that never names one cannot grow it unboundedly.
+                let served = compat::served_codex_model(&head);
+                if let Some(served) = served {
+                    decided = true;
+                    head.clear();
+                    if served != requested {
+                        substitutions.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(
+                            requested_model = %requested,
+                            served_model = %served,
+                            %account,
+                            %provider,
+                            "upstream served a different model than requested"
+                        );
+                    }
+                } else if seen >= OBSERVE_BUDGET {
+                    decided = true;
+                    head.clear();
+                }
+            }
+        }
+        chunk
+    });
+    Body::from_stream(tapped)
 }
 
 fn body_response(status: StatusCode, content_type: Option<&str>, body: Bytes) -> Response {
@@ -3516,6 +3641,7 @@ async fn finish_success(
     status_code: u16,
     created: i64,
     session: compat::ProtocolSession,
+    upstream_model: &str,
 ) -> Result<Response, String> {
     let protocol = session.protocol;
     let content_type = content_type_of(&resp);
@@ -3579,7 +3705,26 @@ async fn finish_success(
         member.record_ok();
         state.metrics.served.fetch_add(1, Ordering::Relaxed);
         state.router.feedback(member.id(), Outcome::Success);
-        return Ok(stream_response(resp, status_code));
+        // The stream is relayed byte-for-byte; watch it for an upstream model
+        // substitution so the log records what actually ran.
+        let passthrough = stream_response(resp, status_code);
+        let (parts, body) = passthrough.into_parts();
+        let expected = if upstream_model.is_empty() {
+            plan.model.clone().unwrap_or_default()
+        } else {
+            upstream_model.to_string()
+        };
+        let body = match Some(expected).filter(|model| !model.is_empty()) {
+            Some(requested) => observe_served_model(
+                body,
+                requested,
+                member.id().to_string(),
+                member.provider_name(),
+                Arc::clone(&state.metrics.served_model_substitutions),
+            ),
+            None => body,
+        };
+        return Ok(Response::from_parts(parts, body));
     }
 
     if content_type
@@ -3651,6 +3796,12 @@ async fn finish_success(
         .map_err(|_| "upstream request timed out during preflight".to_string())??
     } else if protocol == compat::Protocol::Anthropic {
         compat::open_anthropic_stream(resp, get_preflight_deadline(headers)).await?
+    } else if protocol == compat::Protocol::Codex && plan.client_stream {
+        // Codex-family upstreams can answer 200 with a well-formed stream that
+        // carries a role prelude, reasoning, and a terminal event but no text
+        // and no tool call. Holding the preamble lets that turn fail over
+        // instead of reaching the client as an empty response it must retry.
+        compat::open_codex_stream(resp, get_preflight_deadline(headers)).await?
     } else {
         compat::open_stream(resp, protocol).await?
     };
@@ -4392,6 +4543,7 @@ pub async fn handle_relay(
             upstream_model,
             affinity.as_deref(),
             state.as_ref(),
+            headers,
         ) {
             Ok(t) => t,
             Err(message) => return json_error(StatusCode::BAD_REQUEST, &message),
@@ -4543,6 +4695,7 @@ pub async fn handle_relay(
                     cursor_reply,
                     replay: target.replay,
                 },
+                upstream_model,
             )
             .await
             {
@@ -6338,6 +6491,57 @@ mod codex_fast_mode_tests {
             let mut target = plan(compat::CODEX_PATH, original);
             apply_codex_fast_mode(&mut target);
             assert_eq!(target.body, Bytes::from(original.to_string()));
+        }
+    }
+}
+
+#[cfg(test)]
+mod served_model_tap_tests {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+
+    fn frame(model: &str) -> String {
+        format!(
+            "event: response.created\ndata: {{\"type\":\"response.created\",\"response\":{{\"id\":\"r\",\"model\":\"{model}\"}}}}\n\n"
+        )
+    }
+
+    /// Drives the real tap: the body must arrive byte-identical, and the counter
+    /// must move exactly when the upstream names a model other than the one the
+    /// gateway sent. This is the assertion the deployed counter rests on — the
+    /// unit tests on `served_codex_model` alone would pass even if the tap were
+    /// never wired in.
+    #[test]
+    fn tap_forwards_unchanged_and_counts_only_a_real_mismatch() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let original = Bytes::from(format!("{}{}", frame("gpt-6-luna"), frame("gpt-6-luna")));
+
+        for (upstream_model, expected_count) in
+            [("gpt-6-astra", 1u64), ("gpt-6-luna", 0u64)]
+        {
+            let counter = Arc::new(AtomicU64::new(0));
+            let body = Body::from(original.clone());
+            let tapped = observe_served_model(
+                body,
+                upstream_model.to_string(),
+                "acct".to_string(),
+                "codex".to_string(),
+                Arc::clone(&counter),
+            );
+            let forwarded = rt
+                .block_on(http_body_util::BodyExt::collect(tapped))
+                .expect("body collects")
+                .to_bytes();
+            assert_eq!(forwarded, original, "relay must not alter upstream bytes");
+            assert_eq!(
+                counter.load(Ordering::Relaxed),
+                expected_count,
+                "requested {upstream_model} against upstream luna"
+            );
         }
     }
 }

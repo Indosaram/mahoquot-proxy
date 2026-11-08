@@ -291,6 +291,11 @@ fn run_accounts(auth_dir: PathBuf) -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if let Ok(address) = std::env::var("MAHOQUOT_EXEC_SERVER") {
+        if !address.trim().is_empty() {
+            return Ok(mahoquot_gateway::compat::exec_bridge::serve(address.trim()).await?);
+        }
+    }
     let cli = Cli::parse();
 
     let serve_args = match cli.command {

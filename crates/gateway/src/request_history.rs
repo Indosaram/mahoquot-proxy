@@ -2045,10 +2045,10 @@ pub fn sha256(input: &[u8]) -> [u8; 32] {
         0x1f83d9ab,
         0x5be0cd19,
     ];
-    for chunk in message.chunks_exact(64) {
+    for chunk in message.as_chunks::<64>().0 {
         let mut words = [0_u32; 64];
-        for (index, bytes) in chunk.chunks_exact(4).enumerate() {
-            words[index] = u32::from_be_bytes(bytes.try_into().expect("four-byte chunk"));
+        for (index, bytes) in chunk.as_chunks::<4>().0.iter().enumerate() {
+            words[index] = u32::from_be_bytes(*bytes);
         }
         for index in 16..64 {
             let s0 = words[index - 15].rotate_right(7)
@@ -2083,13 +2083,13 @@ pub fn sha256(input: &[u8]) -> [u8; 32] {
             b = a;
             a = temp1.wrapping_add(temp2);
         }
-        for (slot, value) in state.iter_mut().zip([a, b, c, d, e, f, g, h].into_iter()) {
+        for (slot, value) in state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
             *slot = slot.wrapping_add(value);
         }
     }
     let mut digest = [0_u8; 32];
-    for (chunk, value) in digest.chunks_exact_mut(4).zip(state) {
-        chunk.copy_from_slice(&value.to_be_bytes());
+    for (chunk, value) in digest.as_chunks_mut::<4>().0.iter_mut().zip(state) {
+        *chunk = value.to_be_bytes();
     }
     digest
 }

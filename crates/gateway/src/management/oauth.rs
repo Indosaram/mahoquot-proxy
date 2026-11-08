@@ -18,7 +18,7 @@ use crate::state::AppState;
 
 const CLAUDE_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const CLAUDE_DEFAULT_AUTH_URL: &str = "https://claude.ai/oauth/authorize";
-const CLAUDE_DEFAULT_TOKEN_URL: &str = "https://api.anthropic.com/v1/oauth/token";
+const CLAUDE_DEFAULT_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 const CLAUDE_DEFAULT_REDIRECT: &str = "http://localhost:54545/callback";
 const CLAUDE_SCOPES: &str = "org:create_api_key user:profile user:inference";
 const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -818,7 +818,7 @@ fn sha256(data: &[u8]) -> [u8; 32] {
     }
     msg.extend_from_slice(&bit_len.to_be_bytes());
 
-    for chunk in msg.chunks_exact(64) {
+    for chunk in msg.as_chunks::<64>().0 {
         let mut w = [0u32; 64];
         for i in 0..16 {
             w[i] = u32::from_be_bytes([
@@ -999,12 +999,18 @@ pub fn create_anthropic_auth_url(
         .cloned()
         .unwrap_or_else(|| CLAUDE_DEFAULT_REDIRECT.to_string());
 
+    let scopes = params
+        .get("scope")
+        .cloned()
+        .or_else(|| std::env::var("ANTHROPIC_SCOPES").ok())
+        .unwrap_or_else(|| CLAUDE_SCOPES.to_string());
+
     let url = format!(
         "{}?code=true&client_id={}&response_type=code&redirect_uri={}&scope={}&code_challenge={}&code_challenge_method=S256&state={}",
         auth_base,
         url_encode(CLAUDE_CLIENT_ID),
         url_encode(&redirect_uri),
-        url_encode(CLAUDE_SCOPES),
+        url_encode(&scopes),
         url_encode(&challenge),
         state
     );
@@ -1388,7 +1394,8 @@ pub async fn exchange_anthropic_code(
     let resp = client
         .post(&session.token_url)
         .header("content-type", "application/json")
-        .header("accept", "application/json")
+        .header("accept", "application/json, text/plain, */*")
+        .header("user-agent", "axios/1.15.2")
         .json(&payload)
         .send()
         .await
@@ -2830,6 +2837,20 @@ mod tests {
         assert!(url.contains("org%3Acreate_api_key"));
         assert_eq!(session.provider, "anthropic");
         assert_eq!(session.status, SessionStatus::Pending);
+        assert_eq!(session.token_url, CLAUDE_DEFAULT_TOKEN_URL);
+        assert_eq!(session.token_url, "https://platform.claude.com/v1/oauth/token");
+    }
+
+    #[test]
+    fn anthropic_auth_url_honors_explicit_scope_override() {
+        let mut params = HashMap::new();
+        params.insert(
+            "scope".to_string(),
+            "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload".to_string(),
+        );
+        let (url, _, _) = create_anthropic_auth_url(&params);
+        assert!(url.contains("user%3Asessions%3Aclaude_code"));
+        assert!(url.contains("user%3Amcp_servers"));
     }
 
     #[test]

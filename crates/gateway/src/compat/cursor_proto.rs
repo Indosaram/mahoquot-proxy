@@ -1,6 +1,6 @@
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct AgentClientMessage {
-    #[prost(oneof = "agent_client_message::Message", tags = "1, 2, 3, 4, 7")]
+    #[prost(oneof = "agent_client_message::Message", tags = "1, 2, 3, 4, 5, 7")]
     pub message: Option<agent_client_message::Message>,
 }
 
@@ -15,6 +15,8 @@ pub mod agent_client_message {
         KvClientMessage(super::KvClientMessage),
         #[prost(message, tag = "4")]
         ConversationAction(super::ConversationAction),
+        #[prost(message, tag = "5")]
+        ExecClientControlMessage(super::ExecClientControlMessage),
         #[prost(message, tag = "7")]
         ClientHeartbeat(super::ClientHeartbeat),
     }
@@ -32,6 +34,10 @@ pub struct AgentRunRequest {
     pub mcp_tools: Option<McpTools>,
     #[prost(string, optional, tag = "5")]
     pub conversation_id: Option<String>,
+    /// Live AgentRunRequest field 8. A system blob in
+    /// `root_prompt_messages_json` makes the current server return "Error".
+    #[prost(string, optional, tag = "8")]
+    pub custom_system_prompt: Option<String>,
     #[prost(message, optional, tag = "9")]
     pub requested_model: Option<RequestedModel>,
 }
@@ -72,10 +78,25 @@ pub struct UserMessageAction {
     pub user_message: Option<UserMessage>,
 }
 
+/// Live cursor-agent 2026.10.22 `UserMessage.content` text case.
+/// Field 1 is a message, not a string. A string here is parsed as a nested
+/// message and the byte `o` (0x6F) becomes `illegal tag: field no 13 wire type 7`.
 #[derive(Clone, PartialEq, prost::Message)]
-pub struct UserMessage {
+pub struct UserMessageText {
     #[prost(string, tag = "1")]
     pub text: String,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct UserMessageContent {
+    #[prost(message, optional, tag = "1")]
+    pub text: Option<UserMessageText>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct UserMessage {
+    #[prost(message, optional, tag = "1")]
+    pub content: Option<UserMessageContent>,
     #[prost(string, tag = "2")]
     pub message_id: String,
     #[prost(int32, tag = "4")]
@@ -128,8 +149,11 @@ pub struct McpToolDefinition {
     pub name: String,
     #[prost(string, tag = "2")]
     pub description: String,
-    #[prost(bytes = "vec", tag = "3")]
-    pub input_schema: Vec<u8>,
+    /// Live cursor-agent field 3 is a protobuf Value, not raw JSON bytes.
+    /// Raw JSON here is parsed as a message and `o` in "object" becomes
+    /// `illegal tag: field no 13 wire type 7`.
+    #[prost(message, optional, tag = "3")]
+    pub input_schema: Option<prost_types::Value>,
     #[prost(string, tag = "4")]
     pub provider_identifier: String,
     #[prost(string, tag = "5")]
@@ -146,14 +170,37 @@ pub struct ExecClientMessage {
     pub id: u32,
     #[prost(string, tag = "15")]
     pub exec_id: String,
-    #[prost(oneof = "exec_client_message::Message", tags = "10")]
+    #[prost(
+        oneof = "exec_client_message::Message",
+        tags = "2, 3, 4, 5, 7, 8, 9, 10, 14"
+    )]
     pub message: Option<exec_client_message::Message>,
 }
 pub mod exec_client_message {
     #[derive(Clone, PartialEq, prost::Oneof)]
     pub enum Message {
+        #[prost(message, tag = "2")]
+        ShellResult(super::ShellResult),
+        #[prost(message, tag = "3")]
+        WriteResult(super::WriteResult),
+        #[prost(message, tag = "4")]
+        DeleteResult(super::DeleteResult),
+        #[prost(message, tag = "5")]
+        GrepResult(super::GrepResult),
+        #[prost(message, tag = "7")]
+        ReadResult(super::ReadResult),
+        #[prost(message, tag = "8")]
+        LsResult(super::LsResult),
+        #[prost(message, tag = "9")]
+        DiagnosticsResult(super::DiagnosticsResult),
         #[prost(message, tag = "10")]
         RequestContextResult(super::RequestContextResult),
+        #[prost(message, tag = "14")]
+        ShellStream(super::ShellStream),
+        #[prost(message, tag = "17")]
+        ListMcpResourcesExecResult(super::ListMcpResourcesExecResult),
+        #[prost(message, tag = "18")]
+        ReadMcpResourceExecResult(super::ReadMcpResourceExecResult),
     }
 }
 
@@ -288,16 +335,579 @@ pub struct ExecServerMessage {
     pub id: u32,
     #[prost(string, tag = "15")]
     pub exec_id: String,
-    #[prost(oneof = "exec_server_message::Message", tags = "10")]
+    #[prost(
+        oneof = "exec_server_message::Message",
+        tags = "2, 3, 4, 5, 7, 8, 9, 10, 11, 14, 16, 20, 21, 22, 23"
+    )]
     pub message: Option<exec_server_message::Message>,
 }
 pub mod exec_server_message {
     #[derive(Clone, PartialEq, prost::Oneof)]
     pub enum Message {
+        #[prost(message, tag = "2")]
+        ShellArgs(super::ShellArgs),
+        #[prost(message, tag = "3")]
+        WriteArgs(super::WriteArgs),
+        #[prost(message, tag = "4")]
+        DeleteArgs(super::DeleteArgs),
+        #[prost(message, tag = "5")]
+        GrepArgs(super::GrepArgs),
+        #[prost(message, tag = "7")]
+        ReadArgs(super::ReadArgs),
+        #[prost(message, tag = "8")]
+        LsArgs(super::LsArgs),
+        #[prost(message, tag = "9")]
+        DiagnosticsArgs(super::DiagnosticsArgs),
         #[prost(message, tag = "10")]
         RequestContextArgs(super::RequestContextArgs),
+        #[prost(message, tag = "11")]
+        McpArgs(super::ExecMcpArgs),
+        #[prost(message, tag = "14")]
+        ShellStreamArgs(super::ShellArgs),
+        #[prost(message, tag = "16")]
+        BackgroundShellSpawnArgs(super::DiagnosticsArgs),
+        #[prost(message, tag = "20")]
+        FetchArgs(super::DiagnosticsArgs),
+        #[prost(message, tag = "21")]
+        RecordScreenArgs(super::DiagnosticsArgs),
+        #[prost(message, tag = "22")]
+        ComputerUseArgs(super::DiagnosticsArgs),
+        #[prost(message, tag = "23")]
+        WriteShellStdinArgs(super::DiagnosticsArgs),
+        #[prost(message, tag = "17")]
+        ListMcpResourcesExecArgs(super::ListMcpResourcesExecArgs),
+        #[prost(message, tag = "18")]
+        ReadMcpResourceExecArgs(super::ReadMcpResourceExecArgs),
     }
 }
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ListMcpResourcesExecArgs {
+    #[prost(string, optional, tag = "1")]
+    pub server: Option<String>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ListMcpResourcesSuccess {
+    #[prost(message, repeated, tag = "1")]
+    pub resources: Vec<ListMcpResourcesResource>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ListMcpResourcesResource {
+    #[prost(string, tag = "1")]
+    pub uri: String,
+    #[prost(string, tag = "2")]
+    pub name: String,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ListMcpResourcesError {
+    #[prost(string, tag = "1")]
+    pub error: String,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ListMcpResourcesExecResult {
+    #[prost(oneof = "list_mcp_resources_exec_result::Result", tags = "1, 2")]
+    pub result: Option<list_mcp_resources_exec_result::Result>,
+}
+
+pub mod list_mcp_resources_exec_result {
+    #[derive(Clone, PartialEq, prost::Oneof)]
+    pub enum Result {
+        #[prost(message, tag = "1")]
+        Success(super::ListMcpResourcesSuccess),
+        #[prost(message, tag = "2")]
+        Error(super::ListMcpResourcesError),
+    }
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ReadMcpResourceExecArgs {
+    #[prost(string, optional, tag = "1")]
+    pub uri: Option<String>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ReadMcpResourceSuccess {
+    #[prost(string, tag = "1")]
+    pub uri: String,
+    #[prost(string, tag = "2")]
+    pub mime_type: String,
+    #[prost(string, tag = "3")]
+    pub text: String,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ReadMcpResourceError {
+    #[prost(string, tag = "1")]
+    pub error: String,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ReadMcpResourceExecResult {
+    #[prost(oneof = "read_mcp_resource_exec_result::Result", tags = "1, 2, 3")]
+    pub result: Option<read_mcp_resource_exec_result::Result>,
+}
+
+pub mod read_mcp_resource_exec_result {
+    #[derive(Clone, PartialEq, prost::Oneof)]
+    pub enum Result {
+        #[prost(message, tag = "1")]
+        Success(super::ReadMcpResourceSuccess),
+        #[prost(message, tag = "2")]
+        Error(super::ReadMcpResourceError),
+        #[prost(message, tag = "3")]
+        Rejected(super::ReadMcpResourceError),
+    }
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ShellArgs {
+    #[prost(string, tag = "1")]
+    pub command: String,
+    #[prost(string, tag = "2")]
+    pub working_directory: String,
+    #[prost(int32, tag = "3")]
+    pub timeout: i32,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ReadArgs {
+    #[prost(string, tag = "1")]
+    pub path: String,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct WriteArgs {
+    #[prost(string, tag = "1")]
+    pub path: String,
+    #[prost(string, tag = "2")]
+    pub file_text: String,
+    #[prost(string, tag = "3")]
+    pub tool_call_id: String,
+    #[prost(bool, tag = "4")]
+    pub return_file_content_after_write: bool,
+    #[prost(bytes, tag = "5")]
+    pub file_bytes: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct DeleteArgs {
+    #[prost(string, tag = "1")]
+    pub path: String,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct GrepArgs {
+    #[prost(string, tag = "1")]
+    pub pattern: String,
+    #[prost(string, optional, tag = "2")]
+    pub path: Option<String>,
+    #[prost(string, optional, tag = "3")]
+    pub glob: Option<String>,
+    #[prost(string, optional, tag = "4")]
+    pub output_mode: Option<String>,
+    #[prost(int32, optional, tag = "5")]
+    pub context_before: Option<i32>,
+    #[prost(int32, optional, tag = "6")]
+    pub context_after: Option<i32>,
+    #[prost(int32, optional, tag = "7")]
+    pub context: Option<i32>,
+    #[prost(bool, optional, tag = "8")]
+    pub case_insensitive: Option<bool>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct LsArgs {
+    #[prost(string, tag = "1")]
+    pub path: String,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct DiagnosticsArgs {}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ExecMcpArgs {
+    #[prost(string, tag = "1")]
+    pub name: String,
+    #[prost(map = "string, bytes", tag = "2")]
+    pub args: std::collections::HashMap<String, Vec<u8>>,
+    #[prost(string, tag = "3")]
+    pub tool_call_id: String,
+    #[prost(string, tag = "4")]
+    pub provider_identifier: String,
+    #[prost(string, tag = "5")]
+    pub tool_name: String,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ShellSuccess {
+    #[prost(string, tag = "1")]
+    pub command: String,
+    #[prost(string, tag = "2")]
+    pub working_directory: String,
+    #[prost(int32, tag = "3")]
+    pub exit_code: i32,
+    #[prost(string, tag = "4")]
+    pub signal: String,
+    #[prost(string, tag = "5")]
+    pub stdout: String,
+    #[prost(string, tag = "6")]
+    pub stderr: String,
+    #[prost(int32, tag = "7")]
+    pub execution_time: i32,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ShellResult {
+    #[prost(oneof = "shell_result::Result", tags = "1, 2")]
+    pub result: Option<shell_result::Result>,
+}
+pub mod shell_result {
+    #[derive(Clone, PartialEq, prost::Oneof)]
+    pub enum Result {
+        #[prost(message, tag = "1")]
+        Success(super::ShellSuccess),
+        #[prost(message, tag = "2")]
+        Failure(super::ShellSuccess),
+    }
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ReadSuccess {
+    #[prost(string, tag = "1")]
+    pub path: String,
+    #[prost(string, optional, tag = "2")]
+    pub content: Option<String>,
+    #[prost(int32, tag = "3")]
+    pub total_lines: i32,
+    #[prost(int64, tag = "4")]
+    pub file_size: i64,
+    #[prost(bool, tag = "6")]
+    pub truncated: bool,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ReadFailure {
+    #[prost(string, tag = "1")]
+    pub path: String,
+    #[prost(string, tag = "2")]
+    pub error: String,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ReadResult {
+    #[prost(oneof = "read_result::Result", tags = "1, 2")]
+    pub result: Option<read_result::Result>,
+}
+pub mod read_result {
+    #[derive(Clone, PartialEq, prost::Oneof)]
+    pub enum Result {
+        #[prost(message, tag = "1")]
+        Success(super::ReadSuccess),
+        #[prost(message, tag = "2")]
+        Error(super::ReadFailure),
+        #[prost(message, tag = "4")]
+        FileNotFound(super::ReadFileNotFound),
+    }
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ReadFileNotFound {
+    #[prost(string, tag = "1")]
+    pub path: String,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct WriteSuccess {
+    #[prost(string, tag = "1")]
+    pub path: String,
+    #[prost(int32, tag = "2")]
+    pub lines_created: i32,
+    #[prost(int32, tag = "3")]
+    pub file_size: i32,
+    #[prost(string, optional, tag = "4")]
+    pub file_content_after_write: Option<String>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct WriteResult {
+    #[prost(oneof = "write_result::Result", tags = "1, 5")]
+    pub result: Option<write_result::Result>,
+}
+pub mod write_result {
+    #[derive(Clone, PartialEq, prost::Oneof)]
+    pub enum Result {
+        #[prost(message, tag = "1")]
+        Success(super::WriteSuccess),
+        #[prost(message, tag = "5")]
+        Error(super::ReadFailure),
+    }
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct DeleteSuccess {
+    #[prost(string, tag = "1")]
+    pub path: String,
+    #[prost(string, tag = "2")]
+    pub deleted_file: String,
+    #[prost(int64, tag = "3")]
+    pub file_size: i64,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct DeleteResult {
+    #[prost(oneof = "delete_result::Result", tags = "1, 7")]
+    pub result: Option<delete_result::Result>,
+}
+pub mod delete_result {
+    #[derive(Clone, PartialEq, prost::Oneof)]
+    pub enum Result {
+        #[prost(message, tag = "1")]
+        Success(super::DeleteSuccess),
+        #[prost(message, tag = "2")]
+        FileNotFound(super::ReadFileNotFound),
+        #[prost(message, tag = "7")]
+        Error(super::ReadFailure),
+    }
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct LsResult {
+    #[prost(oneof = "ls_result::Result", tags = "1, 2")]
+    pub result: Option<ls_result::Result>,
+}
+pub mod ls_result {
+    #[derive(Clone, PartialEq, prost::Oneof)]
+    pub enum Result {
+        #[prost(message, tag = "1")]
+        Success(super::LsSuccess),
+        #[prost(message, tag = "2")]
+        Error(super::ReadFailure),
+    }
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct LsSuccess {
+    #[prost(message, optional, tag = "1")]
+    pub directory_tree_root: Option<LsDirectoryTreeNode>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct LsDirectoryTreeNode {
+    #[prost(string, tag = "1")]
+    pub abs_path: String,
+    #[prost(int32, tag = "6")]
+    pub num_files: i32,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct GrepResult {
+    #[prost(oneof = "grep_result::Result", tags = "1, 2")]
+    pub result: Option<grep_result::Result>,
+}
+pub mod grep_result {
+    #[derive(Clone, PartialEq, prost::Oneof)]
+    pub enum Result {
+        #[prost(message, tag = "1")]
+        Success(super::GrepSuccess),
+        #[prost(message, tag = "2")]
+        Error(super::GrepFailure),
+    }
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct GrepSuccess {
+    #[prost(string, tag = "1")]
+    pub pattern: String,
+    #[prost(string, tag = "2")]
+    pub path: String,
+    #[prost(string, tag = "3")]
+    pub output_mode: String,
+    #[prost(map = "string, message", tag = "4")]
+    pub workspace_results: std::collections::HashMap<String, GrepUnionResult>,
+
+    #[prost(message, optional, tag = "5")]
+    pub active_editor_result: Option<GrepUnionResult>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct GrepUnionResult {
+    #[prost(oneof = "grep_union_result::Result", tags = "1, 2, 3")]
+    pub result: Option<grep_union_result::Result>,
+}
+
+pub mod grep_union_result {
+    #[derive(Clone, PartialEq, prost::Oneof)]
+    pub enum Result {
+        #[prost(message, tag = "1")]
+        Count(super::GrepCountResult),
+        #[prost(message, tag = "2")]
+        Files(super::GrepFilesResult),
+        #[prost(message, tag = "3")]
+        Content(super::GrepContentResult),
+    }
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct GrepCountResult {
+    #[prost(message, repeated, tag = "1")]
+    pub counts: Vec<GrepFileCount>,
+    #[prost(int32, tag = "2")]
+    pub total_files: i32,
+    #[prost(int32, tag = "3")]
+    pub total_matches: i32,
+    #[prost(bool, tag = "4")]
+    pub client_truncated: bool,
+    #[prost(bool, tag = "5")]
+    pub ripgrep_truncated: bool,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct GrepFileCount {
+    #[prost(string, tag = "1")]
+    pub file: String,
+    #[prost(int32, tag = "2")]
+    pub count: i32,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct GrepFilesResult {
+    #[prost(string, repeated, tag = "1")]
+    pub files: Vec<String>,
+    #[prost(int32, tag = "2")]
+    pub total_files: i32,
+    #[prost(bool, tag = "3")]
+    pub client_truncated: bool,
+    #[prost(bool, tag = "4")]
+    pub ripgrep_truncated: bool,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct GrepContentResult {
+    #[prost(message, repeated, tag = "1")]
+    pub matches: Vec<GrepFileMatch>,
+    #[prost(int32, tag = "2")]
+    pub total_lines: i32,
+    #[prost(int32, tag = "3")]
+    pub total_matched_lines: i32,
+    #[prost(bool, tag = "4")]
+    pub client_truncated: bool,
+    #[prost(bool, tag = "5")]
+    pub ripgrep_truncated: bool,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct GrepFileMatch {
+    #[prost(string, tag = "1")]
+    pub file: String,
+    #[prost(message, repeated, tag = "2")]
+    pub matches: Vec<GrepContentMatch>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct GrepContentMatch {
+    #[prost(int32, tag = "1")]
+    pub line_number: i32,
+    #[prost(string, tag = "2")]
+    pub content: String,
+    #[prost(bool, tag = "3")]
+    pub content_truncated: bool,
+    #[prost(bool, tag = "4")]
+    pub is_context_line: bool,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct GrepFailure {
+    #[prost(string, tag = "1")]
+    pub error: String,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct DiagnosticsResult {}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ExecClientControlMessage {
+    #[prost(oneof = "exec_client_control_message::Message", tags = "1, 2, 3")]
+    pub message: Option<exec_client_control_message::Message>,
+}
+pub mod exec_client_control_message {
+    #[derive(Clone, PartialEq, prost::Oneof)]
+    pub enum Message {
+        #[prost(message, tag = "1")]
+        StreamClose(super::ExecClientStreamClose),
+        #[prost(message, tag = "2")]
+        Throw(super::ExecClientThrow),
+        #[prost(message, tag = "3")]
+        Heartbeat(super::ShellStreamStart),
+    }
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ExecClientStreamClose {
+    #[prost(uint32, tag = "1")]
+    pub id: u32,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ExecClientThrow {
+    #[prost(uint32, tag = "1")]
+    pub id: u32,
+    #[prost(string, tag = "2")]
+    pub error: String,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ShellStream {
+    #[prost(oneof = "shell_stream::Event", tags = "1, 2, 3, 4, 5, 6, 7")]
+    pub event: Option<shell_stream::Event>,
+}
+pub mod shell_stream {
+    #[derive(Clone, PartialEq, prost::Oneof)]
+    pub enum Event {
+        #[prost(message, tag = "1")]
+        Stdout(super::ShellStreamStdout),
+        #[prost(message, tag = "2")]
+        Stderr(super::ShellStreamStderr),
+        #[prost(message, tag = "3")]
+        Exit(super::ShellStreamExit),
+        #[prost(message, tag = "4")]
+        Start(super::ShellStreamStart),
+        #[prost(message, tag = "5")]
+        Rejected(super::ReadFailure),
+        #[prost(message, tag = "6")]
+        PermissionDenied(super::ReadFailure),
+        #[prost(message, tag = "7")]
+        Backgrounded(super::ShellStreamStart),
+    }
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ShellStreamStdout {
+    #[prost(string, tag = "1")]
+    pub data: String,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ShellStreamStderr {
+    #[prost(string, tag = "1")]
+    pub data: String,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ShellStreamExit {
+    #[prost(uint32, tag = "1")]
+    pub code: u32,
+    #[prost(string, tag = "2")]
+    pub cwd: String,
+    #[prost(bool, tag = "4")]
+    pub aborted: bool,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ShellStreamStart {}
 
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct KvServerMessage {

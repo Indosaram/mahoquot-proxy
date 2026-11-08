@@ -42,9 +42,13 @@ prost.workspace = true
 prost-types.workspace = true
 clap.workspace = true
 chrono.workspace = true
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 
 [dev-dependencies]
 tower.workspace = true
 ed25519-dalek.workspace = true
 
+tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+rustls-pki-types = "1.15"

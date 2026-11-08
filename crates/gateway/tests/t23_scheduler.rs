@@ -344,14 +344,17 @@ async fn all_exhausted_restores_base_strategy() {
         Arc::new(AppState::new(&config(auth_dir.clone(), Strategy::StrictRoundRobin)).unwrap());
     let app = create_app(Arc::clone(&state));
     let now = now_unix();
+    // 2% remaining is below the scheduler's exhaustion threshold (3%) but not
+    // the relay's hard 100%-used Codex filter, so the scheduler fails open
+    // while both accounts stay routable for the base strategy.
     state
         .find_member("a")
         .unwrap()
-        .set_usage(usage(0, now + 600));
+        .set_usage(usage(2, now + 600));
     state
         .find_member("b")
         .unwrap()
-        .set_usage(usage(0, now + 900));
+        .set_usage(usage(2, now + 900));
     management(
         &app,
         "PUT",

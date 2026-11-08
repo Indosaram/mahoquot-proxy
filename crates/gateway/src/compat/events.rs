@@ -357,7 +357,7 @@ mod bounded_accumulation_tests {
         // One `data:` line at a time stays under the per-line cap; the joined
         // frame is what exceeds the frame cap.
         let mut line = b"data: ".to_vec();
-        line.extend(std::iter::repeat(b'a').take(1024 * 1024));
+        line.extend(std::iter::repeat_n(b'a', 1024 * 1024));
         line.push(b'\n');
 
         let mut parser = SseParser::default();
