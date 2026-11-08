@@ -988,6 +988,10 @@ pub fn account_management_routes() -> Router<Arc<AppState>> {
         .route("/auth-files/bulk", post(bulk_auth_files))
         .route("/api-key-bindings", get(list_bindings).put(put_binding))
         .route(
+            "/accounts/{account_id}/suspected",
+            axum::routing::delete(clear_suspected_account),
+        )
+        .route(
             "/accounts/credits",
             get(get_codex_credits_opt_in).put(put_codex_credits_opt_in),
         )
@@ -1210,5 +1214,49 @@ pub async fn put_codex_credits_opt_in(
             Ok(Err((status, code, msg))) => typed_error(status, code, msg),
             Err(err) => typed_error(StatusCode::INTERNAL_SERVER_ERROR, "task_join_failed", err),
         }
+    }
+}
+
+/// Remove one account from the persisted Claude suspected list. Nothing else
+/// clears it: the bench is an operator decision.
+pub async fn clear_suspected_account(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(account_id): axum::extract::Path<String>,
+) -> Response {
+    if !state
+        .settings
+        .current()
+        .claude_suspected_accounts
+        .contains_key(&account_id)
+    {
+        return typed_error(
+            StatusCode::NOT_FOUND,
+            "not_suspected",
+            "account is not on the suspected list",
+        );
+    }
+    let settings = Arc::clone(&state.settings);
+    let id = account_id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        settings.mutate(|document| {
+            document.claude_suspected_accounts.remove(&id);
+        })
+    })
+    .await;
+    match result {
+        Ok(Ok(_)) => json_status(
+            StatusCode::OK,
+            json!({ "status": "ok", "account_id": account_id }),
+        ),
+        Ok(Err(err)) => typed_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "persist_failed",
+            err.to_string(),
+        ),
+        Err(err) => typed_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "persist_failed",
+            err.to_string(),
+        ),
     }
 }

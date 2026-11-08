@@ -257,10 +257,23 @@ async fn an_enforcement_403_benches_the_account_without_trying_another() {
         .count();
     assert_eq!(served_by_benched, 0);
 
-    // The operator clears it through the management route.
+    // The operator clears it through the management route. Origin's
+    // management surface is fail-closed: it answers 404 until a secret is
+    // configured, and only trusts the transport peer, so the fixture sets
+    // both the way the other management tests do.
+    restarted
+        .settings
+        .mutate(|document| {
+            document.remote_management.secret_key = "management".into();
+        })
+        .expect("management secret fixture");
     let response = create_app(Arc::clone(&restarted))
         .oneshot(
             Request::delete(format!("/v0/management/accounts/{benched}/suspected"))
+                .header("x-management-key", "management")
+                .extension(axum::extract::ConnectInfo(
+                    "127.0.0.1:18840".parse::<std::net::SocketAddr>().unwrap(),
+                ))
                 .body(Body::empty())
                 .unwrap(),
         )

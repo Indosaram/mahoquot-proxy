@@ -219,7 +219,14 @@ impl Fixture {
         .expect("construct AppState");
 
         state.claude_direct_client = make_direct_client(upstream_addr);
-        state.http_client = make_direct_client(upstream_addr);
+        let current = state.proxy.load_full();
+        state.proxy.store(Arc::new(mahoquot_gateway::proxy_policy::ProxySnapshot {
+            runtime: Arc::clone(&current.runtime),
+            default_client: make_direct_client(upstream_addr),
+            direct_client: current.direct_client.clone(),
+            devin_default_client: current.devin_default_client.clone(),
+            devin_direct_client: current.devin_direct_client.clone(),
+        }));
         Arc::new(state)
     }
 }

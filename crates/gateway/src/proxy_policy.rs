@@ -283,6 +283,40 @@ pub fn build_http_client(proxy_url: Option<&str>) -> anyhow::Result<reqwest::Cli
         .map_err(|e| anyhow::anyhow!("failed to build reqwest client: {e}"))
 }
 
+pub fn build_decompressing_http_client(proxy_url: Option<&str>) -> anyhow::Result<reqwest::Client> {
+    if let Some(url) = proxy_url {
+        validate_proxy_url_candidate(url)?;
+    }
+    let mut builder = reqwest::Client::builder()
+        .gzip(true)
+        .deflate(true)
+        .brotli(true)
+        .zstd(true)
+        // The native client negotiates HTTP/2 over ALPN. An HTTP/1.1-only
+        // gateway reaches the same endpoints with a different transport shape,
+        // which is observable upstream even when the request body matches.
+        .http2_adaptive_window(true)
+        .tcp_nodelay(true)
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .pool_max_idle_per_host(32)
+        .tcp_keepalive(Some(std::time::Duration::from_secs(60)));
+    match proxy_url {
+        Some(url) if !url.trim().is_empty() && !is_direct_or_none(url) => {
+            let trimmed = url.trim();
+            let proxy = reqwest::Proxy::all(trimmed)
+                .map_err(|e| anyhow::anyhow!("failed to build proxy for '{trimmed}': {e}"))?;
+            builder = builder.proxy(proxy);
+        }
+        _ => {
+            builder = builder.no_proxy();
+        }
+    }
+    builder = crate::loopback_guard::apply_qa_loopback_guard(builder);
+    builder
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to build reqwest client: {e}"))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DevinClientBuildError {
     #[error("failed to configure outbound proxy")]

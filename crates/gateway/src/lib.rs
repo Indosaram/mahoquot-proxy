@@ -50,3 +50,8 @@ pub mod plugins;
 
 pub mod aistudio;
 pub mod wsrelay;
+
+pub mod affinity_store;
+pub mod claude_budget;
+pub mod claude_denial;
+pub mod claude_wire;
