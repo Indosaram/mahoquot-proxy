@@ -1,6 +1,5 @@
 mod common;
 
-use std::sync::Arc;
 use axum::http::StatusCode;
 use axum::routing::post;
 use axum::Router;
@@ -14,6 +13,7 @@ use mahoquot_gateway::{
     usage::{AccountUsage, QuotaBucket, QuotaGroup, UsageStateStore},
 };
 use mahoquot_types::{Health, PoolMember, Strategy};
+use std::sync::Arc;
 
 async fn bind_fixture_listener() -> tokio::net::TcpListener {
     for port in 18840..=18899 {
@@ -82,7 +82,10 @@ fn test_cline_model_quota_group_isolation_and_antigravity_policy() {
     let cline_member = create_cline_account(
         "cline-1",
         "http://127.0.0.1:18899",
-        vec!["z-ai/glm-5.3-flash".to_string(), "claude-3-7-sonnet".to_string()],
+        vec![
+            "z-ai/glm-5.3-flash".to_string(),
+            "claude-3-7-sonnet".to_string(),
+        ],
     );
 
     let now_ms = 1_000_000;
@@ -219,9 +222,21 @@ fn test_cline_stats_normalizes_expired_health_and_preserves_future_and_disabled(
 
     let stats = state.get_stats();
 
-    let s1 = stats.accounts.iter().find(|a| a.id == "generic-cline-1").unwrap();
-    let s2 = stats.accounts.iter().find(|a| a.id == "generic-cline-2").unwrap();
-    let s3 = stats.accounts.iter().find(|a| a.id == "generic-cline-3").unwrap();
+    let s1 = stats
+        .accounts
+        .iter()
+        .find(|a| a.id == "generic-cline-1")
+        .unwrap();
+    let s2 = stats
+        .accounts
+        .iter()
+        .find(|a| a.id == "generic-cline-2")
+        .unwrap();
+    let s3 = stats
+        .accounts
+        .iter()
+        .find(|a| a.id == "generic-cline-3")
+        .unwrap();
 
     // m1: expired cooldown must normalize to Available with reset_at_unix_ms: None
     assert!(
@@ -611,8 +626,7 @@ async fn test_cline_request_path_model_isolation_and_rotation() {
     assert_eq!(res2.status(), reqwest::StatusCode::OK);
     let body2: serde_json::Value = res2.json().await.unwrap();
     assert_eq!(
-        body2["choices"][0]["message"]["content"],
-        "hello from server 1",
+        body2["choices"][0]["message"]["content"], "hello from server 1",
         "unrelated model on Account 1 must route to Server 1 successfully"
     );
 
@@ -739,7 +753,10 @@ async fn test_cline_bucket_deduplication_and_canonicalization() {
     let member = create_cline_account(
         "cline-dedup",
         "http://127.0.0.1:18899",
-        vec!["z-ai/glm-5.3-flash".to_string(), "cline-free/deepseek-v4.1-flash".to_string()],
+        vec![
+            "z-ai/glm-5.3-flash".to_string(),
+            "cline-free/deepseek-v4.1-flash".to_string(),
+        ],
     );
 
     let now_sec = std::time::SystemTime::now()
@@ -756,9 +773,16 @@ async fn test_cline_bucket_deduplication_and_canonicalization() {
         50.0,
     );
     let u1 = member.usage_snapshot();
-    let g1 = u1.groups.iter().find(|g| g.display_name.as_deref() == Some("Cline Free Limits")).unwrap();
+    let g1 = u1
+        .groups
+        .iter()
+        .find(|g| g.display_name.as_deref() == Some("Cline Free Limits"))
+        .unwrap();
     assert_eq!(g1.buckets.len(), 1);
-    assert_eq!(g1.buckets[0].bucket_id.as_deref(), Some("cline-free/deepseek-v4.1-flash"));
+    assert_eq!(
+        g1.buckets[0].bucket_id.as_deref(),
+        Some("cline-free/deepseek-v4.1-flash")
+    );
 
     // 2. Upstream 429 returns with upstream name "deepseek/deepseek-v4.1-flash"
     mahoquot_gateway::relay::record_cline_quota_bucket(
@@ -769,10 +793,17 @@ async fn test_cline_bucket_deduplication_and_canonicalization() {
         100.0,
     );
     let u2 = member.usage_snapshot();
-    let g2 = u2.groups.iter().find(|g| g.display_name.as_deref() == Some("Cline Free Limits")).unwrap();
+    let g2 = u2
+        .groups
+        .iter()
+        .find(|g| g.display_name.as_deref() == Some("Cline Free Limits"))
+        .unwrap();
     // Must NOT have 2 buckets; should be exactly 1 deduplicated canonical bucket
     assert_eq!(g2.buckets.len(), 1);
-    assert_eq!(g2.buckets[0].bucket_id.as_deref(), Some("cline-free/deepseek-v4.1-flash"));
+    assert_eq!(
+        g2.buckets[0].bucket_id.as_deref(),
+        Some("cline-free/deepseek-v4.1-flash")
+    );
     assert_eq!(g2.buckets[0].used_percent, Some(100.0));
     assert_eq!(g2.buckets[0].reset_at_unix, Some(now_sec + 7200));
 }

@@ -69,12 +69,11 @@ impl ClineDailyTracker {
         Some((self.used_tokens() as f64 * 100.0 / budget as f64).min(100.0))
     }
 
-    /// The best-known reset: the upstream-named deadline while it is still
-    /// ahead, otherwise window start + 24h. Zero when no window is open.
+    /// The best-known reset, including an elapsed upstream deadline until
+    /// rollover clears the window. Zero when no window is open.
     pub fn estimated_reset_unix(&self) -> i64 {
-        let now = now_unix();
         let over = self.reset_override_unix.load(Ordering::Relaxed);
-        if over > now {
+        if over > 0 {
             return over;
         }
         let start = self.window_start_unix.load(Ordering::Relaxed);
@@ -90,7 +89,7 @@ impl ClineDailyTracker {
         let now = now_unix;
         let start = self.window_start_unix.load(Ordering::Relaxed);
         let over = self.reset_override_unix.load(Ordering::Relaxed);
-        let reset = if over > now {
+        let reset = if over > 0 {
             over
         } else if start > 0 {
             start + DAY_SECS
@@ -145,14 +144,20 @@ impl ClineDailyTracker {
     /// Reconcile with an upstream cap 429: it names the exact reset time, so
     /// the estimate becomes exact and the budget counts as consumed.
     pub fn on_cap_429(&self, reset_at_unix: i64) {
+        self.on_cap_429_at(reset_at_unix, now_unix());
+    }
+
+    fn on_cap_429_at(&self, reset_at_unix: i64, now: i64) {
         // A past reset carries no information about the current window.
-        if reset_at_unix <= now_unix() {
+        if reset_at_unix <= now {
             return;
         }
         self.reset_override_unix
             .store(reset_at_unix, Ordering::Relaxed);
-        self.used_tokens
-            .fetch_max(self.budget_tokens.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.used_tokens.fetch_max(
+            self.budget_tokens.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
         if self.window_start_unix.load(Ordering::Relaxed) == 0 {
             self.window_start_unix
                 .store(reset_at_unix - DAY_SECS, Ordering::Relaxed);
@@ -368,7 +373,8 @@ async fn restore_cap_buckets(
         if cap.credit_driven {
             member.set_group_credit_bench(&cap.model, cap.reset_at_unix * 1000);
         }
-        member.cline_trackers()
+        member
+            .cline_trackers()
             .for_model(&cap.model)
             .on_cap_429(cap.reset_at_unix);
         crate::relay::record_cline_quota_bucket(
@@ -435,6 +441,20 @@ mod tests {
         t.on_cap_429(now - 10);
         assert_eq!(t.estimated_reset_unix(), now + DAY_SECS);
         assert_eq!(t.used_tokens(), 100, "no false consumption");
+    }
+
+    #[test]
+    fn elapsed_upstream_reset_rolls_over_before_estimated_deadline() {
+        let t = tracker();
+        let now = 1_000_000;
+        let reset = now + 13 * 3600;
+        t.observe(100, now);
+        t.on_cap_429_at(reset, now);
+        assert_eq!(t.used_tokens(), 1000);
+        assert_eq!(t.estimated_reset_unix(), reset);
+        t.observe(7, reset + 1);
+        assert_eq!(t.used_tokens(), 7);
+        assert_eq!(t.estimated_reset_unix(), reset + 1 + DAY_SECS);
     }
 
     #[test]
@@ -570,7 +590,11 @@ mod tests {
         t.anchor_window(now);
         assert_eq!(t.estimated_reset_unix(), now + DAY_SECS);
         t.anchor_window(now + 100);
-        assert_eq!(t.estimated_reset_unix(), now + DAY_SECS, "first anchor wins");
+        assert_eq!(
+            t.estimated_reset_unix(),
+            now + DAY_SECS,
+            "first anchor wins"
+        );
     }
 
     #[test]
@@ -584,7 +608,11 @@ mod tests {
             Some(90.0),
             "gemini tracker absorbs only gemini tokens"
         );
-        assert_eq!(ds.used_percent(), Some(0.0), "deepseek tracker stays untouched");
+        assert_eq!(
+            ds.used_percent(),
+            Some(0.0),
+            "deepseek tracker stays untouched"
+        );
         let capped = set.for_model("deepseek/deepseek-v4.1-flash");
         assert!(
             Arc::ptr_eq(&capped, &ds),

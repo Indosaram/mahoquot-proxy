@@ -75,6 +75,21 @@ pub struct ModelAvailability {
     pub available_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credits_would_enable: Option<bool>,
+    /// The upstream's own enum for this catalog entry (`ModelDetails.model`),
+    /// e.g. `MODEL_PLACEHOLDER_M320`. The client echoes it back in the request
+    /// `labels.model_enum`, so it must be the catalog's value for the exact
+    /// variant id, never a value derived from the model name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_enum: Option<String>,
+    /// Vendor reported by the catalog (`api_provider`/`model_provider`). Used
+    /// to set the `used_claude*` and `used_non_gemini_model` request labels
+    /// without hardcoding model ids.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -878,10 +893,10 @@ pub fn parse_cursor_usage_summary(body: &serde_json::Value, now_unix: i64) -> Ac
         .or_else(|| body.get("individual_usage"));
     let plan = usage.and_then(|usage| usage.get("plan"));
     // Cursor meters two pools independently and reports each as its own percentage:
-    // autoPercentUsed for the auto router and apiPercentUsed for named models. The
+    // `autoPercentUsed` for the auto router and `apiPercentUsed` for named models. The
     // plan's limit/remaining only covers the combined total, so a total-only bucket hides
     // an exhausted named pool behind a healthy percentage - exactly the state that makes
-    // cursor/claude-opus-5.5 fail while cursor/auto keeps working.
+    // `cursor/claude-opus-5.5` fail while `cursor/auto` keeps working.
     for (key, label) in [("autoPercentUsed", "Auto"), ("apiPercentUsed", "Named")] {
         if let Some(percent) = plan.and_then(|plan| plan.get(key)).and_then(|v| v.as_f64()) {
             buckets.push(usage_bucket(label, percent, reset_at_unix, now_unix));
@@ -926,6 +941,7 @@ pub fn parse_cursor_usage_summary(body: &serde_json::Value, now_unix: i64) -> Ac
                 models: None,
             }]
         },
+        observed_at_unix: Some(now_unix),
         ..AccountUsage::default()
     }
 }
@@ -971,6 +987,7 @@ pub fn parse_kiro_usage_summary(body: &serde_json::Value, now_unix: i64) -> Acco
                 models: None,
             }]
         },
+        observed_at_unix: Some(now_unix),
         ..AccountUsage::default()
     }
 }
@@ -1050,10 +1067,7 @@ pub fn parse_clinepass_usage_summary(
 /// percent and covers the whole shared pool; products that have not been used
 /// omit `usagePercent` and are reported as 0. A missing pool percent is a
 /// broken response and yields `None` rather than a fake 0%.
-pub fn parse_xai_billing_credits(
-    body: &serde_json::Value,
-    now_unix: i64,
-) -> Option<AccountUsage> {
+pub fn parse_xai_billing_credits(body: &serde_json::Value, now_unix: i64) -> Option<AccountUsage> {
     let config = body.get("config")?;
     let percent = config.get("creditUsagePercent").and_then(|v| v.as_f64())?;
     let reset = config
@@ -1075,7 +1089,10 @@ pub fn parse_xai_billing_credits(
         let Some(product) = item.get("product").and_then(|v| v.as_str()) else {
             continue;
         };
-        let used = item.get("usagePercent").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let used = item
+            .get("usagePercent")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
         let mut bucket = usage_bucket(product, used, reset, now_unix);
         bucket.bucket_id = Some(product.to_string());
         buckets.push(bucket);
@@ -1243,6 +1260,122 @@ pub fn zcode_balances_usage(balances: &[ZcodeBalanceEntry], now_unix: i64) -> Ac
         observed_at_unix: Some(now_unix),
         ..AccountUsage::default()
     }
+}
+
+/// Coding-plan monitor payload from `GET /api/monitor/usage/quota/limit`.
+///
+/// `percentage` is consumption, the same orientation as every other provider.
+/// Reset times arrive as unix milliseconds. A body with no measured limit is
+/// not a snapshot, so the caller keeps the previous one instead of painting 0%.
+pub fn parse_coding_plan_quota(body: &serde_json::Value, now_unix: i64) -> AccountUsage {
+    let data = body.get("data").unwrap_or(body);
+    let Some(limits) = data.get("limits").and_then(|value| value.as_array()) else {
+        return AccountUsage::default();
+    };
+    let mut tokens = Vec::new();
+    let mut tools = Vec::new();
+    for limit in limits {
+        let Some(used) = coding_plan_used_percent(limit) else {
+            continue;
+        };
+        let kind = limit
+            .get("type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let unit = json_i64(limit.get("unit")).unwrap_or(0);
+        let number = json_i64(limit.get("number")).unwrap_or(0);
+        let (label, window) = coding_plan_limit_label(kind, unit, number);
+        let bucket = QuotaBucket {
+            display_name: Some(label),
+            window,
+            used_percent: Some((used.clamp(0.0, 100.0) * 100.0).round() / 100.0),
+            reset_at_unix: limit
+                .get("nextResetTime")
+                .or_else(|| limit.get("next_reset_time"))
+                .and_then(coding_plan_reset_unix),
+            ..QuotaBucket::default()
+        };
+        if kind.eq_ignore_ascii_case("TIME_LIMIT") {
+            tools.push(bucket);
+        } else {
+            tokens.push(bucket);
+        }
+    }
+    tokens.append(&mut tools);
+    if tokens.is_empty() {
+        return AccountUsage::default();
+    }
+    AccountUsage {
+        plan_type: data
+            .get("level")
+            .or_else(|| data.get("plan"))
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        groups: vec![QuotaGroup {
+            display_name: Some("GLM Coding Plan".to_string()),
+            buckets: tokens,
+            models: None,
+        }],
+        observed_at_unix: Some(now_unix),
+        ..AccountUsage::default()
+    }
+}
+
+fn coding_plan_limit_label(kind: &str, unit: i64, number: i64) -> (String, Option<String>) {
+    if kind.eq_ignore_ascii_case("TIME_LIMIT") {
+        return ("Tools".to_string(), None);
+    }
+    match (unit, number) {
+        (3, 5) => ("5h".to_string(), Some("5h".to_string())),
+        (6, 1) => ("Week".to_string(), Some("week".to_string())),
+        _ => {
+            let name = if kind.is_empty() {
+                "Quota".to_string()
+            } else {
+                kind.to_string()
+            };
+            (name, None)
+        }
+    }
+}
+
+fn coding_plan_used_percent(limit: &serde_json::Value) -> Option<f64> {
+    if let Some(percent) =
+        json_f64(limit.get("percentage")).or_else(|| json_f64(limit.get("percent")))
+    {
+        return Some(percent);
+    }
+    json_f64(limit.get("remaining")).map(|remaining| 100.0 - remaining)
+}
+
+fn coding_plan_reset_unix(value: &serde_json::Value) -> Option<i64> {
+    let raw = value
+        .as_i64()
+        .or_else(|| value.as_f64().map(|number| number as i64))?;
+    if raw <= 0 {
+        return None;
+    }
+    Some(if raw > 1_000_000_000_000 {
+        raw / 1000
+    } else {
+        raw
+    })
+}
+
+fn json_f64(value: Option<&serde_json::Value>) -> Option<f64> {
+    value.and_then(|value| {
+        value
+            .as_f64()
+            .or_else(|| value.as_i64().map(|number| number as f64))
+    })
+}
+
+fn json_i64(value: Option<&serde_json::Value>) -> Option<i64> {
+    value.and_then(|value| {
+        value
+            .as_i64()
+            .or_else(|| value.as_f64().map(|number| number as i64))
+    })
 }
 
 /// Seconds until the window resets, preferring the absolute timestamp because
@@ -1569,6 +1702,7 @@ impl WhamUsage {
                             available: v.available,
                             available_at: v.available_at,
                             credits_would_enable: v.credits_would_enable,
+                            ..Default::default()
                         },
                     )
                 })
@@ -1782,17 +1916,38 @@ pub fn extract_response_token_usage(head: &[u8], tail: &[u8]) -> Option<Response
                 .unwrap_or(0),
             });
         }
-        // OpenAI Responses API usage: `input_tokens` plus
-        // `input_tokens_details.cached_tokens` instead of the chat-completions
-        // `prompt_tokens` family. Gated on the details object because Anthropic
-        // message_delta usage objects also carry input/output tokens, and this
-        // branch must never swallow Claude's head-side `cache_read_input_tokens`.
-        if let Some(cached) = nested_object_number(&usage, "input_tokens_details", "cached_tokens")
-        {
+        // OpenAI Responses API usage: `input_tokens` / `output_tokens` / `total_tokens`
+        // without requiring cache details. Gated on any of input_tokens, output_tokens,
+        // or total_tokens being present in the usage object.
+        let input = object_number(&usage, &["input_tokens"]);
+        let output = object_number(&usage, &["output_tokens"]);
+        let total = object_number(&usage, &["total_tokens"]);
+        if input.is_some() || output.is_some() || total.is_some() {
+            let cached_in_tail =
+                nested_object_number(&usage, "input_tokens_details", "cached_tokens")
+                    .or_else(|| {
+                        nested_object_number(&usage, "prompt_tokens_details", "cached_tokens")
+                    })
+                    .or_else(|| {
+                        object_number(&usage, &["cache_read_input_tokens", "cache_read_tokens"])
+                    });
+            let cached =
+                cached_in_tail.or_else(|| last_number_after(head, b"\"cache_read_input_tokens\""));
+
             let cache_write_tokens =
                 nested_object_number(&usage, "input_tokens_details", "cache_creation_tokens")
                     .or_else(|| {
                         nested_object_number(&usage, "input_tokens_details", "cache_write_tokens")
+                    })
+                    .or_else(|| {
+                        nested_object_number(
+                            &usage,
+                            "prompt_tokens_details",
+                            "cache_creation_tokens",
+                        )
+                    })
+                    .or_else(|| {
+                        nested_object_number(&usage, "prompt_tokens_details", "cache_write_tokens")
                     })
                     .or_else(|| {
                         object_number(
@@ -1803,20 +1958,43 @@ pub fn extract_response_token_usage(head: &[u8], tail: &[u8]) -> Option<Response
                                 "cache_creation_tokens",
                             ],
                         )
-                    });
+                    })
+                    .or_else(|| last_number_after(head, b"\"cache_creation_input_tokens\""));
+
+            let reasoning_tokens =
+                nested_object_number(&usage, "output_tokens_details", "reasoning_tokens")
+                    .or_else(|| {
+                        nested_object_number(
+                            &usage,
+                            "completion_tokens_details",
+                            "reasoning_tokens",
+                        )
+                    })
+                    .or_else(|| object_number(&usage, &["reasoning_tokens"]))
+                    .unwrap_or(0);
+
+            // In Claude streaming, input_tokens is in head message_start while output_tokens is in tail message_delta
+            let effective_input = input.or_else(|| last_number_after(head, b"\"input_tokens\""));
+            let effective_output = output;
+
+            let (final_input, final_output) = match (effective_input, effective_output, total) {
+                (Some(i), Some(o), _) => (i, o),
+                (Some(i), None, Some(t)) => (i, t.saturating_sub(i)),
+                (Some(i), None, None) => (i, 0),
+                (None, Some(o), Some(t)) => (t.saturating_sub(o), o),
+                (None, Some(o), None) => (0, o),
+                (None, None, Some(t)) => (0, t),
+                (None, None, None) => (0, 0),
+            };
+
             return Some(ResponseTokenUsage {
-                input_tokens: object_number(&usage, &["input_tokens"]).unwrap_or(0),
-                output_tokens: object_number(&usage, &["output_tokens"]).unwrap_or(0),
-                cached_input_tokens: cached,
-                cached_input_tokens_known: true,
+                input_tokens: final_input,
+                output_tokens: final_output,
+                cached_input_tokens: cached.unwrap_or(0),
+                cached_input_tokens_known: cached.is_some(),
                 cache_write_tokens: cache_write_tokens.unwrap_or(0),
                 cache_write_tokens_known: cache_write_tokens.is_some(),
-                reasoning_tokens: nested_object_number(
-                    &usage,
-                    "output_tokens_details",
-                    "reasoning_tokens",
-                )
-                .unwrap_or(0),
+                reasoning_tokens,
             });
         }
     }
@@ -1837,21 +2015,36 @@ pub fn extract_response_token_usage(head: &[u8], tail: &[u8]) -> Option<Response
             });
         }
     }
-    let input = last_number_after(head, b"\"input_tokens\"");
+    let input = last_number_after(head, b"\"input_tokens\"")
+        .or_else(|| last_number_after(tail, b"\"input_tokens\""));
     let output = last_number_after(tail, b"\"output_tokens\"");
-    if input.is_some() || output.is_some() {
+    let total = last_number_after(tail, b"\"total_tokens\"")
+        .or_else(|| last_number_after(head, b"\"total_tokens\""));
+    if input.is_some() || output.is_some() || total.is_some() {
+        let cached = last_number_after(head, b"\"cache_read_input_tokens\"")
+            .or_else(|| last_number_after(tail, b"\"cache_read_input_tokens\""));
+        let cache_write = last_number_after(head, b"\"cache_creation_input_tokens\"")
+            .or_else(|| last_number_after(tail, b"\"cache_creation_input_tokens\""));
+        let reasoning = last_number_after(tail, b"\"reasoning_tokens\"").unwrap_or(0);
+
+        let (final_input, final_output) = match (input, output, total) {
+            (Some(i), Some(o), _) => (i, o),
+            (Some(i), None, Some(t)) => (i, t.saturating_sub(i)),
+            (Some(i), None, None) => (i, 0),
+            (None, Some(o), Some(t)) => (t.saturating_sub(o), o),
+            (None, Some(o), None) => (0, o),
+            (None, None, Some(t)) => (0, t),
+            (None, None, None) => (0, 0),
+        };
+
         return Some(ResponseTokenUsage {
-            input_tokens: input.unwrap_or(0),
-            output_tokens: output.unwrap_or(0),
-            cached_input_tokens: last_number_after(head, b"\"cache_read_input_tokens\"")
-                .unwrap_or(0),
-            cached_input_tokens_known: last_number_after(head, b"\"cache_read_input_tokens\"")
-                .is_some(),
-            cache_write_tokens: last_number_after(head, b"\"cache_creation_input_tokens\"")
-                .unwrap_or(0),
-            cache_write_tokens_known: last_number_after(head, b"\"cache_creation_input_tokens\"")
-                .is_some(),
-            reasoning_tokens: 0,
+            input_tokens: final_input,
+            output_tokens: final_output,
+            cached_input_tokens: cached.unwrap_or(0),
+            cached_input_tokens_known: cached.is_some(),
+            cache_write_tokens: cache_write.unwrap_or(0),
+            cache_write_tokens_known: cache_write.is_some(),
+            reasoning_tokens: reasoning,
         });
     }
     None
@@ -2093,6 +2286,7 @@ struct UsageSampleInner {
     /// so a standalone store accepts every push until membership is explicit.
     active: Option<std::collections::BTreeSet<String>>,
     entries: std::collections::BTreeMap<String, Vec<UsageSample>>,
+    migration_pending: bool,
 }
 
 #[derive(Debug, Default)]
@@ -2164,6 +2358,9 @@ impl UsageSampleStore {
     pub fn load(path: std::path::PathBuf) -> Self {
         let raw = std::fs::read_to_string(&path).unwrap_or_default();
         let entries = Self::parse_log(&raw);
+        let migration_pending =
+            serde_json::from_str::<std::collections::BTreeMap<String, Vec<UsageSample>>>(&raw)
+                .is_ok();
         // The file may already hold orphaned lines, so start the compaction
         // counter at their count rather than at zero.
         let appended = raw.lines().filter(|line| !line.trim().is_empty()).count();
@@ -2172,6 +2369,7 @@ impl UsageSampleStore {
             inner: std::sync::Mutex::new(UsageSampleInner {
                 active: None,
                 entries,
+                migration_pending,
             }),
             appended: std::sync::atomic::AtomicUsize::new(appended),
         }
@@ -2230,6 +2428,18 @@ impl UsageSampleStore {
         prune_window(window);
         let pruned = window.len() != before + 1;
         let retained = window.clone();
+        if inner.migration_pending {
+            match self.rewrite_log(&inner.entries) {
+                Ok(()) => {
+                    inner.migration_pending = false;
+                    self.appended.store(0, std::sync::atomic::Ordering::Relaxed);
+                }
+                Err(error) => {
+                    tracing::warn!(path = %self.path.display(), %error, "usage sample migration failed; retaining legacy file for retry");
+                }
+            }
+            return retained;
+        }
         let record = SampleRecord {
             account_id: account_id.to_string(),
             sample,
@@ -2242,8 +2452,12 @@ impl UsageSampleStore {
                 + 1;
             let retained_lines: usize = inner.entries.values().map(Vec::len).sum();
             if pruned && appended > retained_lines * COMPACT_GROWTH_FACTOR {
-                self.rewrite_log(&inner.entries);
-                self.appended.store(0, std::sync::atomic::Ordering::Relaxed);
+                match self.rewrite_log(&inner.entries) {
+                    Ok(()) => self.appended.store(0, std::sync::atomic::Ordering::Relaxed),
+                    Err(error) => {
+                        tracing::warn!(path = %self.path.display(), %error, "usage sample compaction failed")
+                    }
+                }
             }
         }
         retained
@@ -2260,8 +2474,15 @@ impl UsageSampleStore {
         inner.entries.retain(|id, _| active.contains(id));
         let dropped = before - inner.entries.len();
         if dropped > 0 {
-            self.rewrite_log(&inner.entries);
-            self.appended.store(0, std::sync::atomic::Ordering::Relaxed);
+            match self.rewrite_log(&inner.entries) {
+                Ok(()) => {
+                    inner.migration_pending = false;
+                    self.appended.store(0, std::sync::atomic::Ordering::Relaxed);
+                }
+                Err(error) => {
+                    tracing::warn!(path = %self.path.display(), %error, "usage sample membership rewrite failed")
+                }
+            }
         }
         dropped
     }
@@ -2273,7 +2494,10 @@ impl UsageSampleStore {
     }
 
     /// Rewrites the log from memory, dropping the lines pruning has orphaned.
-    fn rewrite_log(&self, entries: &std::collections::BTreeMap<String, Vec<UsageSample>>) {
+    fn rewrite_log(
+        &self,
+        entries: &std::collections::BTreeMap<String, Vec<UsageSample>>,
+    ) -> std::io::Result<()> {
         let mut rendered = String::new();
         for (id, samples) in entries.iter() {
             for sample in samples {
@@ -2281,16 +2505,15 @@ impl UsageSampleStore {
                     account_id: id.clone(),
                     sample: *sample,
                 };
-                if let Ok(line) = serde_json::to_string(&record) {
-                    rendered.push_str(&line);
-                    rendered.push('\n');
-                }
+                let line = serde_json::to_string(&record).map_err(std::io::Error::other)?;
+                rendered.push_str(&line);
+                rendered.push('\n');
             }
         }
-        let _ = mahoquot_providers::credential_file::write_credential_atomically(
+        mahoquot_providers::credential_file::write_credential_atomically(
             &self.path,
             rendered.as_bytes(),
-        );
+        )
     }
 
     /// Appends one record. Append is atomic enough for this log because a torn
@@ -2455,6 +2678,80 @@ pub fn parse_relay_account_usage(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_sample_append_survives_restart() {
+        for newline in [false, true] {
+            let root =
+                std::env::temp_dir().join(format!("usage-migration-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&root).unwrap();
+            let path = root.join("samples.json");
+            let sample = |unix, requests| UsageSample {
+                unix,
+                requests,
+                tokens: requests * 10,
+                cost_usd: None,
+            };
+            let old = vec![sample(1_789_000, 10), sample(1_800_060, 20)];
+            let legacy = std::collections::BTreeMap::from([("account".to_string(), old)]);
+            let mut raw = serde_json::to_string(&legacy).unwrap();
+            if newline {
+                raw.push('\n');
+            }
+            std::fs::write(&path, raw).unwrap();
+            let store = UsageSampleStore::load(path.clone());
+            assert_eq!(store.retain_accounts(&["account".to_string()].into()), 0);
+            let expected = store.push("account", sample(1_800_120, 30));
+            drop(store);
+            let reopened = UsageSampleStore::load(path.clone());
+            let inner = reopened.inner.lock().unwrap();
+            let restored = &inner.entries["account"];
+            assert_eq!(restored.len(), 3);
+            assert_eq!(
+                serde_json::to_value(restored).unwrap(),
+                serde_json::to_value(&expected).unwrap()
+            );
+            assert_eq!(
+                window_deltas(restored, 1_800_120),
+                window_deltas(&expected, 1_800_120)
+            );
+            assert_eq!(window_deltas(restored, 1_800_120)[0].requests, 20);
+            assert!(!inner.migration_pending);
+            assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 3);
+            drop(inner);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn legacy_sample_failed_migration_retries_without_appending() {
+        let root =
+            std::env::temp_dir().join(format!("usage-migration-failure-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("samples.json");
+        let raw = r#"{"account":[{"unix":1800000,"requests":1,"tokens":10}]}"#;
+        std::fs::write(&path, raw).unwrap();
+        let store = UsageSampleStore::load(path.clone());
+        let backup = root.join("legacy.json");
+        std::fs::rename(&path, &backup).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let sample = |requests| UsageSample {
+            unix: 1_800_060,
+            requests,
+            tokens: requests * 10,
+            cost_usd: None,
+        };
+        assert_eq!(store.push("account", sample(2)).len(), 2);
+        assert!(store.inner.lock().unwrap().migration_pending);
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), raw);
+        assert!(path.is_dir());
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(&backup, &path).unwrap();
+        store.push("account", sample(3));
+        let reopened = UsageSampleStore::load(path);
+        assert_eq!(reopened.inner.lock().unwrap().entries["account"].len(), 3);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn primary_is_always_the_short_window_across_providers() {
@@ -2671,6 +2968,45 @@ mod tests {
         assert_eq!(usage.output_tokens, 10);
         assert_eq!(usage.cached_input_tokens, 20);
         assert_eq!(usage.cache_write_tokens, 50);
+    }
+
+    #[test]
+    fn extract_reads_responses_api_usage_without_cache_details_across_head_tail_rollover() {
+        let created = b"event: response.created\ndata: {\"type\":\"response.created\"}\n\n";
+        let completed = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":700,\"output_tokens\":60,\"total_tokens\":760,\"output_tokens_details\":{\"reasoning_tokens\":16}}}}\n\n";
+        let mut capture = HeadTailCapture::new();
+        capture.push(created);
+        for _ in 0..20 {
+            capture.push(&vec![b'x'; 4096]);
+        }
+        capture.push(completed);
+        let (head, tail) = capture.parts();
+        let actual = extract_response_token_usage(head, tail).expect("terminal usage exists");
+        assert_eq!(actual.input_tokens, 700);
+        assert_eq!(actual.output_tokens, 60);
+        assert_eq!(actual.reasoning_tokens, 16);
+        assert!(!actual.cached_input_tokens_known);
+        assert_eq!(actual.cached_input_tokens, 0);
+        assert_eq!(actual.total_tokens(), 760);
+    }
+
+    #[test]
+    fn extract_reads_total_only_usage() {
+        let total_only = br#"{"usage":{"total_tokens":760}}"#;
+        let actual =
+            extract_response_token_usage(total_only, total_only).expect("total-only usage exists");
+        assert_eq!(actual.total_tokens(), 760);
+    }
+
+    #[test]
+    fn extract_reads_buffered_responses_usage_preserving_reasoning() {
+        let buffered = br#"{"usage":{"input_tokens":700,"output_tokens":60,"total_tokens":760,"output_tokens_details":{"reasoning_tokens":16}}}"#;
+        let actual =
+            extract_response_token_usage(buffered, buffered).expect("buffered usage exists");
+        assert_eq!(actual.input_tokens, 700);
+        assert_eq!(actual.output_tokens, 60);
+        assert_eq!(actual.reasoning_tokens, 16);
+        assert!(!actual.cached_input_tokens_known);
     }
 
     #[test]
@@ -3568,6 +3904,7 @@ mod tests {
                         available: Some(true),
                         available_at: None,
                         credits_would_enable: Some(false),
+                        ..Default::default()
                     },
                 );
                 map
@@ -3672,7 +4009,6 @@ mod tests {
         assert!(avail.contains_key("tab_flash_lite_preview"));
         assert!(!avail.contains_key("chat_20706"));
     }
-
     #[test]
     fn parses_live_pro_wham_payload_with_chatpass_and_model_availability() {
         let raw = r#"{
@@ -3904,7 +4240,7 @@ mod tests {
                 ..Default::default()
             },
             observed_at_unix: Some(now - 100),
-            ..Default::default()
+            ..AccountUsage::default()
         };
         assert!(
             u.is_codex_included_quota_exhausted(None, now),
@@ -3921,7 +4257,7 @@ mod tests {
         // Explicit overage limit reached
         let u_overage = AccountUsage {
             overage_limit_reached: Some(true),
-            ..Default::default()
+            ..AccountUsage::default()
         };
         assert!(
             u_overage.is_codex_hard_limit_reached(),
@@ -4004,5 +4340,77 @@ mod tests {
         let usage = wham.into_account_usage(1_000);
         assert_eq!(usage.overage_limit_reached, Some(true));
         assert!(usage.is_codex_hard_limit_reached());
+    }
+}
+
+#[cfg(test)]
+mod coding_plan_quota_tests {
+    use super::*;
+
+    #[test]
+    fn monitor_payload_reports_five_hour_usage_and_keeps_tools_second() {
+        let body = serde_json::json!({
+            "code": 200,
+            "data": {
+                "level": "lite",
+                "limits": [
+                    {
+                        "type": "TIME_LIMIT",
+                        "unit": 5,
+                        "number": 1,
+                        "percentage": 1,
+                        "remaining": 99,
+                        "nextResetTime": 1796050452998i64
+                    },
+                    {
+                        "type": "TOKENS_LIMIT",
+                        "unit": 3,
+                        "number": 5,
+                        "percentage": 22,
+                        "nextResetTime": 1793774115449i64
+                    }
+                ]
+            }
+        });
+        let usage = parse_coding_plan_quota(&body, 1_700_000_000);
+        assert_eq!(usage.plan_type.as_deref(), Some("lite"));
+        assert_eq!(usage.observed_at_unix, Some(1_700_000_000));
+        let buckets = &usage.groups[0].buckets;
+        assert_eq!(buckets.len(), 2);
+        assert_eq!(buckets[0].display_name.as_deref(), Some("5h"));
+        assert_eq!(buckets[0].window.as_deref(), Some("5h"));
+        assert_eq!(buckets[0].used_percent, Some(22.0));
+        assert_eq!(buckets[0].reset_at_unix, Some(1_793_774_115));
+        assert_eq!(buckets[1].display_name.as_deref(), Some("Tools"));
+        assert_eq!(buckets[1].used_percent, Some(1.0));
+        assert_eq!(buckets[1].reset_at_unix, Some(1_796_050_452));
+    }
+
+    #[test]
+    fn weekly_credit_window_is_labeled_and_remaining_derives_used_percent() {
+        let body = serde_json::json!({
+            "data": {
+                "limits": [{
+                    "type": "CREDIT_LIMIT",
+                    "unit": 6,
+                    "number": 1,
+                    "remaining": 40,
+                    "nextResetTime": 1_800_000_000
+                }]
+            }
+        });
+        let usage = parse_coding_plan_quota(&body, 10);
+        let bucket = &usage.groups[0].buckets[0];
+        assert_eq!(bucket.display_name.as_deref(), Some("Week"));
+        assert_eq!(bucket.used_percent, Some(60.0));
+        assert_eq!(bucket.reset_at_unix, Some(1_800_000_000));
+    }
+
+    #[test]
+    fn an_unmeasured_monitor_payload_is_not_a_snapshot() {
+        let body = serde_json::json!({"code": 200, "data": {"limits": []}});
+        let usage = parse_coding_plan_quota(&body, 1);
+        assert!(usage.observed_at_unix.is_none());
+        assert!(usage.groups.is_empty());
     }
 }

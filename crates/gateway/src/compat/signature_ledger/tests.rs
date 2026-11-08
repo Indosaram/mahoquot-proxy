@@ -57,11 +57,17 @@ fn a_byte_budget_evicts_least_recently_used_entries_first() {
     scope.remember("kept", "tool", "{}", &blob);
     for index in 0..3 {
         scope.remember(&format!("filler-{index}"), "tool", "{}", &blob);
-        assert_eq!(scope.recall("kept", "tool", "{}").as_deref(), Some(&blob[..]));
+        assert_eq!(
+            scope.recall("kept", "tool", "{}").as_deref(),
+            Some(&blob[..])
+        );
     }
     scope.remember("late", "tool", "{}", &blob);
 
-    assert_eq!(scope.recall("kept", "tool", "{}").as_deref(), Some(&blob[..]));
+    assert_eq!(
+        scope.recall("kept", "tool", "{}").as_deref(),
+        Some(&blob[..])
+    );
     assert_eq!(scope.recall("filler-0", "tool", "{}"), None);
     assert!(ledger.bytes() <= 4096);
 }
@@ -176,7 +182,10 @@ fn a_bounded_snapshot_keeps_the_most_recently_used_entries() {
         restored.recall("oldest", "tool", "{}").as_deref(),
         Some("SIG-OLDEST")
     );
-    assert_eq!(restored.recall("newest", "tool", "{}").as_deref(), Some("SIG-NEWEST"));
+    assert_eq!(
+        restored.recall("newest", "tool", "{}").as_deref(),
+        Some("SIG-NEWEST")
+    );
     assert_eq!(restored.recall("middle", "tool", "{}"), None);
     let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
 }
@@ -291,7 +300,9 @@ fn eviction_keeps_the_order_index_and_byte_total_consistent() {
 fn an_expired_entry_is_dropped_and_excluded_from_the_snapshot() {
     let mut store = LruStore::new(16, 1 << 20);
     let now = Instant::now();
-    let stale = now.checked_sub(TTL + Duration::from_secs(1)).expect("stale");
+    let stale = now
+        .checked_sub(TTL + Duration::from_secs(1))
+        .expect("stale");
     store.insert(
         "stale".to_string(),
         "{}".to_string(),
@@ -321,7 +332,10 @@ fn restore_rebuilds_recency_so_the_coldest_restored_entry_evicts_first() {
         signature: "SIG".to_string(),
         age_ms,
     };
-    store.restore(vec![record("hot", 10), record("warm", 20), record("cold", 30)], now);
+    store.restore(
+        vec![record("hot", 10), record("warm", 20), record("cold", 30)],
+        now,
+    );
 
     assert_eq!(store.len(), 2);
     assert!(store.contains("hot"));
@@ -343,7 +357,10 @@ fn stats_count_replay_hits_misses_and_unsigned_replays() {
     let scope = scope(&ledger);
     scope.remember("call-1", "tool", "{}", "SIG-1");
 
-    assert_eq!(scope.recall("call-1", "tool", "{}").as_deref(), Some("SIG-1"));
+    assert_eq!(
+        scope.recall("call-1", "tool", "{}").as_deref(),
+        Some("SIG-1")
+    );
     assert_eq!(scope.recall("call-2", "tool", "{}"), None);
     // An empty call id never reaches the store and must not be counted.
     assert_eq!(scope.recall("", "tool", "{}"), None);

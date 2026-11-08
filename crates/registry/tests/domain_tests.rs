@@ -1,6 +1,113 @@
 use mahoquot_registry::*;
 
 #[test]
+fn foreign_namespaces_do_not_inherit_open_codex_routes() {
+    for registered_owner in [false, true] {
+        let mut builder = RegistryBuilder::new(CatalogVersion(1), CatalogSource::EmbeddedFallback);
+        builder.register_provider(ProviderId::codex(), ProviderPolicy::Open);
+        if registered_owner {
+            builder.register_provider(
+                ProviderId::new("cline-free").unwrap(),
+                ProviderPolicy::Discovered,
+            );
+        }
+        let foreign = ModelId::new("cline-free/gemini-3.8-flash").unwrap();
+        builder
+            .add_model(ModelDescriptor::new(foreign.clone(), "google"))
+            .unwrap();
+        builder
+            .add_model(ModelDescriptor::new(
+                ModelId::new("bare-catalog-model").unwrap(),
+                "google",
+            ))
+            .unwrap();
+        builder
+            .add_alias(ModelId::new("bare-alias").unwrap(), foreign.clone(), None)
+            .unwrap();
+        builder
+            .add_alias(
+                ModelId::new("cline-free/alias").unwrap(),
+                ModelId::new("bare-catalog-model").unwrap(),
+                None,
+            )
+            .unwrap();
+        let snapshot = builder.build().unwrap();
+        for id in [
+            "cline-free/gemini-3.8-flash",
+            "cline-free/unknown",
+            "unregistered/model",
+            "bare-alias",
+            "cline-free/alias",
+        ] {
+            assert!(
+                matches!(snapshot.resolve(id), Err(RegistryError::UnknownModel(_))),
+                "{id}"
+            );
+        }
+        assert_eq!(snapshot.get_model(&foreign).unwrap().id, foreign);
+        for id in ["bare-catalog-model", "bare-unknown", "codex/own-model"] {
+            let resolved = snapshot.resolve(id).unwrap();
+            assert_eq!(resolved.canonical_id.as_str(), id);
+            assert_eq!(resolved.eligible_bindings.len(), 1);
+            assert_eq!(
+                resolved.eligible_bindings[0].provider_id,
+                ProviderId::codex()
+            );
+        }
+
+        let mut authorized = snapshot.clone();
+        authorized.providers.insert(
+            ProviderId::new("cline").unwrap(),
+            ProviderPolicy::Discovered,
+        );
+        authorized
+            .models
+            .get_mut(&foreign)
+            .unwrap()
+            .bindings
+            .insert(
+                ProviderId::new("cline").unwrap(),
+                ProviderBinding::new(
+                    ProviderId::new("cline").unwrap(),
+                    ProviderPolicy::Discovered,
+                    CatalogSource::Discovered,
+                ),
+            );
+        let resolved = authorized.resolve(foreign.as_str()).unwrap();
+        assert_eq!(resolved.canonical_id, foreign);
+        assert_eq!(resolved.eligible_bindings.len(), 1);
+        assert_eq!(resolved.eligible_bindings[0].provider_id.as_str(), "cline");
+        authorized
+            .models
+            .get_mut(&foreign)
+            .unwrap()
+            .bindings
+            .clear();
+        authorized
+            .models
+            .get_mut(&foreign)
+            .unwrap()
+            .bindings
+            .insert(
+                ProviderId::codex(),
+                ProviderBinding::new(
+                    ProviderId::codex(),
+                    ProviderPolicy::Open,
+                    CatalogSource::LocalOverride,
+                ),
+            );
+        assert_eq!(
+            authorized
+                .resolve(foreign.as_str())
+                .unwrap()
+                .eligible_bindings[0]
+                .provider_id,
+            ProviderId::codex()
+        );
+    }
+}
+
+#[test]
 fn test_invalid_and_empty_ids() {
     // Empty provider ID
     assert_eq!(ProviderId::new(""), Err(RegistryError::EmptyProviderId));
@@ -43,14 +150,38 @@ fn test_invalid_and_empty_ids() {
 fn test_provider_id_canonical() {
     assert_eq!(ProviderId::canonical("openai").unwrap().as_str(), "codex");
     assert_eq!(ProviderId::canonical("OpenAI").unwrap().as_str(), "codex");
-    assert_eq!(ProviderId::canonical("anthropic").unwrap().as_str(), "claude");
-    assert_eq!(ProviderId::canonical("Anthropic").unwrap().as_str(), "claude");
-    assert_eq!(ProviderId::canonical("google-vertex").unwrap().as_str(), "vertex");
-    assert_eq!(ProviderId::canonical("Google-Vertex").unwrap().as_str(), "vertex");
-    assert_eq!(ProviderId::canonical("DeepSeek").unwrap().as_str(), "deepseek");
-    assert_eq!(ProviderId::canonical("deepseek").unwrap().as_str(), "deepseek");
-    assert_eq!(ProviderId::canonical("Mistral").unwrap().as_str(), "mistral");
-    assert_eq!(ProviderId::canonical("  cohere  ").unwrap().as_str(), "cohere");
+    assert_eq!(
+        ProviderId::canonical("anthropic").unwrap().as_str(),
+        "claude"
+    );
+    assert_eq!(
+        ProviderId::canonical("Anthropic").unwrap().as_str(),
+        "claude"
+    );
+    assert_eq!(
+        ProviderId::canonical("google-vertex").unwrap().as_str(),
+        "vertex"
+    );
+    assert_eq!(
+        ProviderId::canonical("Google-Vertex").unwrap().as_str(),
+        "vertex"
+    );
+    assert_eq!(
+        ProviderId::canonical("DeepSeek").unwrap().as_str(),
+        "deepseek"
+    );
+    assert_eq!(
+        ProviderId::canonical("deepseek").unwrap().as_str(),
+        "deepseek"
+    );
+    assert_eq!(
+        ProviderId::canonical("Mistral").unwrap().as_str(),
+        "mistral"
+    );
+    assert_eq!(
+        ProviderId::canonical("  cohere  ").unwrap().as_str(),
+        "cohere"
+    );
 }
 
 #[test]

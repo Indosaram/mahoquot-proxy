@@ -39,7 +39,9 @@ fn fixture(label: &str) -> Fixture {
     let config_path = dir.join("config.yaml");
     std::fs::write(
         &config_path,
-        "logging-to-file: false\ntls:\n  enable: true\nomo-profile-unmodelled-probe: kept\n",
+        format!(
+            "logging-to-file: false\ntls:\n  enable: true\nremote-management:\n  secret-key: {ADMIN_KEY}\nomo-profile-unmodelled-probe: kept\n"
+        ),
     )
     .expect("config fixture");
     let config = GatewayConfig {
@@ -58,7 +60,15 @@ fn fixture(label: &str) -> Fixture {
 }
 
 impl Fixture {
-    async fn send(&self, request: Request<Body>) -> Response {
+    async fn send(&self, mut request: Request<Body>) -> Response {
+        // The management gate only trusts the transport peer, which a
+        // `oneshot` request lacks; pin it to loopback like a local client.
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                18840,
+            ))));
         self.app
             .clone()
             .oneshot(request)
@@ -74,7 +84,8 @@ impl Fixture {
         if let Some(value) = if_none_match {
             builder = builder.header(header::IF_NONE_MATCH, value);
         }
-        self.send(builder.body(Body::empty()).expect("request")).await
+        self.send(builder.body(Body::empty()).expect("request"))
+            .await
     }
 
     async fn put(&self, key: Option<&str>, if_match: Option<&str>, body: Value) -> Response {
@@ -283,7 +294,7 @@ async fn an_oversized_body_is_refused_by_the_route_limit() {
 }
 
 #[tokio::test]
-async fn a_missing_key_is_401_and_a_scoped_key_is_403() {
+async fn a_missing_or_scoped_key_is_401() {
     // given a gateway and a scoped key minted through the control plane
     let fixture = fixture("auth");
     let minted = fixture
@@ -293,7 +304,9 @@ async fn a_missing_key_is_401_and_a_scoped_key_is_403() {
                 .uri("/v0/management/scoped-keys")
                 .header(header::AUTHORIZATION, format!("Bearer {ADMIN_KEY}"))
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(json!({"name": "omo-profile-scoped"}).to_string()))
+                .body(Body::from(
+                    json!({"name": "omo-profile-scoped"}).to_string(),
+                ))
                 .expect("request"),
         )
         .await;
@@ -304,22 +317,26 @@ async fn a_missing_key_is_401_and_a_scoped_key_is_403() {
         .to_string();
     // when the profile is requested without a key
     // then it is unauthorized
-    assert_eq!(fixture.get(None, None).await.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        fixture.get(None, None).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
     assert_eq!(
         fixture.put(None, Some("\"r0\""), profile()).await.status(),
         StatusCode::UNAUTHORIZED
     );
-    // and a scoped key may neither read nor write it
+    // and a scoped key may neither read nor write it: it is never a
+    // management credential, so the gate rejects it like a missing key
     assert_eq!(
         fixture.get(Some(&scoped), None).await.status(),
-        StatusCode::FORBIDDEN
+        StatusCode::UNAUTHORIZED
     );
     assert_eq!(
         fixture
             .put(Some(&scoped), Some("\"r0\""), profile())
             .await
             .status(),
-        StatusCode::FORBIDDEN
+        StatusCode::UNAUTHORIZED
     );
 }
 
@@ -332,10 +349,14 @@ async fn the_profile_and_unrelated_keys_survive_a_reload_from_disk() {
         .await;
     assert_eq!(response.status(), StatusCode::OK);
     // when a fresh store loads the same file
-    let reloaded = SettingsStore::load_or(fixture.config_path.clone(), Settings::default())
-        .expect("reloads");
+    let reloaded =
+        SettingsStore::load_or(fixture.config_path.clone(), Settings::default()).expect("reloads");
     // then the profile is intact
-    let stored = reloaded.current().omo_profile.clone().expect("profile persisted");
+    let stored = reloaded
+        .current()
+        .omo_profile
+        .clone()
+        .expect("profile persisted");
     assert_eq!(stored.revision, 1);
     assert_eq!(stored.models.len(), 2);
     assert_eq!(stored.remove, vec!["retired-model".to_string()]);

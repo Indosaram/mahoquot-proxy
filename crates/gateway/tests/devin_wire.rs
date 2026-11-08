@@ -7,9 +7,9 @@ use prost::Message;
 use serde_json::{json, Value};
 
 use mahoquot_gateway::compat::devin::{
-    authorization_header, build_chat_request, build_model_configs_request,
-    frame_data, frame_end_stream, DevinDecoder, DevinRequestParams,
-    MAX_FRAME_SIZE, STREAM_CONTENT_TYPE, UNARY_CONTENT_TYPE,
+    authorization_header, build_chat_request, build_model_configs_request, frame_data,
+    frame_end_stream, DevinDecoder, DevinRequestParams, MAX_FRAME_SIZE, STREAM_CONTENT_TYPE,
+    UNARY_CONTENT_TYPE,
 };
 use mahoquot_gateway::compat::devin_proto::{
     ChatMessagePrompt, ChatMessageResponse, GetChatMessageRequest,
@@ -88,7 +88,10 @@ fn full_history_preserves_roles_tool_reasoning_signature_and_images() {
     let req = GetChatMessageRequest::decode(wire.as_slice()).unwrap();
     // The system prompt must survive verbatim (no identity rewriting) into
     // `prompt = 2`; history order and roles user=1 assistant=2 tool=4 preserved.
-    assert_eq!(req.prompt.as_deref(), Some("You are Claude Code, Anthropic's official CLI for Claude"));
+    assert_eq!(
+        req.prompt.as_deref(),
+        Some("You are Claude Code, Anthropic's official CLI for Claude")
+    );
     let sources: Vec<i32> = req
         .chat_message_prompts
         .iter()
@@ -106,13 +109,19 @@ fn full_history_preserves_roles_tool_reasoning_signature_and_images() {
     assert_eq!(history[2].tool_calls.len(), 1);
     assert_eq!(history[2].tool_calls[0].id.as_deref(), Some("call_1"));
     assert_eq!(history[2].tool_calls[0].name.as_deref(), Some("inspect"));
-    assert_eq!(history[2].tool_calls[0].arguments_json.as_deref(), Some("{\"q\":1}"));
+    assert_eq!(
+        history[2].tool_calls[0].arguments_json.as_deref(),
+        Some("{\"q\":1}")
+    );
     // Tool result keeps call id and error flag.
     assert_eq!(history[3].tool_call_id.as_deref(), Some("call_1"));
     assert_eq!(history[3].tool_result_is_error, Some(true));
     assert_eq!(history[3].prompt.as_deref(), Some("boom"));
     // Message ids are caller-injected and distinct.
-    let mut ids: Vec<&str> = history.iter().filter_map(|m| m.message_id.as_deref()).collect();
+    let mut ids: Vec<&str> = history
+        .iter()
+        .filter_map(|m| m.message_id.as_deref())
+        .collect();
     ids.sort_unstable();
     ids.dedup();
     assert_eq!(ids.len(), history.len());
@@ -135,9 +144,16 @@ fn schema_descriptions_and_definitions_are_not_stripped() {
     assert_eq!(req.tools.len(), 1);
     assert_eq!(req.tools[0].name.as_deref(), Some("weather"));
     assert_eq!(req.tools[0].description.as_deref(), Some("get weather"));
-    let schema: Value = serde_json::from_str(req.tools[0].json_schema_string.as_deref().unwrap()).unwrap();
-    assert_eq!(schema.pointer("/properties/city/description"), Some(&json!("Korean city")));
-    assert_eq!(schema.pointer("/properties/city/enum"), Some(&json!(["Seoul"])));
+    let schema: Value =
+        serde_json::from_str(req.tools[0].json_schema_string.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        schema.pointer("/properties/city/description"),
+        Some(&json!("Korean city"))
+    );
+    assert_eq!(
+        schema.pointer("/properties/city/enum"),
+        Some(&json!(["Seoul"]))
+    );
 }
 
 #[test]
@@ -147,8 +163,11 @@ fn output_limits_temperature_and_top_p_are_preserved() {
         "max_tokens": 777, "temperature": 0.3, "top_p": 0.9
     });
     let req = GetChatMessageRequest::decode(
-        build_chat_request(&body, &params(), &mut counter()).unwrap().as_slice(),
-    ).unwrap();
+        build_chat_request(&body, &params(), &mut counter())
+            .unwrap()
+            .as_slice(),
+    )
+    .unwrap();
     let cfg = req.configuration.as_ref().unwrap();
     assert_eq!(cfg.max_tokens, Some(777));
     assert_eq!(cfg.temperature, Some(0.3));
@@ -160,8 +179,11 @@ fn output_limits_temperature_and_top_p_are_preserved() {
         "messages": [{"role": "user", "content": "x"}], "max_completion_tokens": 1234
     });
     let req = GetChatMessageRequest::decode(
-        build_chat_request(&body, &params(), &mut counter()).unwrap().as_slice(),
-    ).unwrap();
+        build_chat_request(&body, &params(), &mut counter())
+            .unwrap()
+            .as_slice(),
+    )
+    .unwrap();
     assert_eq!(req.configuration.unwrap().max_tokens, Some(1234));
 }
 
@@ -169,8 +191,11 @@ fn output_limits_temperature_and_top_p_are_preserved() {
 fn absent_options_use_reference_defaults() {
     let body = json!({"messages": [{"role": "user", "content": "x"}]});
     let req = GetChatMessageRequest::decode(
-        build_chat_request(&body, &params(), &mut counter()).unwrap().as_slice(),
-    ).unwrap();
+        build_chat_request(&body, &params(), &mut counter())
+            .unwrap()
+            .as_slice(),
+    )
+    .unwrap();
     let cfg = req.configuration.as_ref().unwrap();
     assert_eq!(cfg.max_tokens, Some(4096));
     assert_eq!(cfg.temperature, Some(1.0));
@@ -183,14 +208,20 @@ fn tool_choice_none_removes_tools_but_auto_keeps_them() {
     let tools = json!([{"type": "function", "function": {"name": "f", "description": "d", "parameters": {}}}]);
     let none = json!({"messages": [{"role": "user", "content": "x"}], "tools": tools, "tool_choice": "none"});
     let req = GetChatMessageRequest::decode(
-        build_chat_request(&none, &params(), &mut counter()).unwrap().as_slice(),
-    ).unwrap();
+        build_chat_request(&none, &params(), &mut counter())
+            .unwrap()
+            .as_slice(),
+    )
+    .unwrap();
     assert!(req.tools.is_empty(), "tool_choice none must drop tools");
 
     let auto = json!({"messages": [{"role": "user", "content": "x"}], "tools": tools, "tool_choice": "auto"});
     let req = GetChatMessageRequest::decode(
-        build_chat_request(&auto, &params(), &mut counter()).unwrap().as_slice(),
-    ).unwrap();
+        build_chat_request(&auto, &params(), &mut counter())
+            .unwrap()
+            .as_slice(),
+    )
+    .unwrap();
     assert_eq!(req.tools.len(), 1);
 }
 
@@ -209,11 +240,17 @@ fn forced_tool_choice_n_1_strict_output_are_rejected() {
         );
     }
     let n2 = merge(&base, &json!({"n": 2}));
-    assert!(build_chat_request(&n2, &params(), &mut counter()).is_err(), "n>1 must be rejected");
+    assert!(
+        build_chat_request(&n2, &params(), &mut counter()).is_err(),
+        "n>1 must be rejected"
+    );
     let strict = json!({"messages": [{"role": "user", "content": "x"}], "tools": [{
         "type": "function", "function": {"name": "f", "description": "d", "parameters": {}, "strict": true}
     }]});
-    assert!(build_chat_request(&strict, &params(), &mut counter()).is_err(), "strict output must be rejected");
+    assert!(
+        build_chat_request(&strict, &params(), &mut counter()).is_err(),
+        "strict output must be rejected"
+    );
 }
 
 fn merge(base: &Value, patch: &Value) -> Value {
@@ -231,15 +268,24 @@ fn remote_images_and_non_vision_models_are_rejected_upstream_of_wire() {
         {"type": "image_url", "image_url": {"url": "https://cdn.example/i.png"}}]}]});
     let mut p = params();
     p.supports_vision = true;
-    assert!(build_chat_request(&remote, &p, &mut counter()).is_err(), "remote image url");
+    assert!(
+        build_chat_request(&remote, &p, &mut counter()).is_err(),
+        "remote image url"
+    );
 
     let vision_body = json!({"messages": [{"role": "user", "content": [
         {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,zz"}}]}]});
-    assert!(build_chat_request(&vision_body, &params(), &mut counter()).is_err(), "non-vision model with image");
+    assert!(
+        build_chat_request(&vision_body, &params(), &mut counter()).is_err(),
+        "non-vision model with image"
+    );
 
     p.supports_vision = false;
     let plain = json!({"messages": [{"role": "user", "content": "no images here"}]});
-    assert!(build_chat_request(&plain, &p, &mut counter()).is_ok(), "text without vision");
+    assert!(
+        build_chat_request(&plain, &p, &mut counter()).is_ok(),
+        "text without vision"
+    );
 }
 
 #[test]
@@ -248,7 +294,10 @@ fn tool_result_without_call_id_is_rejected() {
         {"role": "user", "content": "x"},
         {"role": "tool", "content": "boom"}
     ]});
-    assert!(build_chat_request(&body, &params(), &mut counter()).is_err(), "missing tool_call_id");
+    assert!(
+        build_chat_request(&body, &params(), &mut counter()).is_err(),
+        "missing tool_call_id"
+    );
 }
 
 #[test]
@@ -273,7 +322,10 @@ fn unary_model_request_has_no_connect_envelope() {
         unhex("0a340a0663686973656c1209333030302e322e31371a03746f6b2202656e2a0377696e3a09333030302e322e3137620663686973656c"),
         "unary request wire"
     );
-    assert_eq!(wire[0], 0x0a, "framing-free protobuf starts with the metadata tag");
+    assert_eq!(
+        wire[0], 0x0a,
+        "framing-free protobuf starts with the metadata tag"
+    );
 }
 
 // ─── Pinned response schema (field numbers) ────────────────────────────────
@@ -413,39 +465,80 @@ fn stream_decodes_thinking_signature_redaction_text_tool_and_usage() {
 
 #[test]
 fn stop_frame_alone_does_not_emit_success_until_valid_endstream() {
-    use prost::Message;
     use mahoquot_gateway::compat::devin_proto::ChatMessageResponse;
+    use prost::Message;
     let mut payload = Vec::new();
-    ChatMessageResponse { stop_reason: Some(10), ..Default::default() }
-        .encode(&mut payload)
-        .unwrap();
+    ChatMessageResponse {
+        stop_reason: Some(10),
+        ..Default::default()
+    }
+    .encode(&mut payload)
+    .unwrap();
     let mut wire = frame_data(&payload);
     // No EndStream frame: EOF after a stop frame is a truncated stream.
     let (events, decoder) = decode_all(&wire);
-    assert!(events.iter().any(|e| matches!(e, CodexEvent::Failed { .. })), "{events:?}");
-    assert!(events.iter().all(|e| !matches!(e, CodexEvent::Completed { .. })), "{events:?}");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, CodexEvent::Failed { .. })),
+        "{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|e| !matches!(e, CodexEvent::Completed { .. })),
+        "{events:?}"
+    );
     assert!(!decoder.outcome().terminated);
 
     // Same wire with the EndStream appended does complete.
     wire.extend(frame_end_stream("{\"metadata\":{}}"));
     let (events, _) = decode_all(&wire);
-    assert!(events.iter().any(|e| matches!(e, CodexEvent::Completed { .. })), "{events:?}");
-    assert!(events.iter().all(|e| !matches!(e, CodexEvent::Failed { .. })), "{events:?}");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, CodexEvent::Completed { .. })),
+        "{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|e| !matches!(e, CodexEvent::Failed { .. })),
+        "{events:?}"
+    );
 }
 
 #[test]
 fn code_only_terminal_error_fails_with_code_preserved() {
-    let wire = [rich_payload(), frame_end_stream("{\"error\":{\"code\":\"unauthenticated\"}}")].concat();
+    let wire = [
+        rich_payload(),
+        frame_end_stream("{\"error\":{\"code\":\"unauthenticated\"}}"),
+    ]
+    .concat();
     let (events, decoder) = decode_all(&wire);
-    let failed: Vec<&String> = events.iter().filter_map(|e| match e {
-        CodexEvent::Failed { message } => Some(message),
-        _ => None,
-    }).collect();
+    let failed: Vec<&String> = events
+        .iter()
+        .filter_map(|e| match e {
+            CodexEvent::Failed { message } => Some(message),
+            _ => None,
+        })
+        .collect();
     assert_eq!(failed.len(), 1, "{events:?}");
-    assert!(failed[0].contains("unauthenticated"), "code-only error message");
-    assert_eq!(decoder.outcome().error_code.as_deref(), Some("unauthenticated"));
+    assert!(
+        failed[0].contains("unauthenticated"),
+        "code-only error message"
+    );
+    assert_eq!(
+        decoder.outcome().error_code.as_deref(),
+        Some("unauthenticated")
+    );
     // A later failure never emits normal completion.
-    assert!(events.iter().all(|e| !matches!(e, CodexEvent::Completed { .. })), "{events:?}");
+    assert!(
+        events
+            .iter()
+            .all(|e| !matches!(e, CodexEvent::Completed { .. })),
+        "{events:?}"
+    );
 }
 
 #[test]
@@ -453,11 +546,21 @@ fn duplicate_terminal_and_trailing_data_are_rejected() {
     let clean = rich_stream();
     let duplicate = [clean.clone(), frame_end_stream("{\"metadata\":{}}")].concat();
     let (events, _) = decode_all(&duplicate);
-    assert!(events.iter().any(|e| matches!(e, CodexEvent::Failed { .. })), "duplicate terminal: {events:?}");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, CodexEvent::Failed { .. })),
+        "duplicate terminal: {events:?}"
+    );
 
     let trailing = [clean, frame_data(b"\x00")].concat();
     let (events, _) = decode_all(&trailing);
-    assert!(events.iter().any(|e| matches!(e, CodexEvent::Failed { .. })), "data after terminal: {events:?}");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, CodexEvent::Failed { .. })),
+        "data after terminal: {events:?}"
+    );
 }
 
 #[test]
@@ -468,7 +571,9 @@ fn unnegotiated_compression_flags_are_rejected() {
         frame.extend_from_slice(b"{}");
         let (events, _) = decode_all(&frame);
         assert!(
-            events.iter().any(|e| matches!(e, CodexEvent::Failed { message } if message.contains("compression"))),
+            events.iter().any(
+                |e| matches!(e, CodexEvent::Failed { message } if message.contains("compression"))
+            ),
             "flag {flags}: {events:?}"
         );
     }
@@ -479,43 +584,78 @@ fn oversize_frame_is_rejected_without_buffering() {
     let mut frame = vec![0u8];
     frame.extend_from_slice(&((MAX_FRAME_SIZE + 1) as u32).to_be_bytes());
     let (events, _) = decode_all(&frame);
-    assert!(events.iter().any(|e| matches!(e, CodexEvent::Failed { .. })), "oversize: {events:?}");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, CodexEvent::Failed { .. })),
+        "oversize: {events:?}"
+    );
     // Exactly the limit is still accepted structurally (no rejection on size).
     let mut limit_frame = vec![0u8];
     limit_frame.extend_from_slice(&(MAX_FRAME_SIZE as u32).to_be_bytes());
     let mut decoder = DevinDecoder::new();
     let mut events = Vec::new();
     decoder.decode(&limit_frame, &mut events);
-    assert!(events.is_empty(), "payload not yet arrived, must not reject: {events:?}");
+    assert!(
+        events.is_empty(),
+        "payload not yet arrived, must not reject: {events:?}"
+    );
 }
 
 #[test]
 fn truncated_frame_fails_at_eof() {
     let wire = rich_stream();
     let (events, _) = decode_all(&wire[..wire.len() - 4]);
-    assert!(events.iter().any(|e| matches!(e, CodexEvent::Failed { .. })), "truncated: {events:?}");
-    assert!(events.iter().all(|e| !matches!(e, CodexEvent::Completed { .. })), "{events:?}");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, CodexEvent::Failed { .. })),
+        "truncated: {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|e| !matches!(e, CodexEvent::Completed { .. })),
+        "{events:?}"
+    );
 }
 
 #[test]
 fn malformed_proto_and_malformed_endstream_json_fail() {
-    let bad_proto = [frame_data(b"\xff\xff\xff\x07"), frame_end_stream("{\"metadata\":{}}")].concat();
+    let bad_proto = [
+        frame_data(b"\xff\xff\xff\x07"),
+        frame_end_stream("{\"metadata\":{}}"),
+    ]
+    .concat();
     let (events, _) = decode_all(&bad_proto);
-    assert!(events.iter().any(|e| matches!(e, CodexEvent::Failed { message } if message.contains("protobuf"))), "{events:?}");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, CodexEvent::Failed { message } if message.contains("protobuf"))),
+        "{events:?}"
+    );
 
     let bad_json = [frame_data(b"1a0161"), frame_end_stream("{nope")].concat();
     let (events, _) = decode_all(&bad_json);
-    assert!(events.iter().any(|e| matches!(e, CodexEvent::Failed { .. })), "malformed endstream: {events:?}");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, CodexEvent::Failed { .. })),
+        "malformed endstream: {events:?}"
+    );
 }
 
 #[test]
 fn korean_text_survives_every_chunk_split() {
-    use prost::Message;
     use mahoquot_gateway::compat::devin_proto::ChatMessageResponse;
+    use prost::Message;
     let mut payload = Vec::new();
-    ChatMessageResponse { delta_text: Some("안녕하세요".into()), ..Default::default() }
-        .encode(&mut payload)
-        .unwrap();
+    ChatMessageResponse {
+        delta_text: Some("안녕하세요".into()),
+        ..Default::default()
+    }
+    .encode(&mut payload)
+    .unwrap();
     let mut wire = frame_data(&payload);
     wire.extend(frame_end_stream("{\"metadata\":{}}"));
     for split in 0..=wire.len() {
@@ -524,12 +664,23 @@ fn korean_text_survives_every_chunk_split() {
         decoder.decode(&wire[..split], &mut events);
         decoder.decode(&wire[split..], &mut events);
         decoder.finish(&mut events);
-        let text: String = events.iter().filter_map(|e| match e {
-            CodexEvent::TextDelta(t) => Some(t.clone()),
-            _ => None,
-        }).collect();
-        assert_eq!(text, "안녕하세요", "split {split} corrupted the Korean text");
-        assert!(events.iter().all(|e| !matches!(e, CodexEvent::Failed { .. })), "split {split}: {events:?}");
+        let text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                CodexEvent::TextDelta(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            text, "안녕하세요",
+            "split {split} corrupted the Korean text"
+        );
+        assert!(
+            events
+                .iter()
+                .all(|e| !matches!(e, CodexEvent::Failed { .. })),
+            "split {split}: {events:?}"
+        );
     }
 }
 
@@ -548,18 +699,31 @@ fn every_chunk_split_produces_identical_events() {
     // Many frames coalesced into one byte blob also parse.
     let multi = [rich_payload(), rich_stream()].concat();
     let (events, _) = decode_all(&multi);
-    assert!(events.iter().any(|e| matches!(e, CodexEvent::Completed { .. })), "coalesced frames");
-    assert!(events.iter().all(|e| !matches!(e, CodexEvent::Failed { .. })), "coalesced frames must not fail");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, CodexEvent::Completed { .. })),
+        "coalesced frames"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|e| !matches!(e, CodexEvent::Failed { .. })),
+        "coalesced frames must not fail"
+    );
 }
 
 #[test]
 fn missing_endstream_at_every_frame_boundary_fails() {
-    use prost::Message;
     use mahoquot_gateway::compat::devin_proto::ChatMessageResponse;
+    use prost::Message;
     let mut payload = Vec::new();
-    ChatMessageResponse { delta_text: Some("a".into()), ..Default::default() }
-        .encode(&mut payload)
-        .unwrap();
+    ChatMessageResponse {
+        delta_text: Some("a".into()),
+        ..Default::default()
+    }
+    .encode(&mut payload)
+    .unwrap();
     let wire = frame_data(&payload);
     for split in 0..wire.len() {
         let mut decoder = DevinDecoder::new();
@@ -567,7 +731,9 @@ fn missing_endstream_at_every_frame_boundary_fails() {
         decoder.decode(&wire[..split], &mut events);
         decoder.finish(&mut events);
         assert!(
-            events.iter().any(|e| matches!(e, CodexEvent::Failed { .. })),
+            events
+                .iter()
+                .any(|e| matches!(e, CodexEvent::Failed { .. })),
             "partial frame at {split} must fail, not complete: {events:?}"
         );
     }
@@ -575,8 +741,8 @@ fn missing_endstream_at_every_frame_boundary_fails() {
 
 #[test]
 fn usage_is_none_when_absent_and_final_snapshot_wins_without_double_count() {
-    use prost::Message;
     use mahoquot_gateway::compat::devin_proto::{ChatMessageResponse, ModelUsageStats};
+    use prost::Message;
     let snapshot = |input: u64, output: u64, read: u64| ChatMessageResponse {
         usage: Some(ModelUsageStats {
             input_tokens: Some(input),
@@ -596,10 +762,13 @@ fn usage_is_none_when_absent_and_final_snapshot_wins_without_double_count() {
     wire.extend(frame_end_stream("{\"metadata\":{}}"));
 
     let (events, _) = decode_all(&wire);
-    let completed: Vec<_> = events.iter().filter_map(|e| match e {
-        CodexEvent::Completed { usage } => usage.clone(),
-        _ => None,
-    }).collect();
+    let completed: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            CodexEvent::Completed { usage } => usage.clone(),
+            _ => None,
+        })
+        .collect();
     assert_eq!(completed.len(), 1, "single terminal usage");
     let usage = &completed[0];
     // Last snapshot wins, never summed: 30/40 not 40/60; total excludes cache.
@@ -612,24 +781,33 @@ fn usage_is_none_when_absent_and_final_snapshot_wins_without_double_count() {
     // A stream with no usage frame completes with None, not a fake zero.
     let mut plain = Vec::new();
     let mut buf = Vec::new();
-    ChatMessageResponse { delta_text: Some("x".into()), ..Default::default() }
-        .encode(&mut buf)
-        .unwrap();
+    ChatMessageResponse {
+        delta_text: Some("x".into()),
+        ..Default::default()
+    }
+    .encode(&mut buf)
+    .unwrap();
     plain.extend(frame_data(&buf));
     plain.extend(frame_end_stream("{\"metadata\":{}}"));
     let (events, _) = decode_all(&plain);
-    let completed: Vec<_> = events.iter().filter_map(|e| match e {
-        CodexEvent::Completed { usage } => Some(usage.clone()),
-        _ => None,
-    }).collect();
+    let completed: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            CodexEvent::Completed { usage } => Some(usage.clone()),
+            _ => None,
+        })
+        .collect();
     assert_eq!(completed.len(), 1);
-    assert!(completed[0].is_none(), "usage absent stays None: {completed:?}");
+    assert!(
+        completed[0].is_none(),
+        "usage absent stays None: {completed:?}"
+    );
 }
 
 #[test]
 fn ambiguous_idless_tool_delta_fails_but_single_tool_attaches() {
-    use prost::Message;
     use mahoquot_gateway::compat::devin_proto::{ChatMessageResponse, ChatToolCall};
+    use prost::Message;
     let delta = |id: Option<&str>, name: Option<&str>, args: &str| ChatMessageResponse {
         delta_tool_calls: vec![ChatToolCall {
             id: id.map(String::from),
@@ -652,31 +830,44 @@ fn ambiguous_idless_tool_delta_fails_but_single_tool_attaches() {
     wire.extend(frame_end_stream("{\"metadata\":{}}"));
     let (events, _) = decode_all(&wire);
     assert!(
-        events.iter().any(|e| matches!(e, CodexEvent::Failed { message } if message.contains("ambiguous"))),
+        events
+            .iter()
+            .any(|e| matches!(e, CodexEvent::Failed { message } if message.contains("ambiguous"))),
         "ambiguous id-less delta: {events:?}"
     );
 
     // One tool only: ID-less delta attaches to the active call.
     let mut wire = Vec::new();
-    for d in [delta(Some("c1"), Some("f1"), "{\"a\":"), delta(None, None, "1}")] {
+    for d in [
+        delta(Some("c1"), Some("f1"), "{\"a\":"),
+        delta(None, None, "1}"),
+    ] {
         let mut buf = Vec::new();
         d.encode(&mut buf).unwrap();
         wire.extend(frame_data(&buf));
     }
     wire.extend(frame_end_stream("{\"metadata\":{}}"));
     let (events, _) = decode_all(&wire);
-    let args: String = events.iter().filter_map(|e| match e {
-        CodexEvent::ToolArgsDelta { delta, .. } => Some(delta.clone()),
-        _ => None,
-    }).collect();
+    let args: String = events
+        .iter()
+        .filter_map(|e| match e {
+            CodexEvent::ToolArgsDelta { delta, .. } => Some(delta.clone()),
+            _ => None,
+        })
+        .collect();
     assert_eq!(args, "{\"a\":1}");
-    assert!(events.iter().all(|e| !matches!(e, CodexEvent::Failed { .. })), "{events:?}");
+    assert!(
+        events
+            .iter()
+            .all(|e| !matches!(e, CodexEvent::Failed { .. })),
+        "{events:?}"
+    );
 }
 
 #[test]
 fn tool_begin_is_delayed_until_name_is_known() {
-    use prost::Message;
     use mahoquot_gateway::compat::devin_proto::{ChatMessageResponse, ChatToolCall};
+    use prost::Message;
     let with = |id: Option<&str>, name: Option<&str>, args: Option<&str>| ChatMessageResponse {
         delta_tool_calls: vec![ChatToolCall {
             id: id.map(String::from),
@@ -698,62 +889,105 @@ fn tool_begin_is_delayed_until_name_is_known() {
     let (events, _) = decode_all(&wire);
     // The begin carries the name and stable interleaved index 0; the id-less
     // continuation attached to the single active call, with no second begin.
-    let begins: Vec<_> = events.iter().filter_map(|e| match e {
-        CodexEvent::ToolCallBegin { output_index, call_id, name } => Some((*output_index, call_id.clone(), name.clone())),
-        _ => None,
-    }).collect();
-    assert_eq!(begins, vec![(0, "c1".to_string(), "weather".to_string())], "{events:?}");
-    let args: String = events.iter().filter_map(|e| match e {
-        CodexEvent::ToolArgsDelta { delta, .. } => Some(delta.clone()),
-        _ => None,
-    }).collect();
+    let begins: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            CodexEvent::ToolCallBegin {
+                output_index,
+                call_id,
+                name,
+            } => Some((*output_index, call_id.clone(), name.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        begins,
+        vec![(0, "c1".to_string(), "weather".to_string())],
+        "{events:?}"
+    );
+    let args: String = events
+        .iter()
+        .filter_map(|e| match e {
+            CodexEvent::ToolArgsDelta { delta, .. } => Some(delta.clone()),
+            _ => None,
+        })
+        .collect();
     assert_eq!(args, "{\"city\":\"seoul\"}");
-    assert!(events.iter().all(|e| !matches!(e, CodexEvent::Failed { .. })), "{events:?}");
+    assert!(
+        events
+            .iter()
+            .all(|e| !matches!(e, CodexEvent::Failed { .. })),
+        "{events:?}"
+    );
 }
 
 #[test]
 fn malformed_final_arguments_are_never_repaired_to_empty_object() {
-    use prost::Message;
     use mahoquot_gateway::compat::devin_proto::{ChatMessageResponse, ChatToolCall};
+    use prost::Message;
     let mut wire = Vec::new();
     {
         let d = ChatMessageResponse {
-        stop_reason: Some(10),
-        delta_tool_calls: vec![ChatToolCall {
-            id: Some("c1".into()),
-            name: Some("f".into()),
-            arguments_json: Some("{oops".into()),
-        }],
-        ..Default::default()
-    };
+            stop_reason: Some(10),
+            delta_tool_calls: vec![ChatToolCall {
+                id: Some("c1".into()),
+                name: Some("f".into()),
+                arguments_json: Some("{oops".into()),
+            }],
+            ..Default::default()
+        };
         let mut buf = Vec::new();
         d.encode(&mut buf).unwrap();
         wire.extend(frame_data(&buf));
     }
     wire.extend(frame_end_stream("{\"metadata\":{}}"));
     let (events, _) = decode_all(&wire);
-    let args: String = events.iter().filter_map(|e| match e {
-        CodexEvent::ToolArgsDelta { delta, .. } => Some(delta.clone()),
-        _ => None,
-    }).collect();
+    let args: String = events
+        .iter()
+        .filter_map(|e| match e {
+            CodexEvent::ToolArgsDelta { delta, .. } => Some(delta.clone()),
+            _ => None,
+        })
+        .collect();
     assert_eq!(args, "{oops", "malformed arguments preserved verbatim");
-    assert!(events.iter().all(|e| !matches!(e, CodexEvent::Failed { .. })), "{events:?}");
+    assert!(
+        events
+            .iter()
+            .all(|e| !matches!(e, CodexEvent::Failed { .. })),
+        "{events:?}"
+    );
 }
 
 #[test]
 fn interleaved_tool_indices_are_stable_across_text_and_reasoning() {
-    use prost::Message;
     use mahoquot_gateway::compat::devin_proto::{ChatMessageResponse, ChatToolCall};
+    use prost::Message;
     let mut wire = Vec::new();
     for d in [
-        ChatMessageResponse { delta_text: Some("a".into()), ..Default::default() },
-        ChatMessageResponse { delta_tool_calls: vec![ChatToolCall {
-            id: Some("c1".into()), name: Some("one".into()), arguments_json: Some("{\"x\":".into()),
-        }], ..Default::default() },
-        ChatMessageResponse { delta_thinking: Some("think".into()), ..Default::default() },
-        ChatMessageResponse { delta_tool_calls: vec![ChatToolCall {
-            id: Some("c2".into()), name: Some("two".into()), arguments_json: Some("{\"y\":1}".into()),
-        }], ..Default::default() },
+        ChatMessageResponse {
+            delta_text: Some("a".into()),
+            ..Default::default()
+        },
+        ChatMessageResponse {
+            delta_tool_calls: vec![ChatToolCall {
+                id: Some("c1".into()),
+                name: Some("one".into()),
+                arguments_json: Some("{\"x\":".into()),
+            }],
+            ..Default::default()
+        },
+        ChatMessageResponse {
+            delta_thinking: Some("think".into()),
+            ..Default::default()
+        },
+        ChatMessageResponse {
+            delta_tool_calls: vec![ChatToolCall {
+                id: Some("c2".into()),
+                name: Some("two".into()),
+                arguments_json: Some("{\"y\":1}".into()),
+            }],
+            ..Default::default()
+        },
     ] {
         let mut buf = Vec::new();
         d.encode(&mut buf).unwrap();
@@ -761,49 +995,78 @@ fn interleaved_tool_indices_are_stable_across_text_and_reasoning() {
     }
     wire.extend(frame_end_stream("{\"metadata\":{}}"));
     let (events, _) = decode_all(&wire);
-    let indices: Vec<u64> = events.iter().filter_map(|e| match e {
-        CodexEvent::ToolCallBegin { output_index, .. } => Some(*output_index),
-        _ => None,
-    }).collect();
-    assert_eq!(indices, vec![0, 1], "stable interleaved indices: {events:?}");
-    let delta_for = |index: u64| events.iter().filter_map(move |e| match e {
-        CodexEvent::ToolArgsDelta { output_index, delta } if *output_index == index => Some(delta.clone()),
-        _ => None,
-    }).collect::<Vec<_>>();
+    let indices: Vec<u64> = events
+        .iter()
+        .filter_map(|e| match e {
+            CodexEvent::ToolCallBegin { output_index, .. } => Some(*output_index),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        indices,
+        vec![0, 1],
+        "stable interleaved indices: {events:?}"
+    );
+    let delta_for = |index: u64| {
+        events
+            .iter()
+            .filter_map(move |e| match e {
+                CodexEvent::ToolArgsDelta {
+                    output_index,
+                    delta,
+                } if *output_index == index => Some(delta.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
     assert_eq!(delta_for(0), vec!["{\"x\":"]);
     assert_eq!(delta_for(1), vec!["{\"y\":1}"]);
 }
 
 #[test]
 fn output_limit_stop_reasons_surface_output_limit_reached() {
-    use prost::Message;
     use mahoquot_gateway::compat::devin_proto::ChatMessageResponse;
+    use prost::Message;
     for stop in [3u64, 1, 9] {
         let mut wire = Vec::new();
         let mut buf = Vec::new();
-        ChatMessageResponse { stop_reason: Some(stop as i32), ..Default::default() }
-            .encode(&mut buf)
-            .unwrap();
+        ChatMessageResponse {
+            stop_reason: Some(stop as i32),
+            ..Default::default()
+        }
+        .encode(&mut buf)
+        .unwrap();
         wire.extend(frame_data(&buf));
         wire.extend(frame_end_stream("{\"metadata\":{}}"));
         let (events, _) = decode_all(&wire);
         assert!(
-            events.iter().any(|e| matches!(e, CodexEvent::OutputLimitReached)),
+            events
+                .iter()
+                .any(|e| matches!(e, CodexEvent::OutputLimitReached)),
             "stop {stop}: {events:?}"
         );
-        assert!(events.iter().any(|e| matches!(e, CodexEvent::Completed { .. })), "stop {stop}: {events:?}");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, CodexEvent::Completed { .. })),
+            "stop {stop}: {events:?}"
+        );
     }
 }
 
 #[test]
 fn outcome_reports_stop_reason_and_error_metadata() {
-    use prost::Message;
     use mahoquot_gateway::compat::devin_proto::ChatMessageResponse;
+    use prost::Message;
     let mut wire = Vec::new();
     let mut buf = Vec::new();
-    ChatMessageResponse { stop_reason: Some(10), actual_model_uid: Some("glm-x".into()), ..Default::default() }
-        .encode(&mut buf)
-        .unwrap();
+    ChatMessageResponse {
+        stop_reason: Some(10),
+        actual_model_uid: Some("glm-x".into()),
+        ..Default::default()
+    }
+    .encode(&mut buf)
+    .unwrap();
     wire.extend(frame_data(&buf));
     wire.extend(frame_end_stream("{\"metadata\":{}}"));
     let (_, decoder) = decode_all(&wire);
@@ -824,10 +1087,18 @@ fn devin_stream_aggregates_into_chat_completion_with_tools() {
     use prost::Message;
     let mut wire = Vec::new();
     for d in [
-        ChatMessageResponse { delta_text: Some("hello ".into()), ..Default::default() },
-        ChatMessageResponse { delta_tool_calls: vec![ChatToolCall {
-            id: Some("c1".into()), name: Some("weather".into()), arguments_json: Some("{\"city\":\"Seoul\"}".into()),
-        }], ..Default::default() },
+        ChatMessageResponse {
+            delta_text: Some("hello ".into()),
+            ..Default::default()
+        },
+        ChatMessageResponse {
+            delta_tool_calls: vec![ChatToolCall {
+                id: Some("c1".into()),
+                name: Some("weather".into()),
+                arguments_json: Some("{\"city\":\"Seoul\"}".into()),
+            }],
+            ..Default::default()
+        },
     ] {
         let mut buf = Vec::new();
         d.encode(&mut buf).unwrap();
@@ -836,14 +1107,21 @@ fn devin_stream_aggregates_into_chat_completion_with_tools() {
     wire.extend(frame_end_stream("{\"metadata\":{}}"));
 
     let payload = mahoquot_gateway::compat::aggregate(
-        &wire, "devin/glm-x".into(), 0, Protocol::Devin,
+        &wire,
+        "devin/glm-x".into(),
+        0,
+        Protocol::Devin,
         mahoquot_gateway::compat::ReplyShape::Chat,
-    ).unwrap();
+    )
+    .unwrap();
     let message = &payload["choices"][0]["message"];
     assert_eq!(message["content"], "hello ");
     assert_eq!(message["tool_calls"][0]["id"], "c1");
     assert_eq!(message["tool_calls"][0]["function"]["name"], "weather");
-    assert_eq!(message["tool_calls"][0]["function"]["arguments"], "{\"city\":\"Seoul\"}");
+    assert_eq!(
+        message["tool_calls"][0]["function"]["arguments"],
+        "{\"city\":\"Seoul\"}"
+    );
     assert_eq!(payload["choices"][0]["finish_reason"], "tool_calls");
 }
 
@@ -855,7 +1133,11 @@ fn devin_binary_stream_passes_open_stream_protocol_gate() {
         !mahoquot_gateway::compat::looks_like_sse(&binary),
         "connect frames are binary, not sse"
     );
-    assert_ne!(Protocol::Devin, Protocol::Cursor, "Devin is its own protocol");
+    assert_ne!(
+        Protocol::Devin,
+        Protocol::Cursor,
+        "Devin is its own protocol"
+    );
     let _ = Bytes::new();
 }
 
@@ -871,7 +1153,10 @@ fn defect_1_debug_and_errors_redact_secrets_and_credentials() {
         !debug_repr.contains("super_secret_session_token_12345"),
         "token must not leak in DevinRequestParams Debug: {debug_repr}"
     );
-    assert!(debug_repr.contains("[REDACTED]"), "Debug output should contain [REDACTED]");
+    assert!(
+        debug_repr.contains("[REDACTED]"),
+        "Debug output should contain [REDACTED]"
+    );
 
     // (1b) Remote image URLs with user credentials, query parameters, path or fragment redact secrets
     p.supports_vision = true;
@@ -908,10 +1193,14 @@ fn defect_1_debug_and_errors_redact_secrets_and_credentials() {
 
     // (1c) Upstream error.message with arbitrary bare token is not reflected; recognized code preserved
     let err_endstream = frame_end_stream(
-        r#"{"error":{"code":"unauthenticated","message":"invalid token secret_ABC_999 with arbitrary bare token and leak https://user:leak_pass@auth.example.com/check?api_key=leak_key_99"}}"#
+        r#"{"error":{"code":"unauthenticated","message":"invalid token secret_ABC_999 with arbitrary bare token and leak https://user:leak_pass@auth.example.com/check?api_key=leak_key_99"}}"#,
     );
     let (events, decoder) = decode_all(&err_endstream);
-    let outcome_msg = decoder.outcome().error_message.as_deref().unwrap_or_default();
+    let outcome_msg = decoder
+        .outcome()
+        .error_message
+        .as_deref()
+        .unwrap_or_default();
     assert!(
         !outcome_msg.contains("secret_ABC_999"),
         "Bare token must not be reflected in outcome error message: {outcome_msg}"
@@ -929,10 +1218,13 @@ fn defect_1_debug_and_errors_redact_secrets_and_credentials() {
         Some("unauthenticated"),
         "recognized error code must be preserved for relay feedback"
     );
-    let failed_event_msg = events.iter().find_map(|e| match e {
-        CodexEvent::Failed { message } => Some(message.clone()),
-        _ => None,
-    }).unwrap_or_default();
+    let failed_event_msg = events
+        .iter()
+        .find_map(|e| match e {
+            CodexEvent::Failed { message } => Some(message.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
     assert!(
         !failed_event_msg.contains("secret_ABC_999"),
         "Bare token must not be reflected in failed event message: {failed_event_msg}"
@@ -940,7 +1232,7 @@ fn defect_1_debug_and_errors_redact_secrets_and_credentials() {
 
     // (1d) Upstream error with unknown code is normalized to finite safe code "unknown"
     let unknown_code_endstream = frame_end_stream(
-        r#"{"error":{"code":"secret_code_custom_leak_123","message":"sensitive upstream details with secret_xyz"}}"#
+        r#"{"error":{"code":"secret_code_custom_leak_123","message":"sensitive upstream details with secret_xyz"}}"#,
     );
     let (events2, decoder2) = decode_all(&unknown_code_endstream);
     assert_eq!(
@@ -948,7 +1240,11 @@ fn defect_1_debug_and_errors_redact_secrets_and_credentials() {
         Some("unknown"),
         "unknown error code must normalize to safe 'unknown' code"
     );
-    let outcome_msg2 = decoder2.outcome().error_message.as_deref().unwrap_or_default();
+    let outcome_msg2 = decoder2
+        .outcome()
+        .error_message
+        .as_deref()
+        .unwrap_or_default();
     assert!(
         !outcome_msg2.contains("secret_code_custom_leak_123"),
         "Custom code must not leak: {outcome_msg2}"
@@ -957,10 +1253,13 @@ fn defect_1_debug_and_errors_redact_secrets_and_credentials() {
         !outcome_msg2.contains("secret_xyz"),
         "Custom message must not leak: {outcome_msg2}"
     );
-    let failed_msg2 = events2.iter().find_map(|e| match e {
-        CodexEvent::Failed { message } => Some(message.clone()),
-        _ => None,
-    }).unwrap_or_default();
+    let failed_msg2 = events2
+        .iter()
+        .find_map(|e| match e {
+            CodexEvent::Failed { message } => Some(message.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
     assert!(
         !failed_msg2.contains("secret_code_custom_leak_123"),
         "Custom code must not leak in failed event: {failed_msg2}"
@@ -979,7 +1278,9 @@ fn defect_2_oversized_frame_header_rejected_before_allocating_payload_or_appendi
     chunk.resize(5 + 512 * 1024, 0xAA);
     decoder.decode(&chunk, &mut events);
     assert!(
-        events.iter().any(|e| matches!(e, CodexEvent::Failed { message } if message.contains("too large"))),
+        events
+            .iter()
+            .any(|e| matches!(e, CodexEvent::Failed { message } if message.contains("too large"))),
         "oversized header must fail immediately without allocating payload: {events:?}"
     );
 }
@@ -993,11 +1294,15 @@ fn defect_3_terminated_stream_rejects_subsequent_chunks_and_trailing_data_never_
     let mut events = Vec::new();
     decoder.decode(&wire, &mut events);
     assert!(
-        !events.iter().any(|e| matches!(e, CodexEvent::Completed { .. })),
+        !events
+            .iter()
+            .any(|e| matches!(e, CodexEvent::Completed { .. })),
         "same-chunk terminal followed by junk must NEVER emit Completed: {events:?}"
     );
     assert!(
-        events.iter().any(|e| matches!(e, CodexEvent::Failed { message } if message.contains("trailing"))),
+        events
+            .iter()
+            .any(|e| matches!(e, CodexEvent::Failed { message } if message.contains("trailing"))),
         "must emit Failed for trailing data: {events:?}"
     );
 
@@ -1013,14 +1318,18 @@ fn defect_3_terminated_stream_rejects_subsequent_chunks_and_trailing_data_never_
     let mut events2 = Vec::new();
     decoder.decode(b"extra_chunk_after_terminal", &mut events2);
     assert!(
-        events2.iter().any(|e| matches!(e, CodexEvent::Failed { message } if message.contains("trailing"))),
+        events2
+            .iter()
+            .any(|e| matches!(e, CodexEvent::Failed { message } if message.contains("trailing"))),
         "subsequent chunks after EndStream must fail: {events2:?}"
     );
 
     let mut events3 = Vec::new();
     decoder.finish(&mut events3);
     assert!(
-        !events3.iter().any(|e| matches!(e, CodexEvent::Completed { .. })),
+        !events3
+            .iter()
+            .any(|e| matches!(e, CodexEvent::Completed { .. })),
         "failed stream must never complete in finish: {events3:?}"
     );
 
@@ -1029,13 +1338,17 @@ fn defect_3_terminated_stream_rejects_subsequent_chunks_and_trailing_data_never_
     let mut clean_events1 = Vec::new();
     clean_decoder.decode(&frame_end_stream(r#"{"metadata":{}}"#), &mut clean_events1);
     assert!(
-        !clean_events1.iter().any(|e| matches!(e, CodexEvent::Completed { .. })),
+        !clean_events1
+            .iter()
+            .any(|e| matches!(e, CodexEvent::Completed { .. })),
         "no premature completion before EOF"
     );
     let mut clean_events2 = Vec::new();
     clean_decoder.finish(&mut clean_events2);
     assert!(
-        clean_events2.iter().any(|e| matches!(e, CodexEvent::Completed { .. })),
+        clean_events2
+            .iter()
+            .any(|e| matches!(e, CodexEvent::Completed { .. })),
         "finish must emit Completed for clean stream: {clean_events2:?}"
     );
     // Idempotent: second finish call does not re-emit Completed
@@ -1054,11 +1367,15 @@ fn defect_3_terminated_stream_rejects_subsequent_chunks_and_trailing_data_never_
     decoder.decode(&[0u8, 0u8], &mut events);
     decoder.finish(&mut events);
     assert!(
-        events.iter().any(|e| matches!(e, CodexEvent::Failed { .. })),
+        events
+            .iter()
+            .any(|e| matches!(e, CodexEvent::Failed { .. })),
         "partial post-terminal bytes must cause finish() to fail: {events:?}"
     );
     assert!(
-        !events.iter().any(|e| matches!(e, CodexEvent::Completed { .. })),
+        !events
+            .iter()
+            .any(|e| matches!(e, CodexEvent::Completed { .. })),
         "corrupted stream must never emit Completed: {events:?}"
     );
 
@@ -1066,30 +1383,40 @@ fn defect_3_terminated_stream_rejects_subsequent_chunks_and_trailing_data_never_
     let array_frame = frame_end_stream(r#"[1, 2, 3]"#);
     let (events, _) = decode_all(&array_frame);
     assert!(
-        !events.iter().any(|e| matches!(e, CodexEvent::Completed { .. })),
+        !events
+            .iter()
+            .any(|e| matches!(e, CodexEvent::Completed { .. })),
         "array EndStream JSON must not emit Completed: {events:?}"
     );
     assert!(
-        events.iter().any(|e| matches!(e, CodexEvent::Failed { .. })),
+        events
+            .iter()
+            .any(|e| matches!(e, CodexEvent::Failed { .. })),
         "array EndStream JSON must emit Failed: {events:?}"
     );
 
     let scalar_frame = frame_end_stream(r#""hello world""#);
     let (events, _) = decode_all(&scalar_frame);
     assert!(
-        !events.iter().any(|e| matches!(e, CodexEvent::Completed { .. })),
+        !events
+            .iter()
+            .any(|e| matches!(e, CodexEvent::Completed { .. })),
         "scalar EndStream JSON must not emit Completed: {events:?}"
     );
     assert!(
-        events.iter().any(|e| matches!(e, CodexEvent::Failed { .. })),
+        events
+            .iter()
+            .any(|e| matches!(e, CodexEvent::Failed { .. })),
         "scalar EndStream JSON must emit Failed: {events:?}"
     );
 }
 
 #[tokio::test]
 async fn defect_3_compat_stream_rejects_same_chunk_and_split_terminal_junk() {
-    use mahoquot_gateway::compat::{streaming_body, Protocol, ProtocolSession, ReplyShape, StreamingBodyParams};
     use axum::body::to_bytes;
+    use mahoquot_gateway::compat::{
+        streaming_body, Protocol, ProtocolSession, ReplyShape, StreamingBodyParams,
+    };
 
     // Combined chunk: terminal + junk -> compat stream must terminate with error, not normal DONE chunk
     let mut bad_chunk = frame_end_stream(r#"{"metadata":{}}"#);
@@ -1122,9 +1449,10 @@ async fn defect_3_compat_stream_rejects_same_chunk_and_split_terminal_junk() {
     );
 
     // Split chunk: first terminal, second junk
-    let stream: mahoquot_gateway::compat::UpstreamStream = Box::pin(futures::stream::iter(vec![
-        Ok(Bytes::from_static(b"junk_split")),
-    ]));
+    let stream: mahoquot_gateway::compat::UpstreamStream =
+        Box::pin(futures::stream::iter(vec![Ok(Bytes::from_static(
+            b"junk_split",
+        ))]));
     let body = streaming_body(StreamingBodyParams {
         first: Bytes::from(frame_end_stream(r#"{"metadata":{}}"#)),
         upstream: stream,
@@ -1154,9 +1482,9 @@ async fn defect_3_compat_stream_rejects_same_chunk_and_split_terminal_junk() {
 
 #[test]
 fn defect_4_delayed_id_and_name_resolution_and_interleaved_tools_with_renderers() {
-    use prost::Message;
     use mahoquot_gateway::compat::devin_proto::{ChatMessageResponse, ChatToolCall};
     use mahoquot_gateway::compat::render::{Aggregator, ChunkRenderer, GeminiChunkRenderer};
+    use prost::Message;
 
     // (4a) ID-less tool delta followed by real ID resolves the pending call without allocating second state
     // and args do NOT emit before ToolCallBegin
@@ -1188,10 +1516,17 @@ fn defect_4_delayed_id_and_name_resolution_and_interleaved_tools_with_renderers(
     let (events, _) = decode_all(&wire);
 
     // Verify exactly ONE ToolCallBegin was emitted, with call_real_id_999 and search_web
-    let begins: Vec<_> = events.iter().filter_map(|e| match e {
-        CodexEvent::ToolCallBegin { output_index, call_id, name } => Some((*output_index, call_id.clone(), name.clone())),
-        _ => None,
-    }).collect();
+    let begins: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            CodexEvent::ToolCallBegin {
+                output_index,
+                call_id,
+                name,
+            } => Some((*output_index, call_id.clone(), name.clone())),
+            _ => None,
+        })
+        .collect();
     assert_eq!(
         begins,
         vec![(0, "call_real_id_999".to_string(), "search_web".to_string())],
@@ -1199,8 +1534,13 @@ fn defect_4_delayed_id_and_name_resolution_and_interleaved_tools_with_renderers(
     );
 
     // Verify no ToolArgsDelta was emitted BEFORE ToolCallBegin
-    let begin_idx = events.iter().position(|e| matches!(e, CodexEvent::ToolCallBegin { .. })).unwrap();
-    let first_arg_idx = events.iter().position(|e| matches!(e, CodexEvent::ToolArgsDelta { .. }));
+    let begin_idx = events
+        .iter()
+        .position(|e| matches!(e, CodexEvent::ToolCallBegin { .. }))
+        .unwrap();
+    let first_arg_idx = events
+        .iter()
+        .position(|e| matches!(e, CodexEvent::ToolArgsDelta { .. }));
     if let Some(arg_idx) = first_arg_idx {
         assert!(
             arg_idx > begin_idx,
@@ -1224,11 +1564,15 @@ fn defect_4_delayed_id_and_name_resolution_and_interleaved_tools_with_renderers(
     bad_wire.extend(frame_end_stream(r#"{"metadata":{}}"#));
     let (bad_events, _) = decode_all(&bad_wire);
     assert!(
-        bad_events.iter().any(|e| matches!(e, CodexEvent::Failed { message } if message.contains("unresolved"))),
+        bad_events
+            .iter()
+            .any(|e| matches!(e, CodexEvent::Failed { message } if message.contains("unresolved"))),
         "unresolved tool missing ID at terminal must fail: {bad_events:?}"
     );
     assert!(
-        !bad_events.iter().any(|e| matches!(e, CodexEvent::Completed { .. })),
+        !bad_events
+            .iter()
+            .any(|e| matches!(e, CodexEvent::Completed { .. })),
         "unresolved tool must never emit Completed: {bad_events:?}"
     );
 
@@ -1248,11 +1592,15 @@ fn defect_4_delayed_id_and_name_resolution_and_interleaved_tools_with_renderers(
     bad_name_wire.extend(frame_end_stream(r#"{"metadata":{}}"#));
     let (bad_name_events, _) = decode_all(&bad_name_wire);
     assert!(
-        bad_name_events.iter().any(|e| matches!(e, CodexEvent::Failed { message } if message.contains("unresolved"))),
+        bad_name_events
+            .iter()
+            .any(|e| matches!(e, CodexEvent::Failed { message } if message.contains("unresolved"))),
         "unresolved tool missing NAME at terminal must fail: {bad_name_events:?}"
     );
     assert!(
-        !bad_name_events.iter().any(|e| matches!(e, CodexEvent::Completed { .. })),
+        !bad_name_events
+            .iter()
+            .any(|e| matches!(e, CodexEvent::Completed { .. })),
         "unresolved tool must never emit Completed: {bad_name_events:?}"
     );
 
@@ -1333,7 +1681,11 @@ fn defect_4_delayed_id_and_name_resolution_and_interleaved_tools_with_renderers(
     for frame in &parsed_gemini {
         if let Some(candidates) = frame.get("candidates").and_then(Value::as_array) {
             for c in candidates {
-                if let Some(parts) = c.get("content").and_then(|ct| ct.get("parts")).and_then(Value::as_array) {
+                if let Some(parts) = c
+                    .get("content")
+                    .and_then(|ct| ct.get("parts"))
+                    .and_then(Value::as_array)
+                {
                     for part in parts {
                         if let Some(fc) = part.get("functionCall") {
                             gemini_fc.push(fc.clone());
@@ -1343,11 +1695,21 @@ fn defect_4_delayed_id_and_name_resolution_and_interleaved_tools_with_renderers(
             }
         }
     }
-    assert_eq!(gemini_fc.len(), 2, "must emit both function calls: {parsed_gemini:?}");
-    let gfc0 = gemini_fc.iter().find(|fc| fc["id"] == "call_tool_0").expect("call_tool_0");
+    assert_eq!(
+        gemini_fc.len(),
+        2,
+        "must emit both function calls: {parsed_gemini:?}"
+    );
+    let gfc0 = gemini_fc
+        .iter()
+        .find(|fc| fc["id"] == "call_tool_0")
+        .expect("call_tool_0");
     assert_eq!(gfc0["name"], "fetch_doc");
     assert_eq!(gfc0["args"], json!({"url": "https://example.com"}));
-    let gfc1 = gemini_fc.iter().find(|fc| fc["id"] == "call_tool_1").expect("call_tool_1");
+    let gfc1 = gemini_fc
+        .iter()
+        .find(|fc| fc["id"] == "call_tool_1")
+        .expect("call_tool_1");
     assert_eq!(gfc1["name"], "run_code");
     assert_eq!(gfc1["args"], json!({"code": 42}));
 
@@ -1357,11 +1719,16 @@ fn defect_4_delayed_id_and_name_resolution_and_interleaved_tools_with_renderers(
         agg.push(ev);
     }
     let completion = agg.into_completion();
-    let tool_calls = completion["choices"][0]["message"]["tool_calls"].as_array().unwrap();
+    let tool_calls = completion["choices"][0]["message"]["tool_calls"]
+        .as_array()
+        .unwrap();
     assert_eq!(tool_calls.len(), 2);
     assert_eq!(tool_calls[0]["id"], "call_tool_0");
     assert_eq!(tool_calls[0]["function"]["name"], "fetch_doc");
-    assert_eq!(tool_calls[0]["function"]["arguments"], "{\"url\":\"https://example.com\"}");
+    assert_eq!(
+        tool_calls[0]["function"]["arguments"],
+        "{\"url\":\"https://example.com\"}"
+    );
     assert_eq!(tool_calls[1]["id"], "call_tool_1");
     assert_eq!(tool_calls[1]["function"]["name"], "run_code");
     assert_eq!(tool_calls[1]["function"]["arguments"], "{\"code\":42}");
@@ -1409,20 +1776,24 @@ fn defect_4_delayed_id_and_name_resolution_and_interleaved_tools_with_renderers(
     ambiguous_wire.extend(frame_end_stream(r#"{"metadata":{}}"#));
     let (ambiguous_events, _) = decode_all(&ambiguous_wire);
     assert!(
-        ambiguous_events.iter().any(|e| matches!(e, CodexEvent::Failed { .. })),
+        ambiguous_events
+            .iter()
+            .any(|e| matches!(e, CodexEvent::Failed { .. })),
         "ambiguous tool correlation must fail: {ambiguous_events:?}"
     );
     assert!(
-        !ambiguous_events.iter().any(|e| matches!(e, CodexEvent::Completed { .. })),
+        !ambiguous_events
+            .iter()
+            .any(|e| matches!(e, CodexEvent::Completed { .. })),
         "ambiguous tool correlation must never complete successfully"
     );
 }
 
 #[test]
 fn defect_4f_gemini_interleaved_tool_calls_and_text_stream_preserves_both_calls_and_args() {
-    use prost::Message;
     use mahoquot_gateway::compat::devin_proto::{ChatMessageResponse, ChatToolCall};
     use mahoquot_gateway::compat::render::GeminiChunkRenderer;
+    use prost::Message;
 
     let mut interleaved_wire = Vec::new();
     for d in [
@@ -1503,7 +1874,11 @@ fn defect_4f_gemini_interleaved_tool_calls_and_text_stream_preserves_both_calls_
     for frame in &parsed_frames {
         if let Some(candidates) = frame.get("candidates").and_then(Value::as_array) {
             for c in candidates {
-                if let Some(parts) = c.get("content").and_then(|ct| ct.get("parts")).and_then(Value::as_array) {
+                if let Some(parts) = c
+                    .get("content")
+                    .and_then(|ct| ct.get("parts"))
+                    .and_then(Value::as_array)
+                {
                     for part in parts {
                         if let Some(fc) = part.get("functionCall") {
                             function_calls.push(fc.clone());
@@ -1523,11 +1898,17 @@ fn defect_4f_gemini_interleaved_tool_calls_and_text_stream_preserves_both_calls_
         "must emit exactly 2 functionCall parts: {parsed_frames:?}"
     );
 
-    let fc_a = function_calls.iter().find(|fc| fc["id"] == "call_a").expect("call_a must be present");
+    let fc_a = function_calls
+        .iter()
+        .find(|fc| fc["id"] == "call_a")
+        .expect("call_a must be present");
     assert_eq!(fc_a["name"], "func_a");
     assert_eq!(fc_a["args"], json!({"city": "Tokyo"}));
 
-    let fc_b = function_calls.iter().find(|fc| fc["id"] == "call_b").expect("call_b must be present");
+    let fc_b = function_calls
+        .iter()
+        .find(|fc| fc["id"] == "call_b")
+        .expect("call_b must be present");
     assert_eq!(fc_b["name"], "func_b");
     assert_eq!(fc_b["args"], json!({"query": "weather"}));
 
@@ -1573,9 +1954,9 @@ fn defect_5_response_format_strict_and_json_schema_are_rejected() {
 
 #[test]
 fn defect_6_malformed_tool_arguments_preserved_or_rejected_across_all_render_paths() {
-    use prost::Message;
     use mahoquot_gateway::compat::devin_proto::{ChatMessageResponse, ChatToolCall};
     use mahoquot_gateway::compat::render::{Aggregator, ChunkRenderer, GeminiChunkRenderer};
+    use prost::Message;
 
     let mut wire = Vec::new();
     let d = ChatMessageResponse {
@@ -1600,7 +1981,9 @@ fn defect_6_malformed_tool_arguments_preserved_or_rejected_across_all_render_pat
         agg.push(ev.clone());
     }
     let completion = agg.into_completion();
-    let raw_args = completion["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"].as_str().unwrap();
+    let raw_args = completion["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+        .as_str()
+        .unwrap();
     assert_eq!(raw_args, "{malformed_json_without_closing_brace");
     assert_ne!(raw_args, "{}");
 
@@ -1610,7 +1993,11 @@ fn defect_6_malformed_tool_arguments_preserved_or_rejected_across_all_render_pat
     for ev in &events {
         chunk_frames.extend(chunk_renderer.render(ev.clone()));
     }
-    let chunk_text = chunk_frames.iter().map(|f| String::from_utf8_lossy(f)).collect::<Vec<_>>().join("");
+    let chunk_text = chunk_frames
+        .iter()
+        .map(|f| String::from_utf8_lossy(f))
+        .collect::<Vec<_>>()
+        .join("");
     assert!(chunk_text.contains("{malformed_json_without_closing_brace"));
 
     // Path 3: GeminiChunkRenderer surfaces structured failure for malformed arguments (never {} or string)
@@ -1619,7 +2006,11 @@ fn defect_6_malformed_tool_arguments_preserved_or_rejected_across_all_render_pat
     for ev in &events {
         gemini_frames.extend(gemini_renderer.render(ev.clone()));
     }
-    let gemini_text = gemini_frames.iter().map(|f| String::from_utf8_lossy(f)).collect::<Vec<_>>().join("");
+    let gemini_text = gemini_frames
+        .iter()
+        .map(|f| String::from_utf8_lossy(f))
+        .collect::<Vec<_>>()
+        .join("");
     assert!(
         !gemini_text.contains("\"args\":{}"),
         "GeminiChunkRenderer must never silently repair malformed args to empty object {{}}: {gemini_text}"
@@ -1644,7 +2035,11 @@ fn defect_6_malformed_tool_arguments_preserved_or_rejected_across_all_render_pat
     for frame in &parsed_frames {
         if let Some(candidates) = frame.get("candidates").and_then(Value::as_array) {
             for c in candidates {
-                if let Some(parts) = c.get("content").and_then(|content| content.get("parts")).and_then(Value::as_array) {
+                if let Some(parts) = c
+                    .get("content")
+                    .and_then(|content| content.get("parts"))
+                    .and_then(Value::as_array)
+                {
                     for part in parts {
                         assert!(
                             part.get("functionCall").is_none(),
@@ -1736,6 +2131,8 @@ fn defect_6_malformed_tool_arguments_preserved_or_rejected_across_all_render_pat
             })
             .unwrap_or(false)
     });
-    assert!(has_func_call, "Gemini must emit valid functionCall with object args: {parsed_valid:?}");
+    assert!(
+        has_func_call,
+        "Gemini must emit valid functionCall with object args: {parsed_valid:?}"
+    );
 }
-

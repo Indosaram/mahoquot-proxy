@@ -1,3 +1,5 @@
+#[cfg(target_os = "macos")]
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -21,7 +23,9 @@ pub fn spawn_egress_supervisor(state: Arc<AppState>, poll_interval: Duration) {
 
 pub async fn run_supervisor_loop(state: Arc<AppState>, poll_interval: Duration) {
     let mut consecutive_failures = 0usize;
-    let mut last_recovery_attempt = Instant::now().checked_sub(MIN_RESTART_INTERVAL).unwrap_or_else(Instant::now);
+    let mut last_recovery_attempt = Instant::now()
+        .checked_sub(MIN_RESTART_INTERVAL)
+        .unwrap_or_else(Instant::now);
     let mut was_unhealthy = false;
 
     loop {
@@ -33,8 +37,8 @@ pub async fn run_supervisor_loop(state: Arc<AppState>, poll_interval: Duration) 
             _ = tokio::time::sleep(poll_interval) => {}
         }
 
-        let runtime = state.proxy_runtime.load();
-        if !is_supervision_needed(&runtime) {
+        let snapshot = state.proxy.load();
+        if !is_supervision_needed(&snapshot.runtime) {
             continue;
         }
 
@@ -98,7 +102,7 @@ pub fn is_supervision_needed(proxy_runtime: &ProxyRuntime) -> bool {
 
     #[cfg(target_os = "macos")]
     if let Ok(home) = std::env::var("HOME") {
-        let p = std::path::Path::new(&home).join("Library/LaunchAgents/ai.indo.global-egress.plist");
+        let p = Path::new(&home).join("Library/LaunchAgents/ai.indo.global-egress.plist");
         if p.is_file() {
             return true;
         }
@@ -108,7 +112,10 @@ pub fn is_supervision_needed(proxy_runtime: &ProxyRuntime) -> bool {
 }
 
 pub async fn check_tcp_port(addr: &str, timeout_dur: Duration) -> bool {
-    matches!(timeout(timeout_dur, TcpStream::connect(addr)).await, Ok(Ok(_)))
+    matches!(
+        timeout(timeout_dur, TcpStream::connect(addr)).await,
+        Ok(Ok(_))
+    )
 }
 
 pub async fn attempt_recovery() {
@@ -126,10 +133,11 @@ pub async fn attempt_recovery() {
 async fn recover_macos() {
     let uid = get_current_uid().await.unwrap_or_else(|| "501".to_string());
     let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/indo".to_string());
-    let home_path = std::path::Path::new(&home);
+    let home_path = Path::new(&home);
 
     let egress_plist = home_path.join("Library/LaunchAgents/ai.indo.global-egress.plist");
-    let watchdog_plist = home_path.join("Library/LaunchAgents/ai.indo.global-egress-watchdog.plist");
+    let watchdog_plist =
+        home_path.join("Library/LaunchAgents/ai.indo.global-egress-watchdog.plist");
 
     let target_service = format!("gui/{}/ai.indo.global-egress", uid);
     let check_status = tokio::process::Command::new("launchctl")
@@ -216,8 +224,8 @@ async fn recover_fallback() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
     use crate::management::settings::ProviderProxyPolicy;
+    use std::collections::BTreeMap;
     use tokio::net::TcpListener;
 
     #[tokio::test]

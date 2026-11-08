@@ -241,11 +241,14 @@ fn parse_log_record(line: &str) -> Value {
 
 /// `limit=0` means "every retained line"; omitting it keeps the reply bounded.
 #[derive(Debug, Default, Deserialize)]
-struct LogsQuery {
+pub(crate) struct LogsQuery {
     limit: Option<usize>,
 }
 
-async fn get_logs(State(state): State<Arc<AppState>>, Query(query): Query<LogsQuery>) -> Response {
+pub(crate) async fn get_logs(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<LogsQuery>,
+) -> Response {
     let settings = state.settings.current();
     let dir = log_dir(&settings);
     let mut lines = if settings.logging_to_file {
@@ -290,7 +293,7 @@ async fn get_logs(State(state): State<Arc<AppState>>, Query(query): Query<LogsQu
     )
 }
 
-async fn delete_logs(State(state): State<Arc<AppState>>) -> Response {
+pub(crate) async fn delete_logs(State(state): State<Arc<AppState>>) -> Response {
     let settings = state.settings.current();
     // The tail is the live data while file logging is off, so a clear must
     // always reach it; files are only touched while logging is enabled.
@@ -314,7 +317,7 @@ async fn delete_logs(State(state): State<Arc<AppState>>) -> Response {
     )
 }
 
-async fn request_error_logs(State(state): State<Arc<AppState>>) -> Response {
+pub(crate) async fn request_error_logs(State(state): State<Arc<AppState>>) -> Response {
     let settings = state.settings.current();
     if let Some(refusal) = require_file_logging(&settings) {
         return refusal;
@@ -325,7 +328,7 @@ async fn request_error_logs(State(state): State<Arc<AppState>>) -> Response {
     )
 }
 
-async fn request_error_log_by_name(
+pub(crate) async fn request_error_log_by_name(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Response {
@@ -342,7 +345,7 @@ async fn request_error_log_by_name(
     }
 }
 
-async fn request_log_by_id(Path(id): Path<String>) -> Response {
+pub(crate) async fn request_log_by_id(Path(id): Path<String>) -> Response {
     json_status(
         StatusCode::NOT_FOUND,
         json!({ "error": "not found", "id": id }),
@@ -404,14 +407,16 @@ async fn write_request_log(State(state): State<Arc<AppState>>, raw: bytes::Bytes
     write_field(state, raw, |settings, value| {
         settings.request_log = value.as_bool().ok_or(Refusal::InvalidBody)?;
         Ok(())
-    }).await
+    })
+    .await
 }
 
 async fn write_logs_cap(State(state): State<Arc<AppState>>, raw: bytes::Bytes) -> Response {
     write_field(state, raw, |settings, value| {
         settings.logs_max_total_size_mb = value.as_i64().ok_or(Refusal::InvalidBody)?;
         Ok(())
-    }).await
+    })
+    .await
 }
 
 async fn write_field(

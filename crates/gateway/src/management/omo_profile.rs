@@ -93,7 +93,12 @@ fn validate(body: &ProfileBody) -> Result<(), String> {
 }
 
 async fn get_profile(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let profile = state.settings.current().omo_profile.clone().unwrap_or_default();
+    let profile = state
+        .settings
+        .current()
+        .omo_profile
+        .clone()
+        .unwrap_or_default();
     let etag = etag_for(profile.revision);
     let matches = header_str(&headers, header::IF_NONE_MATCH)
         .is_some_and(|value| value.split(',').any(|candidate| candidate.trim() == etag));

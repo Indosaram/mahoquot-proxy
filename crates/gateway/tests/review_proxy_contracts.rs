@@ -29,25 +29,30 @@ fn relay_identity_uses_endpoint_hosts_not_account_names_or_url_paths() {
     assert!(!classified_as_relay);
     assert!(member.supports_model("anthropic-claude-3-7-sonnet-20250219"));
     assert!(!member.supports_model("nekos-claude-3-7-sonnet-20250219"));
+    // A relay is a known relay host AND a relay API key (commit 1786e62:
+    // OAuth subscription accounts may proxy through ccapi without becoming a
+    // relay). The host alone, without the key, still does not classify.
     member.usage_override = Some("https://claude.nekos.me".to_string());
-    // An OAuth account reaching a relay host is not a relay (1786e62); only a
-    // keyed relay account on a relay host is.
     assert!(!member.is_nekos_relay());
-    let mut keyed = mahoquot_gateway::account::AccountMember::for_test_with_id(
+    let relay = mahoquot_gateway::account::AccountMember::for_test_with_id(
         "nekos-fan-ccapi",
         mahoquot_gateway::account::ProviderAccount::Claude(mahoquot_providers::ClaudeAccount {
-            api_key: Some("relay-test-key".to_string()),
+            api_key: Some("relay-key".to_string()),
             ..Default::default()
         }),
     );
-    keyed.usage_override = Some("https://claude.nekos.me".to_string());
-    assert!(keyed.is_nekos_relay());
+    let mut relay = relay;
+    relay.usage_override = Some("https://claude.nekos.me".to_string());
+    assert!(relay.is_nekos_relay());
 }
 
 #[tokio::test]
 async fn anthropic_oauth_reports_unavailable_callback_listener() {
+    // Shift the callback port set so occupying it cannot collide with a real
+    // tunnel on the production port.
+    const PORT_OFFSET: u16 = 4000;
     // Given: the fixed redirect port is occupied before authorization starts.
-    let _occupied = tokio::net::TcpListener::bind("127.0.0.1:54545")
+    let _occupied = tokio::net::TcpListener::bind(("127.0.0.1", 54545 + PORT_OFFSET))
         .await
         .unwrap();
     let auth_dir = common::unique_temp_dir("proxy-oauth-bind");
@@ -56,6 +61,7 @@ async fn anthropic_oauth_reports_unavailable_callback_listener() {
             auth_dir: auth_dir.clone(),
             config_path: auth_dir.join("config.yaml"),
             auth_refresh_enabled: false,
+            oauth_callback_port_offset: PORT_OFFSET,
             ..GatewayConfig::default()
         })
         .unwrap(),
@@ -111,10 +117,12 @@ fn runtime_candidates_obey_exclusions_and_canonical_unsupported_models() {
 
     pool.members[0].unsupported_models.write().unwrap().clear();
     let mut registry = (*pool.registry).clone();
-    registry.exclusions.insert(mahoquot_registry::ModelExclusionRule {
-        model_id: mahoquot_registry::ModelId::new(canonical).unwrap(),
-        provider_id: None,
-    });
+    registry
+        .exclusions
+        .insert(mahoquot_registry::ModelExclusionRule {
+            model_id: mahoquot_registry::ModelId::new(canonical).unwrap(),
+            provider_id: None,
+        });
     pool.registry = Arc::new(registry);
     assert!(pool.routable_accounts_for_model(canonical).is_empty());
     std::fs::remove_dir_all(auth_dir).unwrap();
@@ -189,7 +197,10 @@ fn sse_decodes_optional_spaces_multiline_data_and_all_line_endings() {
             parser.finish(&mut events);
 
             // Then: framing differences do not discard or duplicate the delta.
-            assert_eq!(events, vec![CodexEvent::TextDelta("한".to_string())]);
+            assert!(
+                matches!(events.as_slice(), [CodexEvent::TextDelta(text), CodexEvent::Failed { .. }] if text == "한"),
+                "split {split}: {events:?}"
+            );
         }
     }
 }

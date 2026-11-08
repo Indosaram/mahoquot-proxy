@@ -6,7 +6,7 @@
 
 use super::cursor::{
     exec_delete, exec_grep, exec_ls, exec_read, exec_request_context,
-    exec_shell, exec_shell_run, exec_write, shell_result_message,
+    exec_shell, exec_shell_run, exec_trace_enabled, exec_write, shell_result_message,
 };
 use super::cursor_proto as proto;
 
@@ -60,7 +60,7 @@ pub fn handle_with(
         Some(_) => "other",
         None => "none",
     };
-    if std::env::var_os("MAHOQUOT_EXEC_TRACE").is_some() {
+    if exec_trace_enabled() {
         eprintln!(
             "mahoquot exec trace: variant={variant} id={id} server={}",
             std::env::var("MAHOQUOT_EXEC_SERVER").unwrap_or_else(|_| "gateway".to_string())

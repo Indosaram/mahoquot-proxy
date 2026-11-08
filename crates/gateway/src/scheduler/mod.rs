@@ -3,7 +3,7 @@ pub mod algorithm;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -105,10 +105,8 @@ mod reservation_tests {
 
     #[test]
     fn retain_accounts_keeps_live_accounts_and_other_instances() {
-        let root = std::env::temp_dir().join(format!(
-            "mahoquot-reservation-keep-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("mahoquot-reservation-keep-{}", std::process::id()));
         let registry = SchedulerRegistry::load(&root.join("config.yaml"), &[]);
         registry.reserve("instance-a", "codex-a").unwrap();
         registry.reserve("instance-b", "codex-b").unwrap();
@@ -199,6 +197,8 @@ pub struct SchedulerRegistry {
     runtime: std::sync::Mutex<PersistedState>,
     settings_path: PathBuf,
     state_path: PathBuf,
+    state_generation: AtomicU64,
+    persisted_generation: Arc<std::sync::Mutex<u64>>,
     state_parse_failed: AtomicBool,
     reservations: std::sync::Mutex<ReservationState>,
 }
@@ -226,6 +226,8 @@ impl SchedulerRegistry {
             runtime: std::sync::Mutex::new(runtime.unwrap_or_default()),
             settings_path,
             state_path,
+            state_generation: AtomicU64::new(0),
+            persisted_generation: Arc::new(std::sync::Mutex::new(0)),
             state_parse_failed: AtomicBool::new(settings_failed || state_failed),
             reservations: std::sync::Mutex::new(ReservationState::default()),
         };
@@ -527,7 +529,15 @@ impl SchedulerRegistry {
         }));
         let after = serde_json::to_vec(&*runtime).unwrap_or_default();
         if before != after {
-            persist_json_background(self.state_path.clone(), runtime.clone());
+            // Assign generations while holding the runtime lock, not when a
+            // blocking task happens to start running.
+            let generation = self.state_generation.fetch_add(1, Ordering::Relaxed) + 1;
+            persist_json_background(
+                self.state_path.clone(),
+                runtime.clone(),
+                generation,
+                Arc::clone(&self.persisted_generation),
+            );
         }
     }
 
@@ -588,7 +598,7 @@ fn persist_json(path: &Path, value: &impl Serialize) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let temp = path.with_extension(format!("tmp{}", std::process::id()));
+    let temp = path.with_extension(format!("tmp{}", uuid::Uuid::new_v4()));
     let mut file = std::fs::File::create(&temp)?;
     file.write_all(&rendered)?;
     file.sync_all()?;
@@ -597,14 +607,91 @@ fn persist_json(path: &Path, value: &impl Serialize) -> std::io::Result<()> {
     })
 }
 
-fn persist_json_background(path: PathBuf, state: PersistedState) {
+fn persist_generation(
+    path: &Path,
+    state: &PersistedState,
+    generation: u64,
+    published: &std::sync::Mutex<u64>,
+) -> std::io::Result<()> {
+    // Keep the publication lock through rename: checking before I/O alone
+    // would still allow an older writer to publish after a newer one.
+    let mut published = published.lock().unwrap_or_else(|p| p.into_inner());
+    if generation <= *published {
+        return Ok(());
+    }
+    persist_json(path, state)?;
+    *published = generation;
+    Ok(())
+}
+
+fn persist_json_background(
+    path: PathBuf,
+    state: PersistedState,
+    generation: u64,
+    published: Arc<std::sync::Mutex<u64>>,
+) {
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         handle.spawn_blocking(move || {
-            if let Err(error) = persist_json(&path, &state) {
+            if let Err(error) = persist_generation(&path, &state, generation, &published) {
                 tracing::warn!(path = %path.display(), error = %error, "failed to persist scheduler state");
             }
         });
-    } else if let Err(error) = persist_json(&path, &state) {
+    } else if let Err(error) = persist_generation(&path, &state, generation, &published) {
         tracing::warn!(path = %path.display(), error = %error, "failed to persist scheduler state");
+    }
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+
+    #[test]
+    fn delayed_generation_cannot_overwrite_newer_state() {
+        let root = std::env::temp_dir().join(format!("scheduler-order-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("scheduler-state.json");
+        let published = Arc::new(std::sync::Mutex::new(0));
+        let (release, wait) = std::sync::mpsc::channel();
+        let (finished, done) = std::sync::mpsc::channel();
+        let old_path = path.clone();
+        let old_published = Arc::clone(&published);
+        let old = std::thread::spawn(move || {
+            wait.recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            let result = persist_generation(
+                &old_path,
+                &PersistedState {
+                    selected: Some("old".into()),
+                    ..Default::default()
+                },
+                1,
+                &old_published,
+            );
+            finished.send(result).unwrap();
+        });
+        persist_generation(
+            &path,
+            &PersistedState {
+                selected: Some("new".into()),
+                exhausted_since_unix: [("old".into(), 123)].into(),
+                ..Default::default()
+            },
+            2,
+            &published,
+        )
+        .unwrap();
+        release.send(()).unwrap();
+        done.recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        old.join().unwrap();
+        let (restored, failed) = load_json::<PersistedState>(&path);
+        assert!(!failed);
+        let restored = restored.unwrap();
+        assert_eq!(restored.selected.as_deref(), Some("new"));
+        assert_eq!(restored.exhausted_since_unix.get("old"), Some(&123));
+        assert_eq!(*published.lock().unwrap(), 2);
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

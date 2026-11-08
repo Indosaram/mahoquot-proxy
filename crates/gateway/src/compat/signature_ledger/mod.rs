@@ -301,9 +301,7 @@ impl ReplayScope {
     /// A replayed call had no signature to reuse, so the request goes upstream
     /// with the `skip_thought_signature_validator` sentinel.
     pub fn record_unsigned_replay(&self) {
-        self.ledger
-            .unsigned_replays
-            .fetch_add(1, Ordering::Relaxed);
+        self.ledger.unsigned_replays.fetch_add(1, Ordering::Relaxed);
     }
 
     fn key(&self, call_id: &str, name: &str) -> String {
@@ -315,12 +313,30 @@ impl ReplayScope {
 }
 
 /// Two spellings of the same arguments object must hit the same entry, while a
-/// genuinely different object must miss. `serde_json::Map` is key-ordered, so
-/// a reparse-and-print is the canonical form.
+/// genuinely different object must miss.
+///
+/// `serde_json::Map` preserves insertion order here, so key order has to be
+/// normalized explicitly: rebuild every object with its keys sorted.
 fn canonical_arguments(arguments: &str) -> String {
     match serde_json::from_str::<Value>(arguments) {
-        Ok(value) => value.to_string(),
+        Ok(value) => sort_object_keys(&value).to_string(),
         Err(_) => arguments.to_string(),
+    }
+}
+
+fn sort_object_keys(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+            entries.sort_by(|left, right| left.0.cmp(right.0));
+            let mut sorted = serde_json::Map::with_capacity(entries.len());
+            for (key, value) in entries {
+                sorted.insert(key.clone(), sort_object_keys(value));
+            }
+            Value::Object(sorted)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(sort_object_keys).collect()),
+        other => other.clone(),
     }
 }
 

@@ -6,6 +6,7 @@
 
 mod common;
 
+use common::with_loopback_peer;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -51,6 +52,17 @@ fn setup_test_context(tag: &str) -> TestContext {
         max_failover: 3,
         ..GatewayConfig::default()
     };
+    mahoquot_gateway::management::settings::Settings {
+        api_keys: vec![TEST_API_KEY.to_string()],
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: TEST_API_KEY.to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(&config.config_path)
+    .expect("persist management test settings");
 
     TestContext { auth_dir, config }
 }
@@ -64,7 +76,7 @@ async fn send_request(
     let mut req_builder = Request::builder()
         .method(method)
         .uri(uri)
-        .header(header::AUTHORIZATION, format!("Bearer {TEST_API_KEY}"));
+        .header("X-Management-Key", TEST_API_KEY);
 
     let req_body = if let Some(b) = body {
         req_builder = req_builder.header(header::CONTENT_TYPE, "application/json");
@@ -73,7 +85,7 @@ async fn send_request(
         Body::empty()
     };
 
-    let req = req_builder.body(req_body).expect("request build");
+    let req = with_loopback_peer(req_builder.body(req_body).expect("request build"));
     let resp = app.clone().oneshot(req).await.expect("service oneshot");
     let status = resp.status();
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
@@ -123,14 +135,10 @@ async fn v1_scoped_key_prefix_survives_multibyte_raw_key() {
         "patching with a multibyte raw key answered {status}: {body}"
     );
 
-    let (status, _) = send_request(
-        &app,
-        Method::GET,
-        "/v0/management/scoped-keys",
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "listing keys after the patch failed");
+    let (status, _) = send_request(&app, Method::GET, "/v0/management/scoped-keys", None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "listing keys after the patch failed"
+    );
 }
-
-

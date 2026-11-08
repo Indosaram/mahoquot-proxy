@@ -901,12 +901,8 @@ async fn test_t3_limit_exhaustion_walks_pool_beyond_max_failover() {
     let temp_dir = unique_temp_dir("qgw-test-t3walk");
     for (index, url) in cap_urls.iter().enumerate() {
         let id = format!("w{index}");
-        let json = create_auth_file_json(
-            &id,
-            &format!("acc_{id}"),
-            &format!("token_{id}"),
-            Some(url),
-        );
+        let json =
+            create_auth_file_json(&id, &format!("acc_{id}"), &format!("token_{id}"), Some(url));
         std::fs::write(temp_dir.join(format!("codex-{id}-plus.json")), json).unwrap();
     }
     let ok_json = create_auth_file_json(
@@ -1032,12 +1028,8 @@ async fn test_t3_plain_429_budget_still_caps_pool_walk() {
     let temp_dir = unique_temp_dir("qgw-test-t3budget");
     for (index, url) in plain_urls.iter().enumerate() {
         let id = format!("p{index}");
-        let json = create_auth_file_json(
-            &id,
-            &format!("acc_{id}"),
-            &format!("token_{id}"),
-            Some(url),
-        );
+        let json =
+            create_auth_file_json(&id, &format!("acc_{id}"), &format!("token_{id}"), Some(url));
         std::fs::write(temp_dir.join(format!("codex-{id}-plus.json")), json).unwrap();
     }
 

@@ -39,8 +39,6 @@ type ActiveIds = BTreeSet<String>;
 struct WarmupInner {
     active: Option<ActiveIds>,
     entries: HashMap<String, WarmupHistoryEntry>,
-    /// Unix times of the probes sent per account in the last 24 hours.
-    probe_log: HashMap<String, std::collections::VecDeque<i64>>,
     flights: HashMap<String, FlightEntry>,
     /// Monotonic tag handed to each new flight so a stale completion can never
     /// remove a flight registered after a prune (or a prune + re-add).
@@ -55,11 +53,11 @@ struct FlightEntry {
 
 impl WarmupInner {
     fn admits(&self, id: &str) -> bool {
-        self.active.as_ref().is_none_or(|active| active.contains(id))
+        self.active
+            .as_ref()
+            .is_none_or(|active| active.contains(id))
     }
 }
-
-const PROBE_LOG_WINDOW_SECS: i64 = 24 * 3600;
 
 pub struct WarmupRunner {
     inner: Mutex<WarmupInner>,
@@ -71,7 +69,6 @@ impl Default for WarmupRunner {
             inner: Mutex::new(WarmupInner {
                 active: None,
                 entries: HashMap::new(),
-                probe_log: HashMap::new(),
                 flights: HashMap::new(),
                 flight_generation: 0,
             }),
@@ -88,7 +85,6 @@ impl WarmupRunner {
         inner.active = Some(active.clone());
         let before_history = inner.entries.len();
         inner.entries.retain(|id, _| active.contains(id));
-        inner.probe_log.retain(|id, _| active.contains(id));
         let before_flights = inner.flights.len();
         inner.flights.retain(|id, _| active.contains(id));
         (before_history - inner.entries.len()) + (before_flights - inner.flights.len())
@@ -102,23 +98,8 @@ impl WarmupRunner {
         if !inner.admits(id) {
             return false;
         }
-        let at_unix = record.1;
-        let log = inner.probe_log.entry(id.to_string()).or_default();
-        log.push_back(at_unix);
-        while log.front().is_some_and(|t| *t <= at_unix - PROBE_LOG_WINDOW_SECS) {
-            log.pop_front();
-        }
         inner.entries.insert(id.to_string(), record);
         true
-    }
-    /// Probes sent for `id` in the 24 hours before `now_unix`.
-    pub fn probes_last_24h(&self, id: &str, now_unix: i64) -> usize {
-        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        inner.probe_log.get(id).map_or(0, |log| {
-            log.iter()
-                .filter(|t| **t > now_unix - PROBE_LOG_WINDOW_SECS)
-                .count()
-        })
     }
     /// Removes the flight registered under `id`, but only while it is still the
     /// exact generation its creator published. A prune (or a prune followed by a
@@ -191,8 +172,8 @@ pub fn available_models(state: &AppState, m: &AccountMember) -> Vec<String> {
                     || id.as_str().contains("glm")));
             // The Claude 5h window is account-wide, so the cheapest model
             // primes it as well as any other.
-            let is_provider_match =
-                is_provider_match && (provider != "claude" || id.as_str().starts_with("claude-haiku"));
+            let is_provider_match = is_provider_match
+                && (provider != "claude" || id.as_str().starts_with("claude-haiku"));
 
             // The live registry decides membership; the account only narrows
             // it to what it has actually been observed to serve.
@@ -217,15 +198,6 @@ fn eligibility(state: &AppState, m: &AccountMember, model: &str) -> Option<&'sta
     }
     if m.is_manually_disabled() {
         return Some("disabled");
-    }
-    if m.provider_name() == "claude"
-        && state
-            .settings
-            .current()
-            .claude_suspected_accounts
-            .contains_key(&m.id)
-    {
-        return Some("suspected");
     }
     let health = m.health();
     let group_derived = matches!(health, Health::Cooldown { until_unix_ms } if m.provider_name() == "antigravity" && m.group_cooldowns.read().unwrap_or_else(|p|p.into_inner()).values().any(|deadline| *deadline == until_unix_ms));
@@ -271,7 +243,11 @@ fn eligibility(state: &AppState, m: &AccountMember, model: &str) -> Option<&'sta
 }
 /// Check whether the account's quota reset window for `model` is currently active (ticking down).
 /// Returns `(is_active, reset_at_unix)`.
-pub fn is_quota_window_active(m: &AccountMember, model: &str, now_unix: i64) -> (bool, Option<i64>) {
+pub fn is_quota_window_active(
+    m: &AccountMember,
+    model: &str,
+    now_unix: i64,
+) -> (bool, Option<i64>) {
     let usage = m.usage_snapshot();
     let provider = m.provider_name();
     if provider == "antigravity" {
@@ -379,11 +355,7 @@ pub fn resolve_window_state(
     }
     // If upstream does not report a live quota reset timestamp (e.g. Cline or unpolled providers),
     // but a warmup probe succeeded recently, recognize the account as primed for 5 hours (18,000s).
-    let history = state
-        .warmup
-        .inner
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let history = state.warmup.inner.lock().unwrap_or_else(|p| p.into_inner());
     if let Some((_, attempt_unix, Some(res))) = history.entries.get(&m.id) {
         if res.ok {
             let window_duration = 5 * 3600; // 5-hour sliding window
@@ -408,10 +380,13 @@ fn due_at(state: &AppState, m: &AccountMember, time: tokio::time::Instant) -> bo
     }
     let models = available_models(state, m);
     let selected = p.model.as_ref().or_else(|| {
-        models.iter().find(|id| {
-            let (active, _) = is_quota_window_active(m, id, now());
-            !active && eligibility(state, m, id).is_none()
-        }).or_else(|| models.first())
+        models
+            .iter()
+            .find(|id| {
+                let (active, _) = is_quota_window_active(m, id, now());
+                !active && eligibility(state, m, id).is_none()
+            })
+            .or_else(|| models.first())
     });
     let Some(model) = selected.filter(|s| models.contains(s)) else {
         return false;
@@ -431,89 +406,7 @@ fn due_at(state: &AppState, m: &AccountMember, time: tokio::time::Instant) -> bo
         return false;
     }
     let (window_active, _) = resolve_window_state(state, m, model, now());
-    if window_active {
-        return false;
-    }
-    if m.provider_name() == "claude" {
-        let reset_unix = m.usage_snapshot().primary.reset_at_unix;
-        let local_hour = local_hour_now();
-        return claude_probe_due(state, m, reset_unix, now(), local_hour);
-    }
-    true
-}
-
-/// Quiet hours (local time) when no Claude probe goes out.
-const CLAUDE_QUIET_HOURS: std::ops::Range<u32> = 1..8;
-const CLAUDE_JITTER_MIN_SECS: i64 = 180;
-const CLAUDE_JITTER_SPAN_SECS: u64 = 1320;
-const CLAUDE_SESSION_WINDOW_SECS: i64 = 18_000;
-
-/// Delay after a reset before an account's probe, fixed per account and
-/// window so a restart gives the same answer and accounts never line up.
-pub fn claude_probe_jitter_secs(account_id: &str, reset_unix: i64) -> i64 {
-    let material = format!("{account_id}{reset_unix}");
-    let spread = crate::affinity_store::fnv1a64(material.as_bytes()) % CLAUDE_JITTER_SPAN_SECS;
-    CLAUDE_JITTER_MIN_SECS + spread as i64
-}
-
-/// W3 gate for a Claude OAuth probe. The anchor is the reset the poller
-/// reported, read directly: `is_quota_window_active` drops past resets.
-/// - unknown reset: skipped until the poller reports one;
-/// - reset in the future: the window is live, refused upstream of here;
-/// - elapsed reset: due from `reset + jitter`, once per window.
-fn claude_probe_due(
-    state: &AppState,
-    m: &AccountMember,
-    reset_unix: Option<i64>,
-    now_unix: i64,
-    local_hour: u32,
-) -> bool {
-    if CLAUDE_QUIET_HOURS.contains(&local_hour) {
-        return false;
-    }
-    let Some(reset_unix) = reset_unix.filter(|reset| *reset > 0) else {
-        // No reset anchor. A polled 0% session means the window has never
-        // been opened, which is exactly what a probe is for; one successful
-        // probe per window length is enough until the poller reports a reset.
-        let unopened = m.usage_snapshot().primary.used_percent.is_some_and(|used| used <= 0.0);
-        if !unopened {
-            return false;
-        }
-        let probed_recently = state
-            .warmup
-            .inner
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .entries
-            .get(&m.id)
-            .is_some_and(|(_, at_unix, result)| {
-                now_unix - *at_unix < CLAUDE_SESSION_WINDOW_SECS
-                    && result.as_ref().is_some_and(|r| r.ok)
-            });
-        return !probed_recently;
-    };
-    if reset_unix > now_unix {
-        return false;
-    }
-    if now_unix < reset_unix + claude_probe_jitter_secs(&m.id, reset_unix) {
-        return false;
-    }
-    let probed_this_window = state
-        .warmup
-        .inner
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .entries
-        .get(&m.id)
-        .is_some_and(|(_, at_unix, result)| {
-            *at_unix >= reset_unix && result.as_ref().is_some_and(|r| r.ok)
-        });
-    !probed_this_window
-}
-
-fn local_hour_now() -> u32 {
-    use chrono::Timelike;
-    chrono::Local::now().hour()
+    !window_active
 }
 type WarmupRequest = (String, Value, Vec<(String, String)>);
 fn warmup_request(m: &AccountMember, model: &str) -> Option<WarmupRequest> {
@@ -560,10 +453,10 @@ fn warmup_request(m: &AccountMember, model: &str) -> Option<WarmupRequest> {
             ),
             json!({
                 "model": model,
-                "max_tokens": 16,
+                "max_tokens": 1,
                 "stream": true,
                 "system": [{"type":"text","text":crate::compat::claude::CLAUDE_CODE_SYSTEM_INSTRUCTION}],
-                "messages": [{"role":"user","content":"Hi"}]
+                "messages": [{"role":"user","content":"."}]
             }),
             headers,
         )),
@@ -601,7 +494,9 @@ fn validate(body: &[u8], provider: &str) -> bool {
                 let delta = &v["choices"][0]["delta"];
                 content |= delta["content"].as_str().is_some_and(|s| !s.is_empty())
                     || delta["reasoning"].as_str().is_some_and(|s| !s.is_empty())
-                    || delta["reasoning_content"].as_str().is_some_and(|s| !s.is_empty());
+                    || delta["reasoning_content"]
+                        .as_str()
+                        .is_some_and(|s| !s.is_empty());
                 terminal |= matches!(
                     v["choices"][0]["finish_reason"].as_str(),
                     Some("stop" | "length")
@@ -690,10 +585,14 @@ async fn execute(state: &Arc<AppState>, id: &str, automatic: bool) -> WarmupResu
     }
     let models = available_models(state, &m);
     let selected = policy(state, &m).model.or_else(|| {
-        models.iter().find(|id| {
-            let (active, _) = is_quota_window_active(&m, id, now());
-            !active && eligibility(state, &m, id).is_none()
-        }).cloned().or_else(|| models.first().cloned())
+        models
+            .iter()
+            .find(|id| {
+                let (active, _) = is_quota_window_active(&m, id, now());
+                !active && eligibility(state, &m, id).is_none()
+            })
+            .cloned()
+            .or_else(|| models.first().cloned())
     });
     let Some(model) = selected.filter(|s| models.contains(s)) else {
         return result(&m, "model_unavailable");
@@ -733,7 +632,10 @@ async fn execute(state: &Arc<AppState>, id: &str, automatic: bool) -> WarmupResu
             })
             .unwrap_or_else(|| model.clone());
         let (url, body, headers) = warmup_request(&m, &upstream_model).unwrap();
-        let client = state.client_for_member(&m);
+        let client = match state.try_client_for_member(&m) {
+            Ok(client) => client,
+            Err(error) => return Err(format!("proxy client construction failed: {error}")),
+        };
         let send = |token: String| {
             let mut req = client.post(&url).bearer_auth(token).json(&body);
             for (k, v) in &headers {
@@ -864,11 +766,7 @@ async fn execute(state: &Arc<AppState>, id: &str, automatic: bool) -> WarmupResu
 }
 async fn run(state: &Arc<AppState>, m: &Arc<AccountMember>, automatic: bool) -> WarmupResult {
     let future = {
-        let mut inner = state
-            .warmup
-            .inner
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let mut inner = state.warmup.inner.lock().unwrap_or_else(|p| p.into_inner());
         // Membership and the flight map share one guard: an account the pool has
         // already dropped can never be handed a fresh flight by a caller that
         // still holds the stale member.
@@ -965,24 +863,10 @@ pub fn status(state: &AppState) -> Value {
             Some(reason)
         } else if window_active {
             Some("window_active")
-        } else if m.provider_name() == "claude"
-            && !claude_probe_due(
-                state,
-                m,
-                m.usage_snapshot().primary.reset_at_unix,
-                current_now,
-                local_hour_now(),
-            )
-        {
-            Some("claude_schedule")
         } else {
             None
         };
-        let history = state
-            .warmup
-            .inner
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let history = state.warmup.inner.lock().unwrap_or_else(|p| p.into_inner());
         let last = history.entries.get(&m.id);
         let next_due = if p.enabled {
             if skip == Some("window_active") {
@@ -1052,7 +936,10 @@ mod tests {
             },
             ..Default::default()
         };
-        assert_eq!(codex_display_window_active(&weekly_only, now), (false, None));
+        assert_eq!(
+            codex_display_window_active(&weekly_only, now),
+            (false, None)
+        );
 
         let active_five_hour = crate::usage::AccountUsage {
             primary: crate::usage::QuotaWindow {
@@ -1113,18 +1000,18 @@ mod tests {
         assert!(supported(&oauth));
         let (url, body, headers) = warmup_request(&oauth, "claude-haiku-5-5").unwrap();
         assert!(url.ends_with("/v1/messages"));
-        assert_eq!(body["max_tokens"], 16);
-        assert_eq!(body["messages"][0]["content"], "Hi");
+        assert_eq!(body["max_tokens"], 1);
         assert_eq!(body["model"], "claude-haiku-5-5");
         assert!(headers.iter().any(|(k, _)| k == "anthropic-beta"));
-        assert!(!headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("authorization")));
+        assert!(!headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("authorization")));
 
-        let relay = AccountMember::for_test(ProviderAccount::Claude(
-            mahoquot_providers::ClaudeAccount {
+        let relay =
+            AccountMember::for_test(ProviderAccount::Claude(mahoquot_providers::ClaudeAccount {
                 api_key: Some("relay-key".into()),
                 ..Default::default()
-            },
-        ));
+            }));
         assert!(!supported(&relay));
 
         let one_token = b"event: message_start\ndata: {\"type\":\"message_start\"}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":1}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
@@ -1132,128 +1019,6 @@ mod tests {
         let spent = b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\"}}\n\n";
         assert!(!validate(spent, "claude"));
     }
-    fn claude_test_state() -> (Arc<AppState>, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("warmup-claude-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let state = Arc::new(
-            AppState::new(&crate::config::GatewayConfig {
-                auth_dir: dir.clone(),
-                config_path: dir.join("config.yaml"),
-                ..Default::default()
-            })
-            .unwrap(),
-        );
-        (state, dir)
-    }
-
-    fn claude_oauth(id: &str) -> AccountMember {
-        AccountMember::for_test_with_id(id, ProviderAccount::Claude(Default::default()))
-    }
-
-    #[test]
-    fn claude_probe_follows_the_reset_jitter_and_quiet_hours() {
-        let (state, dir) = claude_test_state();
-        let member = claude_oauth("claude-a");
-        // The empty test pool activates an allowlist without this account.
-        state.warmup.inner.lock().unwrap().active = None;
-        let reset = 1_800_000_000;
-        let jitter = claude_probe_jitter_secs("claude-a", reset);
-        let day = 12;
-        // (c) unknown reset: wait for the poller.
-        assert!(!claude_probe_due(&state, &member, None, reset + 5_000, day));
-        // (a) reset still ahead: the window is live.
-        assert!(!claude_probe_due(&state, &member, Some(reset), reset - 1, day));
-        // (b) elapsed reset: nothing before the jitter, one probe at it.
-        assert!(!claude_probe_due(&state, &member, Some(reset), reset + jitter - 1, day));
-        assert!(claude_probe_due(&state, &member, Some(reset), reset + jitter, day));
-        // Quiet hours hold the probe even when it is due.
-        assert!(!claude_probe_due(&state, &member, Some(reset), reset + jitter, 3));
-        // A successful probe in this window ends it until the next reset.
-        let mut ok = result(&member, "ok");
-        ok.ok = true;
-        state.warmup.record_probe(
-            &member.id,
-            (tokio::time::Instant::now(), reset + jitter, Some(ok)),
-        );
-        assert!(!claude_probe_due(&state, &member, Some(reset), reset + jitter + 60, day));
-        let next = reset + 18_000;
-        let next_jitter = claude_probe_jitter_secs("claude-a", next);
-        assert!(claude_probe_due(&state, &member, Some(next), next + next_jitter, day));
-        assert_eq!(state.warmup.probes_last_24h(&member.id, reset + jitter + 60), 1);
-        assert_eq!(state.warmup.probes_last_24h(&member.id, reset + jitter + 86_400), 0);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn claude_probe_opens_a_never_used_session_once() {
-        let (state, dir) = claude_test_state();
-        let member = claude_oauth("claude-u");
-        state.warmup.inner.lock().unwrap().active = None;
-        let now = 1_800_000_000;
-        let day = 12;
-        // Never polled: still waits for the poller.
-        assert!(!claude_probe_due(&state, &member, None, now, day));
-        // Polled at 0% with no reset: the session has never been opened.
-        let mut usage = member.usage_snapshot();
-        usage.primary.used_percent = Some(0.0);
-        member.set_usage(usage.clone());
-        assert!(claude_probe_due(&state, &member, None, now, day));
-        assert!(!claude_probe_due(&state, &member, None, now, 3));
-        // Usage without a reset is not an unopened window.
-        let mut used = usage.clone();
-        used.primary.used_percent = Some(12.0);
-        member.set_usage(used);
-        assert!(!claude_probe_due(&state, &member, None, now, day));
-        member.set_usage(usage);
-        // A failed probe does not end the attempt; a successful one does
-        // until a full session length has passed.
-        state.warmup.record_probe(
-            &member.id,
-            (tokio::time::Instant::now(), now, Some(result(&member, "boom"))),
-        );
-        assert!(claude_probe_due(&state, &member, None, now + 60, day));
-        let mut ok = result(&member, "ok");
-        ok.ok = true;
-        state.warmup.record_probe(&member.id, (tokio::time::Instant::now(), now + 60, Some(ok)));
-        assert!(!claude_probe_due(&state, &member, None, now + 120, day));
-        assert!(claude_probe_due(&state, &member, None, now + 60 + 18_000, day));
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn claude_probe_jitter_is_fixed_bounded_and_per_account() {
-        let reset = 1_800_000_000;
-        let a = claude_probe_jitter_secs("claude-a", reset);
-        assert_eq!(a, claude_probe_jitter_secs("claude-a", reset));
-        assert_ne!(a, claude_probe_jitter_secs("claude-b", reset));
-        for id in ["claude-a", "claude-b", "claude-c", "claude-d"] {
-            for offset in 0..50 {
-                let jitter = claude_probe_jitter_secs(id, reset + offset * 18_000);
-                assert!((180..1500).contains(&jitter), "{id}: {jitter}");
-            }
-        }
-    }
-
-    #[test]
-    fn a_suspected_claude_account_is_not_probed() {
-        let (state, dir) = claude_test_state();
-        let member = claude_oauth("claude-s");
-        state
-            .settings
-            .mutate(|document| {
-                document.claude_suspected_accounts.insert(
-                    "claude-s".into(),
-                    crate::management::settings::SuspectedAccount {
-                        reason: "organization has been disabled".into(),
-                        at_unix: 1,
-                    },
-                );
-            })
-            .unwrap();
-        assert_eq!(eligibility(&state, &member, "claude-haiku-5-5"), Some("suspected"));
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
     #[test]
     fn warmup_done_only_is_not_success() {
         assert!(!validate(b"data: [DONE]\n\n", "codex"));
@@ -1393,40 +1158,38 @@ mod tests {
                 crate::usage::QuotaGroup {
                     display_name: Some("Gemini Models".into()),
                     models: None,
-                    buckets: vec![
-                        crate::usage::QuotaBucket {
-                            bucket_id: Some("gemini-5h".into()),
-                            display_name: Some("Five Hour Limit".into()),
-                            window: Some("5h".into()),
-                            used_percent: Some(15.0),
-                            reset_at_unix: Some(current + 18000),
-                        },
-                    ],
+                    buckets: vec![crate::usage::QuotaBucket {
+                        bucket_id: Some("gemini-5h".into()),
+                        display_name: Some("Five Hour Limit".into()),
+                        window: Some("5h".into()),
+                        used_percent: Some(15.0),
+                        reset_at_unix: Some(current + 18000),
+                    }],
                 },
                 crate::usage::QuotaGroup {
                     display_name: Some("Claude and GPT models".into()),
                     models: None,
-                    buckets: vec![
-                        crate::usage::QuotaBucket {
-                            bucket_id: Some("3p-5h".into()),
-                            display_name: Some("Five Hour Limit".into()),
-                            window: Some("5h".into()),
-                            used_percent: Some(0.0),
-                            reset_at_unix: Some(current - 100), // past reset
-                        },
-                    ],
+                    buckets: vec![crate::usage::QuotaBucket {
+                        bucket_id: Some("3p-5h".into()),
+                        display_name: Some("Five Hour Limit".into()),
+                        window: Some("5h".into()),
+                        used_percent: Some(0.0),
+                        reset_at_unix: Some(current - 100), // past reset
+                    }],
                 },
             ],
             ..Default::default()
         });
 
         // Gemini window is recognized as active
-        let (active_gemini, reset_gemini) = is_quota_window_active(&ag, "gemini-3.7-flash-high", current);
+        let (active_gemini, reset_gemini) =
+            is_quota_window_active(&ag, "gemini-3.7-flash-high", current);
         assert!(active_gemini);
         assert_eq!(reset_gemini, Some(current + 18000));
 
         // Claude window is recognized as inactive (can be primed separately!)
-        let (active_claude, reset_claude) = is_quota_window_active(&ag, "claude-3-5-sonnet", current);
+        let (active_claude, reset_claude) =
+            is_quota_window_active(&ag, "claude-3-5-sonnet", current);
         assert!(!active_claude);
         assert_eq!(reset_claude, None);
     }
@@ -1444,27 +1207,33 @@ mod tests {
             .unwrap(),
         );
 
-        let cline = AccountMember::for_test(ProviderAccount::Generic(
-            crate::account::GenericAccount {
+        let cline =
+            AccountMember::for_test(ProviderAccount::Generic(crate::account::GenericAccount {
                 provider: "cline".into(),
                 models: vec![
                     "cline-free/gemini-3.8-flash".into(),
                     "cline-free/deepseek-v4.1-flash".into(),
                 ],
                 ..Default::default()
-            },
-        ));
+            }));
 
         let current = now();
-        let (active_gemini, _) = is_quota_window_active(&cline, "cline-free/gemini-3.8-flash", current);
-        let (active_deepseek, _) = is_quota_window_active(&cline, "cline-free/deepseek-v4.1-flash", current);
+        let (active_gemini, _) =
+            is_quota_window_active(&cline, "cline-free/gemini-3.8-flash", current);
+        let (active_deepseek, _) =
+            is_quota_window_active(&cline, "cline-free/deepseek-v4.1-flash", current);
         assert!(!active_gemini);
         assert!(!active_deepseek);
 
         // When Gemini window is anchored/active, but DeepSeek is still unanchored
-        cline.cline_trackers().for_model("cline-free/gemini-3.8-flash").anchor_window(current);
-        let (active_gemini, reset_gemini) = is_quota_window_active(&cline, "cline-free/gemini-3.8-flash", current);
-        let (active_deepseek, reset_deepseek) = is_quota_window_active(&cline, "cline-free/deepseek-v4.1-flash", current);
+        cline
+            .cline_trackers()
+            .for_model("cline-free/gemini-3.8-flash")
+            .anchor_window(current);
+        let (active_gemini, reset_gemini) =
+            is_quota_window_active(&cline, "cline-free/gemini-3.8-flash", current);
+        let (active_deepseek, reset_deepseek) =
+            is_quota_window_active(&cline, "cline-free/deepseek-v4.1-flash", current);
         assert!(active_gemini);
         assert_eq!(reset_gemini, Some(current + 86400));
         assert!(!active_deepseek);
@@ -1501,13 +1270,12 @@ mod tests {
             .unwrap(),
         );
 
-        let codex = AccountMember::for_test(ProviderAccount::Codex(
-            mahoquot_providers::CodexAccount {
+        let codex =
+            AccountMember::for_test(ProviderAccount::Codex(mahoquot_providers::CodexAccount {
                 access_token: "mock-token".into(),
                 account_id: "codex-test-acc".into(),
                 ..Default::default()
-            },
-        ));
+            }));
 
         let current = now();
         let exhausted_usage = crate::usage::AccountUsage {
@@ -1523,7 +1291,10 @@ mod tests {
         };
         codex.set_usage(exhausted_usage);
 
-        assert!(!state.settings.current().is_codex_account_credit_enabled(&codex.id));
+        assert!(!state
+            .settings
+            .current()
+            .is_codex_account_credit_enabled(&codex.id));
         let reason = eligibility(&state, &codex, "codex");
         assert_eq!(reason, Some("credits_off_quota_exhausted"));
 
@@ -1533,7 +1304,10 @@ mod tests {
                 settings.set_codex_account_credit_use(codex.id.clone(), true);
             })
             .unwrap();
-        assert!(state.settings.current().is_codex_account_credit_enabled(&codex.id));
+        assert!(state
+            .settings
+            .current()
+            .is_codex_account_credit_enabled(&codex.id));
         let reason = eligibility(&state, &codex, "codex");
         assert_eq!(reason, None);
 
@@ -1636,7 +1410,9 @@ mod tests {
         let (state, dir) = warmup_state();
         let member = codex_member();
         // The pool no longer holds this account.
-        let active: ActiveIds = ["some-other-live-account".to_string()].into_iter().collect();
+        let active: ActiveIds = ["some-other-live-account".to_string()]
+            .into_iter()
+            .collect();
         assert_eq!(state.warmup.retain_accounts(&active), 0);
 
         let out = warm_account(&state, &member).await;
@@ -1656,7 +1432,9 @@ mod tests {
     async fn warmup_run_does_not_register_a_flight_for_a_removed_account() {
         let (state, dir) = warmup_state();
         let member = codex_member();
-        let active: ActiveIds = ["some-other-live-account".to_string()].into_iter().collect();
+        let active: ActiveIds = ["some-other-live-account".to_string()]
+            .into_iter()
+            .collect();
         assert_eq!(state.warmup.retain_accounts(&active), 0);
 
         let _ = warm_account(&state, &member).await;
@@ -1700,9 +1478,13 @@ mod tests {
 
         {
             let mut inner = runner.inner.lock().unwrap();
-            inner
-                .flights
-                .insert(member.id.clone(), FlightEntry { generation: 1, flight: flight() });
+            inner.flights.insert(
+                member.id.clone(),
+                FlightEntry {
+                    generation: 1,
+                    flight: flight(),
+                },
+            );
         }
         // A completion of the registered generation retires its own flight.
         runner.finish_flight(&member.id, 1);
@@ -1712,9 +1494,13 @@ mod tests {
         // completion must leave it in place.
         {
             let mut inner = runner.inner.lock().unwrap();
-            inner
-                .flights
-                .insert(member.id.clone(), FlightEntry { generation: 2, flight: flight() });
+            inner.flights.insert(
+                member.id.clone(),
+                FlightEntry {
+                    generation: 2,
+                    flight: flight(),
+                },
+            );
         }
         runner.finish_flight(&member.id, 1);
         assert_eq!(

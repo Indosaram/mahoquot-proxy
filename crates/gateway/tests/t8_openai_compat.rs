@@ -165,9 +165,12 @@ async fn test_t8_unsupported_websocket_transport_fails_before_upgrade() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), reqwest::StatusCode::UPGRADE_REQUIRED);
+    // Task 19: /v1/responses now really upgrades, dialing the account before
+    // the 101. With no eligible websocket-capable account the upgrade is
+    // refused before switching protocols (503), never a silent 101.
+    assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
     let payload: Value = response.json().await.unwrap();
-    assert_eq!(payload["error"]["code"], "realtime_request_failed");
+    assert_eq!(payload["error"]["code"], "websocket_auth_not_found");
     std::fs::remove_dir_all(temp_dir).ok();
 }
 
@@ -509,10 +512,16 @@ async fn test_t8_truncated_upstream_stream_is_closed_for_the_client() {
     );
     let chunks = sse_payloads(&body);
     assert_eq!(
-        chunks.last().unwrap()["choices"][0]["finish_reason"],
-        "stop",
-        "client must receive a terminal finish_reason"
+        chunks
+            .iter()
+            .filter(|chunk| chunk.get("error").is_some())
+            .count(),
+        1,
+        "truncation must produce exactly one error"
     );
+    assert!(chunks
+        .iter()
+        .all(|chunk| chunk["choices"][0]["finish_reason"].is_null()));
     let text: String = chunks
         .iter()
         .filter_map(|c| c["choices"][0]["delta"]["content"].as_str())

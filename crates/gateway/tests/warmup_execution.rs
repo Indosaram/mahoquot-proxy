@@ -108,12 +108,17 @@ async fn warmup_actual_http_validation_and_zero_hit_eligibility() {
     )
     .unwrap();
     let state = Arc::new(
-        AppState::new(&GatewayConfig {
-            auth_dir: dir.clone(),
-            config_path: dir.join("config.yaml"),
-            refresh_url: format!("{base}/refresh"),
-            auth_refresh_enabled: false,
-            ..Default::default()
+        AppState::new(&{
+            // Task 26: the warmup policy PUT goes through the dedicated
+            // management gate, which needs a configured secret.
+            common::configure_management_secret(&dir.join("config.yaml"), "warmup-mgmt");
+            GatewayConfig {
+                auth_dir: dir.clone(),
+                config_path: dir.join("config.yaml"),
+                refresh_url: format!("{base}/refresh"),
+                auth_refresh_enabled: false,
+                ..Default::default()
+            }
         })
         .unwrap(),
     );
@@ -197,6 +202,11 @@ async fn warmup_actual_http_validation_and_zero_hit_eligibility() {
             axum::http::Request::builder()
                 .uri("/v0/management/warmup/settings/provider/codex")
                 .method("PUT")
+                .header("x-management-key", "warmup-mgmt")
+                .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                    [127, 0, 0, 1],
+                    0,
+                ))))
                 .header("content-type", "application/json")
                 .body(axum::body::Body::from(
                     json!({"enabled":true,"model":null,"idle_secs":3600,"min_interval_secs":300})
@@ -258,22 +268,30 @@ async fn warmup_actual_http_validation_and_zero_hit_eligibility() {
     assert_eq!(cline_hits.load(Ordering::SeqCst), 1);
     let usage = cline.usage_snapshot();
     let bucket = &usage.groups[0].buckets[0];
-    assert_eq!(bucket.bucket_id.as_deref(), Some("cline-free/gemini-3.8-flash"));
+    assert_eq!(
+        bucket.bucket_id.as_deref(),
+        Some("cline-free/gemini-3.8-flash")
+    );
     assert_eq!(bucket.used_percent, Some(100.0));
     assert_eq!(
         bucket.reset_at_unix.unwrap() - usage.observed_at_unix.unwrap(),
         9000
     );
     cline.group_cooldowns.write().unwrap().clear();
-    // `set_usage` merges a snapshot without `refreshed_at_unix` into the old
-    // one (keeping its groups), so mark it as a fresh poll to really clear it.
+    // A fresh quota poll that reports no buckets clears the bench. A
+    // non-refresh update (no refreshed_at_unix) deliberately keeps the old
+    // groups (AccountMember::set_usage, commit fb395e8), so mark it refreshed.
     cline.set_usage(mahoquot_gateway::usage::AccountUsage {
-        refreshed_at_unix: Some(usage.observed_at_unix.unwrap()),
+        refreshed_at_unix: Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64,
+        ),
         ..Default::default()
     });
     mode.store(6, Ordering::SeqCst);
-    let recovered = warm_account(&state, &cline).await;
-    assert!(recovered.ok, "{recovered:?}");
+    assert!(warm_account(&state, &cline).await.ok);
     mode.store(5, Ordering::SeqCst);
     std::fs::write(dir.join("antigravity-fixture.json"),json!({"type":"antigravity","identity_slug":"ag-fixture","access_token":"mock","refresh_token":"mock","email":"mock@example.com","expired":"2099-01-01T00:00:00Z","project_id":"mock-project","upstream_override":base}).to_string()).unwrap();
     state.rescan_pool().unwrap();
@@ -304,14 +322,25 @@ async fn warmup_actual_http_validation_and_zero_hit_eligibility() {
     let gateway_base = format!("http://{}", gateway_listener.local_addr().unwrap());
     let gateway = mahoquot_gateway::routes::create_app(state.clone());
     let gateway_task = tokio::spawn(async move {
-        axum::serve(gateway_listener, gateway).await.unwrap();
+        axum::serve(
+            gateway_listener,
+            gateway.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
     let client = reqwest::Client::new();
     for path in [
         "/v0/management/warmup/settings",
         "/v0/management/warmup/status",
     ] {
-        for (key, expected) in [("master-fixture", 200), ("scoped-fixture", 403)] {
+        // Task 26: management/admin take only the dedicated secret; the
+        // inference master key and a scoped key both fail authentication.
+        for (key, expected) in [
+            ("warmup-mgmt", 200),
+            ("master-fixture", 401),
+            ("scoped-fixture", 401),
+        ] {
             let response = client
                 .get(format!("{gateway_base}{path}"))
                 .bearer_auth(key)
@@ -324,7 +353,13 @@ async fn warmup_actual_http_validation_and_zero_hit_eligibility() {
             assert_eq!(code, expected);
         }
     }
-    for (key, expected) in [("master-fixture", 200), ("scoped-fixture", 403)] {
+    // Task 26: management/admin take only the dedicated secret; the
+    // inference master key and a scoped key both fail authentication.
+    for (key, expected) in [
+        ("warmup-mgmt", 200),
+        ("master-fixture", 401),
+        ("scoped-fixture", 401),
+    ] {
         let response = client
             .post(format!("{gateway_base}/admin/accounts/test/warmup"))
             .bearer_auth(key)
@@ -340,7 +375,7 @@ async fn warmup_actual_http_validation_and_zero_hit_eligibility() {
         .put(format!(
             "{gateway_base}/v0/management/warmup/settings/provider/codex"
         ))
-        .bearer_auth("master-fixture")
+        .bearer_auth("warmup-mgmt")
         .json(&json!({"enabled":true,"model":null,"idle_secs":0,"min_interval_secs":300}))
         .send()
         .await

@@ -322,7 +322,6 @@ fn test_zero_fallback_routable_bindings_rejected() {
     assert_eq!(err, CatalogVerificationError::ZeroFallbackRoutableBindings);
 }
 
-
 #[test]
 fn the_production_keyring_does_not_trust_the_committed_test_key() {
     // crates/registry/tests/fixtures/test-ed25519.key is committed, so anyone
@@ -344,7 +343,6 @@ fn the_production_keyring_does_not_trust_the_committed_test_key() {
         "test key must be present only in test/debug builds"
     );
 }
-
 
 #[test]
 fn release_builds_do_not_trust_the_committed_test_key() {

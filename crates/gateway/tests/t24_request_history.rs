@@ -1,7 +1,7 @@
 mod common;
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -11,17 +11,17 @@ use axum::Router;
 use http_body_util::BodyExt;
 use mahoquot_gateway::config::GatewayConfig;
 use mahoquot_gateway::inbound::ApiKeys;
-use mahoquot_gateway::request_history::UsageEvent;
 use mahoquot_gateway::request_history::HistoryQuery;
+use mahoquot_gateway::request_history::UsageEvent;
 use mahoquot_gateway::routes::create_app;
 use mahoquot_gateway::state::AppState;
 use rusqlite::Connection;
 use serde_json::Value;
 use tower::ServiceExt;
 
-use common::{create_auth_file_json, unique_temp_dir, OPENAI_REQUEST};
+use common::{create_auth_file_json, unique_temp_dir, with_loopback_peer, OPENAI_REQUEST};
 
-const API_KEY: &str = "t24-management-key";
+const API_KEY: &str = "t24-inference-key";
 const EXPORT_SECRET: &str = "task-15-export-secret";
 
 #[test]
@@ -42,25 +42,47 @@ fn runtime_maintenance_prunes_expired_records_at_exact_clock_trigger() {
             ..HistoryConfig::default()
         },
         move || worker_clock.load(Ordering::SeqCst),
-    ) else { panic!("open maintenance fixture") };
+    ) else {
+        panic!("open maintenance fixture")
+    };
     for index in 0..150 {
-        store.insert(&UsageEvent {
-            event_id: format!("maintenance-{index}"),
-            occurred_at_ms: now - if index < 100 { 10 * 86_400_000 } else { 3_600_000 },
-            account_identifier: "fixture-account".into(),
-            provider: "codex".into(), model: "fixture-model".into(),
-            key_identifier: None, session_identifier: None, status_code: 200, succeeded: true,
-            input_tokens: 1, output_tokens: 1, cached_input_tokens: 0,
-            cached_input_tokens_known: false, cache_write_tokens: 0,
-            cache_write_tokens_known: false,
-            reasoning_tokens: 0, total_tokens: 2, latency_ms: 1,
-            fast: false,
-        }).unwrap();
+        store
+            .insert(&UsageEvent {
+                event_id: format!("maintenance-{index}"),
+                occurred_at_ms: now
+                    - if index < 100 {
+                        10 * 86_400_000
+                    } else {
+                        3_600_000
+                    },
+                account_identifier: "fixture-account".into(),
+                provider: "codex".into(),
+                model: "fixture-model".into(),
+                key_identifier: None,
+                session_identifier: None,
+                status_code: 200,
+                succeeded: true,
+                input_tokens: 1,
+                output_tokens: 1,
+                cached_input_tokens: 0,
+                cached_input_tokens_known: false,
+                cache_write_tokens: 0,
+                cache_write_tokens_known: false,
+                reasoning_tokens: 0,
+                total_tokens: 2,
+                latency_ms: 1,
+                fast: false,
+            })
+            .unwrap();
     }
     clock.store(now + 59_999, Ordering::SeqCst);
     assert_eq!(store.totals().unwrap().requests, 150, "not due yet");
     clock.store(now + 60_000, Ordering::SeqCst);
-    assert_eq!(store.totals().unwrap().requests, 50, "runtime maintenance is due");
+    assert_eq!(
+        store.totals().unwrap().requests,
+        50,
+        "runtime maintenance is due"
+    );
     assert!(store.detail("maintenance-99").unwrap().is_none());
     assert!(store.detail("maintenance-100").unwrap().is_some());
     drop(store); // Joins the owned worker before deleting its SQLite files.
@@ -85,25 +107,46 @@ fn runtime_maintenance_enforces_configured_size_cap_without_retention() {
             ..HistoryConfig::default()
         },
         move || worker_clock.load(Ordering::SeqCst),
-    ) else { panic!("open cap fixture") };
+    ) else {
+        panic!("open cap fixture")
+    };
     for index in 0..10 {
-        store.insert(&UsageEvent {
-            event_id: format!("cap-{index}"), occurred_at_ms: index,
-            account_identifier: "fixture-account".into(), provider: "codex".into(),
-            model: "m".repeat(20_000), key_identifier: None, session_identifier: None,
-            status_code: 200, succeeded: true, input_tokens: 1, output_tokens: 1,
-            cached_input_tokens: 0, cached_input_tokens_known: false,
-            cache_write_tokens: 0, cache_write_tokens_known: false,
-            reasoning_tokens: 0, total_tokens: 2, latency_ms: 1,
-            fast: false,
-        }).unwrap();
+        store
+            .insert(&UsageEvent {
+                event_id: format!("cap-{index}"),
+                occurred_at_ms: index,
+                account_identifier: "fixture-account".into(),
+                provider: "codex".into(),
+                model: "m".repeat(20_000),
+                key_identifier: None,
+                session_identifier: None,
+                status_code: 200,
+                succeeded: true,
+                input_tokens: 1,
+                output_tokens: 1,
+                cached_input_tokens: 0,
+                cached_input_tokens_known: false,
+                cache_write_tokens: 0,
+                cache_write_tokens_known: false,
+                reasoning_tokens: 0,
+                total_tokens: 2,
+                latency_ms: 1,
+                fast: false,
+            })
+            .unwrap();
     }
     assert_eq!(store.totals().unwrap().requests, 10);
     clock.fetch_add(60_000, Ordering::SeqCst);
     let remaining = store.totals().unwrap().requests;
-    assert!(remaining < 10, "runtime size cap must delete rows, got {remaining}");
+    assert!(
+        remaining < 10,
+        "runtime size cap must delete rows, got {remaining}"
+    );
     let result = store.prune(clock.load(Ordering::SeqCst)).unwrap();
-    assert_eq!(result.deleted_events, 0, "scheduled maintenance already enforced the cap");
+    assert_eq!(
+        result.deleted_events, 0,
+        "scheduled maintenance already enforced the cap"
+    );
     assert!(result.size_cap_satisfied);
     assert!(result.logical_size_bytes <= 100_000);
     drop(store);
@@ -126,17 +169,28 @@ impl Drop for Fixture {
 fn fixture(label: &str, upstream: Option<&str>, queue_capacity: usize) -> Fixture {
     let dir = unique_temp_dir(&format!("t24-request-history-{label}"));
     let mut credential: Value = serde_json::from_str(&create_auth_file_json(
-        "history-account", "account-24", "upstream-token", upstream,
-    )).unwrap();
-    credential["usage_override"] = Value::String(
-        upstream.unwrap_or("http://127.0.0.1:18899").to_string(),
-    );
-    std::fs::write(dir.join("codex-history.json"), credential.to_string()).expect("credential fixture");
-    std::fs::write(
-        dir.join("config.yaml"),
-        "logging-to-file: false\nremote-management:\n  secret-key: task-15-export-secret\n",
-    )
-    .expect("config fixture");
+        "history-account",
+        "account-24",
+        "upstream-token",
+        upstream,
+    ))
+    .unwrap();
+    credential["usage_override"] =
+        Value::String(upstream.unwrap_or("http://127.0.0.1:18899").to_string());
+    std::fs::write(dir.join("codex-history.json"), credential.to_string())
+        .expect("credential fixture");
+    mahoquot_gateway::management::settings::Settings {
+        api_keys: vec![API_KEY.to_string()],
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: EXPORT_SECRET.to_string(),
+            ..Default::default()
+        },
+        auth_dir: dir.to_string_lossy().into_owned(),
+        logging_to_file: false,
+        ..Default::default()
+    }
+    .persist(&dir.join("config.yaml"))
+    .expect("persist management secret");
     let config = GatewayConfig {
         auth_dir: dir.clone(),
         config_path: dir.join("config.yaml"),
@@ -153,13 +207,15 @@ fn fixture(label: &str, upstream: Option<&str>, queue_capacity: usize) -> Fixtur
 }
 
 fn authed_request(method: &str, uri: &str, body: Body) -> Request<Body> {
-    Request::builder()
-        .method(method)
-        .uri(uri)
-        .header("authorization", format!("Bearer {API_KEY}"))
-        .header("content-type", "application/json")
-        .body(body)
-        .expect("request")
+    with_loopback_peer(
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("X-Management-Key", EXPORT_SECRET)
+            .header("content-type", "application/json")
+            .body(body)
+            .expect("request"),
+    )
 }
 
 async fn json(response: Response) -> Value {
@@ -221,10 +277,14 @@ async fn streaming_and_nonstreaming_events_match_analytics() {
         let mut payload: Value =
             serde_json::from_str(OPENAI_REQUEST).expect("canonical OpenAI fixture");
         payload["stream"] = Value::Bool(stream);
-        let request = authed_request(
-            "POST",
-            "/v1/chat/completions",
-            Body::from(payload.to_string()),
+        let request = with_loopback_peer(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", format!("Bearer {API_KEY}"))
+                .header("content-type", "application/json")
+                .body(Body::from(payload.to_string()))
+                .expect("relay request"),
         );
         let response = fixture
             .app
@@ -321,15 +381,18 @@ async fn full_channel_is_nonblocking() {
         .execute_batch("BEGIN IMMEDIATE")
         .expect("lock history database");
 
-    let started = Instant::now();
+    // The writer is stuck behind the database lock and the queue holds one
+    // event, so a non-blocking enqueue must report drops instead of waiting.
+    let mut dropped = 0_u64;
     for index in 0..1_000_u64 {
-        fixture.state.history.enqueue(UsageEvent {
+        let accepted = fixture.state.history.enqueue(UsageEvent {
             event_id: format!("overflow-{index}"),
             occurred_at_ms: index as i64,
             account_identifier: "history-account".to_string(),
             provider: "codex".to_string(),
             model: "gpt-5.1-codex".to_string(),
-            key_identifier: Some("key-label".to_string()), session_identifier: None,
+            key_identifier: Some("key-label".to_string()),
+            session_identifier: None,
             status_code: 200,
             succeeded: true,
             input_tokens: 1,
@@ -343,11 +406,13 @@ async fn full_channel_is_nonblocking() {
             latency_ms: 1,
             fast: false,
         });
+        if !accepted {
+            dropped += 1;
+        }
     }
-    let elapsed = started.elapsed();
     assert!(
-        elapsed < Duration::from_millis(250),
-        "bounded enqueue blocked for {elapsed:?}"
+        dropped > 0,
+        "full bounded queue must drop instead of blocking"
     );
 
     let response = fixture
@@ -427,7 +492,8 @@ async fn cancelled_clear_preserves_rows() {
         account_identifier: "history-account".to_string(),
         provider: "codex".to_string(),
         model: "gpt-5.1-codex".to_string(),
-        key_identifier: Some("key-label".to_string()), session_identifier: None,
+        key_identifier: Some("key-label".to_string()),
+        session_identifier: None,
         status_code: 200,
         succeeded: true,
         input_tokens: 1,
@@ -479,7 +545,8 @@ async fn confirmed_filtered_clear_deletes_only_the_selected_scope() {
             account_identifier: account.to_string(),
             provider: "codex".to_string(),
             model: "gpt-5.1-codex".to_string(),
-            key_identifier: Some("key-label".to_string()), session_identifier: None,
+            key_identifier: Some("key-label".to_string()),
+            session_identifier: None,
             status_code: 200,
             succeeded: true,
             input_tokens: 1,
@@ -554,13 +621,13 @@ async fn unauthorized_export_is_401() {
     let response = fixture
         .app
         .clone()
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .method("GET")
                 .uri("/v0/management/history/export?format=csv")
                 .body(Body::empty())
                 .expect("unauthorized export request"),
-        )
+        ))
         .await
         .expect("unauthorized export response");
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -581,7 +648,8 @@ fn enqueue_event(
         account_identifier: account.to_string(),
         provider: provider.to_string(),
         model: model.to_string(),
-        key_identifier: Some(key.to_string()), session_identifier: None,
+        key_identifier: Some(key.to_string()),
+        session_identifier: None,
         status_code: status,
         succeeded: status < 400,
         input_tokens: 100 + index,
@@ -802,15 +870,17 @@ async fn pages_filters_detail_clear_and_exports_large_history() {
     assert_eq!(json(count).await["count"], 1_000);
 
     let export_request = |format: &str| {
-        Request::builder()
-            .method("GET")
-            .uri(format!(
-                "/v0/management/history/export?format={format}&{query}"
-            ))
-            .header("authorization", format!("Bearer {API_KEY}"))
-            .header("x-mahoquot-export-authorization", EXPORT_SECRET)
-            .body(Body::empty())
-            .expect("authorized export request")
+        with_loopback_peer(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/v0/management/history/export?format={format}&{query}"
+                ))
+                .header("X-Management-Key", EXPORT_SECRET)
+                .header("x-mahoquot-export-authorization", EXPORT_SECRET)
+                .body(Body::empty())
+                .expect("authorized export request"),
+        )
     };
     let csv = fixture
         .app
@@ -836,15 +906,15 @@ async fn pages_filters_detail_clear_and_exports_large_history() {
     let csv_all = fixture
         .app
         .clone()
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .method("GET")
                 .uri("/v0/management/history/export?format=csv")
-                .header("authorization", format!("Bearer {API_KEY}"))
+                .header("X-Management-Key", EXPORT_SECRET)
                 .header("x-mahoquot-export-authorization", EXPORT_SECRET)
                 .body(Body::empty())
                 .expect("authorized full csv export request"),
-        )
+        ))
         .await
         .expect("full csv export");
     assert_eq!(csv_all.status(), StatusCode::OK);
@@ -1021,7 +1091,8 @@ async fn one_invalid_event_does_not_discard_the_valid_events_in_its_batch() {
         account_identifier: "history-account".to_string(),
         provider: "codex".to_string(),
         model: "gpt-5.1-codex".to_string(),
-        key_identifier: Some(id.to_string()), session_identifier: None,
+        key_identifier: Some(id.to_string()),
+        session_identifier: None,
         status_code: 200,
         succeeded: true,
         input_tokens: 1,
@@ -1036,9 +1107,15 @@ async fn one_invalid_event_does_not_discard_the_valid_events_in_its_batch() {
         fast: false,
     };
 
-    fixture.state.history.enqueue(make("k1", "batch-good-1".to_string()));
+    fixture
+        .state
+        .history
+        .enqueue(make("k1", "batch-good-1".to_string()));
     fixture.state.history.enqueue(make("k2", "   ".to_string()));
-    fixture.state.history.enqueue(make("k3", "batch-good-2".to_string()));
+    fixture
+        .state
+        .history
+        .enqueue(make("k3", "batch-good-2".to_string()));
     fixture.state.history.flush().expect("flush ingest worker");
 
     let totals = fixture
@@ -1059,7 +1136,6 @@ async fn one_invalid_event_does_not_discard_the_valid_events_in_its_batch() {
     );
 }
 
-
 /// The export endpoint materialises every matching row into a Vec and then a
 /// second full JSON/CSV copy. With a 512MB retention budget that is unbounded
 /// peak memory, so the row set must be capped rather than growing with the table.
@@ -1077,7 +1153,8 @@ async fn export_is_bounded_instead_of_returning_every_row() {
             account_identifier: "history-account".to_string(),
             provider: "codex".to_string(),
             model: "gpt-5.1-codex".to_string(),
-            key_identifier: Some("key-label".to_string()), session_identifier: None,
+            key_identifier: Some("key-label".to_string()),
+            session_identifier: None,
             status_code: 200,
             succeeded: true,
             input_tokens: 1,

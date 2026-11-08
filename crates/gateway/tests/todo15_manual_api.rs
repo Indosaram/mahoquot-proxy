@@ -20,7 +20,9 @@ fn request(method: &str, uri: &str, export: bool) -> Request<Body> {
     let mut builder = Request::builder()
         .method(method)
         .uri(uri)
-        .header("authorization", format!("Bearer {MANAGEMENT_KEY}"));
+        // Task 26: the configured remote-management secret (EXPORT_SECRET in
+        // this fixture) is the only management credential.
+        .header("X-Management-Key", EXPORT_SECRET);
     if export {
         builder = builder.header("x-mahoquot-export-authorization", EXPORT_SECRET);
     }
@@ -91,11 +93,11 @@ async fn manual_api_driver() {
 
     let page = json(
         app.clone()
-            .oneshot(request(
+            .oneshot(common::with_loopback_peer(request(
                 "GET",
                 &format!("/v0/management/history/events?limit=2&{query}"),
                 false,
-            ))
+            )))
             .await
             .expect("manual QA page"),
     )
@@ -106,11 +108,11 @@ async fn manual_api_driver() {
 
     let page_2 = json(
         app.clone()
-            .oneshot(request(
+            .oneshot(common::with_loopback_peer(request(
                 "GET",
                 &format!("/v0/management/history/events?limit=2&cursor={cursor}&{query}"),
                 false,
-            ))
+            )))
             .await
             .expect("manual QA second page"),
     )
@@ -120,11 +122,11 @@ async fn manual_api_driver() {
 
     let count = json(
         app.clone()
-            .oneshot(request(
+            .oneshot(common::with_loopback_peer(request(
                 "GET",
                 &format!("/v0/management/history/count?{query}"),
                 false,
-            ))
+            )))
             .await
             .expect("manual QA count"),
     )
@@ -134,11 +136,11 @@ async fn manual_api_driver() {
 
     let detail = json(
         app.clone()
-            .oneshot(request(
+            .oneshot(common::with_loopback_peer(request(
                 "GET",
                 "/v0/management/history/events/manual-0",
                 false,
-            ))
+            )))
             .await
             .expect("manual QA detail"),
     )
@@ -148,11 +150,11 @@ async fn manual_api_driver() {
 
     let csv = app
         .clone()
-        .oneshot(request(
+        .oneshot(common::with_loopback_peer(request(
             "GET",
             &format!("/v0/management/history/export?format=csv&{query}"),
             true,
-        ))
+        )))
         .await
         .expect("manual QA CSV");
     assert!(csv.status().is_success());
@@ -172,11 +174,11 @@ async fn manual_api_driver() {
 
     let clear = json(
         app.clone()
-            .oneshot(request(
+            .oneshot(common::with_loopback_peer(request(
                 "DELETE",
                 &format!("/v0/management/history/events?confirm=true&{query}"),
                 false,
-            ))
+            )))
             .await
             .expect("manual QA clear"),
     )
@@ -187,9 +189,13 @@ async fn manual_api_driver() {
     println!("cleared=3 dashboard_removed=true proxy_files_removed=false");
 
     let remaining = json(
-        app.oneshot(request("GET", "/v0/management/history/count", false))
-            .await
-            .expect("manual QA remaining count"),
+        app.oneshot(common::with_loopback_peer(request(
+            "GET",
+            "/v0/management/history/count",
+            false,
+        )))
+        .await
+        .expect("manual QA remaining count"),
     )
     .await;
     assert_eq!(remaining["count"], 3);

@@ -51,9 +51,21 @@ fn cursor_and_kiro_quota_payloads_normalize_to_account_usage() {
         1_800_000_000,
     );
     assert_eq!(cursor.plan_type.as_deref(), Some("pro"));
+    assert_eq!(cursor.observed_at_unix, Some(1_800_000_000));
+    assert_eq!(
+        cursor.groups[0].buckets[0].display_name.as_deref(),
+        Some("Plan")
+    );
     assert_eq!(cursor.groups[0].buckets[0].used_percent, Some(75.0));
+    assert_eq!(
+        cursor.groups[0].buckets[1].display_name.as_deref(),
+        Some("On-Demand")
+    );
     assert_eq!(cursor.groups[0].buckets[1].used_percent, Some(20.0));
-    assert_eq!(cursor.groups[0].buckets[0].reset_at_unix, Some(1_893_456_000));
+    assert_eq!(
+        cursor.groups[0].buckets[0].reset_at_unix,
+        Some(1_893_456_000)
+    );
 
     let kiro = parse_kiro_usage_summary(
         &serde_json::json!({
@@ -63,6 +75,7 @@ fn cursor_and_kiro_quota_payloads_normalize_to_account_usage() {
         }),
         1_800_000_000,
     );
+    assert_eq!(kiro.observed_at_unix, Some(1_800_000_000));
     assert_eq!(kiro.groups[0].buckets[0].used_percent, Some(30.0));
     assert_eq!(kiro.groups[0].buckets[0].reset_at_unix, Some(1_900_000_000));
 }
@@ -174,6 +187,7 @@ async fn reset_credit_refresh_retry_is_idempotent() {
 async fn reset_credit_route_selects_codex_when_another_provider_shares_id() {
     use axum::body::Body;
     use axum::http::Request;
+    use common::with_loopback_peer;
     use http_body_util::BodyExt;
     use mahoquot_gateway::account::ProviderKind;
     use mahoquot_gateway::inbound::ApiKeys;
@@ -182,29 +196,56 @@ async fn reset_credit_route_selects_codex_when_another_provider_shares_id() {
     // Given a non-Codex account appears first with the same runtime id.
     let auth_dir = unique_temp_dir("reset-provider-collision");
     for (name, provider) in [("a-other.json", "antigravity"), ("b-codex.json", "codex")] {
-        std::fs::write(auth_dir.join(name), serde_json::to_vec(&serde_json::json!({
-            "type": provider,
-            "identity_slug": "shared-reset",
-            "access_token": "token",
-            "refresh_token": "refresh",
-            "project_id": "reset-project",
-            "account_id": "account",
-            "email": "reset@example.test",
-            "expired": "2099-01-01T00:00:00Z",
-            "id_token": "id",
-            "last_refresh": "2026-01-01T00:00:00Z",
-            "upstream_override": "http://127.0.0.1:18899"
-        })).unwrap()).unwrap();
+        std::fs::write(
+            auth_dir.join(name),
+            serde_json::to_vec(&serde_json::json!({
+                "type": provider,
+                "identity_slug": "shared-reset",
+                "access_token": "token",
+                "refresh_token": "refresh",
+                "project_id": "reset-project",
+                "account_id": "account",
+                "email": "reset@example.test",
+                "expired": "2099-01-01T00:00:00Z",
+                "id_token": "id",
+                "last_refresh": "2026-01-01T00:00:00Z",
+                "upstream_override": "http://127.0.0.1:18899"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
     }
-    let state = Arc::new(AppState::new(&GatewayConfig {
+    let config = GatewayConfig {
         auth_dir: auth_dir.clone(),
         config_path: auth_dir.join("config.yaml"),
         api_keys: ApiKeys::new(vec!["reset-test".to_string()]),
         auth_refresh_enabled: false,
         ..GatewayConfig::default()
-    }).unwrap());
-    assert_eq!(state.find_member("shared-reset").unwrap().kind(), ProviderKind::Antigravity);
-    let codex = state.pool.load().members.iter().find(|m| m.kind() == ProviderKind::Codex).unwrap().clone();
+    };
+    mahoquot_gateway::management::settings::Settings {
+        api_keys: vec!["reset-test".into()],
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: "reset-test".into(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(&config.config_path)
+    .unwrap();
+    let state = Arc::new(AppState::new(&config).unwrap());
+    assert_eq!(
+        state.find_member("shared-reset").unwrap().kind(),
+        ProviderKind::Antigravity
+    );
+    let codex = state
+        .pool
+        .load()
+        .members
+        .iter()
+        .find(|m| m.kind() == ProviderKind::Codex)
+        .unwrap()
+        .clone();
     assert_eq!(codex.id, "shared-reset");
     codex.set_usage(mahoquot_gateway::usage::AccountUsage {
         reset_credits_available: Some(0),
@@ -213,16 +254,28 @@ async fn reset_credit_route_selects_codex_when_another_provider_shares_id() {
     });
 
     // When the real reset route resolves the shared id (no upstream needed).
-    let response = mahoquot_gateway::routes::create_app(state).oneshot(
-        Request::builder().method("POST").uri("/admin/accounts/shared-reset/reset")
-            .header("Authorization", "Bearer reset-test").body(Body::empty()).unwrap()
-    ).await.unwrap();
+    let response = mahoquot_gateway::routes::create_app(state)
+        .oneshot(with_loopback_peer(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/accounts/shared-reset/reset")
+                .header("X-Management-Key", "reset-test")
+                .body(Body::empty())
+                .unwrap(),
+        ))
+        .await
+        .unwrap();
     let status = response.status();
     let body = response.into_body().collect().await.unwrap().to_bytes();
     std::fs::remove_dir_all(auth_dir).unwrap();
 
     // Then Codex's empty banked-reset balance is reported, not unsupported provider.
-    assert_eq!(status, StatusCode::CONFLICT, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
 }
 
 #[test]
@@ -328,7 +381,12 @@ fn partial_header_updates_preserve_reset_credits_and_poll_freshness() {
     let auth_dir = unique_temp_dir("codex-partial-headers");
     std::fs::write(
         auth_dir.join("codex-plain.json"),
-        common::create_auth_file_json("quota-partial", "acc-123", "token", Some("http://127.0.0.1:18899")),
+        common::create_auth_file_json(
+            "quota-partial",
+            "acc-123",
+            "token",
+            Some("http://127.0.0.1:18899"),
+        ),
     )
     .unwrap();
     let state = AppState::new(&GatewayConfig {
@@ -528,10 +586,19 @@ fn quota_snapshot_age_marks_only_successful_snapshot_stale() {
         refresh_status: Some("ok".into()),
         ..Default::default()
     });
-    assert_eq!(member.usage_snapshot_at(1360).refresh_status.as_deref(), Some("ok"));
-    assert_eq!(member.usage_snapshot_at(1361).refresh_status.as_deref(), Some("stale"));
+    assert_eq!(
+        member.usage_snapshot_at(1360).refresh_status.as_deref(),
+        Some("ok")
+    );
+    assert_eq!(
+        member.usage_snapshot_at(1361).refresh_status.as_deref(),
+        Some("stale")
+    );
     member.record_quota_refresh_failure("429");
-    assert_eq!(member.usage_snapshot_at(2000).refresh_status.as_deref(), Some("error"));
+    assert_eq!(
+        member.usage_snapshot_at(2000).refresh_status.as_deref(),
+        Some("error")
+    );
 }
 
 #[test]
@@ -539,7 +606,12 @@ fn quota_refresh_failure_records_error_without_discarding_last_valid_snapshot() 
     let auth_dir = unique_temp_dir("codex-refresh-failure");
     std::fs::write(
         auth_dir.join("codex-plain.json"),
-        common::create_auth_file_json("quota-failure", "acc-123", "token", Some("http://127.0.0.1:18899")),
+        common::create_auth_file_json(
+            "quota-failure",
+            "acc-123",
+            "token",
+            Some("http://127.0.0.1:18899"),
+        ),
     )
     .unwrap();
     let state = AppState::new(&GatewayConfig {
@@ -576,7 +648,10 @@ fn quota_refresh_failure_records_error_without_discarding_last_valid_snapshot() 
 
     let snapshot = member.usage_snapshot();
     // Error recorded:
-    assert_eq!(snapshot.last_refresh_error.as_deref(), Some("Rate limited (429)"));
+    assert_eq!(
+        snapshot.last_refresh_error.as_deref(),
+        Some("Rate limited (429)")
+    );
     assert_eq!(snapshot.refresh_status.as_deref(), Some("error"));
 
     // Previous valid snapshot preserved:
@@ -586,4 +661,41 @@ fn quota_refresh_failure_records_error_without_discarding_last_valid_snapshot() 
     assert_eq!(snapshot.plan_type.as_deref(), Some("plus"));
 
     std::fs::remove_dir_all(auth_dir).ok();
+}
+
+/// Cursor reports the auto and named pools separately. A live ultra account can sit at 3%
+/// total while its named pool is fully spent, which is why `cursor/auto` answers and
+/// `cursor/claude-opus-5.5` is rejected. The total must not hide that split.
+#[test]
+fn cursor_quota_separates_auto_and_named_pools() {
+    let usage = parse_cursor_usage_summary(
+        &serde_json::json!({
+            "membershipType": "ultra",
+            "billingCycleEnd": "2026-11-16T16:48:30Z",
+            "individualUsage": {
+                "plan": {
+                    "enabled": true,
+                    "used": 10258,
+                    "limit": 40000,
+                    "remaining": 29742,
+                    "autoPercentUsed": 0.07666666666666667,
+                    "apiPercentUsed": 100,
+                    "totalPercentUsed": 3.309032258064516
+                },
+                "onDemand": { "enabled": false }
+            }
+        }),
+        1_800_000_000,
+    );
+    let buckets = &usage.groups[0].buckets;
+    let by_name = |name: &str| {
+        buckets
+            .iter()
+            .find(|bucket| bucket.display_name.as_deref() == Some(name))
+            .unwrap_or_else(|| panic!("missing {name} bucket"))
+            .used_percent
+    };
+    assert_eq!(by_name("Named"), Some(100.0));
+    assert_eq!(by_name("Auto"), Some(0.08));
+    assert_eq!(by_name("Plan"), Some(25.64));
 }

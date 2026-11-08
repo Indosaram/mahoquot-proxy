@@ -38,7 +38,9 @@ use prost::Message;
 use serde::{Deserialize, Serialize};
 
 use crate::account::AccountMember;
-use crate::compat::devin_proto::{GetCascadeModelConfigsRequest, GetCascadeModelConfigsResponse, Metadata};
+use crate::compat::devin_proto::{
+    GetCascadeModelConfigsRequest, GetCascadeModelConfigsResponse, Metadata,
+};
 
 /// 5-minute TTL for model discovery cache.
 pub const DEVIN_CATALOG_TTL_SECS: u64 = 300;
@@ -222,7 +224,9 @@ impl DevinDiscoveryError {
         match self {
             Self::Network => "upstream network connection failed",
             Self::Timeout => "upstream request timed out",
-            Self::InvalidContentType => "upstream returned invalid content type; expected application/proto",
+            Self::InvalidContentType => {
+                "upstream returned invalid content type; expected application/proto"
+            }
             Self::BodyTooLarge => "upstream response body exceeded 16 MiB limit",
             Self::HttpStatus { status } => match status.as_u16() {
                 401 => "upstream authentication failed (HTTP 401)",
@@ -233,7 +237,9 @@ impl DevinDiscoveryError {
                 _ => "upstream returned HTTP error status",
             },
             Self::Decode => "upstream returned malformed protobuf response",
-            Self::StalePublication => "discovery publication aborted due to concurrent credential change",
+            Self::StalePublication => {
+                "discovery publication aborted due to concurrent credential change"
+            }
             Self::ClientBuild => "failed to build upstream HTTP client",
             Self::Internal(_) => "internal discovery error",
         }
@@ -304,7 +310,8 @@ async fn fetch_devin_model_catalog_inner(
     token: &str,
 ) -> Result<Vec<DiscoveredDevinModel>, DevinDiscoveryError> {
     let clean_base = base_url.trim_end_matches('/');
-    let target_url = format!("{clean_base}/exa.api_server_pb.ApiServerService/GetCascadeModelConfigs");
+    let target_url =
+        format!("{clean_base}/exa.api_server_pb.ApiServerService/GetCascadeModelConfigs");
 
     let req = GetCascadeModelConfigsRequest {
         metadata: Some(Metadata {
@@ -499,7 +506,9 @@ pub async fn refresh_account_models(
     state_cache: Option<&DevinDiscoveryCache>,
 ) -> Result<Arc<DevinAccountCatalogState>, DevinDiscoveryError> {
     if member.kind() != crate::account::ProviderKind::Devin {
-        return Err(DevinDiscoveryError::Internal("account is not a Devin account"));
+        return Err(DevinDiscoveryError::Internal(
+            "account is not a Devin account",
+        ));
     }
 
     // Capture pre-await snapshot of credentials and identity
@@ -527,7 +536,10 @@ pub async fn refresh_account_models(
     };
 
     // Sample strictly monotonic request sequence before issuing upstream RPC
-    let request_seq = member.devin_discovery_seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    let request_seq = member
+        .devin_discovery_seq
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        + 1;
 
     let fetch_res = fetch_devin_model_catalog(client, &pre_base_url, &pre_token).await;
 
@@ -565,14 +577,17 @@ pub async fn refresh_account_models(
 
     match fetch_res {
         Ok(models) => {
-            let state = Arc::new(DevinAccountCatalogState::new_success(key.clone(), models, now_unix).with_sequence(request_seq));
+            let state = Arc::new(
+                DevinAccountCatalogState::new_success(key.clone(), models, now_unix)
+                    .with_sequence(request_seq),
+            );
             Ok(state)
         }
         Err(err) => {
             let safe_err = err.safe_message();
-            let existing = member.devin_catalog_state().or_else(|| {
-                state_cache.and_then(|c| c.get(&key))
-            });
+            let existing = member
+                .devin_catalog_state()
+                .or_else(|| state_cache.and_then(|c| c.get(&key)));
             if let Some(existing) = existing {
                 if existing.key == key && existing.has_succeeded {
                     let mut updated = (*existing).clone();
@@ -631,7 +646,10 @@ mod tests {
         // the same identity slug instead of accumulating a second entry.
         let newer = cache_key("devin-live", "token-2");
         cache.insert(newer.clone(), catalog(&newer, 1_726_000_100));
-        assert!(cache.get(&older).is_none(), "older revision must be dropped");
+        assert!(
+            cache.get(&older).is_none(),
+            "older revision must be dropped"
+        );
         assert!(cache.get(&newer).is_some());
         assert_eq!(cache.tracked_accounts(), vec!["devin-live".to_string()]);
 

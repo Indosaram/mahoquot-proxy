@@ -19,11 +19,15 @@ async fn glm_preserves_usage_presence_and_does_not_inject_cache_routing_fields()
             3 => usage["prompt_tokens_details"] = json!({"cached_tokens": 80}),
             _ => {}
         }
-        axum::Json(json!({"id": "fixture", "object": "chat.completion", "choices": [], "usage": usage}))
+        axum::Json(
+            json!({"id": "fixture", "object": "chat.completion", "choices": [], "usage": usage}),
+        )
     }
     let mut listener = None;
     for port in 18860..=18879 {
-        if let Ok(bound) = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await {
+        if let Ok(bound) =
+            tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await
+        {
             listener = Some(bound);
             break;
         }
@@ -32,15 +36,29 @@ async fn glm_preserves_usage_presence_and_does_not_inject_cache_routing_fields()
     let upstream = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn({
         let seen = seen.clone();
-        async move { axum::serve(listener, Router::new().fallback(post(capture)).with_state(seen)).await.unwrap() }
+        async move {
+            axum::serve(
+                listener,
+                Router::new().fallback(post(capture)).with_state(seen),
+            )
+            .await
+            .unwrap()
+        }
     });
     let auth = common::unique_temp_dir("cache-glm-wire");
-    std::fs::write(auth.join("generic-cline-fixture.json"), json!({
-        "type": "generic", "provider": "cline", "adapter": "openai-chat",
-        "base_url": upstream, "api_key": "fixture", "models": ["z-ai/glm-5.3-flash"]
-    }).to_string()).unwrap();
+    std::fs::write(
+        auth.join("generic-cline-fixture.json"),
+        json!({
+            "type": "generic", "provider": "cline", "adapter": "openai-chat",
+            "base_url": upstream, "api_key": "fixture", "models": ["z-ai/glm-5.3-flash"]
+        })
+        .to_string(),
+    )
+    .unwrap();
     let config = GatewayConfig {
-        auth_dir: auth.clone(), config_path: auth.join("config.yaml"), auth_refresh_enabled: false,
+        auth_dir: auth.clone(),
+        config_path: auth.join("config.yaml"),
+        auth_refresh_enabled: false,
         api_keys: mahoquot_gateway::inbound::ApiKeys::from_env_value("fixture-key"),
         ..GatewayConfig::default()
     };
@@ -50,16 +68,31 @@ async fn glm_preserves_usage_presence_and_does_not_inject_cache_routing_fields()
         "tools": [{"type": "function", "function": {"name": "fixture", "parameters": {"type": "object"}}}]
     });
     for expected in [None, Some(0), Some(80)] {
-        let response = tokio::time::timeout(std::time::Duration::from_secs(5), app.clone().oneshot(
-            axum::http::Request::post("/v1/chat/completions")
-                .header("authorization", "Bearer fixture-key").header("content-type", "application/json")
-                .header("x-session-id", "stable-fixture")
-                .body(axum::body::Body::from(request_body.to_string())).unwrap()
-        )).await.unwrap().unwrap();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            app.clone().oneshot(
+                axum::http::Request::post("/v1/chat/completions")
+                    .header("authorization", "Bearer fixture-key")
+                    .header("content-type", "application/json")
+                    .header("x-session-id", "stable-fixture")
+                    .body(axum::body::Body::from(request_body.to_string()))
+                    .unwrap(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(response.status(), 200);
-        let raw = axum::body::to_bytes(response.into_body(), 1_000_000).await.unwrap();
+        let raw = axum::body::to_bytes(response.into_body(), 1_000_000)
+            .await
+            .unwrap();
         let output: Value = serde_json::from_slice(&raw).unwrap();
-        assert_eq!(output.pointer("/usage/prompt_tokens_details/cached_tokens").and_then(Value::as_u64), expected);
+        assert_eq!(
+            output
+                .pointer("/usage/prompt_tokens_details/cached_tokens")
+                .and_then(Value::as_u64),
+            expected
+        );
         let usage = mahoquot_gateway::usage::extract_response_token_usage(&raw, &raw).unwrap();
         assert_eq!(usage.cached_input_tokens_known, expected.is_some());
         assert_eq!(usage.cached_input_tokens, expected.unwrap_or(0));

@@ -13,7 +13,8 @@ use mahoquot_gateway::state::AppState;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
-const TEST_API_KEY: &str = "test-mgmt-key";
+const TEST_API_KEY: &str = "test-key-provider-api-key";
+const TEST_MANAGEMENT_KEY: &str = "test-management-secret";
 
 struct TestContext {
     auth_dir: PathBuf,
@@ -37,6 +38,11 @@ fn setup_test_context(tag: &str) -> TestContext {
             .as_nanos()
     ));
     std::fs::create_dir_all(&auth_dir).expect("create test auth dir");
+    std::fs::write(
+        auth_dir.join("config.yaml"),
+        format!("remote-management:\n  secret-key: {TEST_MANAGEMENT_KEY}\n"),
+    )
+    .expect("write management test secret");
 
     let config = GatewayConfig {
         auth_dir: auth_dir.clone(),
@@ -54,10 +60,10 @@ async fn send_request(
     uri: &str,
     body: Option<Value>,
 ) -> (StatusCode, Value) {
-    let mut req_builder = Request::builder()
-        .method(method)
-        .uri(uri)
-        .header(header::AUTHORIZATION, format!("Bearer {TEST_API_KEY}"));
+    let mut req_builder = Request::builder().method(method).uri(uri).header(
+        header::AUTHORIZATION,
+        format!("Bearer {TEST_MANAGEMENT_KEY}"),
+    );
 
     let req_body = if let Some(b) = body {
         req_builder = req_builder.header(header::CONTENT_TYPE, "application/json");
@@ -66,7 +72,7 @@ async fn send_request(
         Body::empty()
     };
 
-    let req = req_builder.body(req_body).expect("request build");
+    let req = common::with_loopback_peer(req_builder.body(req_body).expect("request build"));
     let resp = app.clone().oneshot(req).await.expect("service oneshot");
     let status = resp.status();
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
@@ -327,12 +333,17 @@ async fn test_unauthenticated_request_is_rejected() {
     let state = Arc::new(AppState::new(&ctx.config).expect("app state"));
     let app = create_app(state);
 
-    let req = Request::builder()
-        .method(Method::GET)
-        .uri("/v0/management/claude-api-key")
-        .body(Body::empty())
-        .expect("request");
+    let req = common::with_loopback_peer(
+        Request::builder()
+            .method(Method::GET)
+            .uri("/v0/management/claude-api-key")
+            .body(Body::empty())
+            .expect("request"),
+    );
 
-    let resp = app.oneshot(req).await.expect("service oneshot");
+    let resp = app
+        .oneshot(common::with_loopback_peer(req))
+        .await
+        .expect("service oneshot");
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }

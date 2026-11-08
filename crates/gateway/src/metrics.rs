@@ -1,7 +1,6 @@
 use mahoquot_types::Health;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 
 use crate::monitor::{LastError, TtftSnapshot};
 use crate::telemetry::TelemetryBucket;
@@ -24,14 +23,6 @@ pub struct RegistryRefreshMetrics {
 pub struct GatewayMetrics {
     pub served: AtomicU64,
     pub failed_over: AtomicU64,
-    /// Turns where the upstream's own envelope named a model other than the one
-    /// the gateway sent. The Codex backend does this deliberately through its
-    /// safety-buffering path; the count makes that visible without changing
-    /// routing.
-    ///
-    /// Held behind `Arc` because a relayed body outlives the request handler and
-    /// must be able to increment it from inside the response stream.
-    pub served_model_substitutions: Arc<AtomicU64>,
     pub exposed_errors: AtomicU64,
     pub exposed_client_errors: AtomicU64,
     pub history_dropped: AtomicU64,
@@ -104,26 +95,6 @@ pub struct AccountStats {
     pub discovery: Option<AccountDiscoveryMetadata>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credits_after_limit: Option<bool>,
-    /// Claude OAuth/API-key safety state; absent for every other provider.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub claude: Option<ClaudeAccountSafety>,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq)]
-pub struct ClaudeAccountSafety {
-    /// `oauth_first` | `api_key_first` | `api_key_only`.
-    pub route_mode: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub suspected_reason: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub suspected_at_unix: Option<i64>,
-    /// Sessions durably pinned to this account.
-    pub affinity_bindings: usize,
-    /// Warmup probes sent in the last 24 hours.
-    pub probes_24h: usize,
-    /// Host of the per-account egress proxy, never the full URL.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub egress_host: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -173,10 +144,6 @@ pub struct AdminStatsResponse {
     pub in_flight: u64,
     pub served: u64,
     pub failed_over: u64,
-    /// Turns whose upstream envelope named a different model than the gateway
-    /// requested. See `GatewayMetrics::served_model_substitutions`.
-    #[serde(default)]
-    pub served_model_substitutions: u64,
     pub refreshed: u64,
     pub exposed_errors: u64,
     pub exposed_client_errors: u64,

@@ -9,6 +9,7 @@ use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
+use futures::StreamExt;
 use mahoquot_registry::{ModelCapability, ProviderBinding, ProviderId};
 use mahoquot_types::{Health, Outcome, PoolMember, SessionHint};
 
@@ -16,6 +17,36 @@ use crate::account::AccountMember;
 use crate::compat;
 use crate::state::AppState;
 use crate::usage::{parse_claude_headers, parse_codex_headers};
+
+fn account_retry_limit(member: &AccountMember, global_retry: i64) -> usize {
+    member
+        .request_retry_override()
+        .unwrap_or(global_retry.max(0))
+        .max(0) as usize
+}
+
+fn retry_round_allows(member: &AccountMember, round: usize, global_retry: i64) -> bool {
+    round == 0 || account_retry_limit(member, global_retry) >= round
+}
+
+fn retry_status(status: u16) -> bool {
+    matches!(status, 403 | 408 | 429 | 500 | 502 | 503 | 504)
+}
+
+fn retry_round_wait_ms(
+    deadlines_ms: impl IntoIterator<Item = i64>,
+    now_ms: i64,
+    max_interval_secs: i64,
+) -> Option<u64> {
+    let max_wait_ms = u64::try_from(max_interval_secs.max(0))
+        .ok()?
+        .saturating_mul(1000);
+    deadlines_ms
+        .into_iter()
+        .map(|deadline| u64::try_from(deadline.saturating_sub(now_ms).max(0)).unwrap_or(0))
+        .filter(|wait| *wait <= max_wait_ms)
+        .min()
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum RelayMode {
@@ -35,10 +66,228 @@ pub enum RelayMode {
     Responses,
 }
 
+pub(crate) async fn send_interactions(
+    state: &AppState,
+    member: &Arc<AccountMember>,
+    url: &str,
+    wire: &serde_json::Value,
+) -> Result<reqwest::Response, String> {
+    let client = state
+        .try_client_for_member(member)
+        .map_err(|error| error.to_string())?;
+    let body = serde_json::to_vec(wire).map_err(|error| error.to_string())?;
+    let settings = state.settings.current();
+    let retries = account_retry_limit(member, settings.request_retry);
+    let mut attempt = 0usize;
+    let mut refreshed = false;
+    loop {
+        let token = member.access_token();
+        let mut request = client.post(url).body(body.clone());
+        for (name, value) in member.build_upstream_headers() {
+            request = request.header(name, value);
+        }
+        request = request.header(header::CONTENT_TYPE, "application/json");
+        let response = request.send().await;
+        match response {
+            Ok(response)
+                if response.status() == StatusCode::UNAUTHORIZED
+                    && state.auth_refresh_enabled
+                    && !refreshed =>
+            {
+                refreshed = true;
+                drop(response);
+                state
+                    .refresh_member(member, Some(&token))
+                    .await
+                    .map_err(|error| error.to_string())?;
+                continue;
+            }
+            Ok(response) if retry_status(response.status().as_u16()) && attempt < retries => {
+                let wait = response
+                    .headers()
+                    .get(header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(0);
+                let max_wait = u64::try_from(settings.max_retry_interval.max(0)).unwrap_or(0);
+                if wait > max_wait {
+                    return Ok(response);
+                }
+                drop(response);
+                attempt = attempt.saturating_add(1);
+                if wait > 0 {
+                    tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                }
+            }
+            Ok(response) => return Ok(response),
+            Err(error) if attempt < retries => {
+                tracing::debug!(%error, "Interactions pre-commit transport retry");
+                attempt = attempt.saturating_add(1);
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // Keep the stable relay call contract unchanged.
+pub(crate) fn count_interactions_response(
+    state: Arc<AppState>,
+    member: Arc<AccountMember>,
+    auth: &crate::inbound::ResolvedAuth,
+    headers: &HeaderMap,
+    model: String,
+    bytes_in: usize,
+    started: std::time::Instant,
+    activity: crate::account::AccountActivity,
+    response: Response,
+) -> Response {
+    let status = response.status().as_u16();
+    let (parts, body) = response.into_parts();
+    let capture = Arc::new(std::sync::Mutex::new(None));
+    let usage_capture = Arc::clone(&capture);
+    let is_sse = parts
+        .headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.contains("event-stream"));
+    let observed = futures::stream::unfold(
+        (
+            body.into_data_stream(),
+            compat::events::SseParser::default(),
+            Vec::new(),
+        ),
+        move |(mut source, mut parser, mut json_body)| {
+            let capture = Arc::clone(&usage_capture);
+            async move {
+                let next = source.next().await?;
+                if let Ok(bytes) = &next {
+                    let mut frames = Vec::new();
+                    if is_sse {
+                        if let Err(error) = parser.push_raw_data(bytes, &mut frames) {
+                            return Some((
+                                Err(axum::Error::new(std::io::Error::other(error.message()))),
+                                (source, parser, json_body),
+                            ));
+                        }
+                    } else {
+                        if json_body.len().saturating_add(bytes.len()) > 32 * 1024 * 1024 {
+                            return Some((
+                                Err(axum::Error::new(std::io::Error::other(
+                                    "Interactions JSON exceeds limit",
+                                ))),
+                                (source, parser, json_body),
+                            ));
+                        }
+                        json_body.extend_from_slice(bytes);
+                        frames.push(json_body.clone());
+                    }
+                    for frame in frames {
+                        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&frame) {
+                            let interaction = value.get("interaction").unwrap_or(&value);
+                            if let Some(usage) = interaction.get("usage") {
+                                let cached = usage
+                                    .get("cached_tokens")
+                                    .or_else(|| usage.get("total_cached_tokens"))
+                                    .and_then(serde_json::Value::as_u64);
+                                *capture.lock().unwrap_or_else(|p| p.into_inner()) =
+                                    Some(crate::usage::ResponseTokenUsage {
+                                        input_tokens: usage
+                                            .get("input_tokens")
+                                            .or_else(|| usage.get("total_input_tokens"))
+                                            .and_then(serde_json::Value::as_u64)
+                                            .unwrap_or(0),
+                                        output_tokens: usage
+                                            .get("output_tokens")
+                                            .or_else(|| usage.get("total_output_tokens"))
+                                            .and_then(serde_json::Value::as_u64)
+                                            .unwrap_or(0),
+                                        cached_input_tokens: cached.unwrap_or(0),
+                                        cached_input_tokens_known: cached.is_some(),
+                                        reasoning_tokens: usage
+                                            .get("reasoning_tokens")
+                                            .or_else(|| usage.get("total_thought_tokens"))
+                                            .and_then(serde_json::Value::as_u64)
+                                            .unwrap_or(0),
+                                        ..Default::default()
+                                    });
+                            }
+                        }
+                    }
+                }
+                Some((next, (source, parser, json_body)))
+            }
+        },
+    );
+    let key_identifier = auth.key_identifier.clone();
+    let scoped_entry = key_identifier
+        .as_ref()
+        .and_then(|key| state.scoped_keys.get(key));
+    let in_flight = state.monitor.track_in_flight();
+    let outcome = StreamedOutcome {
+        _activity: activity,
+        state: Arc::clone(&state),
+        credential_token: member.access_token(),
+        provider: member.provider_name(),
+        member,
+        event_id: uuid::Uuid::new_v4().to_string(),
+        occurred_at_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|time| i64::try_from(time.as_millis()).unwrap_or(i64::MAX))
+            .unwrap_or(0),
+        model: Some(model),
+        key_identifier,
+        session: headers
+            .get("x-session-id")
+            .and_then(|value| value.to_str().ok())
+            .map(session_digest),
+        scoped_entry,
+        upstream_capture: Some(capture),
+        devin_outcome: None,
+        status,
+        started,
+        bytes_in,
+        fast: false,
+    };
+    Response::from_parts(
+        parts,
+        Body::from_stream(CountedStream::new(
+            Body::from_stream(observed),
+            outcome,
+            in_flight,
+            state.plugins.clone(),
+        )),
+    )
+}
+
 struct FinalFailure {
     status: StatusCode,
     content_type: Option<String>,
     body: Bytes,
+}
+
+const MAX_BUFFERED_UPSTREAM_BYTES: usize = 32 * 1024 * 1024;
+
+async fn bounded_response_bytes(resp: reqwest::Response) -> Result<Bytes, String> {
+    let mut stream = resp.bytes_stream();
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| error.to_string())?;
+        if chunk.len() > MAX_BUFFERED_UPSTREAM_BYTES.saturating_sub(body.len()) {
+            return Err("upstream response exceeds buffered byte limit".to_string());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(body))
+}
+
+fn buffered_failure_response(message: &str) -> reqwest::Response {
+    rebuild_plan_response(
+        StatusCode::BAD_GATEWAY,
+        &HeaderMap::new(),
+        serde_json::json!({"error":{"type":"upstream_error","message":message}})
+            .to_string()
+            .as_bytes(),
+    )
 }
 
 fn now_unix_secs() -> i64 {
@@ -54,6 +303,11 @@ pub fn subscribe_finalizer(
 ) -> tokio::sync::mpsc::Receiver<()> {
     state.subscribe_finalizer(account_or_event)
 }
+
+/// How long an Anthropic stream is held back waiting for its first text or
+/// tool call. Claude occasionally finishes a turn after thinking alone; only a
+/// hold that outlasts the thinking can turn that into a failover.
+const ANTHROPIC_EMPTY_HOLD: std::time::Duration = std::time::Duration::from_secs(180);
 
 fn get_preflight_deadline(headers: &HeaderMap) -> std::time::Duration {
     let ms = headers
@@ -93,6 +347,13 @@ struct StreamCapture {
     outcome: Option<StreamedOutcome>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StreamEnd {
+    Eof,
+    TransportError,
+    Cancelled,
+}
+
 impl StreamCapture {
     fn observe(&mut self, data: &[u8]) {
         self.bytes_out += data.len() as u64;
@@ -100,7 +361,7 @@ impl StreamCapture {
     }
 
     /// Spawn the deferred record exactly once; safe to call from `Drop`.
-    fn finalize(&mut self) {
+    fn finalize(&mut self, end: StreamEnd) {
         let Some(outcome) = self.outcome.take() else {
             return;
         };
@@ -118,10 +379,40 @@ impl StreamCapture {
             });
         let tokens = token_usage.map(crate::usage::ResponseTokenUsage::total_tokens);
         let bytes_out = self.bytes_out;
-        let state = outcome.state;
+        let state = Arc::clone(&outcome.state);
 
-        let mut success = true;
+        let mut success = end == StreamEnd::Eof && outcome.status < 400;
         let mut status = outcome.status;
+
+        if status < 400 {
+            status = match end {
+                StreamEnd::Eof => status,
+                StreamEnd::TransportError => 502,
+                StreamEnd::Cancelled => 499,
+            };
+        }
+
+        // A locally rendered stream that ended on an error frame (an upstream
+        // truncated before its finish reason, a mid-stream failure) delivered
+        // a failed request even though the HTTP status was already 200.
+        if outcome.provider != "devin" && stream_ended_with_error(self.head_tail.parts().1) {
+            success = false;
+            status = 502;
+        }
+
+        if outcome.provider != "devin" {
+            if success {
+                outcome.member.record_ok();
+                state.metrics.served.fetch_add(1, Ordering::Relaxed);
+                state.monitor.clear_error(outcome.member.id());
+                state
+                    .scheduler
+                    .record_success(outcome.member.id(), &state.pool.load().members);
+                state.router.feedback(outcome.member.id(), Outcome::Success);
+            } else {
+                outcome.member.record_fail();
+            }
+        }
 
         if outcome.provider == "devin" {
             // Defect 1: Default to failure unless verified EOF terminal success!
@@ -156,7 +447,7 @@ impl StreamCapture {
                 }
             }
 
-            if terminal_success {
+            if terminal_success && end == StreamEnd::Eof {
                 success = true;
                 outcome.member.record_ok();
                 if let Some(ref current) = current_pool_member {
@@ -227,6 +518,18 @@ impl StreamCapture {
             }
         }
 
+        if let Some(lease) = &outcome.member.home_lease {
+            lease.release();
+        }
+
+        // An HTTP error response (status >= 400) that streamed through the
+        // shared finalizer is a failed request, not a success.
+        if status >= 400 {
+            success = false;
+        }
+
+        observe_stream_account(&outcome, "finalized", Some(status));
+
         tokio::spawn(async move {
             let record = OutcomeRecord {
                 event_id: &outcome.event_id,
@@ -248,11 +551,54 @@ impl StreamCapture {
             };
             record_request_outcome(&state, record).await;
             state.notify_finalizer(Some(outcome.member.id()), &outcome.event_id);
+            tracing::info!(
+                "cancel_observation={}",
+                serde_json::json!({
+                    "event": "recorded", "request_id": outcome.event_id
+                })
+            );
         });
     }
 }
 
+fn stream_ended_with_error(tail: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(tail);
+    text.lines()
+        .rev()
+        .filter_map(|line| line.strip_prefix("data:").map(str::trim))
+        .filter(|data| !data.is_empty() && *data != "[DONE]")
+        .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+        .any(|value| {
+            value.get("error").is_some_and(|e| !e.is_null())
+                || matches!(
+                    value["type"].as_str(),
+                    Some("response.failed" | "response.incomplete")
+                )
+        })
+}
+
 type SharedCapture = Arc<std::sync::Mutex<StreamCapture>>;
+
+// No credentials, headers, prompts or response content in lifecycle observations.
+fn observe_stream_account(outcome: &StreamedOutcome, event: &str, status: Option<u16>) {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or(0);
+    let health = outcome.member.health();
+    tracing::info!(
+        "cancel_observation={}",
+        serde_json::json!({
+            "event": event, "request_id": outcome.event_id,
+            "account": outcome.member.id(), "model": outcome.model,
+            "health": format!("{health:?}"),
+            "group_cooldown_ms": outcome.member.earliest_group_cooldown_ms(now_ms),
+            "eligible": health.is_available(now_ms) && outcome.model.as_deref()
+                .is_none_or(|model| outcome.member.group_available(model, now_ms)),
+            "status": status,
+        })
+    );
+}
 
 fn with_capture(shared: &SharedCapture, f: impl FnOnce(&mut StreamCapture)) {
     let mut guard = shared
@@ -269,10 +615,20 @@ struct CountedStream {
     inner: http_body_util::BodyStream<Body>,
     shared: SharedCapture,
     in_flight: Option<crate::monitor::InFlightGuard>,
+    plugins: Option<Arc<crate::plugins::loader::PluginHost>>,
+    stream_request_id: String,
+    stream_chunk_index: i64,
 }
 
 impl CountedStream {
-    fn new(body: Body, outcome: StreamedOutcome, in_flight: crate::monitor::InFlightGuard) -> Self {
+    fn new(
+        body: Body,
+        outcome: StreamedOutcome,
+        in_flight: crate::monitor::InFlightGuard,
+        plugins: Option<Arc<crate::plugins::loader::PluginHost>>,
+    ) -> Self {
+        let stream_request_id = outcome.event_id.clone();
+        observe_stream_account(&outcome, "stream-open", None);
         Self {
             in_flight: Some(in_flight),
             inner: http_body_util::BodyStream::new(body),
@@ -281,13 +637,31 @@ impl CountedStream {
                 head_tail: crate::usage::HeadTailCapture::new(),
                 outcome: Some(outcome),
             })),
+            plugins,
+            stream_request_id,
+            stream_chunk_index: 0,
+        }
+    }
+
+    fn release_guard(&mut self) {
+        if let Some(guard) = self.in_flight.take() {
+            drop(guard);
+            tracing::info!(
+                "cancel_observation={}",
+                serde_json::json!({
+                    "event": "guard-release", "request_id": self.stream_request_id
+                })
+            );
         }
     }
 }
 
 impl Drop for CountedStream {
     fn drop(&mut self) {
-        with_capture(&self.shared, StreamCapture::finalize);
+        self.release_guard();
+        with_capture(&self.shared, |capture| {
+            capture.finalize(StreamEnd::Cancelled)
+        });
     }
 }
 
@@ -302,18 +676,49 @@ impl futures::Stream for CountedStream {
             match std::task::ready!(std::pin::Pin::new(&mut self.inner).poll_next(cx)) {
                 Some(Ok(frame)) => {
                     if let Some(data) = frame.data_ref() {
-                        with_capture(&self.shared, |capture| capture.observe(data));
-                        return std::task::Poll::Ready(Some(Ok(data.clone())));
+                        let mut chunk_bytes = data.clone();
+                        if let Some(ref plugins) = self.plugins {
+                            let hooks =
+                                crate::plugins::hooks::PluginHookRegistry::new(plugins.clone());
+                            let chunk_idx = self.stream_chunk_index;
+                            self.stream_chunk_index += 1;
+                            let res = hooks.intercept_stream_chunk(
+                                crate::plugins::hooks::StreamChunkInterceptRequest {
+                                    request_id: self.stream_request_id.clone(),
+                                    source_format: String::new(),
+                                    model: String::new(),
+                                    requested_model: String::new(),
+                                    request_headers: std::collections::HashMap::new(),
+                                    response_headers: std::collections::HashMap::new(),
+                                    original_request: Vec::new(),
+                                    request_body: Vec::new(),
+                                    body: chunk_bytes.to_vec(),
+                                    history_chunks: Vec::new(),
+                                    chunk_index: chunk_idx,
+                                    metadata: std::collections::HashMap::new(),
+                                },
+                            );
+                            if res.drop_chunk {
+                                continue;
+                            }
+                            if !res.body.is_empty() {
+                                chunk_bytes = Bytes::from(res.body);
+                            }
+                        }
+                        with_capture(&self.shared, |capture| capture.observe(&chunk_bytes));
+                        return std::task::Poll::Ready(Some(Ok(chunk_bytes)));
                     }
                 }
                 Some(Err(error)) => {
-                    self.in_flight.take();
-                    with_capture(&self.shared, StreamCapture::finalize);
+                    self.release_guard();
+                    with_capture(&self.shared, |capture| {
+                        capture.finalize(StreamEnd::TransportError)
+                    });
                     return std::task::Poll::Ready(Some(Err(error)));
                 }
                 None => {
-                    self.in_flight.take();
-                    with_capture(&self.shared, StreamCapture::finalize);
+                    self.release_guard();
+                    with_capture(&self.shared, |capture| capture.finalize(StreamEnd::Eof));
                     return std::task::Poll::Ready(None);
                 }
             }
@@ -342,132 +747,6 @@ struct OutcomeRecord<'a> {
     /// tier, i.e. whether the caller's fast-mode switch applied to it.
     fast: bool,
     token_usage: Option<crate::usage::ResponseTokenUsage>,
-}
-
-/// Request-scoped fields a terminal Claude denial needs to log its outcome.
-struct OutcomeContext<'a> {
-    event_id: &'a str,
-    occurred_at_ms: i64,
-    plan: &'a RelayPlan,
-    key_identifier: Option<&'a str>,
-    session: Option<&'a str>,
-    scoped_entry: Option<&'a crate::state::ScopedKeyEntry>,
-    started: std::time::Instant,
-    fast: bool,
-}
-
-/// A Claude OAuth account whose messages go to api.anthropic.com itself gets
-/// the full Claude Code wire profile; relays (ccapi) keep the legacy shape.
-fn is_direct_claude_oauth(member: &AccountMember, state: &AppState) -> bool {
-    member.kind() == crate::account::ProviderKind::Claude
-        && member.relay_api_key().is_none()
-        && !state.settings.current().disable_claude_cloak_mode
-        && crate::claude_wire::is_direct_base(member.upstream_override.as_deref())
-}
-
-fn is_claude_member(member: &AccountMember) -> bool {
-    member.kind() == crate::account::ProviderKind::Claude && !member.is_nekos_relay()
-}
-
-fn rebuild_response(failure: FinalFailure) -> reqwest::Response {
-    let mut builder = http::Response::builder().status(failure.status);
-    if let Some(content_type) = failure.content_type {
-        builder = builder.header(header::CONTENT_TYPE, content_type);
-    }
-    builder
-        .body(failure.body)
-        .map(reqwest::Response::from)
-        .unwrap_or_else(|_| reqwest::Response::from(http::Response::new(Bytes::new())))
-}
-
-/// Record the denial on the account. Enforcement (or a second plain denial
-/// inside the window) adds the account to the persisted suspected list, which
-/// only an operator clears.
-async fn handle_claude_denial(
-    state: &AppState,
-    member: &AccountMember,
-    status: u16,
-    message: &str,
-    denial: crate::claude_denial::Denial,
-) {
-    member.record_fail();
-    let now = now_unix_secs();
-    let promote = match denial {
-        crate::claude_denial::Denial::Enforcement => true,
-        crate::claude_denial::Denial::Denied => state.claude_denials.record(member.id(), now),
-        crate::claude_denial::Denial::Other => false,
-    };
-    if !promote {
-        state
-            .monitor
-            .record_error(member.id(), status, "claude permission denial");
-        return;
-    }
-    let reason = crate::claude_denial::enforcement_reason(status, message);
-    state
-        .monitor
-        .record_error(member.id(), status, &format!("suspected enforcement: {reason}"));
-    tracing::warn!(account = %member.id(), %reason, "claude account benched as suspected");
-    let account = member.id().to_string();
-    let settings = Arc::clone(&state.settings);
-    let result = tokio::task::spawn_blocking(move || {
-        settings.mutate(|document| {
-            document.claude_suspected_accounts.insert(
-                account,
-                crate::management::settings::SuspectedAccount {
-                    reason,
-                    at_unix: now,
-                },
-            );
-        })
-    })
-    .await;
-    match result {
-        Ok(Err(err)) => tracing::warn!("failed to persist suspected claude account: {err}"),
-        Err(err) => tracing::warn!("suspected claude account persistence task failed: {err}"),
-        Ok(Ok(_)) => {}
-    }
-}
-
-/// A Claude denial ends the request on this account: the client gets the
-/// upstream answer and no other account sees the request.
-async fn finish_claude_denial(
-    state: &AppState,
-    member: &AccountMember,
-    failure: FinalFailure,
-    ctx: OutcomeContext<'_>,
-) -> Response {
-    state
-        .metrics
-        .exposed_client_errors
-        .fetch_add(1, Ordering::Relaxed);
-    record_request_outcome(
-        state,
-        OutcomeRecord {
-            event_id: ctx.event_id,
-            occurred_at_ms: ctx.occurred_at_ms,
-            provider: member.provider_name(),
-            account: Some(member.id()),
-            model: ctx.plan.model.as_deref(),
-            key_identifier: ctx.key_identifier,
-            session: ctx.session,
-            scoped_entry: ctx.scoped_entry,
-            status: failure.status.as_u16(),
-            success: false,
-            elapsed_ms: ctx.started.elapsed().as_millis() as u64,
-            bytes_in: ctx.plan.original_body.len(),
-            bytes_out: failure.body.len() as u64,
-            tokens: None,
-            fast: ctx.fast,
-            token_usage: None,
-        },
-    )
-    .await;
-    body_response(
-        failure.status,
-        failure.content_type.as_deref(),
-        failure.body,
-    )
 }
 
 async fn record_request_outcome(state: &AppState, record: OutcomeRecord<'_>) {
@@ -526,6 +805,7 @@ async fn record_request_outcome(state: &AppState, record: OutcomeRecord<'_>) {
     }
     let mut entry = serde_json::json!({
         "kind": "request",
+        "event-id": record.event_id,
         "timestamp": timestamp,
         "provider": record.provider.as_str(),
         "account": record.account,
@@ -546,16 +826,31 @@ async fn record_request_outcome(state: &AppState, record: OutcomeRecord<'_>) {
     let line = entry.to_string();
     // The live tail is always fed; file persistence is the only gated part.
     state.log_tail.push(line.clone());
+    // A Home-coordinated node mirrors each request record to Home's
+    // `request-log` queue (Task 32). Off the async executor: RESP is blocking.
+    if let Some(home) = state.home_client() {
+        if home.enabled() && !home.dispatch_fenced() {
+            let payload = line.clone().into_bytes();
+            tokio::task::spawn_blocking(move || {
+                if let Err(error) = home.rpush_request_log(&payload) {
+                    tracing::warn!(%error, "failed to push request log to Home");
+                }
+            });
+        }
+    }
     track_cline_daily_usage(state, &record, timestamp);
     let settings = state.settings.current();
     if !settings.logging_to_file {
         return;
     }
     let settings = (*settings).clone();
-    let _ = tokio::task::spawn_blocking(move || {
+    if let Err(error) = tokio::task::spawn_blocking(move || {
         crate::management::observability::append_log_line(&settings, &line);
     })
-    .await;
+    .await
+    {
+        tracing::error!(%error, "proxy log append task failed");
+    }
 }
 
 /// Cline daily-budget tracking: count served tokens and surface the running
@@ -712,6 +1007,80 @@ fn body_with_model(body: &Bytes, model: &str) -> Bytes {
 
 fn openai_body_with_model(plan: &RelayPlan, model: &str) -> Option<serde_json::Value> {
     let mut body = plan.openai_body.clone()?;
+    // Internal translation markers never leave the gateway. A mid-conversation
+    // effort update is folded back into the ordinary `reasoning.effort` field:
+    // providers consuming this body have no `configuration_update` item, and
+    // their effort settings live outside the prompt prefix anyway.
+    let mut effort_update: Option<String> = None;
+    if let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        messages.retain(|message| {
+            if let Some(effort) = message
+                .get("x_effort_update")
+                .and_then(serde_json::Value::as_str)
+            {
+                effort_update = Some(effort.to_string());
+                return false;
+            }
+            true
+        });
+        for message in messages {
+            if let Some(object) = message.as_object_mut() {
+                object.remove("x_anthropic_tool_result");
+            }
+        }
+    }
+    if let Some(effort) = effort_update {
+        if let Some(object) = body.as_object_mut() {
+            object.insert(
+                "reasoning".to_string(),
+                serde_json::json!({"effort": effort}),
+            );
+        }
+    }
+    if let Some(object) = body.as_object_mut() {
+        object.insert(
+            "model".to_string(),
+            serde_json::Value::String(model.to_string()),
+        );
+    }
+    normalize_developer_role(&mut body);
+    Some(body)
+}
+
+/// The OpenAI-shaped body for a Claude upstream: a thinking suffix the client
+/// put on its model (`claude-x(2048)`) is an option, not part of the model id,
+/// so it is kept on the upstream model for the Anthropic translation to
+/// resolve (Task 5).
+fn openai_body_with_model_keep_suffix(plan: &RelayPlan, model: &str) -> Option<serde_json::Value> {
+    let suffix = plan
+        .openai_body
+        .as_ref()?
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|requested| compat::request::parse_model_suffix(requested).ok())
+        .and_then(|(_, suffix)| suffix.map(str::to_string));
+    match suffix {
+        Some(suffix)
+            if compat::request::parse_model_suffix(model).is_ok_and(|(_, s)| s.is_none()) =>
+        {
+            anthropic_openai_body(plan, &format!("{model}({suffix})"))
+        }
+        _ => anthropic_openai_body(plan, model),
+    }
+}
+
+/// The OpenAI-shaped body for a Claude upstream. Unlike the general helper this
+/// keeps the mid-conversation effort marker: `openai_to_anthropic` turns it into
+/// the beta-gated `role: "system"` effort message that preserves the cache.
+fn anthropic_openai_body(plan: &RelayPlan, model: &str) -> Option<serde_json::Value> {
+    let mut body = plan.openai_body.clone()?;
+    if let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        for message in messages {
+            if let Some(object) = message.as_object_mut() {
+                object.remove("x_anthropic_tool_result");
+            }
+        }
+    }
     if let Some(object) = body.as_object_mut() {
         object.insert(
             "model".to_string(),
@@ -757,7 +1126,6 @@ fn body_session_anchor(body: &serde_json::Value) -> Option<String> {
     None
 }
 
-#[allow(clippy::too_many_arguments)]
 fn resolve_target(
     pool: &crate::state::PoolSnapshot,
     member: &AccountMember,
@@ -766,10 +1134,17 @@ fn resolve_target(
     upstream_model: &str,
     session_affinity: Option<&str>,
     state: &AppState,
-    client_headers: &HeaderMap,
 ) -> Result<UpstreamTarget, String> {
+    // Generic accounts keep the host on base_url. upstream_override is only a
+    // redirect; ignoring base_url posts xAI chat at a relative path and never
+    // reaches api.x.ai.
+    let stored_base = member.generic_base_url();
+    let upstream = crate::url::account_upstream_base(
+        member.upstream_override.as_deref(),
+        stored_base.as_deref(),
+    );
     if plan.mode == RelayMode::Image {
-        let base = member.upstream_override.as_deref().unwrap_or_default();
+        let base = upstream.unwrap_or_default();
         return Ok(UpstreamTarget {
             url: crate::url::join_provider_path(base, &plan.upstream_path),
             body: body_with_model(&plan.original_body, upstream_model),
@@ -795,9 +1170,7 @@ fn resolve_target(
         }
         let wrapped = serde_json::json!({ "request": gemini });
         return Ok(UpstreamTarget {
-            url: crate::url::build_antigravity_count_tokens_url(
-                member.upstream_override.as_deref(),
-            ),
+            url: crate::url::build_antigravity_count_tokens_url(upstream),
             body: Bytes::from(wrapped.to_string()),
             protocol: compat::Protocol::Antigravity,
             headers: None,
@@ -834,7 +1207,7 @@ fn resolve_target(
             let framed = compat::devin::frame_data(&wire);
             let url = crate::url::build_provider_url(
                 member.kind(),
-                member.upstream_override.as_deref(),
+                upstream,
                 "/exa.api_server_pb.ApiServerService/GetChatMessage",
             );
             return Ok(UpstreamTarget {
@@ -877,9 +1250,12 @@ fn resolve_target(
                 obj.insert("sessionId".to_string(), serde_json::json!(session_id));
             }
         }
-        let wrapped = crate::v1beta::wrap_for_antigravity(&model, &project, &inner);
+        // Claude-ness follows the model identity; the step count is separate.
+        let labels = crate::v1beta::labels_for(member, &model, model.starts_with("claude-"));
+        let wrapped =
+            crate::v1beta::wrap_for_antigravity_with_labels(&model, &project, &inner, &labels);
         return Ok(UpstreamTarget {
-            url: crate::url::build_antigravity_url(member.upstream_override.as_deref()),
+            url: crate::url::build_antigravity_url(upstream),
             body: Bytes::from(wrapped.to_string()),
             protocol: compat::Protocol::Antigravity,
             headers: None,
@@ -924,7 +1300,7 @@ fn resolve_target(
             let framed = compat::devin::frame_data(&wire);
             let url = crate::url::build_provider_url(
                 member.kind(),
-                member.upstream_override.as_deref(),
+                upstream,
                 "/exa.api_server_pb.ApiServerService/GetChatMessage",
             );
             return Ok(UpstreamTarget {
@@ -964,12 +1340,12 @@ fn resolve_target(
                 "/v1/projects/{project}/locations/{location}/publishers/google/models/{model}:{action}"
             );
             return Ok(UpstreamTarget {
-                url: crate::url::build_provider_url(
-                    member.kind(),
-                    member.upstream_override.as_deref(),
-                    &path,
-                ),
-                body: Bytes::from(compat::gemini::openai_to_gemini(&openai)?.to_string()),
+                url: crate::url::build_provider_url(member.kind(), upstream, &path),
+                body: Bytes::from({
+                    let mut gemini = compat::gemini::openai_to_gemini(&openai)?;
+                    apply_vertex_thinking(plan, model, &mut gemini)?;
+                    gemini.to_string()
+                }),
                 protocol: compat::Protocol::Antigravity,
                 headers: None,
                 replay: None,
@@ -979,6 +1355,88 @@ fn resolve_target(
             let adapter = member
                 .generic_adapter()
                 .unwrap_or_else(|| "openai-chat".to_string());
+            if adapter == "meta" {
+                let body = if matches!(plan.mode, RelayMode::Responses | RelayMode::Native) {
+                    plan.original_body.to_vec()
+                } else {
+                    let openai = openai_body_with_model(plan, upstream_model)
+                        .ok_or_else(|| "Meta requires an OpenAI-shaped request".to_string())?;
+                    serde_json::to_vec(&openai).map_err(|error| error.to_string())?
+                };
+                let body = compat::meta::prepare_request(&body, upstream_model)
+                    .map_err(|error| error.to_string())?;
+                return Ok(UpstreamTarget {
+                    url: crate::url::build_provider_url(member.kind(), upstream, "/responses"),
+                    body: Bytes::from(body),
+                    protocol: compat::Protocol::Codex,
+                    headers: None,
+                    replay: None,
+                });
+            }
+            if adapter == "xai" {
+                // Chat clients must stay on chat completions. plan.body for that
+                // mode is a Codex translation, and api.x.ai rejects it on
+                // /v1/responses. The response is relayed verbatim, so the
+                // upstream wire has to match the client wire.
+                let chat = matches!(
+                    plan.mode,
+                    RelayMode::OpenAiCompat | RelayMode::LegacyCompletions
+                );
+                let raw = if chat {
+                    body_with_model(&plan.original_body, upstream_model)
+                } else {
+                    plan.body.clone()
+                };
+                let mut body = serde_json::from_slice::<serde_json::Value>(&raw)
+                    .map_err(|error| format!("invalid xAI request body: {error}"))?;
+                compat::xai::normalize_request(&mut body);
+                return Ok(UpstreamTarget {
+                    url: crate::url::build_provider_url(
+                        member.kind(),
+                        upstream,
+                        if chat {
+                            "/v1/chat/completions"
+                        } else {
+                            "/v1/responses"
+                        },
+                    ),
+                    body: Bytes::from(body.to_string()),
+                    protocol: compat::Protocol::Codex,
+                    headers: None,
+                    replay: None,
+                });
+            }
+            if adapter == "kimi" {
+                let format = match plan.mode {
+                    RelayMode::Anthropic => compat::kimi::Format::Claude,
+                    RelayMode::Responses | RelayMode::Native => compat::kimi::Format::Responses,
+                    _ => compat::kimi::Format::OpenAi,
+                };
+                // Kimi speaks the client's own wire (Claude Messages or
+                // Responses), so it gets the untranslated client body; only
+                // chat clients go through the OpenAI-shaped body.
+                let body = match format {
+                    compat::kimi::Format::OpenAi => openai_body_with_model(plan, upstream_model)
+                        .ok_or_else(|| "Kimi requires an OpenAI-shaped request".to_string())?,
+                    _ => serde_json::from_slice::<serde_json::Value>(&plan.original_body)
+                        .map_err(|error| format!("invalid Kimi request body: {error}"))?,
+                };
+                let body = compat::kimi::prepare_request(format, &body, upstream_model)?;
+                return Ok(UpstreamTarget {
+                    url: crate::url::build_provider_url(
+                        member.kind(),
+                        upstream,
+                        &format!("/v1/{}", format.path()),
+                    ),
+                    body: Bytes::from(body.to_string()),
+                    protocol: match format {
+                        compat::kimi::Format::Claude => compat::Protocol::Anthropic,
+                        _ => compat::Protocol::Codex,
+                    },
+                    headers: None,
+                    replay: None,
+                });
+            }
             let openai_body = openai_body_with_model(plan, upstream_model)
                 .ok_or_else(|| "generic adapter requires OpenAI-compatible input".to_string())?;
             if adapter == "google" {
@@ -993,11 +1451,7 @@ fn resolve_target(
                 };
                 let path = format!("/v1beta/models/{model}:{action}");
                 return Ok(UpstreamTarget {
-                    url: crate::url::build_provider_url(
-                        member.kind(),
-                        member.upstream_override.as_deref(),
-                        &path,
-                    ),
+                    url: crate::url::build_provider_url(member.kind(), upstream, &path),
                     body: Bytes::from(compat::gemini::openai_to_gemini(&openai_body)?.to_string()),
                     protocol: compat::Protocol::Antigravity,
                     headers: None,
@@ -1006,11 +1460,7 @@ fn resolve_target(
             }
             if adapter == "anthropic" {
                 return Ok(UpstreamTarget {
-                    url: crate::url::build_provider_url(
-                        member.kind(),
-                        member.upstream_override.as_deref(),
-                        "/v1/messages",
-                    ),
+                    url: crate::url::build_provider_url(member.kind(), upstream, "/v1/messages"),
                     body: Bytes::from(
                         serde_json::to_vec(&compat::claude::openai_to_anthropic(&openai_body)?)
                             .map_err(|error| error.to_string())?,
@@ -1021,7 +1471,7 @@ fn resolve_target(
                 });
             }
             if adapter == "mimo-free" {
-                let endpoint = member.upstream_override.clone().unwrap_or_default();
+                let endpoint = upstream.unwrap_or("").to_string();
                 if !mahoquot_providers::is_mimo_endpoint(&endpoint) {
                     return Err(
                         "the mimo-free adapter only serves the canonical MiMo Free endpoint; use openai-chat for a custom one"
@@ -1039,11 +1489,7 @@ fn resolve_target(
                 });
             }
             if adapter == "openai-responses" || adapter == "azure-openai" {
-                let url = crate::url::build_provider_url(
-                    member.kind(),
-                    member.upstream_override.as_deref(),
-                    "/v1/responses",
-                );
+                let url = crate::url::build_provider_url(member.kind(), upstream, "/v1/responses");
                 // The catalog ships Azure's host as a {resource} template, so a
                 // request against an unedited base URL must fail loudly here
                 // rather than reach a nonexistent host.
@@ -1063,7 +1509,7 @@ fn resolve_target(
             return Ok(UpstreamTarget {
                 url: crate::url::build_provider_url(
                     member.kind(),
-                    member.upstream_override.as_deref(),
+                    upstream,
                     "/v1/chat/completions",
                 ),
                 body: body_with_model(&plan.original_body, upstream_model),
@@ -1078,7 +1524,7 @@ fn resolve_target(
             return Ok(UpstreamTarget {
                 url: crate::url::build_provider_url(
                     member.kind(),
-                    member.upstream_override.as_deref(),
+                    upstream,
                     "/agent.v1.AgentService/Run",
                 ),
                 body: Bytes::from(compat::cursor::openai_to_cursor_connect(&openai)?),
@@ -1092,7 +1538,7 @@ fn resolve_target(
                 .ok_or_else(|| "Kiro requires an OpenAI-shaped request".to_string())?;
             return Ok(UpstreamTarget {
                 url: mahoquot_providers::kiro_generate_url(
-                    member.upstream_override.as_deref(),
+                    upstream,
                     member
                         .kiro_region()
                         .as_deref()
@@ -1116,32 +1562,51 @@ fn resolve_target(
         ) {
             let mut anthropic_val: serde_json::Value = if plan.mode == RelayMode::Anthropic {
                 let bytes = body_with_model(&plan.original_body, upstream_model);
-                serde_json::from_slice(&bytes).unwrap_or_else(|_| serde_json::json!({}))
+                let mut value: serde_json::Value =
+                    serde_json::from_slice(&bytes).unwrap_or_else(|_| serde_json::json!({}));
+                // A thinking suffix on the client's model (claude-x(2048)) is
+                // resolved exactly as on the translated paths (Task 5).
+                let requested = serde_json::from_slice::<serde_json::Value>(&plan.original_body)
+                    .ok()
+                    .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_string))
+                    .unwrap_or_default();
+                compat::claude::apply_native_thinking_suffix(
+                    &requested,
+                    upstream_model,
+                    &mut value,
+                )?;
+                value
             } else {
-                let openai = openai_body_with_model(plan, upstream_model).ok_or_else(|| {
-                    "Anthropic provider requires an OpenAI-shaped request".to_string()
-                })?;
+                let openai =
+                    openai_body_with_model_keep_suffix(plan, upstream_model).ok_or_else(|| {
+                        "Anthropic provider requires an OpenAI-shaped request".to_string()
+                    })?;
                 compat::claude::openai_to_anthropic(&openai)?
             };
 
             if member.kind() == crate::account::ProviderKind::Claude
                 && !member.is_nekos_relay()
                 && member.relay_api_key().is_none()
-                && !is_direct_claude_oauth(member, state)
             {
-                // W4: with cloaking off the body keeps the caller's own system
-                // and cache layout; only the shared identity headers remain.
-                if !state.settings.current().disable_claude_cloak_mode {
-                    compat::claude::ensure_claude_code_system_instruction(&mut anthropic_val);
-                    compat::claude::apply_prompt_cache_breakpoints(&mut anthropic_val);
-                }
-                // The account, not the caller, owns this field upstream; a
-                // caller value would tie one client identity to many accounts.
-                if let Some(metadata) = anthropic_val
-                    .get_mut("metadata")
-                    .and_then(serde_json::Value::as_object_mut)
-                {
-                    metadata.remove("user_id");
+                compat::claude::ensure_claude_code_system_instruction(&mut anthropic_val);
+                compat::claude::apply_prompt_cache_breakpoints(&mut anthropic_val);
+                if let Some(session) = session_affinity {
+                    if let Some(found) = state.claude_prefix_watch.observe(session, &anthropic_val)
+                    {
+                        tracing::info!(
+                            target: "claude_prefix",
+                            session = %session_digest(session),
+                            account = %member.id(),
+                            model = upstream_model,
+                            index = found.index,
+                            section = found.section,
+                            previous_blocks = found.previous_len,
+                            current_blocks = found.current_len,
+                            previous_kind = %found.previous_kind,
+                            current_kind = %found.current_kind,
+                            "claude prompt prefix changed between turns"
+                        );
+                    }
                 }
             }
 
@@ -1155,48 +1620,9 @@ fn resolve_target(
                 );
             }
 
-            if is_direct_claude_oauth(member, state) {
-                let account_uuid = member.account_id().unwrap_or_default();
-                let wire_affinity = affinity_header(client_headers, true).or_else(|| {
-                    match body_affinity_material(&plan.original_body) {
-                        Some(BodyAffinity::Id(id)) => Some(id),
-                        Some(BodyAffinity::FirstUser(_)) | None => None,
-                    }
-                });
-                let mut wire = crate::claude_wire::build_with_headers(
-                    anthropic_val,
-                    &crate::claude_wire::Identity {
-                        account_key: member.id(),
-                        account_uuid: &account_uuid,
-                        session_affinity: wire_affinity.as_deref(),
-                        device_id: member.claude_device_id(),
-                    },
-                    Some(client_headers),
-                    crate::claude_wire::is_subagent(client_headers),
-                )?;
-                if plan.mode == RelayMode::Anthropic {
-                    crate::claude_wire::preserve_native_bytes(&mut wire, &plan.original_body)?;
-                }
-                let mut headers = wire.headers;
-                if let Some(auth) = headers.iter_mut().find(|(k, _)| k == "authorization") {
-                    auth.1 = format!("Bearer {}", member.access_token());
-                }
-                return Ok(UpstreamTarget {
-                    url: crate::claude_wire::messages_url(member.upstream_override.as_deref()),
-                    body: Bytes::from(wire.body),
-                    protocol: compat::Protocol::Anthropic,
-                    headers: Some(headers),
-                    replay: None,
-                });
-            }
-
             let body = Bytes::from(serde_json::to_vec(&anthropic_val).map_err(|e| e.to_string())?);
             return Ok(UpstreamTarget {
-                url: crate::url::build_provider_url(
-                    member.kind(),
-                    member.upstream_override.as_deref(),
-                    "/v1/messages",
-                ),
+                url: crate::url::build_provider_url(member.kind(), upstream, "/v1/messages"),
                 body,
                 protocol: compat::Protocol::Anthropic,
                 headers: None,
@@ -1204,11 +1630,7 @@ fn resolve_target(
             });
         }
         return Ok(UpstreamTarget {
-            url: crate::url::build_provider_url(
-                member.kind(),
-                member.upstream_override.as_deref(),
-                &plan.upstream_path,
-            ),
+            url: crate::url::build_provider_url(member.kind(), upstream, &plan.upstream_path),
             body: body_with_model(&plan.body, upstream_model),
             protocol: compat::Protocol::Codex,
             headers: None,
@@ -1235,9 +1657,17 @@ fn resolve_target(
         Some(replay) => compat::openai_to_antigravity_with_replay(&openai_body, &project, replay)?,
         None => compat::openai_to_antigravity(&openai_body, &project)?,
     };
+    // The enum and vendor flags describe the upstream model, so they are
+    // looked up by the catalog key rather than derived from the name.
+    let translated = crate::v1beta::apply_catalog_labels(
+        translated,
+        member,
+        upstream_model,
+        compat::gemini::openai_request_uses_claude(&openai_body),
+    );
 
     Ok(UpstreamTarget {
-        url: crate::url::build_antigravity_url(member.upstream_override.as_deref()),
+        url: crate::url::build_antigravity_url(upstream),
         body: Bytes::from(translated.to_string()),
         protocol: compat::Protocol::Antigravity,
         headers: None,
@@ -1249,6 +1679,7 @@ fn resolve_target(
 enum UpstreamSendError {
     Reqwest(reqwest::Error),
     DevinClient(crate::proxy_policy::DevinClientBuildError),
+    ProxyClient(crate::proxy_policy::ProxyClientBuildError),
     CursorReply(String),
 }
 
@@ -1257,6 +1688,7 @@ impl std::fmt::Display for UpstreamSendError {
         match self {
             Self::Reqwest(e) => write!(f, "{e}"),
             Self::DevinClient(e) => write!(f, "{e}"),
+            Self::ProxyClient(e) => write!(f, "{e}"),
             Self::CursorReply(message) => write!(f, "{message}"),
         }
     }
@@ -1276,44 +1708,21 @@ impl From<crate::proxy_policy::DevinClientBuildError> for UpstreamSendError {
     }
 }
 
+impl From<crate::proxy_policy::ProxyClientBuildError> for UpstreamSendError {
+    fn from(e: crate::proxy_policy::ProxyClientBuildError) -> Self {
+        Self::ProxyClient(e)
+    }
+}
+
 impl UpstreamSendError {
     fn is_ambiguous(&self) -> bool {
         match self {
             Self::Reqwest(e) => e.is_timeout() || e.is_connect() || e.is_request(),
             Self::DevinClient(_) => false,
+            Self::ProxyClient(_) => false,
             Self::CursorReply(_) => false,
         }
     }
-}
-
-/// Claude OAuth headers with the gateway's client identity removed: keeps
-/// auth, version and content headers, narrows `anthropic-beta` to the OAuth
-/// flag (client betas are merged afterwards), and passes the client's own
-/// identity headers through when it sent any.
-fn uncloaked_claude_headers(
-    member_headers: Vec<(String, String)>,
-    client_headers: &HeaderMap,
-) -> Vec<(String, String)> {
-    let mut kept: Vec<(String, String)> = member_headers
-        .into_iter()
-        .filter(|(name, _)| {
-            matches!(
-                name.as_str(),
-                "authorization" | "anthropic-version" | "content-type"
-            )
-        })
-        .collect();
-    kept.push(("anthropic-beta".to_string(), "oauth-2025-04-20".to_string()));
-    for (name, value) in client_headers {
-        let name = name.as_str();
-        if !(name == "user-agent" || name == "x-app" || name.starts_with("x-stainless-")) {
-            continue;
-        }
-        if let Ok(value) = value.to_str() {
-            kept.push((name.to_string(), value.to_string()));
-        }
-    }
-    kept
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1330,7 +1739,7 @@ async fn send_upstream(
     let client = if member.kind() == crate::account::ProviderKind::Devin {
         state.try_devin_client_for_member(member)?
     } else {
-        state.client_for_member(member)
+        state.try_client_for_member(member)?
     };
     let mut req_builder = client.post(target_url);
     if protocol == compat::Protocol::Devin {
@@ -1342,31 +1751,9 @@ async fn send_upstream(
         member.build_upstream_headers()
     };
 
-    // W4: with cloaking off a Claude OAuth request carries no gateway-chosen
-    // identity: only auth, version, the OAuth beta, and whatever identity the
-    // client itself sent.
-    if custom_headers.is_none()
-        && member.kind() == crate::account::ProviderKind::Claude
-        && !member.is_nekos_relay()
-        && member.relay_api_key().is_none()
-        && state.settings.current().disable_claude_cloak_mode
-    {
-        member_headers = uncloaked_claude_headers(member_headers, headers);
-    }
-
-    // The direct Claude Code profile already folded the client's betas in and
-    // owns its full header set; nothing below may add to it.
-    let claude_direct = protocol == compat::Protocol::Anthropic
-        && custom_headers.is_some()
-        && is_direct_claude_oauth(member, state);
-
     // If client provided anthropic-beta headers, merge them with member headers
     // so client-requested beta features (e.g. prompt-caching, output-128k) are preserved.
-    if let Some(client_beta) = headers
-        .get("anthropic-beta")
-        .and_then(|v| v.to_str().ok())
-        .filter(|_| !claude_direct)
-    {
+    if let Some(client_beta) = headers.get("anthropic-beta").and_then(|v| v.to_str().ok()) {
         if let Some((_, val)) = member_headers
             .iter_mut()
             .find(|(k, _)| k == "anthropic-beta")
@@ -1382,6 +1769,19 @@ async fn send_upstream(
         } else if member.kind() == crate::account::ProviderKind::Claude {
             member_headers.push(("anthropic-beta".to_string(), client_beta.to_string()));
         }
+    }
+
+    // The translated body may itself require a beta: a per-message
+    // `output_config.effort` (the cache-preserving effort switch) is rejected
+    // outright by Anthropic unless this header rides along, and the client
+    // never sent it because the gateway synthesized the message.
+    if protocol == compat::Protocol::Anthropic
+        && compat::claude::uses_mid_conversation_effort_bytes(body_bytes)
+    {
+        merge_beta_header(
+            &mut member_headers,
+            compat::claude::MID_CONVERSATION_EFFORT_BETA,
+        );
     }
 
     // ChatGPT-backend prompt-cache affinity rides the session_id HEADER (codex
@@ -1422,6 +1822,7 @@ async fn send_upstream(
             solve_gate: &state.captcha_solve_gate,
         }
     });
+    strip_ingress_headers(&mut member_headers, headers);
     let member_sets_content_type = member_headers
         .iter()
         .any(|(name, _)| name.eq_ignore_ascii_case("content-type"));
@@ -1434,17 +1835,19 @@ async fn send_upstream(
             accept.unwrap_or(compat::devin::STREAM_CONTENT_TYPE),
         );
     } else {
-        if let Some(accept) = accept.filter(|_| !claude_direct) {
+        if let Some(accept) = accept {
             req_builder = req_builder.header(header::ACCEPT, accept);
         }
-        if !member_sets_content_type && protocol != compat::Protocol::Cursor {
-            if let Some(ct) = headers
+        // reqwest appends. x.ai's edge answers 415 when content-type is
+        // repeated, so a member header that already carries it must win alone.
+        if let Some(ct) = content_type_to_append(
+            member_sets_content_type,
+            headers
                 .get(header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .filter(|_| !claude_direct)
-            {
-                req_builder = req_builder.header(header::CONTENT_TYPE.as_str(), ct);
-            }
+                .and_then(|v| v.to_str().ok()),
+            protocol,
+        ) {
+            req_builder = req_builder.header(header::CONTENT_TYPE, ct);
         }
     }
     let req_start = std::time::Instant::now();
@@ -1510,7 +1913,15 @@ async fn send_upstream(
             if response.status() == StatusCode::BAD_REQUEST {
                 let status = response.status();
                 let response_headers = response.headers().clone();
-                let bytes = response.bytes().await?;
+                let bytes = match bounded_response_bytes(response).await {
+                    Ok(bytes) => bytes,
+                    Err(message) => {
+                        return Ok(UpstreamExchange {
+                            response: buffered_failure_response(&message),
+                            cursor_reply: None,
+                        })
+                    }
+                };
                 let retryable = serde_json::from_slice::<serde_json::Value>(&bytes)
                     .ok()
                     .is_some_and(|value| {
@@ -1572,7 +1983,10 @@ async fn zcode_plan_gateway_response(
         .map(|v| !v.trim().is_empty())
         .unwrap_or(false);
     let upstream_headers = resp.headers().clone();
-    let body = resp.bytes().await.unwrap_or_default();
+    let body = match bounded_response_bytes(resp).await {
+        Ok(body) => body,
+        Err(message) => return buffered_failure_response(&message),
+    };
     if !status.is_success() {
         if challenge_header
             || mahoquot_providers::zcode::ZCODE_CAPTCHA_BODY_MARKERS
@@ -1593,7 +2007,10 @@ async fn zcode_plan_gateway_response(
                             return replayed;
                         }
                         let replay_headers = replayed.headers().clone();
-                        let replay_body = replayed.bytes().await.unwrap_or_default();
+                        let replay_body = match bounded_response_bytes(replayed).await {
+                            Ok(body) => body,
+                            Err(message) => return buffered_failure_response(&message),
+                        };
                         let replay_challenge = mahoquot_providers::zcode::is_plan_captcha_challenge(
                             replay_status.as_u16(),
                             replay_headers
@@ -1698,7 +2115,16 @@ async fn extract_failure(resp: reqwest::Response, status_code: u16) -> FinalFail
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(ToString::to_string);
-    let body = resp.bytes().await.unwrap_or_default();
+    let body = match bounded_response_bytes(resp).await {
+        Ok(body) => body,
+        Err(message) => {
+            return FinalFailure {
+                status: StatusCode::BAD_GATEWAY,
+                content_type: Some("application/json".to_string()),
+                body: Bytes::from(serde_json::json!({"error":{"message":message}}).to_string()),
+            }
+        }
+    };
     let status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     FinalFailure {
         status,
@@ -1748,7 +2174,6 @@ pub fn cooldown_deadline_from_headers(headers: &reqwest::header::HeaderMap, now_
         .get(reqwest::header::RETRY_AFTER)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.trim().parse::<i64>().ok())
-        .filter(|secs| *secs > 0)
         .or_else(|| {
             headers
                 .iter()
@@ -1949,6 +2374,28 @@ pub fn record_cline_quota_bucket(
     member.set_usage(usage);
 }
 
+/// Claude's documented model/overage-scoped rejection: the unified status is
+/// `rejected` because of the overage (or a single-model) claim while both the
+/// shared 5h and 7d windows still allow traffic. Any other combination is not
+/// provably model-scoped and keeps the existing account-wide bench.
+fn claude_model_scoped_rejection(headers: &reqwest::header::HeaderMap) -> bool {
+    let get = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.trim().to_ascii_lowercase())
+    };
+    let window_allows =
+        |name: &str| get(name).is_some_and(|v| v == "allowed" || v == "allowed_warning");
+    get("anthropic-ratelimit-unified-status").as_deref() == Some("rejected")
+        && matches!(
+            get("anthropic-ratelimit-unified-representative-claim").as_deref(),
+            Some("overage" | "model")
+        )
+        && window_allows("anthropic-ratelimit-unified-5h-status")
+        && window_allows("anthropic-ratelimit-unified-7d-status")
+}
+
 async fn record_cooldown(
     resp: reqwest::Response,
     member: &AccountMember,
@@ -1964,7 +2411,22 @@ async fn record_cooldown(
     // cannot overflow into a past (or panicking) cooldown deadline. Read the
     // headers before the body extraction consumes the response.
     let header_until_unix_ms = cooldown_deadline_from_headers(resp.headers(), now_ms);
+    // Claude reports a model/overage-scoped rejection with the shared 5h/7d
+    // windows still allowed: only the requested model is benched, the account
+    // stays routable for its other models (Task 21). Unknown scope keeps the
+    // existing account-wide behaviour.
+    let claude_model_scoped = member.kind() == crate::account::ProviderKind::Claude
+        && claude_model_scoped_rejection(resp.headers());
     let failure = extract_failure(resp, status_code).await;
+    if claude_model_scoped {
+        if let Some(model) = model {
+            member.set_model_cooldown(model, header_until_unix_ms);
+            member.record_fail();
+            state.metrics.failed_over.fetch_add(1, Ordering::Relaxed);
+            state.monitor.clear_error(member.id());
+            return failure;
+        }
+    }
     // Record why this account is benched. Without it the exhaustion response
     // can only see a deadline, and a transient rate limit becomes
     // indistinguishable from a plan cap that has to run out.
@@ -2168,68 +2630,6 @@ fn stream_response(resp: reqwest::Response, status_code: u16) -> Response {
         .unwrap_or_else(|_| {
             (StatusCode::INTERNAL_SERVER_ERROR, "failed to build body").into_response()
         })
-}
-
-/// Passes an upstream body through untouched while observing which model the
-/// upstream says it served.
-///
-/// `/v1/responses` and `/backend-api/codex/responses` relay the upstream stream
-/// byte-for-byte, so the client already sees the upstream's own
-/// `response.model`. What the gateway previously lost was the record: every
-/// history row and log line attributes the turn to `usage_events.model`, which
-/// is the *requested* id. An upstream that answers one model with another (the
-/// Codex safety-buffering path) therefore left no trace at all.
-///
-/// The scan is bounded to the head of the stream and never delays a chunk: once
-/// the model is seen, or the budget is spent, the tap stops inspecting and only
-/// forwards.
-fn observe_served_model(
-    body: Body,
-    requested: String,
-    account: String,
-    provider: String,
-    substitutions: Arc<std::sync::atomic::AtomicU64>,
-) -> Body {
-    use futures::StreamExt;
-
-    const OBSERVE_BUDGET: usize = 16 * 1024;
-    let mut seen = 0usize;
-    let mut decided = false;
-    let mut head: Vec<u8> = Vec::new();
-    let tapped = body.into_data_stream().map(move |chunk| {
-        if !decided {
-            if let Ok(bytes) = &chunk {
-                if seen < OBSERVE_BUDGET {
-                    let take = bytes.len().min(OBSERVE_BUDGET - seen);
-                    head.extend_from_slice(&bytes[..take]);
-                    seen += take;
-                }
-                // A model mismatch is only decidable once a frame carrying
-                // `response.model` arrives. Clear the buffer at the budget so a
-                // stream that never names one cannot grow it unboundedly.
-                let served = compat::served_codex_model(&head);
-                if let Some(served) = served {
-                    decided = true;
-                    head.clear();
-                    if served != requested {
-                        substitutions.fetch_add(1, Ordering::Relaxed);
-                        tracing::warn!(
-                            requested_model = %requested,
-                            served_model = %served,
-                            %account,
-                            %provider,
-                            "upstream served a different model than requested"
-                        );
-                    }
-                } else if seen >= OBSERVE_BUDGET {
-                    decided = true;
-                    head.clear();
-                }
-            }
-        }
-        chunk
-    });
-    Body::from_stream(tapped)
 }
 
 fn body_response(status: StatusCode, content_type: Option<&str>, body: Bytes) -> Response {
@@ -2438,6 +2838,359 @@ fn exhaustion_failure_response(
         })
 }
 
+/// Per-attempt native replay bookkeeping for xAI and Kimi.
+enum NativeReplayCapture {
+    Xai {
+        store: Arc<std::sync::Mutex<compat::xai::ReasoningReplay>>,
+        scope: compat::xai::ReplayScope,
+    },
+    Kimi {
+        store: Arc<std::sync::Mutex<compat::kimi::ReplayCache>>,
+        snapshot: compat::kimi::ReplaySnapshot,
+    },
+}
+
+const NATIVE_REPLAY_CAPTURE_LIMIT: usize = 8 * 1024 * 1024;
+
+fn replay_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or(0)
+}
+
+fn prepare_native_replay(
+    state: &AppState,
+    member: &AccountMember,
+    protocol: compat::Protocol,
+    upstream_model: &str,
+    caller: Option<&str>,
+    session: Option<&str>,
+    body: &mut Bytes,
+) -> Option<NativeReplayCapture> {
+    if member.kind() != crate::account::ProviderKind::Generic {
+        return None;
+    }
+    let adapter = member.generic_adapter()?;
+    // Unauthenticated local callers still get a stable, non-empty principal.
+    let caller = caller.filter(|c| !c.trim().is_empty()).unwrap_or("local");
+    let session = session?;
+    let mut value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let capture = match adapter.as_str() {
+        "xai" => {
+            let scope =
+                compat::xai::ReplayScope::new(caller, member.id(), upstream_model, session)?;
+            state
+                .xai_replay
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .apply(&scope, &mut value, false, std::time::Instant::now());
+            NativeReplayCapture::Xai {
+                store: Arc::clone(&state.xai_replay),
+                scope,
+            }
+        }
+        "kimi" if protocol == compat::Protocol::Anthropic => {
+            let scope =
+                compat::kimi::ReplayScope::new(caller, member.id(), session, upstream_model)?;
+            let snapshot = state
+                .kimi_replay
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .prepare(scope, &mut value, replay_now_ms());
+            NativeReplayCapture::Kimi {
+                store: Arc::clone(&state.kimi_replay),
+                snapshot,
+            }
+        }
+        _ => return None,
+    };
+    if let Ok(encoded) = serde_json::to_vec(&value) {
+        *body = Bytes::from(encoded);
+    }
+    Some(capture)
+}
+
+impl NativeReplayCapture {
+    fn failed(self, status: u16) {
+        if let Self::Kimi { store, snapshot } = self {
+            store.lock().unwrap_or_else(|p| p.into_inner()).failed(
+                &snapshot,
+                status,
+                replay_now_ms(),
+            );
+        }
+    }
+
+    /// Streams the response through unchanged while keeping a bounded copy;
+    /// the completed turn is recorded once the body has been fully relayed.
+    fn wrap(self, response: Response) -> Response {
+        let (parts, body) = response.into_parts();
+        let seen = Arc::new(std::sync::Mutex::new(Some(Vec::<u8>::new())));
+        let tap = Arc::clone(&seen);
+        let relayed = body.into_data_stream().inspect(move |chunk| {
+            if let Ok(chunk) = chunk {
+                let mut guard = tap.lock().unwrap_or_else(|p| p.into_inner());
+                let overflow = guard
+                    .as_ref()
+                    .is_some_and(|buf| buf.len() + chunk.len() > NATIVE_REPLAY_CAPTURE_LIMIT);
+                if overflow {
+                    *guard = None;
+                } else if let Some(buf) = guard.as_mut() {
+                    buf.extend_from_slice(chunk);
+                }
+            }
+        });
+        let finish = futures::stream::once(async move {
+            let captured = seen.lock().unwrap_or_else(|p| p.into_inner()).take();
+            if let Some(bytes) = captured {
+                self.complete(&bytes);
+            }
+            Ok::<Bytes, axum::Error>(Bytes::new())
+        });
+        Response::from_parts(parts, Body::from_stream(relayed.chain(finish)))
+    }
+
+    fn complete(self, bytes: &[u8]) {
+        match self {
+            Self::Xai { store, scope } => {
+                if let Some(response) = final_responses_object(bytes) {
+                    store
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .store_completed(scope, &response, std::time::Instant::now());
+                }
+            }
+            Self::Kimi { store, snapshot } => {
+                if let Some(message) = final_anthropic_message(bytes) {
+                    store.lock().unwrap_or_else(|p| p.into_inner()).complete(
+                        &snapshot,
+                        &message,
+                        replay_now_ms(),
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn sse_events(bytes: &[u8]) -> Vec<serde_json::Value> {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .filter_map(|data| serde_json::from_str(data.trim()).ok())
+        .collect()
+}
+
+/// The completed Responses object from a JSON body or a `response.completed` SSE event.
+fn final_responses_object(bytes: &[u8]) -> Option<serde_json::Value> {
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) {
+        return Some(value);
+    }
+    sse_events(bytes)
+        .into_iter()
+        .rev()
+        .find(|event| event["type"] == "response.completed")
+}
+
+/// The final Anthropic message from a JSON body, or rebuilt from SSE blocks.
+fn final_anthropic_message(bytes: &[u8]) -> Option<serde_json::Value> {
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) {
+        return Some(value);
+    }
+    let mut blocks: Vec<serde_json::Value> = Vec::new();
+    let mut partial_json: std::collections::BTreeMap<usize, String> = Default::default();
+    let mut stopped = false;
+    for event in sse_events(bytes) {
+        // Wire bytes do not bound a sparse upstream index's allocation.
+        let index = event["index"]
+            .as_u64()
+            .and_then(|i| usize::try_from(i).ok())
+            .filter(|i| *i < 1024);
+        match event["type"].as_str() {
+            Some("content_block_start") => {
+                let index = index?;
+                if blocks.len() <= index {
+                    blocks.resize(index.checked_add(1)?, serde_json::Value::Null);
+                }
+                blocks[index] = event["content_block"].clone();
+            }
+            Some("content_block_delta") => {
+                let block = blocks.get_mut(index?)?;
+                let delta = &event["delta"];
+                let append = |block: &mut serde_json::Value, key: &str, text: &str| {
+                    let current = block[key].as_str().unwrap_or_default().to_string();
+                    block[key] = serde_json::Value::String(current + text);
+                };
+                match delta["type"].as_str() {
+                    Some("text_delta") => append(block, "text", delta["text"].as_str()?),
+                    Some("thinking_delta") => {
+                        append(block, "thinking", delta["thinking"].as_str()?)
+                    }
+                    Some("signature_delta") => {
+                        block["signature"] = delta["signature"].clone();
+                    }
+                    Some("input_json_delta") => partial_json
+                        .entry(index?)
+                        .or_default()
+                        .push_str(delta["partial_json"].as_str().unwrap_or_default()),
+                    _ => {}
+                }
+            }
+            Some("message_stop") => stopped = true,
+            _ => {}
+        }
+    }
+    if !stopped {
+        return None;
+    }
+    for (index, raw) in partial_json {
+        if let (Some(block), Ok(input)) = (blocks.get_mut(index), serde_json::from_str(&raw)) {
+            block["input"] = input;
+        }
+    }
+    Some(serde_json::json!({ "content": blocks }))
+}
+
+/// A buffered chat completion as a single Responses object: message text,
+/// reasoning and function calls keep their ids (Task 9 non-stream path).
+fn chat_completion_to_responses(
+    chat: &serde_json::Value,
+    model: &str,
+    created: i64,
+) -> serde_json::Value {
+    let message = &chat["choices"][0]["message"];
+    let mut output = Vec::new();
+    if let Some(reasoning) = message["reasoning_content"]
+        .as_str()
+        .filter(|r| !r.is_empty())
+    {
+        output.push(serde_json::json!({
+            "id": "rs_0", "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": reasoning}],
+        }));
+    }
+    if let Some(text) = message["content"].as_str().filter(|t| !t.is_empty()) {
+        output.push(serde_json::json!({
+            "id": "msg_0", "type": "message", "status": "completed", "role": "assistant",
+            "content": [{"type": "output_text", "text": text, "annotations": []}],
+        }));
+    }
+    for (index, call) in message["tool_calls"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        output.push(serde_json::json!({
+            "id": format!("fc_{index}"), "type": "function_call", "status": "completed",
+            "call_id": call["id"], "name": call["function"]["name"],
+            "arguments": call["function"]["arguments"].as_str().unwrap_or("{}"),
+        }));
+    }
+    let usage = &chat["usage"];
+    serde_json::json!({
+        "id": format!("resp_{}", chat["id"].as_str().unwrap_or("0")),
+        "object": "response",
+        "created_at": created,
+        "status": "completed",
+        "model": model,
+        "output": output,
+        "usage": {
+            "input_tokens": usage["prompt_tokens"].as_u64().unwrap_or(0),
+            "output_tokens": usage["completion_tokens"].as_u64().unwrap_or(0),
+            "total_tokens": usage["total_tokens"].as_u64().unwrap_or(0),
+        },
+    })
+}
+
+/// Whether the client request carries a document/file input part, in any of
+/// the client wire shapes (OpenAI `file`, Anthropic `document`, Responses
+/// `input_file`), including malformed file parts with no usable data.
+fn request_carries_document(original_body: &[u8]) -> bool {
+    fn walk(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::Object(map) => {
+                matches!(
+                    map.get("type").and_then(serde_json::Value::as_str),
+                    Some("file" | "document" | "input_file")
+                ) || map.values().any(walk)
+            }
+            serde_json::Value::Array(items) => items.iter().any(walk),
+            _ => false,
+        }
+    }
+    let Ok(body) = serde_json::from_slice::<serde_json::Value>(original_body) else {
+        return false;
+    };
+    ["messages", "input"]
+        .iter()
+        .filter_map(|key| body.get(*key))
+        .any(walk)
+}
+
+/// Vertex thinking follows the catalog's `thinking.vertex` capability and the
+/// client's suffix/effort exactly as the other translations do (Task 5): a
+/// level-only model gets thinkingLevel, a budget model a clamped
+/// thinkingBudget, and an option the model cannot take is a 400.
+fn apply_vertex_thinking(
+    plan: &RelayPlan,
+    upstream_model: &str,
+    gemini: &mut serde_json::Value,
+) -> Result<(), String> {
+    use compat::request::ThinkingMode;
+    let Some(openai) = plan.openai_body.as_ref() else {
+        return Ok(());
+    };
+    // Structured output: Gemini takes the JSON MIME type plus the schema
+    // verbatim as responseJsonSchema (Task 5).
+    match openai["response_format"]["type"].as_str() {
+        Some("json_schema") => {
+            if !gemini["generationConfig"].is_object() {
+                gemini["generationConfig"] = serde_json::json!({});
+            }
+            gemini["generationConfig"]["responseMimeType"] = serde_json::json!("application/json");
+            if let Some(schema) = openai["response_format"]["json_schema"].get("schema") {
+                gemini["generationConfig"]["responseJsonSchema"] = schema.clone();
+            }
+        }
+        Some("json_object") => {
+            if !gemini["generationConfig"].is_object() {
+                gemini["generationConfig"] = serde_json::json!({});
+            }
+            gemini["generationConfig"]["responseMimeType"] = serde_json::json!("application/json");
+        }
+        _ => {}
+    }
+    let requested = openai
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(upstream_model);
+    let Some(mode) =
+        compat::request::thinking_mode(requested, openai).map_err(|e| e.to_string())?
+    else {
+        return Ok(());
+    };
+    let capability = compat::request::embedded_thinking_capability(upstream_model, "vertex")?;
+    let mode = compat::request::target_thinking_mode(mode, &capability, false)?;
+    let config = match mode {
+        ThinkingMode::None => serde_json::json!({"thinkingBudget": 0}),
+        ThinkingMode::Auto => serde_json::json!({"thinkingBudget": -1, "includeThoughts": true}),
+        ThinkingMode::Budget(budget) => {
+            serde_json::json!({"thinkingBudget": budget, "includeThoughts": true})
+        }
+        ThinkingMode::Level(level) => serde_json::json!({
+            "thinkingLevel": level.to_ascii_uppercase(),
+            "includeThoughts": true,
+        }),
+    };
+    if !gemini["generationConfig"].is_object() {
+        gemini["generationConfig"] = serde_json::json!({});
+    }
+    gemini["generationConfig"]["thinkingConfig"] = config;
+    Ok(())
+}
+
 fn json_error(status: StatusCode, message: &str) -> Response {
     let payload = serde_json::json!({
         "type": "error",
@@ -2640,6 +3393,7 @@ fn member_provider_id(member: &AccountMember) -> Option<ProviderId> {
         crate::account::ProviderKind::Zcode => ProviderId::zcode(),
         crate::account::ProviderKind::Vertex => ProviderId::vertex(),
         crate::account::ProviderKind::Devin => ProviderId::devin(),
+        crate::account::ProviderKind::OpenCode => ProviderId::opencode(),
         crate::account::ProviderKind::Generic => {
             ProviderId::canonical(member.provider_name()).ok()?
         }
@@ -2828,6 +3582,8 @@ fn eligible_indices(
     scoped_key: Option<&crate::management::settings::ScopedApiKey>,
     state: &AppState,
 ) -> Vec<usize> {
+    let scheduler = state.scheduler.snapshot();
+    let scheduler_fail_open = scheduler.enabled && scheduler.fail_open;
     let Some(route) = route else {
         let now_unix = now_ms / 1000;
         return pool
@@ -2848,7 +3604,10 @@ fn eligible_indices(
                         .settings
                         .current()
                         .is_codex_account_credit_enabled(member.id());
-                    if !credit_enabled && usage.is_codex_included_quota_exhausted(None, now_unix) {
+                    if !credit_enabled
+                        && !scheduler_fail_open
+                        && usage.is_codex_included_quota_exhausted(None, now_unix)
+                    {
                         return false;
                     }
                 }
@@ -2863,7 +3622,7 @@ fn eligible_indices(
                 {
                     return false;
                 }
-                claude_member_routable(state, member)
+                true
             })
             .map(|(index, _)| index)
             .collect();
@@ -2906,6 +3665,7 @@ fn eligible_indices(
                 .current()
                 .is_codex_account_credit_enabled(member.id());
             if !credit_enabled
+                && !scheduler_fail_open
                 && usage.is_codex_included_quota_exhausted(Some(canonical_model), now_ms / 1000)
             {
                 continue;
@@ -2918,9 +3678,6 @@ fn eligible_indices(
                 .usage_snapshot()
                 .is_claude_included_quota_exhausted(now_ms / 1000)
         {
-            continue;
-        }
-        if !claude_member_routable(state, member) {
             continue;
         }
         match prefix {
@@ -2967,160 +3724,16 @@ fn eligible_indices(
         ranked.push((index, provider.binding.priority));
     }
     // Stable: equal priorities retain pool order.
-    ranked.sort_by_key(|entry| std::cmp::Reverse(entry.1));
+    ranked.sort_by_key(|item| std::cmp::Reverse(item.1));
     let mut ordered: Vec<usize> = ranked.into_iter().map(|(index, _)| index).collect();
-    let ranks = state
-        .claude_reset_order
-        .ranks(&pool.members, now_ms / 1000);
+    let ranks = state.claude_reset_order.ranks(&pool.members, now_ms / 1000);
     crate::claude_reset_order::reorder_claude_slots(
         &mut ordered,
         &pool.members,
         &ranks,
         now_ms / 1000,
     );
-    if state.settings.current().claude_route_mode
-        == crate::management::settings::ClaudeRouteMode::ApiKeyFirst
-    {
-        prefer_claude_api_keys(&mut ordered, &pool.members);
-    }
     ordered
-}
-
-/// Claude-only gates shared by every eligibility path: a suspected account
-/// (W1), an API-key account over its monthly budget (W0), OAuth accounts
-/// under `api_key_only` (W0), and an account whose egress did not build (W5).
-pub(crate) fn claude_member_routable(state: &AppState, member: &AccountMember) -> bool {
-    if member.kind() != crate::account::ProviderKind::Claude || member.is_nekos_relay() {
-        return true;
-    }
-    let settings = state.settings.current();
-    if settings.claude_suspected_accounts.contains_key(member.id()) {
-        return false;
-    }
-    if state.claude_egress_invalid(member) {
-        return false;
-    }
-    if member.relay_api_key().is_some() {
-        return !state
-            .claude_budgets
-            .is_over(&settings.claude_api_key_budgets, member.id());
-    }
-    settings.claude_route_mode != crate::management::settings::ClaudeRouteMode::ApiKeyOnly
-}
-
-fn is_claude_oauth(member: &AccountMember) -> bool {
-    member.kind() == crate::account::ProviderKind::Claude
-        && !member.is_nekos_relay()
-        && member.relay_api_key().is_none()
-}
-
-/// A Claude bound cooldown at most this long holds the session (429) rather
-/// than moving it to an account without its prompt cache.
-const BOUND_COOLDOWN_HOLD_MS: i64 = 120_000;
-
-fn route_serves_claude(route: Option<&ResolvedRoute>) -> bool {
-    route.is_none_or(|route| {
-        route
-            .provider_classes
-            .iter()
-            .any(|p| p.binding.provider_id == mahoquot_registry::ProviderId::claude())
-    })
-}
-
-enum BoundMember {
-    Eligible,
-    ShortCooldown { retry_after_secs: i64 },
-    Unusable,
-}
-
-/// Where the durable binding stands for this request. The bound account must
-/// be a Claude OAuth member that passes this request's model and key scope;
-/// a plain-429 cooldown ending within two minutes holds the session.
-#[allow(clippy::too_many_arguments)]
-fn bound_member_state(
-    pool: &crate::state::PoolSnapshot,
-    route: Option<&ResolvedRoute>,
-    requested_model: Option<&str>,
-    bound_id: &str,
-    eligible: &[usize],
-    api_key_binding: Option<&crate::management::settings::ApiKeyBinding>,
-    scoped_key: Option<&crate::management::settings::ScopedApiKey>,
-    state: &AppState,
-    now_ms: i64,
-) -> BoundMember {
-    let Some(index) = pool.members.iter().position(|m| m.id() == bound_id) else {
-        return BoundMember::Unusable;
-    };
-    let member = &pool.members[index];
-    if !is_claude_oauth(member) {
-        return BoundMember::Unusable;
-    }
-    if eligible.contains(&index) {
-        return BoundMember::Eligible;
-    }
-    let Health::Cooldown { until_unix_ms } = member.health() else {
-        return BoundMember::Unusable;
-    };
-    let remaining_ms = until_unix_ms - now_ms;
-    if remaining_ms <= 0 || remaining_ms > BOUND_COOLDOWN_HOLD_MS {
-        return BoundMember::Unusable;
-    }
-    // Same request filters, health aside: the binding counts only if the
-    // account would serve this request once its cooldown ends.
-    if !member_matches_api_key_binding(member, api_key_binding)
-        || !crate::models_route::member_matches_scope(member, scoped_key)
-        || !claude_member_routable(state, member)
-        || member
-            .usage_snapshot()
-            .is_claude_included_quota_exhausted(now_ms / 1000)
-    {
-        return BoundMember::Unusable;
-    }
-    if let Some(route) = route {
-        let model = requested_model.unwrap_or(&route.canonical_model);
-        let declared = route.provider_classes.iter().any(|provider| {
-            member_provider_id(member).as_ref() == Some(&provider.binding.provider_id)
-                && account_declares_binding_model(
-                    pool,
-                    member,
-                    model,
-                    &route.canonical_model,
-                    provider,
-                )
-        });
-        if !declared || !member.group_available(&route.canonical_model, until_unix_ms) {
-            return BoundMember::Unusable;
-        }
-    }
-    BoundMember::ShortCooldown {
-        retry_after_secs: (remaining_ms + 999) / 1000,
-    }
-}
-
-fn is_claude_api_key(member: &AccountMember) -> bool {
-    member.kind() == crate::account::ProviderKind::Claude
-        && !member.is_nekos_relay()
-        && member.relay_api_key().is_some()
-}
-
-/// Within the slots Claude members occupy, move API-key members ahead of
-/// OAuth members, stable inside each group. Other providers keep their slots.
-fn prefer_claude_api_keys(ordered: &mut [usize], members: &[Arc<AccountMember>]) {
-    let slots: Vec<usize> = ordered
-        .iter()
-        .enumerate()
-        .filter(|(_, index)| {
-            members
-                .get(**index)
-                .is_some_and(|m| is_claude_oauth(m) || is_claude_api_key(m))
-        })
-        .map(|(slot, _)| slot)
-        .collect();
-    let mut claude: Vec<usize> = slots.iter().map(|slot| ordered[*slot]).collect();
-    claude.sort_by_key(|index| !is_claude_api_key(&members[*index]));
-    for (slot, index) in slots.into_iter().zip(claude) {
-        ordered[slot] = index;
-    }
 }
 
 pub(crate) fn eligible_account_ids_for_model(
@@ -3253,6 +3866,7 @@ fn capture_usage(member: &AccountMember, headers: &HeaderMap) {
     let usage = match member.kind() {
         crate::account::ProviderKind::Claude => parse_claude_headers(&map, now),
         crate::account::ProviderKind::Devin => crate::usage::AccountUsage::default(),
+        crate::account::ProviderKind::OpenCode => crate::usage::AccountUsage::default(),
         _ => parse_codex_headers(&map, now),
     };
     if usage.observed_at_unix.is_some() {
@@ -3466,6 +4080,113 @@ mod usage_capture_tests {
     }
 }
 
+async fn collect_antigravity_once(
+    first: Bytes,
+    stream: compat::UpstreamStream,
+    session: compat::ProtocolSession,
+    model: String,
+    created: i64,
+    shape: compat::ReplyShape,
+) -> Result<serde_json::Value, String> {
+    let mut decoder = match session.replay.clone() {
+        Some(replay) => compat::gemini::GeminiDecoder::with_replay(replay),
+        None => compat::gemini::GeminiDecoder::new(),
+    };
+    let mut aggregator = compat::render::Aggregator::new(model.clone(), created);
+    if let Some(replay) = session.replay {
+        aggregator = aggregator.with_replay(replay);
+    }
+    let mut parser = compat::events::SseParser::default();
+    let source = futures::stream::once(async { Ok(first) }).chain(stream);
+    futures::pin_mut!(source);
+    let mut total = 0usize;
+    let mut usage = None;
+    let mut signature = None;
+    loop {
+        let mut frames = Vec::new();
+        let eof = match source.next().await {
+            Some(chunk) => {
+                let chunk = chunk.map_err(|error| error.to_string())?;
+                if chunk.len() > MAX_BUFFERED_UPSTREAM_BYTES.saturating_sub(total) {
+                    return Err("upstream response exceeds buffered byte limit".to_string());
+                }
+                total += chunk.len();
+                parser
+                    .push_raw_data(&chunk, &mut frames)
+                    .map_err(|e| e.message().to_string())?;
+                false
+            }
+            None => {
+                parser
+                    .finish_raw_data(&mut frames)
+                    .map_err(|e| e.message().to_string())?;
+                true
+            }
+        };
+        let mut events = Vec::new();
+        for frame in frames {
+            decoder.decode(&frame, &mut events);
+        }
+        if eof {
+            decoder.finish(&mut events);
+        }
+        for event in events {
+            match &event {
+                compat::events::CodexEvent::Failed { message } => return Err(message.clone()),
+                compat::events::CodexEvent::Completed { usage: value } => usage = value.clone(),
+                compat::events::CodexEvent::ReasoningSignature(value) => {
+                    signature = Some(value.clone())
+                }
+                _ => {}
+            }
+            aggregator.push(event);
+        }
+        if eof {
+            break;
+        }
+    }
+    match shape {
+        compat::ReplyShape::Chat => Ok(aggregator.into_completion()),
+        compat::ReplyShape::TextCompletion => Ok(aggregator.into_text_completion()),
+        compat::ReplyShape::Gemini => aggregator.into_gemini(),
+        compat::ReplyShape::Responses => aggregator.into_responses(),
+        compat::ReplyShape::Anthropic => {
+            let chat = aggregator.into_completion();
+            let message = &chat["choices"][0]["message"];
+            let tools = message["tool_calls"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|tool| {
+                    (
+                        tool["id"].as_str().unwrap_or_default().to_string(),
+                        tool["function"]["name"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string(),
+                        tool["function"]["arguments"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            Ok(compat::claude::messages_payload_full(
+                &format!("msg_{created}"),
+                &model,
+                message["content"].as_str().unwrap_or_default(),
+                &tools,
+                chat["choices"][0]["finish_reason"]
+                    .as_str()
+                    .unwrap_or("stop"),
+                usage.as_ref(),
+                message["reasoning_content"].as_str(),
+                signature.as_deref(),
+            ))
+        }
+    }
+}
+
 pub fn connect_code_to_http_status(code: &str) -> StatusCode {
     match code {
         "canceled" => StatusCode::REQUEST_TIMEOUT,
@@ -3641,7 +4362,6 @@ async fn finish_success(
     status_code: u16,
     created: i64,
     session: compat::ProtocolSession,
-    upstream_model: &str,
 ) -> Result<Response, String> {
     let protocol = session.protocol;
     let content_type = content_type_of(&resp);
@@ -3662,10 +4382,6 @@ async fn finish_success(
         }
     } else {
         capture_usage(member, resp.headers());
-        state.monitor.clear_error(member.id());
-        state
-            .scheduler
-            .record_success(member.id(), &state.pool.load().members);
     }
 
     // Generic accounts relay verbatim only when the upstream speaks the same
@@ -3683,9 +4399,6 @@ async fn finish_success(
         {
             return Err("upstream returned html instead of an api response".to_string());
         }
-        member.record_ok();
-        state.metrics.served.fetch_add(1, Ordering::Relaxed);
-        state.router.feedback(member.id(), Outcome::Success);
         return Ok(stream_response(resp, status_code));
     }
 
@@ -3702,29 +4415,7 @@ async fn finish_success(
         {
             return Err("upstream returned html instead of an api response".to_string());
         }
-        member.record_ok();
-        state.metrics.served.fetch_add(1, Ordering::Relaxed);
-        state.router.feedback(member.id(), Outcome::Success);
-        // The stream is relayed byte-for-byte; watch it for an upstream model
-        // substitution so the log records what actually ran.
-        let passthrough = stream_response(resp, status_code);
-        let (parts, body) = passthrough.into_parts();
-        let expected = if upstream_model.is_empty() {
-            plan.model.clone().unwrap_or_default()
-        } else {
-            upstream_model.to_string()
-        };
-        let body = match Some(expected).filter(|model| !model.is_empty()) {
-            Some(requested) => observe_served_model(
-                body,
-                requested,
-                member.id().to_string(),
-                member.provider_name(),
-                Arc::clone(&state.metrics.served_model_substitutions),
-            ),
-            None => body,
-        };
-        return Ok(Response::from_parts(parts, body));
+        return Ok(stream_response(resp, status_code));
     }
 
     if content_type
@@ -3740,13 +4431,21 @@ async fn finish_success(
             .as_deref()
             .is_some_and(|ct| ct.starts_with("application/json"))
     {
-        let raw = resp.bytes().await.map_err(|e| e.to_string())?;
+        let raw = bounded_response_bytes(resp).await?;
         let value: serde_json::Value = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
         member.record_ok();
         state.metrics.served.fetch_add(1, Ordering::Relaxed);
         state.router.feedback(member.id(), Outcome::Success);
         let output = if plan.mode == RelayMode::Anthropic {
             value
+        } else if plan.mode == RelayMode::Responses {
+            // A buffered Messages reply re-rendered as one Responses object.
+            let chat = compat::claude::anthropic_json_to_openai(
+                &value,
+                &plan.model.clone().unwrap_or_default(),
+                created,
+            );
+            chat_completion_to_responses(&chat, &plan.model.clone().unwrap_or_default(), created)
         } else {
             compat::claude::anthropic_json_to_openai(
                 &value,
@@ -3769,14 +4468,21 @@ async fn finish_success(
             .as_deref()
             .is_some_and(|ct| ct.starts_with("application/json"))
     {
-        let raw = resp.bytes().await.map_err(|error| error.to_string())?;
+        let raw = bounded_response_bytes(resp).await?;
         let value: serde_json::Value =
             serde_json::from_slice(&raw).map_err(|error| error.to_string())?;
-        let output = compat::gemini::gemini_json_to_openai(
+        let mut output = compat::gemini::gemini_json_to_openai(
             &value,
             &plan.model.clone().unwrap_or_default(),
             created,
         );
+        if plan.mode == RelayMode::Responses {
+            output = chat_completion_to_responses(
+                &output,
+                &plan.model.clone().unwrap_or_default(),
+                created,
+            );
+        }
         member.record_ok();
         state.metrics.served.fetch_add(1, Ordering::Relaxed);
         state.router.feedback(member.id(), Outcome::Success);
@@ -3795,26 +4501,47 @@ async fn finish_success(
         .await
         .map_err(|_| "upstream request timed out during preflight".to_string())??
     } else if protocol == compat::Protocol::Anthropic {
-        compat::open_anthropic_stream(resp, get_preflight_deadline(headers)).await?
-    } else if protocol == compat::Protocol::Codex && plan.client_stream {
-        // Codex-family upstreams can answer 200 with a well-formed stream that
-        // carries a role prelude, reasoning, and a terminal event but no text
-        // and no tool call. Holding the preamble lets that turn fail over
-        // instead of reaching the client as an empty response it must retry.
-        compat::open_codex_stream(resp, get_preflight_deadline(headers)).await?
+        // The hold now spans leading thinking, which routinely outlasts the
+        // generic preflight window; give it room so an empty finish is still
+        // caught before the first byte is committed.
+        let hold = if headers.contains_key("x-test-preflight-deadline-ms") {
+            get_preflight_deadline(headers)
+        } else {
+            ANTHROPIC_EMPTY_HOLD
+        };
+        compat::open_anthropic_stream(resp, hold).await?
     } else {
         compat::open_stream(resp, protocol).await?
     };
     let model = plan.model.clone().unwrap_or_default();
 
+    if protocol == compat::Protocol::Antigravity && !plan.client_stream {
+        let completion = collect_antigravity_once(
+            first,
+            stream,
+            session,
+            model,
+            created,
+            if plan.mode == RelayMode::Anthropic {
+                compat::ReplyShape::Anthropic
+            } else {
+                reply_shape(plan.mode)
+            },
+        )
+        .await?;
+        member.record_ok();
+        state.metrics.served.fetch_add(1, Ordering::Relaxed);
+        state.router.feedback(member.id(), Outcome::Success);
+        return Ok(body_response(
+            StatusCode::OK,
+            Some("application/json"),
+            Bytes::from(completion.to_string()),
+        ));
+    }
+
     if plan.mode == RelayMode::Anthropic && plan.client_stream {
         let devin_outcome =
             (protocol == compat::Protocol::Devin).then(|| Arc::new(std::sync::Mutex::new(None)));
-        if protocol != compat::Protocol::Devin {
-            member.record_ok();
-            state.metrics.served.fetch_add(1, Ordering::Relaxed);
-            state.router.feedback(member.id(), Outcome::Success);
-        }
         let upstream_capture = Arc::new(std::sync::Mutex::new(None));
         let body = compat::streaming_body(compat::StreamingBodyParams {
             first,
@@ -3877,11 +4604,6 @@ async fn finish_success(
     if plan.client_stream {
         let devin_outcome =
             (protocol == compat::Protocol::Devin).then(|| Arc::new(std::sync::Mutex::new(None)));
-        if protocol != compat::Protocol::Devin {
-            member.record_ok();
-            state.metrics.served.fetch_add(1, Ordering::Relaxed);
-            state.router.feedback(member.id(), Outcome::Success);
-        }
         let upstream_capture = Arc::new(std::sync::Mutex::new(None));
         let body = compat::streaming_body(compat::StreamingBodyParams {
             first,
@@ -4042,14 +4764,472 @@ fn codex_session_cache_key(headers: &HeaderMap, body_bytes: &[u8]) -> Option<Str
     prompt_cache_key_for(headers, body_bytes)
 }
 
-fn affinity_key(headers: &HeaderMap) -> Option<String> {
-    affinity_header(headers, false)
+const INGRESS_ROUTING_HEADERS: [&str; 12] = [
+    "x-session-id",
+    "x-parent-session-id",
+    "x-session-affinity",
+    "x-client-request-id",
+    "x-claude-code-session-id",
+    "session_id",
+    "session-id",
+    "thread-id",
+    "x-codex-parent-thread-id",
+    "conversation_id",
+    "x-conversation-id",
+    "anthropic-client-session",
+];
+
+/// One content-type to add, or none when the member headers already have one.
+///
+/// `RequestBuilder::header` appends. x.ai's edge returns 415 `Expected request
+/// with Content-Type: application/json` when the same header is sent twice,
+/// even if both values are `application/json`.
+fn content_type_to_append<'a>(
+    member_sets_content_type: bool,
+    client_content_type: Option<&'a str>,
+    protocol: compat::Protocol,
+) -> Option<&'a str> {
+    if member_sets_content_type
+        || protocol == compat::Protocol::Cursor
+        || protocol == compat::Protocol::Devin
+    {
+        return None;
+    }
+    Some(
+        client_content_type
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("application/json"),
+    )
 }
 
-/// The session header chain. `claude_only` drops `x-client-request-id`: it is
-/// a per-request id for Claude callers, so binding on it pins nothing and
-/// would fill the durable store with one-shot keys.
-fn affinity_header(headers: &HeaderMap, claude_only: bool) -> Option<String> {
+#[cfg(test)]
+mod content_type_append_tests {
+    use super::content_type_to_append;
+    use crate::compat::Protocol;
+
+    #[test]
+    fn member_content_type_is_not_duplicated() {
+        assert_eq!(
+            content_type_to_append(true, Some("application/json"), Protocol::Codex),
+            None
+        );
+    }
+
+    #[test]
+    fn missing_content_type_defaults_to_json() {
+        assert_eq!(
+            content_type_to_append(false, None, Protocol::Codex),
+            Some("application/json")
+        );
+        assert_eq!(
+            content_type_to_append(false, Some("text/plain"), Protocol::Codex),
+            Some("text/plain")
+        );
+    }
+}
+
+/// Merges one beta flag into a header list, keeping the existing order.
+fn merge_beta_header(headers: &mut Vec<(String, String)>, beta: &str) {
+    match headers
+        .iter_mut()
+        .find(|(name, _)| name.eq_ignore_ascii_case("anthropic-beta"))
+    {
+        Some((_, value)) => {
+            if !value.split(',').any(|existing| existing.trim() == beta) {
+                value.push(',');
+                value.push_str(beta);
+            }
+        }
+        None => headers.push(("anthropic-beta".to_string(), beta.to_string())),
+    }
+}
+
+fn strip_ingress_headers(out: &mut Vec<(String, String)>, ingress: &HeaderMap) {
+    out.retain(|(name, value)| {
+        let forwarded_from_client = INGRESS_ROUTING_HEADERS
+            .iter()
+            .any(|header| header.eq_ignore_ascii_case(name))
+            && ingress
+                .get(name.as_str())
+                .and_then(|sent| sent.to_str().ok())
+                == Some(value.as_str());
+        !forwarded_from_client
+    });
+}
+
+/// Task 13 hierarchy affinity: explicit session identity, parent inheritance
+/// and the opt-in LCP matcher for session-less conversations, plus the generic
+/// prompt-cache-key derivation for opted-in openai-compatibility providers.
+struct HierarchyContext {
+    /// Router affinity scope for this conversation (caller/route/model scoped).
+    affinity_scope: String,
+    /// Session identity used for cache-key derivation.
+    session: String,
+    /// Member an established, still-valid binding or parent points at.
+    preferred_member: Option<String>,
+    explicit: bool,
+    ttl_ms: i64,
+    lcp: Option<(
+        String,
+        mahoquot_router::lcp::Prepared,
+        mahoquot_router::lcp::Bounds,
+    )>,
+    lcp_binding: Option<mahoquot_router::lcp::Binding>,
+}
+
+const HIERARCHY_EXPLICIT_HEADERS: [&str; 6] = [
+    "x-session-id",
+    "x-claude-code-session-id",
+    "session_id",
+    "session-id",
+    "x-session-affinity",
+    "conversation_id",
+];
+
+fn header_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+}
+
+fn hierarchy_digest(parts: &[&str]) -> String {
+    let mut joined = String::new();
+    for part in parts {
+        joined.push_str(&part.len().to_string());
+        joined.push(':');
+        joined.push_str(part);
+    }
+    let digest = crate::request_history::sha256(joined.as_bytes());
+    digest.iter().take(16).map(|b| format!("{b:02x}")).collect()
+}
+
+/// Canonical turn identities (role + content incl. tool results) including
+/// the turn being asked now, plus the stable system environment. Siblings that
+/// share a prefix therefore diverge on their own last turn.
+fn hierarchy_turns(body: &serde_json::Value) -> (Vec<String>, String) {
+    let mut environment = String::new();
+    let mut turns = Vec::new();
+    let mut push = |role: &str, content: &serde_json::Value| {
+        turns.push(hierarchy_digest(&[role, &content.to_string()]));
+    };
+    if let Some(system) = body.get("system") {
+        environment = system.to_string();
+    }
+    if let Some(instructions) = body.get("instructions").and_then(|v| v.as_str()) {
+        environment = instructions.to_string();
+    }
+    let items = body
+        .get("messages")
+        .or_else(|| body.get("input"))
+        .or_else(|| body.get("contents"))
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    for item in &items {
+        let role = item
+            .get("role")
+            .and_then(|r| r.as_str())
+            .or_else(|| item.get("type").and_then(|t| t.as_str()))
+            .unwrap_or("user");
+        if role == "system" || role == "developer" {
+            environment = item
+                .get("content")
+                .map(|c| c.to_string())
+                .unwrap_or_default();
+            continue;
+        }
+        let content = item
+            .get("content")
+            .or_else(|| item.get("parts"))
+            .or_else(|| item.get("output"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        push(role, &content);
+    }
+    (turns, environment)
+}
+
+impl HierarchyContext {
+    fn resolve(
+        state: &AppState,
+        routing: &crate::management::settings::RoutingSettings,
+        headers: &HeaderMap,
+        original_body: &[u8],
+        caller: Option<&str>,
+        route: Option<&ResolvedRoute>,
+        requested_model: Option<&str>,
+    ) -> Option<Self> {
+        if routing.session_affinity == Some(false) {
+            return None;
+        }
+        let ttl_ms = routing.affinity_ttl_ms();
+        let caller_scope = caller.unwrap_or("*");
+        // Only a real identity is explicit: a session header or an explicit
+        // body id. The first-user-message fallback is inference, not identity.
+        let explicit = HIERARCHY_EXPLICIT_HEADERS
+            .iter()
+            .find_map(|name| header_value(headers, name))
+            .map(str::to_string)
+            .or_else(|| body_affinity_key(original_body).filter(|key| key.starts_with("body-id-")));
+        let scope_of = |session: &str| {
+            scoped_affinity_key(Some(caller_scope), route, requested_model, session)
+        };
+        if let Some(session) = explicit {
+            // Explicit identity wins and bypasses inference. An eligible
+            // parent's binding is inherited only for a not-yet-bound child.
+            let scope = scope_of(&session);
+            let now = now_ms_wall();
+            let bindings = state
+                .session_bindings
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let own = bindings
+                .get(&scope)
+                .filter(|(_, expires)| *expires > now)
+                .map(|(member, _)| member.clone());
+            let parent = header_value(headers, "x-parent-session-id")
+                .or_else(|| header_value(headers, "x-codex-parent-thread-id"))
+                .and_then(|parent| {
+                    bindings
+                        .get(&scope_of(parent))
+                        .filter(|(_, expires)| *expires > now)
+                        .map(|(member, _)| member.clone())
+                });
+            return Some(Self {
+                affinity_scope: scope,
+                session,
+                preferred_member: own.or(parent),
+                explicit: true,
+                ttl_ms,
+                lcp: None,
+                lcp_binding: None,
+            });
+        }
+        if !routing.session_affinity_lcp {
+            return None;
+        }
+        // LCP requires an authenticated caller identity (a presented key),
+        // never the shared keyless master/open-gateway principal.
+        let caller = caller.filter(|c| *c != "master" && *c != "unrestricted")?;
+        let body: serde_json::Value = serde_json::from_slice(original_body).ok()?;
+        let (turns, environment) = hierarchy_turns(&body);
+        let model = route
+            .map(|r| r.canonical_model.as_str())
+            .or(requested_model)
+            .unwrap_or("*");
+        let namespace = scoped_affinity_key(Some(caller), route, Some(model), "lcp");
+        let prepared = mahoquot_router::lcp::Prepared {
+            tail: turns.iter().rev().take(32).rev().cloned().collect(),
+            turns: {
+                let mut with_env = vec![hierarchy_digest(&["environment", &environment])];
+                with_env.extend(turns);
+                with_env
+            },
+            environment,
+            min_prefix: 1,
+        };
+        let bounds = routing.lcp_bounds();
+        let now = now_ms_wall();
+        let binding = state
+            .lcp
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .resolve(&namespace, &prepared, bounds, now, |prefix, parent| {
+                let mut parts: Vec<&str> = vec![parent.unwrap_or("root")];
+                parts.extend(prefix.iter().map(String::as_str));
+                hierarchy_digest(&parts)
+            })?;
+        let preferred_member = (!binding.member.is_empty()).then(|| binding.member.clone());
+        Some(Self {
+            affinity_scope: scope_of(&binding.session),
+            session: binding.session.clone(),
+            preferred_member,
+            explicit: false,
+            ttl_ms,
+            lcp: Some((namespace, prepared, bounds)),
+            lcp_binding: Some(binding),
+        })
+    }
+
+    /// An established healthy binding beats priority, but only within this
+    /// request's eligible, not-yet-attempted candidates.
+    fn preferred_index(
+        &self,
+        pool: &crate::state::PoolSnapshot,
+        eligible: &[usize],
+        attempted: &[usize],
+        now_ms: i64,
+    ) -> Option<usize> {
+        let preferred = self.preferred_member.as_deref()?;
+        eligible.iter().copied().find(|&idx| {
+            !attempted.contains(&idx)
+                && pool
+                    .members
+                    .get(idx)
+                    .is_some_and(|m| m.id() == preferred && m.health().is_available(now_ms))
+        })
+    }
+
+    fn bind(&mut self, state: &AppState, member: &str, now_ms: i64) {
+        self.preferred_member = Some(member.to_string());
+        let expires = now_ms.saturating_add(self.ttl_ms);
+        if self.explicit {
+            let mut bindings = state
+                .session_bindings
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            bindings.retain(|_, (_, deadline)| *deadline > now_ms);
+            bindings.insert(self.affinity_scope.clone(), (member.to_string(), expires));
+            while bindings.len() > 65_536 {
+                let Some(key) = bindings.keys().next().cloned() else {
+                    break;
+                };
+                bindings.remove(&key);
+            }
+        } else if let (Some((namespace, prepared, bounds)), Some(binding)) =
+            (self.lcp.as_ref(), self.lcp_binding.as_ref())
+        {
+            let mut binding = binding.clone();
+            binding.member = member.to_string();
+            state.lcp.lock().unwrap_or_else(|p| p.into_inner()).bind(
+                namespace,
+                prepared.clone(),
+                binding,
+                *bounds,
+                now_ms,
+            );
+        }
+    }
+
+    /// Generic support-prompt-cache-key: only for an openai-compatibility
+    /// provider that opted in; an explicit nonempty client key wins.
+    fn inject_generic_cache_key(
+        &self,
+        state: &AppState,
+        member: &AccountMember,
+        body: &Bytes,
+        original_body: &[u8],
+    ) -> Option<Bytes> {
+        if member.kind() != crate::account::ProviderKind::Generic {
+            return None;
+        }
+        let provider = member.provider_name();
+        let settings = state.settings.current();
+        let opted_in = settings
+            .openai_compatibility
+            .iter()
+            .any(|entry| match entry {
+                crate::management::settings::ProviderKeyEntry::Config(config) => {
+                    config.metadata.get("name").and_then(|v| v.as_str()) == Some(provider.as_str())
+                        && config
+                            .metadata
+                            .get("support-prompt-cache-key")
+                            .and_then(|v| v.as_bool())
+                            == Some(true)
+                }
+                _ => false,
+            });
+        if !opted_in {
+            return None;
+        }
+        let mut value: serde_json::Value = serde_json::from_slice(body).ok()?;
+        let object = value.as_object_mut()?;
+        // Only a key the CLIENT sent is explicit and wins; a key a translation
+        // derived from the legacy first-message fallback is replaced.
+        let client_key = serde_json::from_slice::<serde_json::Value>(original_body)
+            .ok()
+            .and_then(|v| {
+                v.get("prompt_cache_key")
+                    .and_then(|k| k.as_str())
+                    .map(str::to_string)
+            })
+            .filter(|k| !k.trim().is_empty());
+        if let Some(key) = client_key {
+            object.insert("prompt_cache_key".into(), serde_json::Value::String(key));
+            return Some(Bytes::from(serde_json::to_vec(&value).ok()?));
+        }
+        // Provider-scoped UUIDv5 (OID namespace) of the session identity.
+        let namespace = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, provider.as_bytes());
+        let key = uuid::Uuid::new_v5(
+            &namespace,
+            format!("{}|{}", self.affinity_scope, self.session).as_bytes(),
+        );
+        object.insert(
+            "prompt_cache_key".into(),
+            serde_json::Value::String(key.to_string()),
+        );
+        Some(Bytes::from(serde_json::to_vec(&value).ok()?))
+    }
+}
+
+fn now_ms_wall() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or(0)
+}
+
+/// The caller principal that scopes affinity, cache keys and replay (Task
+/// 13): the presented key's stable identifier when there is one, otherwise
+/// the identity kind, so a keyless master and an open gateway never share a
+/// scope with a keyed caller.
+fn auth_affinity_principal(
+    auth: &crate::inbound::ResolvedAuth,
+    key_identifier: Option<&str>,
+) -> String {
+    if let Some(key) = key_identifier.filter(|key| !key.trim().is_empty()) {
+        return key.to_string();
+    }
+    match &auth.identity {
+        crate::inbound::AuthIdentity::Unrestricted => "unrestricted".to_string(),
+        crate::inbound::AuthIdentity::Master => "master".to_string(),
+        crate::inbound::AuthIdentity::Scoped(scoped) => format!("scoped:{}", scoped.key_identifier),
+    }
+}
+
+fn scoped_affinity_key(
+    caller: Option<&str>,
+    route: Option<&ResolvedRoute>,
+    requested_model: Option<&str>,
+    session: &str,
+) -> String {
+    let mut providers = route
+        .into_iter()
+        .flat_map(|route| route.provider_classes.iter())
+        .map(|class| class.binding.provider_id.as_str())
+        .collect::<Vec<_>>();
+    providers.sort_unstable();
+    providers.dedup();
+
+    let model_group = if providers.is_empty() {
+        route
+            .map(|route| route.canonical_model.as_str())
+            .or(requested_model)
+            .unwrap_or("*")
+            .to_string()
+    } else {
+        "*".to_string()
+    };
+    let fields = [
+        caller.unwrap_or("*"),
+        providers.first().copied().unwrap_or("*"),
+        &model_group,
+        session,
+    ];
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for field in fields {
+        hasher.write_u64(field.len() as u64);
+        hasher.write(field.as_bytes());
+    }
+    let provider_set = providers.join("\u{1f}");
+    hasher.write_u64(provider_set.len() as u64);
+    hasher.write(provider_set.as_bytes());
+    format!("affinity-v2-{:016x}", hasher.finish())
+}
+
+fn affinity_key(headers: &HeaderMap) -> Option<String> {
     for name in [
         "x-claude-code-session-id",
         "session_id",
@@ -4065,9 +5245,6 @@ fn affinity_header(headers: &HeaderMap, claude_only: bool) -> Option<String> {
         "x-conversation-id",
         "anthropic-client-session",
     ] {
-        if claude_only && name == "x-client-request-id" {
-            continue;
-        }
         if let Some(v) = headers.get(name).and_then(|v| v.to_str().ok()) {
             let v = v.trim();
             if !v.is_empty() {
@@ -4078,57 +5255,7 @@ fn affinity_header(headers: &HeaderMap, claude_only: bool) -> Option<String> {
     None
 }
 
-/// The session key chain used for routing (`affinity_key`, then the body
-/// fallbacks), minus `x-client-request-id` on Claude-only routes.
-fn routing_affinity_key(headers: &HeaderMap, body: &[u8], claude_only: bool) -> Option<String> {
-    affinity_header(headers, claude_only)
-        .or_else(|| body_affinity_key(body))
-        .or_else(|| body_prefix_affinity_key(body))
-}
-
-/// Stable digest of the same chain for the durable Claude store. The
-/// `DefaultHasher` keys are not stable across builds, so the body fallbacks are
-/// re-hashed from their original bytes with FNV-1a.
-fn durable_affinity_digest(headers: &HeaderMap, body: &[u8], claude_only: bool) -> Option<u64> {
-    use crate::affinity_store::digest;
-    if let Some(value) = affinity_header(headers, claude_only) {
-        return Some(digest("header", value.as_bytes()));
-    }
-    match body_affinity_material(body) {
-        Some(BodyAffinity::Id(id)) => return Some(digest("body-id", id.as_bytes())),
-        Some(BodyAffinity::FirstUser(text)) => {
-            return Some(digest("first-user", text.as_bytes()))
-        }
-        None => {}
-    }
-    if body.len() < BODY_AFFINITY_MIN_BYTES {
-        return None;
-    }
-    Some(digest(
-        "body-prefix",
-        &body[..body.len().min(BODY_AFFINITY_HEAD_BYTES)],
-    ))
-}
-
-enum BodyAffinity {
-    /// An explicit conversation/thread/session id from the body.
-    Id(String),
-    /// The trimmed text of the first user message.
-    FirstUser(String),
-}
-
 fn body_affinity_key(body: &[u8]) -> Option<String> {
-    match body_affinity_material(body)? {
-        BodyAffinity::Id(id) => Some(format!("body-id-{id}")),
-        BodyAffinity::FirstUser(text) => {
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            hasher.write(text.as_bytes());
-            Some(format!("body-first-user-{:016x}", hasher.finish()))
-        }
-    }
-}
-
-fn body_affinity_material(body: &[u8]) -> Option<BodyAffinity> {
     let value: serde_json::Value = serde_json::from_slice(body).ok()?;
     let obj = value.as_object()?;
 
@@ -4156,7 +5283,7 @@ fn body_affinity_material(body: &[u8]) -> Option<BodyAffinity> {
         "session-id",
     ] {
         if let Some(v) = obj.get(field).and_then(extract_val) {
-            return Some(BodyAffinity::Id(v));
+            return Some(format!("body-id-{v}"));
         }
     }
 
@@ -4170,7 +5297,7 @@ fn body_affinity_material(body: &[u8]) -> Option<BodyAffinity> {
             "session-id",
         ] {
             if let Some(v) = metadata.get(field).and_then(extract_val) {
-                return Some(BodyAffinity::Id(v));
+                return Some(format!("body-id-{v}"));
             }
         }
     }
@@ -4179,7 +5306,7 @@ fn body_affinity_material(body: &[u8]) -> Option<BodyAffinity> {
         let user = user.trim();
         if user.starts_with("session_") || user.starts_with("conv_") || user.starts_with("thread_")
         {
-            return Some(BodyAffinity::Id(user.to_string()));
+            return Some(format!("body-id-{user}"));
         }
     }
 
@@ -4192,14 +5319,18 @@ fn body_affinity_material(body: &[u8]) -> Option<BodyAffinity> {
                 if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
                     let trimmed = content.trim();
                     if !trimmed.is_empty() {
-                        return Some(BodyAffinity::FirstUser(trimmed.to_string()));
+                        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                        hasher.write(trimmed.as_bytes());
+                        return Some(format!("body-first-user-{:016x}", hasher.finish()));
                     }
                 } else if let Some(parts) = msg.get("content").and_then(|c| c.as_array()) {
                     for part in parts {
                         if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
                             let trimmed = text.trim();
                             if !trimmed.is_empty() {
-                                return Some(BodyAffinity::FirstUser(trimmed.to_string()));
+                                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                                hasher.write(trimmed.as_bytes());
+                                return Some(format!("body-first-user-{:016x}", hasher.finish()));
                             }
                         }
                     }
@@ -4242,6 +5373,22 @@ pub async fn handle_relay(
 ) -> Response {
     let request_started = std::time::Instant::now();
     let event_id = uuid::Uuid::new_v4().to_string();
+    // Private QA correlation only: never log an arbitrary caller header.
+    if std::env::var("MAHOQUOT_QA_LOOPBACK_ONLY").as_deref() == Ok("1") {
+        if let Some(observation_id) = headers
+            .get("x-mahoquot-observation-id")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| uuid::Uuid::parse_str(value).ok())
+        {
+            tracing::info!(
+                "history_observation={}",
+                serde_json::json!({
+                    "event": "request", "observation_id": observation_id.to_string(),
+                    "event_id": event_id,
+                })
+            );
+        }
+    }
     let occurred_at_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
@@ -4251,6 +5398,45 @@ pub async fn handle_relay(
     let scoped_entry = scoped_key
         .as_ref()
         .and_then(|key| state.scoped_keys.get(&key.key_identifier));
+
+    let plugins_host = state.plugin_host();
+    if let Some(ref plugins) = plugins_host {
+        let hooks = crate::plugins::hooks::PluginHookRegistry::new(plugins.clone());
+        let mut req_hdrs = std::collections::HashMap::new();
+        for (k, v) in headers.iter() {
+            if let Ok(v_str) = v.to_str() {
+                req_hdrs
+                    .entry(k.as_str().to_string())
+                    .or_insert_with(Vec::new)
+                    .push(v_str.to_string());
+            }
+        }
+        let intercept_res =
+            hooks.intercept_request_before_auth(crate::plugins::hooks::RequestInterceptRequest {
+                request_id: event_id.clone(),
+                trace_id: String::new(),
+                source_format: match mode {
+                    RelayMode::Native | RelayMode::Responses => "codex".to_string(),
+                    RelayMode::Anthropic => "claude".to_string(),
+                    RelayMode::GeminiNative => "gemini".to_string(),
+                    _ => "openai".to_string(),
+                },
+                to_format: "openai".to_string(),
+                model: String::new(),
+                requested_model: String::new(),
+                stream: false,
+                headers: req_hdrs,
+                body: body_bytes.to_vec(),
+                metadata: std::collections::HashMap::new(),
+            });
+        if intercept_res.terminate {
+            return (
+                StatusCode::from_u16(intercept_res.status_code).unwrap_or(StatusCode::FORBIDDEN),
+                Bytes::from(intercept_res.response_body),
+            )
+                .into_response();
+        }
+    }
 
     // 1. Quota check: if token budget is exhausted, reject with 429.
     if let Some(ref entry) = scoped_entry {
@@ -4272,6 +5458,12 @@ pub async fn handle_relay(
         .find(|binding| Some(&binding.key_identifier) == key_identifier.as_ref())
         .cloned();
     let _in_flight = state.monitor.track_in_flight();
+    tracing::info!(
+        "cancel_observation={}",
+        serde_json::json!({
+            "event": "guard-acquire", "request_id": event_id
+        })
+    );
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
@@ -4296,9 +5488,144 @@ pub async fn handle_relay(
         }
     }
 
+    if let Some(requested_model) = plan.model.as_deref() {
+        if state.aistudio.is_aistudio_model(requested_model) {
+            let worker_id = state
+                .aistudio
+                .worker_for_model(requested_model, scoped_key.as_deref());
+            let Some(worker_id) = worker_id else {
+                return json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "No connected AI Studio worker available for this model",
+                );
+            };
+
+            let gemini_body = match plan.openai_body.as_ref() {
+                Some(body) => match compat::gemini::openai_to_gemini(body) {
+                    Ok(b) => serde_json::to_vec(&b).unwrap_or_else(|_| plan.body.to_vec()),
+                    Err(e) => return json_error(StatusCode::BAD_REQUEST, &e),
+                },
+                None => plan.body.to_vec(),
+            };
+
+            let mut worker_headers = headers.clone();
+            worker_headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/json"),
+            );
+
+            let method = "POST";
+            let url = format!("/v1beta/models/{}:generateContent", requested_model);
+            let mut token_usage = None;
+            let response = async {
+                match crate::aistudio::execute(
+                    &state.aistudio,
+                    &worker_id,
+                    method,
+                    &url,
+                    worker_headers,
+                    gemini_body,
+                )
+                .await
+                {
+                    Ok(upstream_resp) => {
+                        let status = upstream_resp.status();
+                        let (parts, body) = upstream_resp.into_parts();
+                        let bytes =
+                            match axum::body::to_bytes(body, MAX_BUFFERED_UPSTREAM_BYTES).await {
+                                Ok(bytes) => bytes,
+                                Err(e) => {
+                                    return json_error(
+                                        StatusCode::BAD_GATEWAY,
+                                        &format!("AI Studio worker body failed: {e}"),
+                                    )
+                                }
+                            };
+
+                        if status == StatusCode::OK {
+                            let response_body = if let Ok(gemini_json) =
+                                serde_json::from_slice::<serde_json::Value>(&bytes)
+                            {
+                                let openai_json = compat::gemini::gemini_json_to_openai(
+                                    &gemini_json,
+                                    requested_model,
+                                    created,
+                                );
+                                Bytes::from(
+                                    serde_json::to_vec(&openai_json)
+                                        .unwrap_or_else(|_| bytes.to_vec()),
+                                )
+                            } else {
+                                bytes
+                            };
+                            token_usage = crate::usage::extract_response_token_usage(
+                                &response_body,
+                                &response_body,
+                            );
+                            Response::from_parts(parts, axum::body::Body::from(response_body))
+                        } else {
+                            Response::from_parts(parts, axum::body::Body::from(bytes))
+                        }
+                    }
+                    Err(e) => json_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        &format!("AI Studio worker error: {e}"),
+                    ),
+                }
+            }
+            .await;
+            let success = response.status().is_success();
+            record_request_outcome(
+                &state,
+                OutcomeRecord {
+                    event_id: &event_id,
+                    occurred_at_ms,
+                    provider: "aistudio".to_string(),
+                    account: Some(&worker_id),
+                    model: Some(requested_model),
+                    key_identifier: key_identifier.as_deref(),
+                    session: headers
+                        .get("x-session-id")
+                        .and_then(|v| v.to_str().ok())
+                        .map(session_digest)
+                        .as_deref(),
+                    scoped_entry: scoped_entry.as_deref(),
+                    status: response.status().as_u16(),
+                    success,
+                    elapsed_ms: request_started.elapsed().as_millis() as u64,
+                    bytes_in: plan.original_body.len(),
+                    bytes_out: http_body::Body::size_hint(response.body())
+                        .exact()
+                        .unwrap_or(0),
+                    tokens: token_usage.map(crate::usage::ResponseTokenUsage::total_tokens),
+                    fast: false,
+                    token_usage,
+                },
+            )
+            .await;
+            if success {
+                state.metrics.served.fetch_add(1, Ordering::Relaxed);
+            }
+            state.notify_finalizer(Some(&worker_id), &event_id);
+            return response;
+        }
+    }
+
     // One immutable generation governs resolution, eligibility, account
     // selection, and upstream model rewriting for the whole request.
     let pool = state.pool.load_full();
+    // A Home dispatch that ended ambiguously fences this node (Task 32): no
+    // further request may run locally or through Home, because Home may
+    // already have issued the credential. Fail closed before any selection,
+    // including the no-local-account early exit below.
+    if let Some(home_client) = state.home_client() {
+        if home_client.dispatch_fenced() {
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Home dispatch is fenced after an ambiguous dispatch",
+            );
+        }
+    }
     let required_capability = match plan.mode {
         RelayMode::Image => Some(ModelCapability::Image),
         RelayMode::GeminiCountTokens => Some(ModelCapability::CountTokens),
@@ -4324,60 +5651,7 @@ pub async fn handle_relay(
         scoped_key.as_deref(),
         &state,
     );
-
-    // W2: the durable Claude OAuth binding is consulted before the empty-pool
-    // exits, so a bound account in a short cooldown answers 429 instead of
-    // the request moving (and re-writing its prompt cache) elsewhere.
-    let claude_only = route.as_ref().is_some_and(|route| {
-        !route.provider_classes.is_empty()
-            && route
-                .provider_classes
-                .iter()
-                .all(|p| p.binding.provider_id == mahoquot_registry::ProviderId::claude())
-    });
-    let durable_key = (state.settings.current().claude_route_mode
-        != crate::management::settings::ClaudeRouteMode::ApiKeyOnly
-        && route_serves_claude(route.as_ref()))
-    .then(|| durable_affinity_digest(headers, &plan.original_body, claude_only))
-    .flatten();
-    let mut durable_bound: Option<String> = None;
-    if let Some(key) = durable_key {
-        if let Some(bound_id) = state.claude_affinity.get(key, created) {
-            match bound_member_state(
-                &pool,
-                route.as_ref(),
-                plan.model.as_deref(),
-                &bound_id,
-                &eligible,
-                binding.as_ref(),
-                scoped_key.as_deref(),
-                &state,
-                now_ms,
-            ) {
-                BoundMember::Eligible => {
-                    if let Some(pos) = eligible
-                        .iter()
-                        .position(|&idx| pool.members.get(idx).is_some_and(|m| m.id() == bound_id))
-                    {
-                        let idx = eligible.remove(pos);
-                        eligible.insert(0, idx);
-                    }
-                    durable_bound = Some(bound_id);
-                }
-                BoundMember::ShortCooldown { retry_after_secs } => {
-                    let mut response = json_error(
-                        StatusCode::TOO_MANY_REQUESTS,
-                        "the account serving this session is cooling down; retry shortly",
-                    );
-                    if let Ok(value) = HeaderValue::from_str(&retry_after_secs.to_string()) {
-                        response.headers_mut().insert(header::RETRY_AFTER, value);
-                    }
-                    return response;
-                }
-                BoundMember::Unusable => {}
-            }
-        }
-    }
+    let initial_eligible = eligible.clone();
     if eligible.is_empty() && scoped_key.is_some() {
         return json_error(
             StatusCode::FORBIDDEN,
@@ -4385,6 +5659,14 @@ pub async fn handle_relay(
         );
     }
     let max_attempts = std::cmp::min(eligible.len(), state.max_failover);
+    // While Home is authoritative it owns credential selection, so an empty
+    // local pool is not a reason to refuse: dispatch through Home instead.
+    let home_authoritative = crate::home::is_home_authoritative() && state.home_client().is_some();
+    let max_attempts = if max_attempts == 0 && home_authoritative {
+        1
+    } else {
+        max_attempts
+    };
     if max_attempts == 0 {
         let model = plan.model.as_deref().unwrap_or_default();
         if !pool.members.is_empty()
@@ -4416,48 +5698,104 @@ pub async fn handle_relay(
     // happened to answer with a buffered HTTP failure: transport and
     // proactive-refresh failures end an attempt without an HTTP response.
     let mut last_attempted: Option<(String, String)> = None;
-    let affinity = routing_affinity_key(headers, plan.original_body.as_ref(), claude_only);
-    let session = affinity.as_deref().map(session_digest).or_else(|| {
-        // Mirror the ledger's identity chain: a caller with no session
-        // header still anchors on its first user message, and the history
-        // row must carry the same label the ledger entries are keyed on.
+    let affinity = affinity_key(headers)
+        .or_else(|| body_affinity_key(plan.original_body.as_ref()))
+        .or_else(|| body_prefix_affinity_key(plan.original_body.as_ref()));
+    let affinity_session = affinity.as_deref().map(session_digest);
+    let session = affinity_session.clone().or_else(|| {
         let value: serde_json::Value = serde_json::from_slice(&plan.original_body).ok()?;
         body_session_anchor(&value).map(|anchor| session_digest(&anchor))
     });
+    let routing_settings = state.settings.current().routing.clone();
+    let affinity_principal = auth_affinity_principal(auth, key_identifier.as_deref());
+    let mut hierarchy = HierarchyContext::resolve(
+        &state,
+        &routing_settings,
+        headers,
+        &plan.original_body,
+        Some(affinity_principal.as_str()),
+        route.as_ref(),
+        plan.model.as_deref(),
+    );
     let hint = SessionHint {
-        affinity_key: affinity.clone(),
+        affinity_key: if routing_settings.session_affinity == Some(false) {
+            None
+        } else if let Some(h) = hierarchy.as_ref() {
+            // Hierarchy owns this conversation's binding (TTL-bounded); the
+            // router's sequence-based affinity must not keep a binding alive
+            // past its deadline, so only an established binding is passed on.
+            h.preferred_member
+                .as_ref()
+                .map(|_| h.affinity_scope.clone())
+        } else if routing_settings.session_affinity_lcp {
+            // LCP enabled but nothing matched: cold selection in fill-first
+            // order, no inferred first-message anchor.
+            None
+        } else {
+            session.as_deref().map(|session| {
+                scoped_affinity_key(
+                    key_identifier.as_deref(),
+                    route.as_ref(),
+                    plan.model.as_deref(),
+                    session,
+                )
+            })
+        },
     };
-    // The durable binding wins over any in-memory rebind left by an earlier
-    // one-off failover.
-    if let Some(bound_id) = durable_bound.as_deref() {
-        state.router.select_forced(bound_id, affinity.as_deref());
-    }
     // Accounts already tried in this request. 5xx and transport failures leave
     // health untouched (per contract), so exclusion is what forces the next
     // attempt onto a distinct account even when session affinity binds the
     // router to the failing one.
     let mut attempted: Vec<usize> = Vec::new();
+    let mut permission_denied_accounts: Vec<usize> = Vec::new();
+    let mut retry_round = 0usize;
+    let mut round_attempts = 0usize;
+    let mut round_retryable = false;
+    let scheduler = state.scheduler.snapshot();
+    let scheduler_fail_open = scheduler.enabled && scheduler.fail_open;
+    let settings = state.settings.current();
+    let retry_limit = initial_eligible
+        .iter()
+        .filter_map(|&index| pool.members.get(index))
+        .map(|member| account_retry_limit(member, settings.request_retry))
+        .max()
+        .unwrap_or(0);
+    let round_credential_cap = if home_authoritative {
+        1
+    } else if settings.max_retry_credentials == 0 {
+        eligible.len()
+    } else {
+        settings.max_retry_credentials.min(eligible.len())
+    };
     let select_model = route
         .as_ref()
         .map(|r| r.canonical_model.as_str())
         .or(plan.model.as_deref());
 
-    // Limit-exhaustion 429s (daily model caps) bench the account for hours,
-    // so the same account can never repeat: walking the remaining pool is
-    // safe and must not consume the failover budget, which stays reserved
-    // for failures that CAN repeat on another account (5xx, transport,
-    // plain rate limits). The loop bound is the pool walk itself.
+    // The legacy failure budget applies when no extra rounds are configured.
+    // Each round excludes attempted accounts and the round ceiling bounds
+    // repetition. Cooldown waiting never changes the network timeout policy.
     let mut failover_budget = 0usize;
-    for _ in 0..eligible.len() {
-        if failover_budget >= max_attempts {
+    loop {
+        if (retry_limit == 0 && failover_budget >= max_attempts)
+            || permission_denied_accounts.len() >= max_attempts
+        {
             break;
         }
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+            .unwrap_or(0);
         // `eligible` was computed once, before this request attempted
         // anything. An account benched by an attempt earlier in this same walk,
         // or by a concurrent request, must not be chosen again: each repeat 429
         // stamps a brand-new 24h deadline over the one already recorded, which
         // is what pushed reset times forward and batched them.
+        eligible = initial_eligible.clone();
         eligible.retain(|&idx| {
+            if permission_denied_accounts.contains(&idx) {
+                return false;
+            }
             let Some(member) = pool.members.get(idx) else {
                 return false;
             };
@@ -4471,6 +5809,7 @@ pub async fn handle_relay(
                     .current()
                     .is_codex_account_credit_enabled(member.id());
                 if !credit_enabled
+                    && !scheduler_fail_open
                     && usage.is_codex_included_quota_exhausted(select_model, now_ms / 1000)
                 {
                     return false;
@@ -4489,17 +5828,112 @@ pub async fn handle_relay(
                 return false;
             }
             select_model.is_none_or(|model| member.group_available(model, now_ms))
+                && member.health().is_available(now_ms)
+                && retry_round_allows(member, retry_round, settings.request_retry)
         });
-        let chosen_idx = match select_index(&state, &pool, &hint, &eligible, &attempted) {
+        let chosen_idx = match (round_attempts < round_credential_cap)
+            .then(|| {
+                if home_authoritative {
+                    // Home picks the credential; the local index is unused.
+                    Some(usize::MAX)
+                } else {
+                    hierarchy
+                        .as_ref()
+                        .and_then(|h| h.preferred_index(&pool, &eligible, &attempted, now_ms))
+                        .or_else(|| select_index(&state, &pool, &hint, &eligible, &attempted))
+                }
+            })
+            .flatten()
+        {
             Some(idx) => idx,
-            None => break,
+            None => {
+                if !round_retryable || retry_round >= retry_limit {
+                    break;
+                }
+                let wait_deadlines = initial_eligible
+                    .iter()
+                    .filter(|index| !permission_denied_accounts.contains(index))
+                    .filter_map(|&index| pool.members.get(index))
+                    .filter(|member| {
+                        retry_round_allows(member, retry_round + 1, settings.request_retry)
+                    })
+                    .filter(|member| state.scheduler.permits(member.id()))
+                    .filter_map(|member| match member.health() {
+                        Health::AuthFailed | Health::Disabled => None,
+                        health => {
+                            let account_deadline = match health {
+                                Health::Cooldown { until_unix_ms } => until_unix_ms,
+                                _ => now_ms,
+                            };
+                            Some(
+                                account_deadline.max(
+                                    member
+                                        .group_reset_at_unix(select_model.unwrap_or_default())
+                                        .map(|unix_secs| unix_secs.saturating_mul(1000))
+                                        .unwrap_or(now_ms),
+                                ),
+                            )
+                        }
+                    });
+                let wait_now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+                    .unwrap_or(0);
+                let wait_ms =
+                    retry_round_wait_ms(wait_deadlines, wait_now_ms, settings.max_retry_interval);
+                let Some(wait_ms) = wait_ms else {
+                    break;
+                };
+                if wait_ms > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+                }
+                retry_round += 1;
+                round_attempts = 0;
+                round_retryable = false;
+                failover_budget = 0;
+                attempted.clear();
+                continue;
+            }
         };
-        let member = match pool.members.get(chosen_idx) {
-            Some(m) => m.clone(),
-            None => break,
+        let member = if crate::home::is_home_authoritative() {
+            if let Some(ref home_client) = state.home_client() {
+                if home_client.dispatch_fenced() {
+                    return json_error(StatusCode::SERVICE_UNAVAILABLE, "Home dispatch is fenced");
+                }
+                let requested = plan.model.as_deref().unwrap_or_default();
+                match home_client.dispatch_member(requested) {
+                    Ok((mut m, _)) => {
+                        let lease = crate::home::HomeLease::new(
+                            home_client.clone(),
+                            m.id().to_string(),
+                            requested.to_string(),
+                        );
+                        m.home_lease = Some(lease);
+                        Arc::new(m)
+                    }
+                    Err(e) => {
+                        return json_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            &format!("Home dispatch error: {e}"),
+                        );
+                    }
+                }
+            } else {
+                match pool.members.get(chosen_idx) {
+                    Some(m) => m.clone(),
+                    None => break,
+                }
+            }
+        } else {
+            match pool.members.get(chosen_idx) {
+                Some(m) => m.clone(),
+                None => break,
+            }
         };
         let activity = member.begin_activity();
+        round_retryable = false;
         attempted.push(chosen_idx);
+        round_attempts += 1;
         last_attempted = Some((member.provider_name(), member.id().to_string()));
 
         let mut refreshed_this_account = false;
@@ -4535,6 +5969,17 @@ pub async fn handle_relay(
             .map(|provider| provider.upstream_model.as_str())
             .or(plan.model.as_deref())
             .unwrap_or_default();
+        // Document/file inputs reach only a target that can carry them
+        // (Claude Messages). Every other translation refuses them before any
+        // upstream dial instead of silently dropping the bytes (Task 4).
+        if member.kind() != crate::account::ProviderKind::Claude
+            && request_carries_document(&plan.original_body)
+        {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "target translation does not support document inputs",
+            );
+        }
         let target = match resolve_target(
             &pool,
             &member,
@@ -4543,12 +5988,133 @@ pub async fn handle_relay(
             upstream_model,
             affinity.as_deref(),
             state.as_ref(),
-            headers,
         ) {
             Ok(t) => t,
             Err(message) => return json_error(StatusCode::BAD_REQUEST, &message),
         };
-        let target_url = target.url;
+
+        let mut target_body = target.body;
+        if let Some(h) = hierarchy.as_ref() {
+            if let Some(body) =
+                h.inject_generic_cache_key(&state, &member, &target_body, &plan.original_body)
+            {
+                target_body = body;
+            }
+        }
+        let mut target_url = target.url;
+        let target_headers = target.headers;
+
+        let payload_settings = &state.settings.current().payload.extra;
+        if !payload_settings.is_empty() {
+            if let Ok(mut json_val) = serde_json::from_slice::<serde_json::Value>(&target_body) {
+                let orig_val: serde_json::Value =
+                    serde_json::from_slice(&plan.original_body).unwrap_or(serde_json::Value::Null);
+                let ctx = crate::relay_payload::PayloadRuleContext {
+                    model: upstream_model,
+                    requested_model: plan.model.as_deref().unwrap_or_default(),
+                    protocol: target.protocol.as_str(),
+                    from_protocol: match plan.mode {
+                        RelayMode::Native | RelayMode::Responses => "codex",
+                        RelayMode::Anthropic => "claude",
+                        RelayMode::GeminiNative => "gemini",
+                        _ => "openai",
+                    },
+                    headers,
+                    original_body: &orig_val,
+                };
+                crate::relay_payload::apply_payload_rules(payload_settings, &mut json_val, &ctx);
+                if let Ok(encoded) = serde_json::to_vec(&json_val) {
+                    target_body = Bytes::from(encoded);
+                }
+            }
+        }
+
+        // Provider-native reasoning replay (Tasks 16/17): restore the signed
+        // reasoning this caller/account/model/session last received, and
+        // capture the completed turn from the response below.
+        let mut replay_capture = prepare_native_replay(
+            &state,
+            &member,
+            target.protocol,
+            upstream_model,
+            Some(affinity_principal.as_str()),
+            affinity.as_deref(),
+            &mut target_body,
+        );
+
+        let plugins_host = state.plugin_host();
+        if let Some(ref plugins) = plugins_host {
+            let hooks = crate::plugins::hooks::PluginHookRegistry::new(plugins.clone());
+            let mut req_hdrs = std::collections::HashMap::new();
+            for (k, v) in headers.iter() {
+                if let Ok(v_str) = v.to_str() {
+                    req_hdrs
+                        .entry(k.as_str().to_string())
+                        .or_insert_with(Vec::new)
+                        .push(v_str.to_string());
+                }
+            }
+            // Task 30: request translators/normalizers registered by plugins
+            // see the provider-bound body before the after-auth interceptors.
+            let from_format = match plan.mode {
+                RelayMode::Native | RelayMode::Responses => "codex",
+                RelayMode::Anthropic => "claude",
+                RelayMode::GeminiNative => "gemini",
+                _ => "openai",
+            };
+            let to_format = target.protocol.as_str().to_string();
+            let (translated, did_translate) = hooks.translate_request(
+                from_format,
+                &to_format,
+                upstream_model,
+                &target_body,
+                plan.client_stream,
+            );
+            if did_translate {
+                target_body = Bytes::from(translated);
+            }
+            target_body = Bytes::from(hooks.normalize_request(
+                from_format,
+                &to_format,
+                upstream_model,
+                &target_body,
+                plan.client_stream,
+            ));
+            let intercept_res = hooks.intercept_request_after_auth(
+                crate::plugins::hooks::RequestInterceptRequest {
+                    request_id: event_id.clone(),
+                    trace_id: String::new(),
+                    source_format: match plan.mode {
+                        RelayMode::Native | RelayMode::Responses => "codex".to_string(),
+                        RelayMode::Anthropic => "claude".to_string(),
+                        RelayMode::GeminiNative => "gemini".to_string(),
+                        _ => "openai".to_string(),
+                    },
+                    to_format: target.protocol.as_str().to_string(),
+                    model: upstream_model.to_string(),
+                    requested_model: plan.model.clone().unwrap_or_default(),
+                    stream: plan.client_stream,
+                    headers: req_hdrs,
+                    body: target_body.to_vec(),
+                    metadata: std::collections::HashMap::new(),
+                },
+            );
+            if intercept_res.terminate {
+                return (
+                    StatusCode::from_u16(intercept_res.status_code)
+                        .unwrap_or(StatusCode::FORBIDDEN),
+                    Bytes::from(intercept_res.response_body),
+                )
+                    .into_response();
+            }
+            if !intercept_res.body.is_empty() {
+                target_body = Bytes::from(intercept_res.body);
+            }
+            if !intercept_res.path.is_empty() {
+                target_url = intercept_res.path;
+            }
+        }
+
         // The MiMo anti-abuse gate inspects Accept the way it inspects the
         // User-Agent, so mirror what its own CLI client sends.
         let accept = (member.kind() == crate::account::ProviderKind::Generic
@@ -4563,10 +6129,10 @@ pub async fn handle_relay(
             &target_url,
             &member,
             headers,
-            &target.body,
+            &target_body,
             target.protocol,
             accept,
-            target.headers.as_deref(),
+            target_headers.as_deref(),
         )
         .await
         {
@@ -4596,42 +6162,6 @@ pub async fn handle_relay(
 
         let mut status_code = resp.status().as_u16();
 
-        // W1: a Claude denial is classified before anything else may act on it
-        // (refresh, failover), so an enforcement signal never reaches another
-        // account. Non-denials are rebuilt unchanged for the existing flow.
-        if is_claude_member(&member) && matches!(status_code, 400 | 401 | 403) {
-            let failure = extract_failure(resp, status_code).await;
-            let message = String::from_utf8_lossy(&failure.body);
-            let is_model_rejection = plan.model.is_some()
-                && is_account_scoped_model_rejection(status_code, &failure.body);
-            let denial = if is_model_rejection {
-                crate::claude_denial::Denial::Other
-            } else {
-                crate::claude_denial::classify(status_code, &message)
-            };
-            if denial != crate::claude_denial::Denial::Other {
-                handle_claude_denial(&state, &member, status_code, &message, denial).await;
-                return finish_claude_denial(
-                    &state,
-                    &member,
-                    failure,
-                    OutcomeContext {
-                        event_id: &event_id,
-                        occurred_at_ms,
-                        plan: &plan,
-                        key_identifier: key_identifier.as_deref(),
-                        session: session.as_deref(),
-                        scoped_entry: scoped_entry.as_deref(),
-                        started: request_started,
-                        fast,
-                    },
-                )
-                .await;
-            }
-            resp = rebuild_response(failure);
-            status_code = resp.status().as_u16();
-        }
-
         // Only a 401 earns the refresh-and-replay: a 403 carries a valid
         // credential that was merely denied (workspace/entitlement/model), so
         // refreshing it changes nothing (opencodex #1789, 1fa0f6aad).
@@ -4643,10 +6173,10 @@ pub async fn handle_relay(
                         &target_url,
                         &member,
                         headers,
-                        &target.body,
+                        &target_body,
                         target.protocol,
                         accept,
-                        target.headers.as_deref(),
+                        target_headers.as_deref(),
                     )
                     .await
                     {
@@ -4681,6 +6211,12 @@ pub async fn handle_relay(
             }
         }
 
+        round_retryable = retry_status(status_code);
+        if !(200..=399).contains(&status_code) {
+            if let Some(capture) = replay_capture.take() {
+                capture.failed(status_code);
+            }
+        }
         if (200..=399).contains(&status_code) {
             match finish_success(
                 &state,
@@ -4695,23 +6231,15 @@ pub async fn handle_relay(
                     cursor_reply,
                     replay: target.replay,
                 },
-                upstream_model,
             )
             .await
             {
                 Ok(mut response) => {
-                    if let Some(key) = durable_key.filter(|_| is_claude_oauth(&member)) {
-                        match durable_bound.as_deref() {
-                            // A one-off failover serves this turn only; the
-                            // next turn goes back to the bound account.
-                            Some(bound_id) if bound_id != member.id() => {
-                                state.router.select_forced(bound_id, affinity.as_deref());
-                            }
-                            _ => {
-                                state.claude_affinity.put(key, member.id(), now_unix);
-                                state.router.select_forced(member.id(), affinity.as_deref());
-                            }
-                        }
+                    if let Some(h) = hierarchy.as_mut() {
+                        h.bind(&state, member.id(), now_ms);
+                    }
+                    if let Some(capture) = replay_capture.take() {
+                        response = capture.wrap(response);
                     }
                     let upstream_capture = response
                         .extensions_mut()
@@ -4769,6 +6297,12 @@ pub async fn handle_relay(
                             .or_else(|| crate::usage::extract_response_token_usage(&bytes, &bytes));
                         let tokens =
                             token_usage.map(crate::usage::ResponseTokenUsage::total_tokens);
+                        if parts.status.is_success() {
+                            state.monitor.clear_error(member.id());
+                            state
+                                .scheduler
+                                .record_success(member.id(), &state.pool.load().members);
+                        }
                         record_request_outcome(
                             &state,
                             OutcomeRecord {
@@ -4780,8 +6314,8 @@ pub async fn handle_relay(
                                 key_identifier: key_identifier.as_deref(),
                                 session: session.as_deref(),
                                 scoped_entry: scoped_entry.as_deref(),
-                                status: status_code,
-                                success: true,
+                                status: parts.status.as_u16(),
+                                success: parts.status.is_success(),
                                 elapsed_ms: request_started.elapsed().as_millis() as u64,
                                 bytes_in,
                                 bytes_out: bytes.len() as u64,
@@ -4791,7 +6325,57 @@ pub async fn handle_relay(
                             },
                         )
                         .await;
-                        return Response::from_parts(parts, Body::from(bytes));
+                        let mut final_bytes = bytes.to_vec();
+                        if let Some(ref plugins) = state.plugins {
+                            let hooks =
+                                crate::plugins::hooks::PluginHookRegistry::new(plugins.clone());
+                            let from_format = target.protocol.as_str();
+                            let to_format = match plan.mode {
+                                RelayMode::Native | RelayMode::Responses => "codex",
+                                RelayMode::Anthropic => "claude",
+                                RelayMode::GeminiNative => "gemini",
+                                _ => "openai",
+                            };
+                            let model_name = plan.model.as_deref().unwrap_or_default();
+                            let raw_body = target_body.as_ref();
+                            let orig_body = plan.original_body.as_ref();
+
+                            final_bytes = hooks.normalize_response_before(
+                                from_format,
+                                to_format,
+                                model_name,
+                                orig_body,
+                                raw_body,
+                                &final_bytes,
+                                false,
+                            );
+
+                            let (translated, _did_translate) = hooks.translate_response(
+                                from_format,
+                                to_format,
+                                model_name,
+                                orig_body,
+                                raw_body,
+                                &final_bytes,
+                                false,
+                            );
+                            final_bytes = translated;
+
+                            final_bytes = hooks.normalize_response_after(
+                                from_format,
+                                to_format,
+                                model_name,
+                                orig_body,
+                                raw_body,
+                                &final_bytes,
+                                false,
+                            );
+                        }
+
+                        if let Some(lease) = &member.home_lease {
+                            lease.release();
+                        }
+                        return Response::from_parts(parts, Body::from(final_bytes));
                     }
                     let credential_token = member.access_token();
                     let outcome = StreamedOutcome {
@@ -4813,7 +6397,8 @@ pub async fn handle_relay(
                         bytes_in,
                         fast,
                     };
-                    let counted = CountedStream::new(body, outcome, _in_flight);
+                    let counted =
+                        CountedStream::new(body, outcome, _in_flight, state.plugins.clone());
                     return Response::from_parts(parts, Body::from_stream(counted));
                 }
                 Err(reason) => {
@@ -4828,45 +6413,6 @@ pub async fn handle_relay(
                             (StatusCode::BAD_GATEWAY, "unknown", reason.as_str())
                         };
 
-                    // W1, early-SSE path: the upstream said 200 and then sent
-                    // an `error` event. Classify with the mapped status; the
-                    // client gets the same JSON failure body as before, never
-                    // a retry on another account.
-                    if is_claude_member(&member)
-                        && matches!(code, "permission_denied" | "unauthenticated")
-                    {
-                        let sse_status = if code == "permission_denied" { 403 } else { 401 };
-                        let denial = crate::claude_denial::classify(sse_status, description);
-                        if denial != crate::claude_denial::Denial::Other {
-                            handle_claude_denial(&state, &member, sse_status, description, denial)
-                                .await;
-                            let failure = FinalFailure {
-                                status: mapped_status,
-                                content_type: Some("application/json".to_string()),
-                                body: Bytes::from(
-                                    serde_json::json!({"error": {"message": description, "type": "upstream_error", "code": code}})
-                                        .to_string(),
-                                ),
-                            };
-                            return finish_claude_denial(
-                                &state,
-                                &member,
-                                failure,
-                                OutcomeContext {
-                                    event_id: &event_id,
-                                    occurred_at_ms,
-                                    plan: &plan,
-                                    key_identifier: key_identifier.as_deref(),
-                                    session: session.as_deref(),
-                                    scoped_entry: scoped_entry.as_deref(),
-                                    started: request_started,
-                                    fast,
-                                },
-                            )
-                            .await;
-                        }
-                    }
-
                     member.record_fail();
                     state.metrics.failed_over.fetch_add(1, Ordering::Relaxed);
                     // Stream protocol anomalies are transport-class noise; the
@@ -4874,17 +6420,24 @@ pub async fn handle_relay(
                     // log. A persistent banner would just linger on accounts
                     // that recover moments later.
 
-                    if code == "resource_exhausted" {
+                    let claude_permission_denied = code == "permission_denied"
+                        && member.kind() == crate::account::ProviderKind::Claude;
+                    if code == "resource_exhausted"
+                        || (code == "permission_denied" && !claude_permission_denied)
+                    {
                         let now_ms = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
                             .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
                             .unwrap_or(0);
-                        member.set_health(Health::Cooldown {
-                            until_unix_ms: cooldown_deadline_ms(now_ms, 300),
-                        });
+                        bench_exhausted_quota(
+                            &member,
+                            plan.model.as_deref(),
+                            cooldown_deadline_ms(now_ms, 300),
+                            crate::account::BenchKind::RateLimited,
+                        );
                     } else if code == "unauthenticated" {
                         member.set_health(Health::AuthFailed);
-                    } else {
+                    } else if !claude_permission_denied {
                         state
                             .scheduler
                             .record_non_auth_failure(member.id(), &state.pool.load().members);
@@ -4898,6 +6451,15 @@ pub async fn handle_relay(
                                 .to_string(),
                         ),
                     });
+                    if claude_permission_denied {
+                        tracing::warn!(account = member.id(), model = ?plan.model, code, "upstream stream permission denied; excluding account for this request");
+                        permission_denied_accounts.push(chosen_idx);
+                        failover_budget += 1;
+                        if home_authoritative {
+                            break;
+                        }
+                        continue;
+                    }
                     if member.kind() == crate::account::ProviderKind::Devin
                         && (reason.contains("ended without EndStream")
                             || reason.contains("truncated")
@@ -4905,7 +6467,9 @@ pub async fn handle_relay(
                     {
                         break;
                     }
-                    if code != "resource_exhausted" {
+                    if matches!(code, "resource_exhausted" | "permission_denied") {
+                        round_attempts = round_attempts.saturating_sub(1);
+                    } else {
                         failover_budget += 1;
                     }
                     continue;
@@ -4922,20 +6486,9 @@ pub async fn handle_relay(
             // budgeted — it may be a shared limiter that every account hits.
             if !failure_is_limit_exhaustion(&failure.body) {
                 failover_budget += 1;
-            }
-            last_failure = Some(failure);
-            continue;
-        }
-
-        if status_code == 429 {
-            let failure =
-                record_cooldown(resp, &member, status_code, plan.model.as_deref(), &state).await;
-            // A limit-exhaustion 429 durably benches this account (hours, per
-            // the upstream reset), so it cannot repeat here: keep walking the
-            // pool without spending the failover budget. Any other 429 stays
-            // budgeted — it may be a shared limiter that every account hits.
-            if !failure_is_limit_exhaustion(&failure.body) {
-                failover_budget += 1;
+                round_retryable = true;
+            } else {
+                round_attempts = round_attempts.saturating_sub(1);
             }
             last_failure = Some(failure);
             continue;
@@ -4952,6 +6505,7 @@ pub async fn handle_relay(
                 && plan.model.is_some()
                 && member.provider_name() == "cline"
             {
+                round_attempts = round_attempts.saturating_sub(1);
                 let now_ms = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
@@ -4986,9 +6540,7 @@ pub async fn handle_relay(
             continue;
         }
 
-        if (500..=504).contains(&status_code)
-            || (status_code == 529 && is_claude_member(&member))
-        {
+        if (500..=504).contains(&status_code) {
             // Contract: ServerError leaves health unchanged. The account is
             // excluded from this request's remaining attempts, but a transient
             // upstream 5xx never benches it for other requests — and never
@@ -5000,6 +6552,7 @@ pub async fn handle_relay(
             state.metrics.failed_over.fetch_add(1, Ordering::Relaxed);
             last_failure = Some(extract_failure(resp, status_code).await);
             failover_budget += 1;
+            round_retryable = matches!(status_code, 500 | 502 | 503 | 504);
             continue;
         }
 
@@ -5066,6 +6619,17 @@ pub async fn handle_relay(
 
         if status_code == 403 {
             member.record_fail();
+            if member.kind() == crate::account::ProviderKind::Claude {
+                tracing::warn!(account = member.id(), model = ?plan.model, "upstream HTTP permission denied; excluding account for this request");
+                last_failure = Some(failure);
+                permission_denied_accounts.push(chosen_idx);
+                failover_budget += 1;
+                round_retryable = false;
+                if home_authoritative {
+                    break;
+                }
+                continue;
+            }
             state
                 .scheduler
                 .record_non_auth_failure(member.id(), &state.pool.load().members);
@@ -5075,6 +6639,14 @@ pub async fn handle_relay(
                 .record_error(member.id(), status_code, "forbidden denial");
             last_failure = Some(failure);
             failover_budget += 1;
+            round_retryable = true;
+            continue;
+        }
+
+        if status_code == 408 {
+            last_failure = Some(failure);
+            failover_budget += 1;
+            round_retryable = true;
             continue;
         }
 
@@ -5193,6 +6765,25 @@ mod limit_exhaustion_tests {
     use super::*;
 
     #[test]
+    fn retry_interval_zero_allows_ready_candidates_but_not_cooldown_wait() {
+        assert_eq!(retry_round_wait_ms([1_000], 1_000, 0), Some(0));
+        assert_eq!(retry_round_wait_ms([1_001], 1_000, 0), None);
+        assert_eq!(retry_round_wait_ms([1_001, 1_000], 1_000, -1), Some(0));
+        assert_eq!(retry_round_wait_ms([2_000], 1_000, 1), Some(1_000));
+        assert_eq!(retry_round_wait_ms([2_001], 1_000, 1), None);
+    }
+
+    #[test]
+    fn extra_round_statuses_are_exact() {
+        for status in [403, 408, 429, 500, 502, 503, 504] {
+            assert!(retry_status(status));
+        }
+        for status in [200, 400, 401, 402, 404, 501, 505] {
+            assert!(!retry_status(status));
+        }
+    }
+
+    #[test]
     fn cline_daily_free_limit_body_is_limit_exhaustion() {
         let body = br#"{"error":{"code":"INFERENCE_CAP_ERROR","message":"Error 429: Daily free limit reached on model z-ai/glm-5.3-flash. Try again in 8h 48m"}}"#;
         assert!(failure_is_limit_exhaustion(body));
@@ -5248,139 +6839,297 @@ mod routing_tests {
     use super::*;
     use crate::config::GatewayConfig;
 
-    #[test]
-    fn client_request_id_is_a_session_key_only_outside_claude_routes() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-client-request-id", HeaderValue::from_static("req-9"));
-        assert_eq!(
-            routing_affinity_key(&headers, b"{}", false).as_deref(),
-            Some("req-9")
-        );
-        assert_eq!(routing_affinity_key(&headers, b"{}", true), None);
-        assert_eq!(durable_affinity_digest(&headers, b"{}", true), None);
-        assert!(durable_affinity_digest(&headers, b"{}", false).is_some());
+    struct ReviewRoot(std::path::PathBuf);
+    impl Drop for ReviewRoot {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
     }
 
-    #[test]
-    fn the_durable_digest_is_stable_and_separates_key_kinds() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "x-claude-code-session-id",
-            HeaderValue::from_static("abc"),
-        );
-        let header_digest = durable_affinity_digest(&headers, b"{}", true).unwrap();
-        assert_eq!(
-            header_digest,
-            crate::affinity_store::digest("header", b"abc")
-        );
-        let body = br#"{"messages":[{"role":"user","content":"  abc  "}]}"#;
-        let body_digest = durable_affinity_digest(&HeaderMap::new(), body, true).unwrap();
-        assert_eq!(
-            body_digest,
-            crate::affinity_store::digest("first-user", b"abc")
-        );
-        assert_ne!(header_digest, body_digest);
-    }
-
-    fn route_mode_pool() -> (AppState, std::path::PathBuf) {
-        let claude = |slug: &str, api_key: bool| {
-            let key = if api_key {
-                r#""api_key":"sk-ant-api","#
-            } else {
-                ""
+    #[tokio::test]
+    async fn counted_stream_records_cancel_error_and_eof_once() {
+        use http_body_util::BodyExt;
+        for end in [
+            StreamEnd::Cancelled,
+            StreamEnd::TransportError,
+            StreamEnd::Eof,
+        ] {
+            let root = ReviewRoot(
+                std::env::temp_dir().join(format!("relay-outcome-{}", uuid::Uuid::new_v4())),
+            );
+            std::fs::create_dir_all(&root.0).unwrap();
+            std::fs::write(root.0.join("codex.json"), credential("codex")).unwrap();
+            let state = Arc::new(
+                AppState::new(&GatewayConfig {
+                    auth_dir: root.0.clone(),
+                    config_path: root.0.join("config.yaml"),
+                    auth_refresh_enabled: false,
+                    ..Default::default()
+                })
+                .unwrap(),
+            );
+            let member = state.pool.load().members[0].clone();
+            let mut finalized = subscribe_finalizer(&state, member.id());
+            let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(2);
+            let source = futures::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|chunk| (chunk, rx))
+            });
+            let outcome = StreamedOutcome {
+                _activity: member.begin_activity(),
+                state: state.clone(),
+                member: member.clone(),
+                credential_token: member.access_token(),
+                event_id: uuid::Uuid::new_v4().to_string(),
+                occurred_at_ms: 1,
+                provider: member.provider_name(),
+                model: Some("test".into()),
+                key_identifier: None,
+                session: None,
+                scoped_entry: None,
+                upstream_capture: None,
+                devin_outcome: None,
+                status: 200,
+                started: std::time::Instant::now(),
+                bytes_in: 2,
+                fast: false,
             };
-            format!(
-                r#"{{{key}"type":"claude","identity_slug":"{slug}","access_token":"t","refresh_token":"r","expired":"2099-01-01T00:00:00Z"}}"#
+            let mut body = Body::from_stream(CountedStream::new(
+                Body::from_stream(source),
+                outcome,
+                state.monitor.track_in_flight(),
+                None,
+            ));
+            tx.send(Ok(Bytes::from_static(
+                b"data: {\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3}}\n\n",
+            )))
+            .await
+            .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), body.frame())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(member.ok_count.load(Ordering::Relaxed), 0);
+            assert_eq!(state.metrics.served.load(Ordering::Relaxed), 0);
+            if end == StreamEnd::Cancelled {
+                drop(body);
+            } else {
+                if end == StreamEnd::TransportError {
+                    tx.send(Err(std::io::Error::other("fixture failure")))
+                        .await
+                        .unwrap();
+                }
+                drop(tx);
+                let result =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), body.collect())
+                        .await
+                        .unwrap();
+                assert_eq!(result.is_ok(), end == StreamEnd::Eof);
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(5), finalized.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let status = match end {
+                StreamEnd::Cancelled => 499,
+                StreamEnd::TransportError => 502,
+                StreamEnd::Eof => 200,
+            };
+            let history_state = state.clone();
+            let (totals, status_totals) = tokio::task::spawn_blocking(move || {
+                history_state.history.flush().unwrap();
+                let totals = history_state
+                    .history
+                    .store()
+                    .unwrap()
+                    .query(&Default::default())
+                    .unwrap()
+                    .totals;
+                let status_totals = history_state
+                    .history
+                    .store()
+                    .unwrap()
+                    .query(&crate::request_history::HistoryQuery {
+                        status_codes: vec![status],
+                        ..Default::default()
+                    })
+                    .unwrap()
+                    .totals;
+                (totals, status_totals)
+            })
+            .await
+            .unwrap();
+            assert_eq!(totals.requests, 1);
+            assert_eq!(status_totals.requests, 1);
+            assert_eq!(totals.successful_requests, u64::from(end == StreamEnd::Eof));
+            assert_eq!(totals.failed_requests, u64::from(end != StreamEnd::Eof));
+            assert_eq!(totals.total_tokens, 10);
+            assert_eq!(
+                member.ok_count.load(Ordering::Relaxed),
+                u64::from(end == StreamEnd::Eof)
+            );
+            assert_eq!(
+                member.fail_count.load(Ordering::Relaxed),
+                u64::from(end != StreamEnd::Eof)
+            );
+            assert_eq!(
+                state.metrics.served.load(Ordering::Relaxed),
+                u64::from(end == StreamEnd::Eof)
+            );
+            assert_eq!(state.monitor.in_flight(), 0);
+        }
+    }
+
+    #[test]
+    fn kimi_replay_rejects_oversized_block_index() {
+        for index in [1024, 1_000_000_000, u64::MAX] {
+            let wire = format!("data: {{\"type\":\"content_block_start\",\"index\":{index},\"content_block\":{{\"type\":\"text\",\"text\":\"x\"}}}}\n\ndata: {{\"type\":\"message_stop\"}}\n\n");
+            assert!(final_anthropic_message(wire.as_bytes()).is_none());
+        }
+        let wire = b"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"hello\"}}\n\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"name\":\"todo\",\"input\":{}}}\n\ndata: {\"type\":\"message_stop\"}\n\n";
+        let value = final_anthropic_message(wire).unwrap();
+        assert_eq!(value["content"].as_array().unwrap().len(), 2);
+        assert_eq!(value["content"][0]["text"], "hello");
+        assert_eq!(value["content"][1]["name"], "todo");
+    }
+
+    #[tokio::test]
+    async fn antigravity_nonstream_preserves_signed_generated_ids() {
+        for shape in [compat::ReplyShape::Chat, compat::ReplyShape::Anthropic] {
+            let ledger = compat::signature_ledger::SignatureLedger::in_memory();
+            let replay = ledger.scope("gemini-test", "session-test");
+            let wire = Bytes::from_static(b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"todo\",\"args\":{}},\"thoughtSignature\":\"original-signature\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":7,\"candidatesTokenCount\":3,\"totalTokenCount\":10}}\n\n");
+            let value = collect_antigravity_once(
+                wire,
+                Box::pin(futures::stream::empty()),
+                compat::ProtocolSession {
+                    protocol: compat::Protocol::Antigravity,
+                    cursor_reply: None,
+                    replay: Some(replay.clone()),
+                },
+                "gemini-test".into(),
+                1,
+                shape,
             )
-        };
-        state_with_credentials(
-            "route-mode",
-            &[
-                ("claude-o1.json", claude("o1", false)),
-                ("claude-o2.json", claude("o2", false)),
-                ("claude-k1.json", claude("k1", true)),
-                ("claude-k2.json", claude("k2", true)),
-                ("codex-c1.json", credential("codex")),
-            ],
+            .await
+            .unwrap();
+            let id = if shape == compat::ReplyShape::Chat {
+                value["choices"][0]["message"]["tool_calls"][0]["id"]
+                    .as_str()
+                    .unwrap()
+            } else {
+                value["content"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|v| v["type"] == "tool_use")
+                    .unwrap()["id"]
+                    .as_str()
+                    .unwrap()
+            };
+            assert_eq!(
+                replay.recall(id, "todo", "{}").as_deref(),
+                Some("original-signature")
+            );
+            let next = compat::gemini::openai_to_gemini_with_replay(&serde_json::json!({
+                "model":"gemini-test", "messages":[
+                    {"role":"user","content":"use todo"},
+                    {"role":"assistant","tool_calls":[{"id":id,"type":"function","function":{"name":"todo","arguments":"{}"}}]},
+                    {"role":"tool","tool_call_id":id,"name":"todo","content":"done"}
+                ]
+            }), &replay).unwrap();
+            assert_eq!(
+                next["contents"][1]["parts"][0]["thoughtSignature"],
+                "original-signature"
+            );
+        }
+    }
+
+    fn chunked_response(status: StatusCode, extra: bool) -> reqwest::Response {
+        let chunk = Bytes::from(vec![b'x'; 1024 * 1024]);
+        let count = MAX_BUFFERED_UPSTREAM_BYTES / chunk.len() + usize::from(extra);
+        let chunks =
+            futures::stream::iter((0..count).map(move |_| Ok::<_, std::io::Error>(chunk.clone())));
+        reqwest::Response::from(
+            http::Response::builder()
+                .status(status)
+                .header("content-type", "application/json")
+                .body(reqwest::Body::wrap_stream(chunks))
+                .unwrap(),
         )
     }
 
-    fn ids(pool: &crate::state::PoolSnapshot, indices: &[usize]) -> Vec<String> {
-        indices
-            .iter()
-            .map(|i| pool.members[*i].id().to_string())
-            .collect()
-    }
-
-    #[test]
-    fn claude_route_modes_order_and_filter_claude_members_only() {
-        use crate::management::settings::ClaudeRouteMode;
-        let (state, auth_dir) = route_mode_pool();
-        let pool = state.pool.load_full();
-        let all = |state: &AppState| {
-            ids(
-                &pool,
-                &eligible_indices(&pool, None, None, 0, None, None, state),
-            )
-        };
-        let claude_ids = |list: &[String]| -> Vec<String> {
-            list.iter().filter(|id| *id != "codex").cloned().collect()
-        };
-
-        let oauth_first = all(&state);
-        assert_eq!(oauth_first.len(), 5);
-
-        state
-            .settings
-            .mutate(|d| d.claude_route_mode = ClaudeRouteMode::ApiKeyOnly)
-            .unwrap();
-        let only = all(&state);
-        assert!(!only.iter().any(|id| id == "o1" || id == "o2"), "{only:?}");
-        assert!(only.iter().any(|id| id == "codex"), "codex unaffected: {only:?}");
-        assert_eq!(only.len(), 3);
-
-        let model = "claude-sonnet-4-5-20250929";
-        let route = resolve_route(&pool, Some(model), None).ok().flatten();
-        state
-            .settings
-            .mutate(|d| d.claude_route_mode = ClaudeRouteMode::ApiKeyFirst)
-            .unwrap();
-        let first = ids(
-            &pool,
-            &eligible_indices(&pool, route.as_ref(), Some(model), 0, None, None, &state),
+    #[tokio::test]
+    async fn buffered_upstream_limits_cover_chunked_errors_and_zcode() {
+        assert_eq!(
+            bounded_response_bytes(chunked_response(StatusCode::OK, false))
+                .await
+                .unwrap()
+                .len(),
+            MAX_BUFFERED_UPSTREAM_BYTES
         );
-        let claude_first = claude_ids(&first);
-        assert_eq!(&claude_first[..2], &["k1".to_string(), "k2".to_string()], "{first:?}");
-        let oauth_tail: Vec<_> = claude_first[2..].to_vec();
-        assert_eq!(oauth_tail.len(), 2);
-        assert!(oauth_tail.iter().all(|id| id.starts_with('o')));
-
-        let _ = std::fs::remove_dir_all(auth_dir);
+        assert!(
+            bounded_response_bytes(chunked_response(StatusCode::OK, true))
+                .await
+                .is_err()
+        );
+        let failure = extract_failure(chunked_response(StatusCode::BAD_REQUEST, true), 400).await;
+        assert_eq!(failure.status, StatusCode::BAD_GATEWAY);
+        assert!(failure.body.len() < 1024);
+        let response =
+            zcode_plan_gateway_response(chunked_response(StatusCode::OK, true), None).await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(bounded_response_bytes(response).await.unwrap().len() < 1024);
     }
 
-    #[test]
-    fn an_api_key_member_over_budget_is_skipped() {
-        let (state, auth_dir) = route_mode_pool();
-        let pool = state.pool.load_full();
-        state
-            .settings
-            .mutate(|d| {
-                d.claude_api_key_budgets.insert("k1".into(), 100);
-                d.claude_api_key_budgets.insert("k2".into(), 100);
+    #[tokio::test]
+    async fn buffered_json_adapters_reject_oversized_success() {
+        for (kind, protocol) in [
+            ("claude", compat::Protocol::Anthropic),
+            ("vertex", compat::Protocol::Antigravity),
+        ] {
+            let root = ReviewRoot(
+                std::env::temp_dir().join(format!("relay-limit-{}", uuid::Uuid::new_v4())),
+            );
+            std::fs::create_dir_all(&root.0).unwrap();
+            std::fs::write(root.0.join(format!("{kind}.json")), credential(kind)).unwrap();
+            let state = AppState::new(&GatewayConfig {
+                auth_dir: root.0.clone(),
+                config_path: root.0.join("config.yaml"),
+                auth_refresh_enabled: false,
+                ..Default::default()
             })
             .unwrap();
-        let budgets = state.settings.current().claude_api_key_budgets.clone();
-        state.claude_budgets.refresh_with(&budgets, |account| {
-            Ok::<u64, String>(if account == "k1" { 100 } else { 99 })
-        });
-        let list = ids(
-            &pool,
-            &eligible_indices(&pool, None, None, 0, None, None, &state),
-        );
-        assert!(!list.iter().any(|id| id == "k1"), "{list:?}");
-        assert!(list.iter().any(|id| id == "k2"), "{list:?}");
-        let _ = std::fs::remove_dir_all(auth_dir);
+            let member = state.pool.load().members[0].clone();
+            let plan = build_plan(
+                RelayMode::OpenAiCompat,
+                "/v1/chat/completions",
+                Bytes::from_static(
+                    b"{\"model\":\"test\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}",
+                ),
+                None,
+            )
+            .unwrap();
+            let result = finish_success(
+                &state,
+                &member,
+                &plan,
+                &HeaderMap::new(),
+                chunked_response(StatusCode::OK, true),
+                200,
+                1,
+                compat::ProtocolSession {
+                    protocol,
+                    cursor_reply: None,
+                    replay: None,
+                },
+            )
+            .await;
+            assert!(result.is_err());
+            assert_eq!(member.ok_count.load(Ordering::Relaxed), 0);
+        }
     }
+
     #[test]
     fn body_affinity_key_extracts_expected_fields() {
         // Top-level fields
@@ -5478,6 +7227,37 @@ mod routing_tests {
         assert_eq!(body_affinity_key(br#"{"other_field":"val"}"#), None);
         assert_eq!(body_affinity_key(b"not json"), None);
         assert_eq!(body_affinity_key(b"[]"), None);
+    }
+
+    #[test]
+    fn hierarchy_affinity_principal_isolated_for_master_and_scoped_callers() {
+        let master_one = crate::inbound::ResolvedAuth {
+            identity: crate::inbound::AuthIdentity::Master,
+            key_identifier: Some("caller-one".to_string()),
+        };
+        let master_two = crate::inbound::ResolvedAuth {
+            identity: crate::inbound::AuthIdentity::Master,
+            key_identifier: Some("caller-two".to_string()),
+        };
+        let no_key = crate::inbound::ResolvedAuth {
+            identity: crate::inbound::AuthIdentity::Master,
+            key_identifier: None,
+        };
+        assert_ne!(
+            auth_affinity_principal(&master_one, master_one.key_identifier.as_deref()),
+            auth_affinity_principal(&master_two, master_two.key_identifier.as_deref())
+        );
+        assert_eq!(auth_affinity_principal(&no_key, None), "master");
+        assert_eq!(
+            auth_affinity_principal(
+                &crate::inbound::ResolvedAuth {
+                    identity: crate::inbound::AuthIdentity::Unrestricted,
+                    key_identifier: None,
+                },
+                None,
+            ),
+            "unrestricted"
+        );
     }
 
     #[test]
@@ -6491,57 +8271,6 @@ mod codex_fast_mode_tests {
             let mut target = plan(compat::CODEX_PATH, original);
             apply_codex_fast_mode(&mut target);
             assert_eq!(target.body, Bytes::from(original.to_string()));
-        }
-    }
-}
-
-#[cfg(test)]
-mod served_model_tap_tests {
-    use super::*;
-    use std::sync::atomic::AtomicU64;
-
-    fn frame(model: &str) -> String {
-        format!(
-            "event: response.created\ndata: {{\"type\":\"response.created\",\"response\":{{\"id\":\"r\",\"model\":\"{model}\"}}}}\n\n"
-        )
-    }
-
-    /// Drives the real tap: the body must arrive byte-identical, and the counter
-    /// must move exactly when the upstream names a model other than the one the
-    /// gateway sent. This is the assertion the deployed counter rests on — the
-    /// unit tests on `served_codex_model` alone would pass even if the tap were
-    /// never wired in.
-    #[test]
-    fn tap_forwards_unchanged_and_counts_only_a_real_mismatch() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-
-        let original = Bytes::from(format!("{}{}", frame("gpt-6-luna"), frame("gpt-6-luna")));
-
-        for (upstream_model, expected_count) in
-            [("gpt-6-astra", 1u64), ("gpt-6-luna", 0u64)]
-        {
-            let counter = Arc::new(AtomicU64::new(0));
-            let body = Body::from(original.clone());
-            let tapped = observe_served_model(
-                body,
-                upstream_model.to_string(),
-                "acct".to_string(),
-                "codex".to_string(),
-                Arc::clone(&counter),
-            );
-            let forwarded = rt
-                .block_on(http_body_util::BodyExt::collect(tapped))
-                .expect("body collects")
-                .to_bytes();
-            assert_eq!(forwarded, original, "relay must not alter upstream bytes");
-            assert_eq!(
-                counter.load(Ordering::Relaxed),
-                expected_count,
-                "requested {upstream_model} against upstream luna"
-            );
         }
     }
 }

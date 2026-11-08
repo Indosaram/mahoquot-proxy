@@ -12,11 +12,14 @@ pub mod core;
 pub mod creds;
 pub mod gate;
 pub mod history;
+#[cfg(test)]
+mod inventory_qa;
 pub mod lists;
 pub mod oauth;
 pub mod observability;
 pub mod omo_profile;
 pub mod plugins;
+pub mod quotas;
 pub mod registry;
 pub mod scalar_table;
 pub mod scalars;
@@ -35,11 +38,13 @@ use crate::state::AppState;
 
 pub fn management_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
     Router::new()
+        .merge(crate::compat::meta::onboarding_routes())
         .merge(accounts::account_management_routes())
         .merge(apikeys::apikeys_routes())
         .merge(creds::creds_routes())
         .merge(history::history_routes())
         .merge(observability::observability_routes())
+        .merge(plugins::plugins_routes())
         .merge(omo_profile::omo_profile_routes())
         .merge(registry::registry_routes())
         .merge(core::core_routes())
@@ -47,8 +52,21 @@ pub fn management_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .merge(scalars::scalars_routes())
         .merge(scheduler::scheduler_routes())
         .merge(warmup::warmup_routes())
+        // Task 33: the configured store's health is reported on v0 too.
+        .route(
+            "/storage/status",
+            axum::routing::get(crate::management::store::v8::storage_status_v8),
+        )
+        // The gate reads the live settings document so a configured
+        // `remote-management.secret-key` (and runtime key edits) take effect;
+        // without it the management secret would always read as unset (404).
         .layer(axum::middleware::from_fn_with_state(
-            state.api_keys.clone(),
+            // Cloning the state's keys keeps one shared management-attempt
+            // (ban) ledger across both management mounts.
+            Arc::new(crate::inbound::ApiKeys::with_live_settings(
+                Arc::clone(&state.settings),
+                (*state.api_keys).clone(),
+            )),
             require_api_key,
         ))
         .layer(axum::middleware::from_fn(gate::stamp_management_response))

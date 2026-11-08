@@ -24,11 +24,11 @@ use mahoquot_gateway::config::GatewayConfig;
 use mahoquot_gateway::routes::create_app;
 use mahoquot_gateway::runtime_state::PoolSnapshot;
 use mahoquot_gateway::state::AppState;
-use mahoquot_types::{Health, PoolMember};
 use mahoquot_registry::{
     AuthorityMask, CatalogSource, CatalogVersion, DiscoveredModel, ModelCapability, ModelId,
     ProviderContribution, ProviderId, ProviderPolicy, RegistryBuilder,
 };
+use mahoquot_types::{Health, PoolMember};
 
 static TEST_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -113,12 +113,12 @@ impl DevinMockProcess {
 
         let parsed: serde_json::Value = serde_json::from_str(&line_res)
             .unwrap_or_else(|e| panic!("failed to parse mock readiness JSON '{line_res}': {e}"));
-        let url = parsed["url"].as_str().expect("url must be string").to_string();
+        let url = parsed["url"]
+            .as_str()
+            .expect("url must be string")
+            .to_string();
 
-        Self {
-            _guard: guard,
-            url,
-        }
+        Self { _guard: guard, url }
     }
 
     async fn get_state(&self) -> serde_json::Value {
@@ -315,39 +315,40 @@ async fn test_devin_relay_wire_contract_assertions() {
     let captured = Arc::new(Mutex::new(None));
     let captured_clone = Arc::clone(&captured);
 
-    let mock_app = Router::new().fallback(post(
-        move |req: axum::extract::Request| {
-            let captured = Arc::clone(&captured_clone);
-            async move {
-                let version = req.version();
-                let headers = req.headers().clone();
-                let bytes = axum::body::to_bytes(req.into_body(), 10 * 1024 * 1024)
-                    .await
-                    .unwrap()
-                    .to_vec();
+    let mock_app = Router::new().fallback(post(move |req: axum::extract::Request| {
+        let captured = Arc::clone(&captured_clone);
+        async move {
+            let version = req.version();
+            let headers = req.headers().clone();
+            let bytes = axum::body::to_bytes(req.into_body(), 10 * 1024 * 1024)
+                .await
+                .unwrap()
+                .to_vec();
 
-                *captured.lock().unwrap() = Some(CapturedWire {
-                    version,
-                    headers,
-                    body: bytes,
-                });
+            *captured.lock().unwrap() = Some(CapturedWire {
+                version,
+                headers,
+                body: bytes,
+            });
 
-                let f1 = frame_data(b"");
-                let end = frame_end_stream(r#"{"error":null,"hasSyncPoints":false}"#);
-                let mut wire = f1;
-                wire.extend_from_slice(&end);
+            let f1 = frame_data(b"");
+            let end = frame_end_stream(r#"{"error":null,"hasSyncPoints":false}"#);
+            let mut wire = f1;
+            wire.extend_from_slice(&end);
 
-                (
-                    StatusCode::OK,
-                    [
-                        (header::CONTENT_TYPE, STREAM_CONTENT_TYPE),
-                        (header::HeaderName::from_static("connect-protocol-version"), "1"),
-                    ],
-                    wire,
-                )
-            }
-        },
-    ));
+            (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, STREAM_CONTENT_TYPE),
+                    (
+                        header::HeaderName::from_static("connect-protocol-version"),
+                        "1",
+                    ),
+                ],
+                wire,
+            )
+        }
+    }));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mock_addr = listener.local_addr().unwrap();
@@ -377,11 +378,19 @@ async fn test_devin_relay_wire_contract_assertions() {
     let body = resp.text().await.unwrap();
     assert!(body.contains("[DONE]"), "stream must close with [DONE]");
 
-    let wire = captured.lock().unwrap().take().expect("mock must receive request");
+    let wire = captured
+        .lock()
+        .unwrap()
+        .take()
+        .expect("mock must receive request");
     mock_task.abort();
 
     // 1. Assert HTTP/1.1
-    assert_eq!(wire.version, Version::HTTP_11, "upstream request must use HTTP/1.1");
+    assert_eq!(
+        wire.version,
+        Version::HTTP_11,
+        "upstream request must use HTTP/1.1"
+    );
 
     // 2. Assert literal Authorization header: Basic <token>-<token>
     let auth = wire
@@ -411,7 +420,10 @@ async fn test_devin_relay_wire_contract_assertions() {
     );
 
     // 4. Assert Accept header
-    let accept = wire.headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
+    let accept = wire
+        .headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok());
     assert_eq!(
         accept,
         Some(STREAM_CONTENT_TYPE),
@@ -420,19 +432,29 @@ async fn test_devin_relay_wire_contract_assertions() {
 
     // 5. Assert Connect-Protocol-Version: 1
     assert_eq!(
-        wire.headers.get("connect-protocol-version").and_then(|v| v.to_str().ok()),
+        wire.headers
+            .get("connect-protocol-version")
+            .and_then(|v| v.to_str().ok()),
         Some("1")
     );
 
     // 6. Assert Connect envelope framing: flag 0x00 and 4-byte BE length
-    assert!(wire.body.len() >= 5, "body must contain 5-byte Connect header");
+    assert!(
+        wire.body.len() >= 5,
+        "body must contain 5-byte Connect header"
+    );
     assert_eq!(wire.body[0], 0x00, "flag must be 0x00 (data frame)");
     let payload_len = u32::from_be_bytes(wire.body[1..5].try_into().unwrap()) as usize;
-    assert_eq!(wire.body.len(), 5 + payload_len, "exact declared payload length");
+    assert_eq!(
+        wire.body.len(),
+        5 + payload_len,
+        "exact declared payload length"
+    );
 
     // 7. Parse protobuf and assert metadata.api_key equals token
     let proto_bytes = &wire.body[5..5 + payload_len];
-    let req = GetChatMessageRequest::decode(proto_bytes).expect("must decode GetChatMessageRequest");
+    let req =
+        GetChatMessageRequest::decode(proto_bytes).expect("must decode GetChatMessageRequest");
     let meta = req.metadata.expect("metadata must be present");
     assert_eq!(
         meta.api_key.as_deref(),
@@ -543,13 +565,18 @@ async fn test_devin_relay_streaming_success() {
 
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
-        resp.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+        resp.headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
         Some("text/event-stream")
     );
 
     let text = resp.text().await.unwrap();
     assert!(text.contains("data: "), "must contain SSE data frames");
-    assert!(text.contains("Hello, I am Devin."), "must contain text delta from mock");
+    assert!(
+        text.contains("Hello, I am Devin."),
+        "must contain text delta from mock"
+    );
     assert!(text.contains("[DONE]"), "must terminate with [DONE]");
 
     let state = mock.get_state().await;
@@ -579,7 +606,9 @@ async fn test_devin_relay_non_streaming_success() {
 
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
-        resp.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+        resp.headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
         Some("application/json")
     );
 
@@ -634,17 +663,18 @@ async fn test_devin_relay_fragmented_code_only_error_matches_unsplit() {
 
     let mock_app = Router::new().fallback(post(|| async {
         let frame = frame_end_stream(r#"{"error":{"code":"resource_exhausted"}}"#);
-        let chunks: Vec<bytes::Bytes> = frame
-            .chunks(2)
-            .map(bytes::Bytes::copy_from_slice)
-            .collect();
+        let chunks: Vec<bytes::Bytes> =
+            frame.chunks(2).map(bytes::Bytes::copy_from_slice).collect();
         let stream = futures::stream::iter(chunks.into_iter().map(Ok::<_, std::io::Error>));
 
         (
             StatusCode::OK,
             [
                 (header::CONTENT_TYPE, STREAM_CONTENT_TYPE),
-                (header::HeaderName::from_static("connect-protocol-version"), "1"),
+                (
+                    header::HeaderName::from_static("connect-protocol-version"),
+                    "1",
+                ),
             ],
             axum::body::Body::from_stream(stream),
         )
@@ -710,7 +740,8 @@ async fn test_devin_relay_late_error_no_success_terminal() {
             let mut f1_payload = Vec::new();
             msg.encode(&mut f1_payload).unwrap();
             let f1 = frame_data(&f1_payload);
-            let f2 = frame_end_stream(r#"{"error":{"code":"internal","message":"stream crashed"}}"#);
+            let f2 =
+                frame_end_stream(r#"{"error":{"code":"internal","message":"stream crashed"}}"#);
 
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             // Emit Frame 1 first
@@ -729,7 +760,10 @@ async fn test_devin_relay_late_error_no_success_terminal() {
                 StatusCode::OK,
                 [
                     (header::CONTENT_TYPE, STREAM_CONTENT_TYPE),
-                    (header::HeaderName::from_static("connect-protocol-version"), "1"),
+                    (
+                        header::HeaderName::from_static("connect-protocol-version"),
+                        "1",
+                    ),
                 ],
                 axum::body::Body::from_stream(futures::stream::unfold(rx, |mut rx| async move {
                     rx.recv().await.map(|chunk| (chunk, rx))
@@ -738,8 +772,10 @@ async fn test_devin_relay_late_error_no_success_terminal() {
         }
     }));
 
-    let task_split = tokio::spawn(async move { axum::serve(listener_split, mock_app_split).await.unwrap() });
-    let gw_split = start_devin_gateway("late-split", "tok-late-1", &format!("http://{addr_split}")).await;
+    let task_split =
+        tokio::spawn(async move { axum::serve(listener_split, mock_app_split).await.unwrap() });
+    let gw_split =
+        start_devin_gateway("late-split", "tok-late-1", &format!("http://{addr_split}")).await;
 
     let client = reqwest::Client::new();
     let resp = client
@@ -788,7 +824,10 @@ async fn test_devin_relay_late_error_no_success_terminal() {
         !remaining.contains(r#""finish_reason":"stop""#),
         "late-error must NOT emit success finish_reason 'stop'"
     );
-    assert!(remaining.ends_with("data: [DONE]\n\n"), "must end with [DONE]");
+    assert!(
+        remaining.ends_with("data: [DONE]\n\n"),
+        "must end with [DONE]"
+    );
 
     task_split.abort();
 
@@ -813,14 +852,19 @@ async fn test_devin_relay_late_error_no_success_terminal() {
             StatusCode::OK,
             [
                 (header::CONTENT_TYPE, STREAM_CONTENT_TYPE),
-                (header::HeaderName::from_static("connect-protocol-version"), "1"),
+                (
+                    header::HeaderName::from_static("connect-protocol-version"),
+                    "1",
+                ),
             ],
             combined,
         )
     }));
 
-    let task_coal = tokio::spawn(async move { axum::serve(listener_coal, mock_app_coal).await.unwrap() });
-    let gw_coal = start_devin_gateway("late-coal", "tok-late-2", &format!("http://{addr_coal}")).await;
+    let task_coal =
+        tokio::spawn(async move { axum::serve(listener_coal, mock_app_coal).await.unwrap() });
+    let gw_coal =
+        start_devin_gateway("late-coal", "tok-late-2", &format!("http://{addr_coal}")).await;
 
     let resp_coal = client
         .post(format!("{}/v1/chat/completions", gw_coal.base_url))
@@ -838,10 +882,22 @@ async fn test_devin_relay_late_error_no_success_terminal() {
     assert_eq!(resp_coal.status(), StatusCode::OK);
     let coal_text = resp_coal.text().await.unwrap();
 
-    assert!(coal_text.contains("Coalesced output"), "must deliver text delta");
-    assert!(coal_text.contains(r#""type":"upstream_error""#), "must deliver error frame");
-    assert!(!coal_text.contains(r#""finish_reason":"stop""#), "must NOT deliver finish_reason 'stop'");
-    assert!(coal_text.ends_with("data: [DONE]\n\n"), "must end with [DONE]");
+    assert!(
+        coal_text.contains("Coalesced output"),
+        "must deliver text delta"
+    );
+    assert!(
+        coal_text.contains(r#""type":"upstream_error""#),
+        "must deliver error frame"
+    );
+    assert!(
+        !coal_text.contains(r#""finish_reason":"stop""#),
+        "must NOT deliver finish_reason 'stop'"
+    );
+    assert!(
+        coal_text.ends_with("data: [DONE]\n\n"),
+        "must end with [DONE]"
+    );
 
     task_coal.abort();
 }
@@ -927,7 +983,11 @@ async fn test_devin_relay_no_retry_on_ambiguous_precommit_failure() {
             let end = frame_end_stream(r#"{"error":null}"#);
             let mut wire = f1;
             wire.extend_from_slice(&end);
-            (StatusCode::OK, [(header::CONTENT_TYPE, STREAM_CONTENT_TYPE)], wire)
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, STREAM_CONTENT_TYPE)],
+                wire,
+            )
         }
     }));
     let task2 = tokio::spawn(async move { axum::serve(listener2, app2).await.unwrap() });
@@ -992,7 +1052,8 @@ async fn test_devin_relay_no_retry_after_downstream_commitment() {
             let mut f1_payload = Vec::new();
             msg.encode(&mut f1_payload).unwrap();
             let f1 = frame_data(&f1_payload);
-            let f2 = frame_end_stream(r#"{"error":{"code":"internal","message":"stream crashed"}}"#);
+            let f2 =
+                frame_end_stream(r#"{"error":{"code":"internal","message":"stream crashed"}}"#);
 
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             let _ = tx.send(Ok::<_, std::io::Error>(bytes::Bytes::from(f1)));
@@ -1008,7 +1069,10 @@ async fn test_devin_relay_no_retry_after_downstream_commitment() {
                 StatusCode::OK,
                 [
                     (header::CONTENT_TYPE, STREAM_CONTENT_TYPE),
-                    (header::HeaderName::from_static("connect-protocol-version"), "1"),
+                    (
+                        header::HeaderName::from_static("connect-protocol-version"),
+                        "1",
+                    ),
                 ],
                 axum::body::Body::from_stream(futures::stream::unfold(rx, |mut rx| async move {
                     rx.recv().await.map(|chunk| (chunk, rx))
@@ -1029,7 +1093,11 @@ async fn test_devin_relay_no_retry_after_downstream_commitment() {
             let end = frame_end_stream(r#"{"error":null}"#);
             let mut wire = f1;
             wire.extend_from_slice(&end);
-            (StatusCode::OK, [(header::CONTENT_TYPE, STREAM_CONTENT_TYPE)], wire)
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, STREAM_CONTENT_TYPE)],
+                wire,
+            )
         }
     }));
     let task2 = tokio::spawn(async move { axum::serve(listener2, app2).await.unwrap() });
@@ -1101,7 +1169,10 @@ async fn test_devin_relay_upstream_disconnect_inflight_and_history_failure() {
 
     // 1. Establish replay cursor BEFORE request action
     let initial_state = mock.get_state().await;
-    let initial_events_count = initial_state["events"].as_array().map(|a| a.len()).unwrap_or(0);
+    let initial_events_count = initial_state["events"]
+        .as_array()
+        .map(|a| a.len())
+        .unwrap_or(0);
 
     // 2. Subscribe to exact finalizer notification signal BEFORE triggering cancellation
     let mut finalizer_rx = mahoquot_gateway::relay::subscribe_finalizer(&gw.state, "cancel-acc");
@@ -1131,7 +1202,8 @@ async fn test_devin_relay_upstream_disconnect_inflight_and_history_failure() {
     drop(stream);
 
     // 3. Await exact finalizer completion signal with bounded timeout (not scheduling luck)
-    let finalizer_completed = tokio::time::timeout(Duration::from_secs(5), finalizer_rx.recv()).await;
+    let finalizer_completed =
+        tokio::time::timeout(Duration::from_secs(5), finalizer_rx.recv()).await;
     assert!(
         finalizer_completed.is_ok(),
         "finalizer must signal completion on client drop"
@@ -1148,13 +1220,19 @@ async fn test_devin_relay_upstream_disconnect_inflight_and_history_failure() {
         .send()
         .await
         .expect("must post wait-event");
-    assert!(wait_res.status().is_success(), "mock server must confirm client_closed event");
+    assert!(
+        wait_res.status().is_success(),
+        "mock server must confirm client_closed event"
+    );
     let wait_body: serde_json::Value = wait_res.json().await.unwrap();
     assert_eq!(wait_body["event"]["type"], "client_closed");
 
     let final_state = mock.get_state().await;
     let events = final_state["events"].as_array().unwrap();
-    let has_closed = events.iter().skip(initial_events_count).any(|e| e["type"] == "client_closed");
+    let has_closed = events
+        .iter()
+        .skip(initial_events_count)
+        .any(|e| e["type"] == "client_closed");
     assert!(
         has_closed,
         "mock replay cursor must contain client_closed event occurring after start cursor"
@@ -1169,7 +1247,10 @@ async fn test_devin_relay_upstream_disconnect_inflight_and_history_failure() {
     assert_eq!(inflight, 0, "in_flight must return to 0 after cancellation");
 
     // 6. Flush history synchronously through the channel
-    gw.state.history.flush().expect("history flush must succeed");
+    gw.state
+        .history
+        .flush()
+        .expect("history flush must succeed");
 
     // 7. Query actual SQLite rows from `usage_events`: cancellation must be logged as failure (succeeded == 0)
     let db_path = gw.config_path.with_file_name("request-history.sqlite");
@@ -1186,7 +1267,10 @@ async fn test_devin_relay_upstream_disconnect_inflight_and_history_failure() {
         succeeded, 0,
         "canceled stream must be recorded as failure (succeeded == 0) in request history"
     );
-    assert_eq!(status_val, 499, "canceled stream must be recorded with status 499");
+    assert_eq!(
+        status_val, 499,
+        "canceled stream must be recorded with status 499"
+    );
 }
 
 // ─── Test 12: Logs and History Token Non-Disclosure with Real DB & WAL Audit ─
@@ -1211,10 +1295,16 @@ async fn test_devin_relay_token_non_disclosure() {
         .unwrap();
 
     let body = resp.text().await.unwrap();
-    assert!(!body.contains(test_token), "response body must not disclose session token");
+    assert!(
+        !body.contains(test_token),
+        "response body must not disclose session token"
+    );
 
     // 1. Flush SQLite history
-    gw.state.history.flush().expect("history flush must succeed");
+    gw.state
+        .history
+        .flush()
+        .expect("history flush must succeed");
 
     // 2. Query actual SQLite rows from `usage_events` (must exist and not be empty)
     let db_path = gw.config_path.with_file_name("request-history.sqlite");
@@ -1248,19 +1338,26 @@ async fn test_devin_relay_token_non_disclosure() {
             assert!(!k.contains(test_token), "key_identifier contains secret");
         }
     }
-    assert!(row_count > 0, "request history must contain at least 1 record");
+    assert!(
+        row_count > 0,
+        "request history must contain at least 1 record"
+    );
 
     // 3. Raw byte audit of SQLite DB and WAL files (never unwrap_or_default)
     let db_bytes = std::fs::read(&db_path).expect("read db bytes");
     assert!(
-        !db_bytes.windows(test_token.len()).any(|w| w == test_token.as_bytes()),
+        !db_bytes
+            .windows(test_token.len())
+            .any(|w| w == test_token.as_bytes()),
         "SQLite database raw bytes must not contain token"
     );
     let wal_path = gw.config_path.with_file_name("request-history.sqlite-wal");
     if wal_path.exists() {
         let wal_bytes = std::fs::read(&wal_path).expect("read wal bytes");
         assert!(
-            !wal_bytes.windows(test_token.len()).any(|w| w == test_token.as_bytes()),
+            !wal_bytes
+                .windows(test_token.len())
+                .any(|w| w == test_token.as_bytes()),
             "SQLite WAL raw bytes must not contain token"
         );
     }
@@ -1269,7 +1366,10 @@ async fn test_devin_relay_token_non_disclosure() {
     let logs = gw.state.log_tail.snapshot();
     assert!(!logs.is_empty(), "log tail must contain recorded events");
     for line in logs {
-        assert!(!line.contains(test_token), "log line discloses token: {line}");
+        assert!(
+            !line.contains(test_token),
+            "log line discloses token: {line}"
+        );
     }
 
     // 5. Audit disk log files if present
@@ -1280,7 +1380,9 @@ async fn test_devin_relay_token_non_disclosure() {
             if entry.path().is_file() {
                 let log_bytes = std::fs::read(entry.path()).expect("read log file");
                 assert!(
-                    !log_bytes.windows(test_token.len()).any(|w| w == test_token.as_bytes()),
+                    !log_bytes
+                        .windows(test_token.len())
+                        .any(|w| w == test_token.as_bytes()),
                     "log file on disk discloses token: {:?}",
                     entry.path()
                 );
@@ -1356,7 +1458,10 @@ async fn test_devin_relay_concurrent_refresh_and_credential_rotation() {
                 StatusCode::OK,
                 [
                     (header::CONTENT_TYPE, STREAM_CONTENT_TYPE),
-                    (header::HeaderName::from_static("connect-protocol-version"), "1"),
+                    (
+                        header::HeaderName::from_static("connect-protocol-version"),
+                        "1",
+                    ),
                 ],
                 axum::body::Body::from_stream(futures::stream::unfold(rx, |mut rx| async move {
                     rx.recv().await.map(|chunk| (chunk, rx))
@@ -1396,7 +1501,11 @@ async fn test_devin_relay_concurrent_refresh_and_credential_rotation() {
 
     // 1. While Chat is running, discovery refresh publishes a new snapshot with cloned member
     let current_pool = gw.state.pool.load();
-    let member = current_pool.members.iter().find(|m| m.id == "concurrent-acc").unwrap();
+    let member = current_pool
+        .members
+        .iter()
+        .find(|m| m.id == "concurrent-acc")
+        .unwrap();
     let cloned_member = Arc::new(member.clone_for_snapshot(None));
     let new_pool = PoolSnapshot::new(
         current_pool.generation + 1,
@@ -1414,7 +1523,11 @@ async fn test_devin_relay_concurrent_refresh_and_credential_rotation() {
 
     // 3. Current pool's member (same credential) must reflect the success exactly once!
     let updated_pool = gw.state.pool.load();
-    let current_member = updated_pool.members.iter().find(|m| m.id == "concurrent-acc").unwrap();
+    let current_member = updated_pool
+        .members
+        .iter()
+        .find(|m| m.id == "concurrent-acc")
+        .unwrap();
     assert_eq!(
         current_member.ok_count.load(Ordering::SeqCst),
         1,
@@ -1460,7 +1573,9 @@ async fn test_devin_relay_concurrent_refresh_and_credential_rotation() {
             let mut f1_payload = Vec::new();
             msg.encode(&mut f1_payload).unwrap();
             let f1 = frame_data(&f1_payload);
-            let f2 = frame_end_stream(r#"{"error":{"code":"unauthenticated","message":"token revoked"}}"#);
+            let f2 = frame_end_stream(
+                r#"{"error":{"code":"unauthenticated","message":"token revoked"}}"#,
+            );
 
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             let _ = tx.send(Ok::<_, std::io::Error>(bytes::Bytes::from(f1)));
@@ -1476,7 +1591,10 @@ async fn test_devin_relay_concurrent_refresh_and_credential_rotation() {
                 StatusCode::OK,
                 [
                     (header::CONTENT_TYPE, STREAM_CONTENT_TYPE),
-                    (header::HeaderName::from_static("connect-protocol-version"), "1"),
+                    (
+                        header::HeaderName::from_static("connect-protocol-version"),
+                        "1",
+                    ),
                 ],
                 axum::body::Body::from_stream(futures::stream::unfold(rx, |mut rx| async move {
                     rx.recv().await.map(|chunk| (chunk, rx))
@@ -1484,9 +1602,11 @@ async fn test_devin_relay_concurrent_refresh_and_credential_rotation() {
             )
         }
     }));
-    let task_err = tokio::spawn(async move { axum::serve(listener_err, mock_app_err).await.unwrap() });
+    let task_err =
+        tokio::spawn(async move { axum::serve(listener_err, mock_app_err).await.unwrap() });
 
-    let gw_rot = start_devin_gateway("rot-acc", "old-token-xyz", &format!("http://{addr_err}")).await;
+    let gw_rot =
+        start_devin_gateway("rot-acc", "old-token-xyz", &format!("http://{addr_err}")).await;
     let resp_err = client
         .post(format!("{}/v1/chat/completions", gw_rot.base_url))
         .header(header::AUTHORIZATION, "Bearer test-inbound-key")
@@ -1570,7 +1690,9 @@ async fn test_devin_relay_late_error_exactly_once_failure_and_retained_health() 
             let mut f1_payload = Vec::new();
             msg.encode(&mut f1_payload).unwrap();
             let f1 = frame_data(&f1_payload);
-            let f2 = frame_end_stream(r#"{"error":{"code":"unauthenticated","message":"session token revoked"}}"#);
+            let f2 = frame_end_stream(
+                r#"{"error":{"code":"unauthenticated","message":"session token revoked"}}"#,
+            );
 
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             let _ = tx.send(Ok::<_, std::io::Error>(bytes::Bytes::from(f1)));
@@ -1586,7 +1708,10 @@ async fn test_devin_relay_late_error_exactly_once_failure_and_retained_health() 
                 StatusCode::OK,
                 [
                     (header::CONTENT_TYPE, STREAM_CONTENT_TYPE),
-                    (header::HeaderName::from_static("connect-protocol-version"), "1"),
+                    (
+                        header::HeaderName::from_static("connect-protocol-version"),
+                        "1",
+                    ),
                 ],
                 axum::body::Body::from_stream(futures::stream::unfold(rx, |mut rx| async move {
                     rx.recv().await.map(|chunk| (chunk, rx))
@@ -1595,7 +1720,12 @@ async fn test_devin_relay_late_error_exactly_once_failure_and_retained_health() 
         }
     }));
     let task_a = tokio::spawn(async move { axum::serve(listener_a, app_a).await.unwrap() });
-    let gw_a = start_devin_gateway("late-unauth", "tok-unauth-test", &format!("http://{addr_a}")).await;
+    let gw_a = start_devin_gateway(
+        "late-unauth",
+        "tok-unauth-test",
+        &format!("http://{addr_a}"),
+    )
+    .await;
 
     let client = reqwest::Client::new();
     let resp_a = client
@@ -1626,7 +1756,15 @@ async fn test_devin_relay_late_error_exactly_once_failure_and_retained_health() 
         let _ = chunk.unwrap();
     }
 
-    let member_a = gw_a.state.pool.load().members.iter().find(|m| m.id() == "late-unauth").unwrap().clone();
+    let member_a = gw_a
+        .state
+        .pool
+        .load()
+        .members
+        .iter()
+        .find(|m| m.id() == "late-unauth")
+        .unwrap()
+        .clone();
     assert_eq!(
         member_a.fail_count.load(Ordering::Relaxed),
         1,
@@ -1660,7 +1798,9 @@ async fn test_devin_relay_late_error_exactly_once_failure_and_retained_health() 
             let mut f1_payload = Vec::new();
             msg.encode(&mut f1_payload).unwrap();
             let f1 = frame_data(&f1_payload);
-            let f2 = frame_end_stream(r#"{"error":{"code":"resource_exhausted","message":"rate limit hit"}}"#);
+            let f2 = frame_end_stream(
+                r#"{"error":{"code":"resource_exhausted","message":"rate limit hit"}}"#,
+            );
 
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             let _ = tx.send(Ok::<_, std::io::Error>(bytes::Bytes::from(f1)));
@@ -1676,7 +1816,10 @@ async fn test_devin_relay_late_error_exactly_once_failure_and_retained_health() 
                 StatusCode::OK,
                 [
                     (header::CONTENT_TYPE, STREAM_CONTENT_TYPE),
-                    (header::HeaderName::from_static("connect-protocol-version"), "1"),
+                    (
+                        header::HeaderName::from_static("connect-protocol-version"),
+                        "1",
+                    ),
                 ],
                 axum::body::Body::from_stream(futures::stream::unfold(rx, |mut rx| async move {
                     rx.recv().await.map(|chunk| (chunk, rx))
@@ -1685,7 +1828,12 @@ async fn test_devin_relay_late_error_exactly_once_failure_and_retained_health() 
         }
     }));
     let task_b = tokio::spawn(async move { axum::serve(listener_b, app_b).await.unwrap() });
-    let gw_b = start_devin_gateway("late-exhaust", "tok-exhaust-test", &format!("http://{addr_b}")).await;
+    let gw_b = start_devin_gateway(
+        "late-exhaust",
+        "tok-exhaust-test",
+        &format!("http://{addr_b}"),
+    )
+    .await;
 
     let resp_b = client
         .post(format!("{}/v1/chat/completions", gw_b.base_url))
@@ -1713,7 +1861,15 @@ async fn test_devin_relay_late_error_exactly_once_failure_and_retained_health() 
         let _ = chunk.unwrap();
     }
 
-    let member_b = gw_b.state.pool.load().members.iter().find(|m| m.id() == "late-exhaust").unwrap().clone();
+    let member_b = gw_b
+        .state
+        .pool
+        .load()
+        .members
+        .iter()
+        .find(|m| m.id() == "late-exhaust")
+        .unwrap()
+        .clone();
     assert_eq!(
         member_b.fail_count.load(Ordering::Relaxed),
         1,
@@ -1749,7 +1905,9 @@ async fn test_devin_relay_nonstream_late_connect_error_mapping() {
         let mut f1_payload = Vec::new();
         msg.encode(&mut f1_payload).unwrap();
         let f1 = frame_data(&f1_payload);
-        let f2 = frame_end_stream(r#"{"error":{"code":"resource_exhausted","message":"nonstream quota exceeded"}}"#);
+        let f2 = frame_end_stream(
+            r#"{"error":{"code":"resource_exhausted","message":"nonstream quota exceeded"}}"#,
+        );
 
         let mut combined = f1;
         combined.extend_from_slice(&f2);
@@ -1758,14 +1916,22 @@ async fn test_devin_relay_nonstream_late_connect_error_mapping() {
             StatusCode::OK,
             [
                 (header::CONTENT_TYPE, STREAM_CONTENT_TYPE),
-                (header::HeaderName::from_static("connect-protocol-version"), "1"),
+                (
+                    header::HeaderName::from_static("connect-protocol-version"),
+                    "1",
+                ),
             ],
             combined,
         )
     }));
 
     let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let gw = start_devin_gateway("nonstream-err-acc", "tok-nonstream-err", &format!("http://{addr}")).await;
+    let gw = start_devin_gateway(
+        "nonstream-err-acc",
+        "tok-nonstream-err",
+        &format!("http://{addr}"),
+    )
+    .await;
 
     let client = reqwest::Client::new();
     let resp = client
@@ -1787,7 +1953,10 @@ async fn test_devin_relay_nonstream_late_connect_error_mapping() {
     );
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["error"]["code"], "resource_exhausted");
-    assert_eq!(body["error"]["message"], "upstream quota or rate limit exhausted");
+    assert_eq!(
+        body["error"]["message"],
+        "upstream quota or rate limit exhausted"
+    );
 
     task.abort();
 }
@@ -1868,7 +2037,10 @@ async fn test_devin_relay_split_header_and_coalesced_oversize() {
             StatusCode::OK,
             [
                 (header::CONTENT_TYPE, STREAM_CONTENT_TYPE),
-                (header::HeaderName::from_static("connect-protocol-version"), "1"),
+                (
+                    header::HeaderName::from_static("connect-protocol-version"),
+                    "1",
+                ),
             ],
             axum::body::Body::from_stream(futures::stream::unfold(rx, |mut rx| async move {
                 rx.recv().await.map(|chunk| (chunk, rx))
@@ -1876,8 +2048,14 @@ async fn test_devin_relay_split_header_and_coalesced_oversize() {
         )
     }));
 
-    let task_split = tokio::spawn(async move { axum::serve(listener_split, app_split).await.unwrap() });
-    let gw_split = start_devin_gateway("split-hdr-acc", "tok-split-hdr", &format!("http://{addr_split}")).await;
+    let task_split =
+        tokio::spawn(async move { axum::serve(listener_split, app_split).await.unwrap() });
+    let gw_split = start_devin_gateway(
+        "split-hdr-acc",
+        "tok-split-hdr",
+        &format!("http://{addr_split}"),
+    )
+    .await;
 
     let client = reqwest::Client::new();
     let resp_split = client
@@ -1894,7 +2072,10 @@ async fn test_devin_relay_split_header_and_coalesced_oversize() {
 
     assert_eq!(resp_split.status(), StatusCode::OK);
     let text = resp_split.text().await.unwrap();
-    assert!(text.contains("Split header survived!"), "split-header stream must succeed");
+    assert!(
+        text.contains("Split header survived!"),
+        "split-header stream must succeed"
+    );
 
     task_split.abort();
 
@@ -1913,14 +2094,23 @@ async fn test_devin_relay_split_header_and_coalesced_oversize() {
             StatusCode::OK,
             [
                 (header::CONTENT_TYPE, STREAM_CONTENT_TYPE),
-                (header::HeaderName::from_static("connect-protocol-version"), "1"),
+                (
+                    header::HeaderName::from_static("connect-protocol-version"),
+                    "1",
+                ),
             ],
             bytes::Bytes::copy_from_slice(&hdr),
         )
     }));
 
-    let task_oversize = tokio::spawn(async move { axum::serve(listener_oversize, app_oversize).await.unwrap() });
-    let gw_oversize = start_devin_gateway("oversize-acc", "tok-oversize", &format!("http://{addr_oversize}")).await;
+    let task_oversize =
+        tokio::spawn(async move { axum::serve(listener_oversize, app_oversize).await.unwrap() });
+    let gw_oversize = start_devin_gateway(
+        "oversize-acc",
+        "tok-oversize",
+        &format!("http://{addr_oversize}"),
+    )
+    .await;
 
     let resp_oversize = client
         .post(format!("{}/v1/chat/completions", gw_oversize.base_url))
@@ -1954,7 +2144,8 @@ async fn test_devin_relay_preflight_total_deadline_headers_then_no_body() {
 
     // Upstream immediately returns HTTP 200 OK + Content-Type headers, but yields NO body bytes
     let app = Router::new().fallback(post(|| async {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<bytes::Bytes, std::io::Error>>();
+        let (tx, rx) =
+            tokio::sync::mpsc::unbounded_channel::<Result<bytes::Bytes, std::io::Error>>();
         // Hold sender alive so stream does NOT close with immediate EOF
         tokio::spawn(async move {
             let _tx = tx;
@@ -1964,7 +2155,10 @@ async fn test_devin_relay_preflight_total_deadline_headers_then_no_body() {
             StatusCode::OK,
             [
                 (header::CONTENT_TYPE, STREAM_CONTENT_TYPE),
-                (header::HeaderName::from_static("connect-protocol-version"), "1"),
+                (
+                    header::HeaderName::from_static("connect-protocol-version"),
+                    "1",
+                ),
             ],
             axum::body::Body::from_stream(futures::stream::unfold(rx, |mut rx| async move {
                 rx.recv().await.map(|chunk| (chunk, rx))
@@ -2002,8 +2196,7 @@ async fn test_devin_relay_preflight_total_deadline_headers_then_no_body() {
     );
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(
-        body["error"]["message"],
-        "upstream request timed out during preflight",
+        body["error"]["message"], "upstream request timed out during preflight",
         "must return safe error without leaking URLs or raw strings"
     );
 
@@ -2100,7 +2293,11 @@ async fn test_devin_relay_absent_catalog_account_b_denied_account_a_model() {
 
     // Disable Account A to verify Account B is NOT chosen as fallback
     let current_updated = gw.state.pool.load();
-    let mem_a = current_updated.members.iter().find(|m| m.id() == "acc-a").unwrap();
+    let mem_a = current_updated
+        .members
+        .iter()
+        .find(|m| m.id() == "acc-a")
+        .unwrap();
     mem_a.set_health(Health::Disabled);
 
     let client = reqwest::Client::new();

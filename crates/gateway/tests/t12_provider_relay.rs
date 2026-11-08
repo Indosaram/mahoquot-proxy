@@ -70,7 +70,14 @@ async fn start_mock(
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let task = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            (app).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap()
+    });
     (format!("http://{addr}"), seen, task)
 }
 
@@ -122,11 +129,18 @@ async fn start_gateway(
         config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
-    let state = Arc::new(AppState::new(&config).unwrap());
+    let state = Arc::new(AppState::new(&common::managed_ref(&config)).unwrap());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let app = create_app(state);
-    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let task = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            (app).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap()
+    });
     (format!("http://{addr}"), auth_dir, task)
 }
 
@@ -161,7 +175,7 @@ async fn start_generic_gateway(
         config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
-    let state = Arc::new(AppState::new(&config).unwrap());
+    let state = Arc::new(AppState::new(&common::managed_ref(&config)).unwrap());
     assert_eq!(
         state.pool.load().members.len(),
         1,
@@ -171,7 +185,14 @@ async fn start_generic_gateway(
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let app = create_app(state);
-    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let task = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            (app).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap()
+    });
     (format!("http://{addr}"), auth_dir, task)
 }
 
@@ -203,11 +224,18 @@ async fn start_google_gateway(
         config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
-    let state = Arc::new(AppState::new(&config).unwrap());
+    let state = Arc::new(AppState::new(&common::managed_ref(&config)).unwrap());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let app = create_app(state);
-    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let task = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            (app).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap()
+    });
     (format!("http://{addr}"), auth_dir, task)
 }
 
@@ -243,7 +271,7 @@ async fn start_static_header_gateway(
         config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
-    let state = Arc::new(AppState::new(&config).unwrap());
+    let state = Arc::new(AppState::new(&common::managed_ref(&config)).unwrap());
     assert_eq!(
         state.pool.load().members.len(),
         1,
@@ -256,7 +284,14 @@ async fn start_static_header_gateway(
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let app = create_app(state);
-    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let task = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            (app).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap()
+    });
     (format!("http://{addr}"), auth_dir, task)
 }
 
@@ -291,7 +326,7 @@ async fn start_adapter_gateway(
         config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
-    let state = Arc::new(AppState::new(&config).unwrap());
+    let state = Arc::new(AppState::new(&common::managed_ref(&config)).unwrap());
     assert_eq!(
         state.pool.load().members.len(),
         1,
@@ -300,7 +335,14 @@ async fn start_adapter_gateway(
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let app = create_app(state);
-    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let task = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            (app).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap()
+    });
     (format!("http://{addr}"), auth_dir, task)
 }
 
@@ -458,7 +500,14 @@ async fn start_mimo_gateway(
         });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let mock_task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mock_task = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            (app).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap()
+    });
     let upstream = format!("http://{addr}");
 
     let auth_dir = common::unique_temp_dir("t12-mimo-free");
@@ -493,7 +542,7 @@ async fn start_mimo_gateway(
         config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
-    let state = Arc::new(AppState::new(&config).unwrap());
+    let state = Arc::new(AppState::new(&common::managed_ref(&config)).unwrap());
     assert_eq!(
         state.pool.load().members.len(),
         1,
@@ -502,7 +551,14 @@ async fn start_mimo_gateway(
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let app = create_app(state);
-    let gateway_task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let gateway_task = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            (app).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap()
+    });
     (
         format!("http://{addr}"),
         auth_dir,
@@ -612,7 +668,14 @@ async fn mimo_free_streaming_declares_event_stream_and_relays_sse_verbatim() {
         });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let mock_task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mock_task = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            (app).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap()
+    });
     let upstream = format!("http://{addr}");
 
     let auth_dir = common::unique_temp_dir("t12-mimo-stream");
@@ -640,11 +703,18 @@ async fn mimo_free_streaming_declares_event_stream_and_relays_sse_verbatim() {
         config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
-    let state = Arc::new(AppState::new(&config).unwrap());
+    let state = Arc::new(AppState::new(&common::managed_ref(&config)).unwrap());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let app = create_app(state);
-    let gateway_task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let gateway_task = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            (app).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap()
+    });
     let gateway = format!("http://{addr}");
 
     let reply = reqwest::Client::new()
@@ -901,12 +971,14 @@ async fn assert_anthropic_native(kind: &str, model: &str) {
             .unwrap()
             .starts_with("You are ZCode"));
         assert_eq!(request.body["metadata"]["user_id"], "usr-42");
-    } else {
-        // apply_prompt_cache_breakpoints marks the last message so the history
-        // is cached as one prefix; string content becomes a single text block.
+    } else if kind == "claude" {
+        // Subscription requests get a cache breakpoint on the conversation
+        // tail, which turns string content into a single text block.
         let content = request.body["messages"][0]["content"].as_array().unwrap();
         assert_eq!(content[0]["text"], "ping");
         assert_eq!(content[0]["cache_control"]["type"], "ephemeral");
+    } else {
+        assert_eq!(request.body["messages"][0]["content"], "ping");
     }
     assert!(
         request.body.get("input").is_none(),
@@ -971,7 +1043,14 @@ async fn anthropic_stream_forwards_first_delta_before_upstream_finishes() {
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream = format!("http://{}", listener.local_addr().unwrap());
-    let mock_task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mock_task = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            (app).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap()
+    });
     let (gateway, auth_dir, gateway_task) = start_gateway("claude", &upstream).await;
     let response = tokio::time::timeout(
         std::time::Duration::from_millis(500),
@@ -1153,7 +1232,12 @@ async fn kiro_relays_conversation_state_and_decodes_eventstream() {
     let listener = bound.expect("available fixture port");
     let upstream = format!("http://{}", listener.local_addr().unwrap());
     let mock_task = tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        axum::serve(
+            listener,
+            (app).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
     let (gateway, auth_dir, gateway_task) = start_gateway("kiro", &upstream).await;
 
@@ -1228,7 +1312,14 @@ async fn cursor_relays_connect_protobuf_and_decodes_text_delta() {
         });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let mock_task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mock_task = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            (app).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap()
+    });
     let (gateway, auth_dir, gateway_task) =
         start_gateway("cursor", &format!("http://{addr}")).await;
 
@@ -1318,7 +1409,14 @@ async fn cursor_keeps_request_open_and_replies_to_server_kv_frames() {
     let app = Router::new().route("/agent.v1.AgentService/Run", post(duplex));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream = format!("http://{}", listener.local_addr().unwrap());
-    let mock_task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mock_task = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            (app).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap()
+    });
     let (gateway, auth_dir, gateway_task) = start_gateway("cursor", &upstream).await;
 
     let response = reqwest::Client::new()

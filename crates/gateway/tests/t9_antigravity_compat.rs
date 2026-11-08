@@ -74,7 +74,7 @@ fn test_t9_thinking_model_small_max_tokens_gets_headroom() {
 
 #[test]
 fn test_t9_live_captured_frame_decodes_to_text_and_usage() {
-    let live = r#"{"response": {"candidates": [{"content": {"role": "model","parts": [{"text": "alpha bravo"}]}}],"usageMetadata": {"promptTokenCount": 6,"candidatesTokenCount": 2,"totalTokenCount": 68,"thoughtsTokenCount": 60},"modelVersion": "gemini-3.7-flash","responseId": "bOSQar2JGfDe2roP1Iec8Qs"},"traceId": "8ac79e0a6b70c6a2","metadata": {}}"#;
+    let live = r#"{"response": {"candidates": [{"content": {"role": "model","parts": [{"text": "alpha bravo"}]},"finishReason":"STOP"}],"usageMetadata": {"promptTokenCount": 6,"candidatesTokenCount": 2,"totalTokenCount": 68,"thoughtsTokenCount": 60},"modelVersion": "gemini-3.7-flash","responseId": "bOSQar2JGfDe2roP1Iec8Qs"},"traceId": "8ac79e0a6b70c6a2","metadata": {}}"#;
 
     let events = decode_all(&[live]);
 
@@ -148,13 +148,21 @@ fn test_t9_upstream_error_frame_becomes_failed_not_silence() {
 }
 
 #[test]
-fn test_t9_truncated_stream_still_completes() {
+fn test_t9_truncated_stream_fails_not_completed() {
     let partial =
         r#"{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"half"}]}}]}}"#;
     let events = decode_all(&[partial]);
     assert!(
-        matches!(events.last(), Some(CodexEvent::Completed { .. })),
-        "cut stream must still terminate for the client: {events:?}"
+        events
+            .iter()
+            .any(|e| matches!(e, CodexEvent::Failed { .. })),
+        "cut stream must fail rather than completing: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, CodexEvent::Completed { .. })),
+        "cut stream must not emit Completed: {events:?}"
     );
 }
 

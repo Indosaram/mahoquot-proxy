@@ -1,7 +1,7 @@
 mod common;
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
@@ -42,6 +42,10 @@ fn state_with(masters: Vec<String>, scoped: Vec<ScopedApiKey>) -> Arc<AppState> 
     let settings = Settings {
         api_keys: masters,
         scoped_api_keys: scoped,
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: MASTER.to_string(),
+            ..Default::default()
+        },
         auth_dir: dir.to_string_lossy().to_string(),
         ..Settings::default()
     };
@@ -57,10 +61,18 @@ fn state_with(masters: Vec<String>, scoped: Vec<ScopedApiKey>) -> Arc<AppState> 
 async fn status_for(state: Arc<AppState>, path: &str, key: Option<&str>) -> StatusCode {
     let mut request = Request::builder().uri(path);
     if let Some(key) = key {
-        request = request.header(header::AUTHORIZATION, format!("Bearer {key}"));
+        // Control plane takes the dedicated management header (Task 26);
+        // the relay surface takes the inference Bearer key.
+        request = if path.starts_with("/v0/management") || path.starts_with("/admin") {
+            request.header("x-management-key", key)
+        } else {
+            request.header("authorization", format!("Bearer {key}"))
+        };
     }
     create_app(state)
-        .oneshot(request.body(Body::empty()).expect("request"))
+        .oneshot(common::with_loopback_peer(
+            request.body(Body::empty()).expect("request"),
+        ))
         .await
         .expect("response")
         .status()
@@ -76,12 +88,16 @@ async fn a_minted_scoped_key_stays_scoped_without_a_master_key() {
 
     // when the scoped secret is presented
     let relay = status_for(Arc::clone(&state), "/v1/models", Some(SCOPED_RAW)).await;
-    let management =
-        status_for(Arc::clone(&state), "/v0/management/api-keys", Some(SCOPED_RAW)).await;
+    let management = status_for(
+        Arc::clone(&state),
+        "/v0/management/api-keys",
+        Some(SCOPED_RAW),
+    )
+    .await;
 
     // then it relays but never reaches management
     assert_eq!(relay, StatusCode::OK);
-    assert_eq!(management, StatusCode::FORBIDDEN);
+    assert_eq!(management, StatusCode::UNAUTHORIZED);
 }
 
 /// The same open gateway must stay open for the local console, which calls it
@@ -102,10 +118,12 @@ async fn an_unconfigured_gateway_stays_open_for_callers_that_are_not_scoped() {
     let disabled = state_with(Vec::new(), vec![scoped_key(false)]);
     let inactive = status_for(disabled, "/v0/management/api-keys", Some(SCOPED_RAW)).await;
 
-    // then each keeps full authority instead of being locked out
-    assert_eq!(anonymous, StatusCode::OK);
-    assert_eq!(unknown, StatusCode::OK);
-    assert_eq!(inactive, StatusCode::OK);
+    // then none of them gets the control plane: Task 26 replaced the
+    // open-console path with the dedicated management secret (configured by
+    // this fixture), so a caller without it fails authentication.
+    assert_eq!(anonymous, StatusCode::UNAUTHORIZED);
+    assert_eq!(unknown, StatusCode::UNAUTHORIZED);
+    assert_eq!(inactive, StatusCode::UNAUTHORIZED);
 }
 
 /// Configuring a master key closes the gateway again: the scoped key keeps its
@@ -122,13 +140,19 @@ async fn a_configured_master_key_closes_the_open_path() {
         Some("not-a-minted-key"),
     )
     .await;
-    let scoped =
-        status_for(Arc::clone(&state), "/v0/management/api-keys", Some(SCOPED_RAW)).await;
+    let scoped = status_for(
+        Arc::clone(&state),
+        "/v0/management/api-keys",
+        Some(SCOPED_RAW),
+    )
+    .await;
     let master = status_for(Arc::clone(&state), "/v0/management/api-keys", Some(MASTER)).await;
 
-    // then only the master key manages, and the unknown key is rejected
+    // then only the management secret manages (this fixture sets it equal
+    // to MASTER); a scoped key is never a management credential under Task 26
+    // and fails authentication like any other non-management key.
     assert_eq!(unknown, StatusCode::UNAUTHORIZED);
-    assert_eq!(scoped, StatusCode::FORBIDDEN);
+    assert_eq!(scoped, StatusCode::UNAUTHORIZED);
     assert_eq!(master, StatusCode::OK);
 }
 
@@ -237,7 +261,7 @@ async fn a_replayed_stale_token_does_not_spend_a_second_refresh() {
 
 async fn patch_scoped_key(state: Arc<AppState>, id: &str, payload: serde_json::Value) -> Response {
     let response = create_app(state)
-        .oneshot(
+        .oneshot(common::with_loopback_peer(
             Request::builder()
                 .method("PATCH")
                 .uri(format!("/v0/management/scoped-keys/{id}"))
@@ -245,7 +269,7 @@ async fn patch_scoped_key(state: Arc<AppState>, id: &str, payload: serde_json::V
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(payload.to_string()))
                 .expect("request"),
-        )
+        ))
         .await
         .expect("response");
     let status = response.status();
@@ -340,5 +364,8 @@ async fn patching_an_unknown_scoped_key_reports_not_found() {
     // then the request is refused and the existing key is untouched
     assert_eq!(patched.status, StatusCode::NOT_FOUND);
     assert_eq!(state.settings.current().scoped_api_keys.len(), 1);
-    assert_eq!(state.settings.current().scoped_api_keys[0].name, "delegated");
+    assert_eq!(
+        state.settings.current().scoped_api_keys[0].name,
+        "delegated"
+    );
 }

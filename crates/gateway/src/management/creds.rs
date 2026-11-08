@@ -17,10 +17,93 @@ fn json_status(status: StatusCode, body: Value) -> Response {
 
 const ACCOUNT_ORDER_FILE: &str = ".mahoquot-account-order.json";
 
+pub(crate) fn storage_error(error: mahoquot_registry::store::StoreError) -> Box<Response> {
+    use mahoquot_registry::store::StoreError;
+    let (status, code) = match &error {
+        StoreError::Conflict(_) => (StatusCode::CONFLICT, "storage_conflict"),
+        StoreError::Unavailable(_) | StoreError::Network(_) | StoreError::Database(_) => {
+            (StatusCode::SERVICE_UNAVAILABLE, "storage_unavailable")
+        }
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "credential_persistence_failed",
+        ),
+    };
+    Box::new(json_status(
+        status,
+        json!({"error": code, "message": error.to_string()}),
+    ))
+}
+
+/// Commit authoritative bytes before publishing the local credential projection.
+pub(crate) fn persist_credential(
+    state: &AppState,
+    path: &std::path::Path,
+    bytes: &[u8],
+) -> Result<(), mahoquot_registry::store::StoreError> {
+    if let Some(store) = state.settings.storage_manager() {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                mahoquot_registry::store::StoreError::InvalidConfig(
+                    "invalid credential name".into(),
+                )
+            })?;
+        store.put(&format!("auths/{name}"), bytes)?;
+        if path == store.auth_dir().join(name) {
+            return Ok(());
+        }
+    }
+    write_credential_atomically(path, bytes)?;
+    Ok(())
+}
+
+pub(crate) fn remove_credential(
+    state: &AppState,
+    path: &std::path::Path,
+) -> Result<(), mahoquot_registry::store::StoreError> {
+    if let Some(store) = state.settings.storage_manager() {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                mahoquot_registry::store::StoreError::InvalidConfig(
+                    "invalid credential name".into(),
+                )
+            })?;
+        store.delete(&format!("auths/{name}"))?;
+        if path == store.auth_dir().join(name) {
+            return Ok(());
+        }
+        match std::fs::remove_file(path) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    std::fs::remove_file(path)?;
+    Ok(())
+}
+
+/// A single filename on every supported host, not a host-dependent path.
+/// Check Windows separators and drive/stream syntax even on Unix before joining.
+pub(crate) fn valid_name(name: &str) -> bool {
+    if name.trim().is_empty() || name.contains(['/', '\\', ':', '\0']) {
+        return false;
+    }
+    let mut components = std::path::Path::new(name).components();
+    matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_none()
+}
+
 fn is_credential_filename(name: &str) -> bool {
     let lowered = name.to_ascii_lowercase();
-    lowered.ends_with(".json") && lowered != ACCOUNT_ORDER_FILE
-        && lowered != "account-order.json" && lowered != "telemetry.json"
+    valid_name(name)
+        && lowered.ends_with(".json")
+        && lowered != ACCOUNT_ORDER_FILE
+        && lowered != "account-order.json"
+        && lowered != "telemetry.json"
 }
 
 fn is_credential_document(value: &Value) -> bool {
@@ -35,6 +118,7 @@ fn is_credential_document(value: &Value) -> bool {
                 | "kiro"
                 | "zcode"
                 | "generic"
+                | "meta"
                 | "vertex"
                 | "google-vertex"
                 | "devin"
@@ -156,7 +240,7 @@ fn describe(dir: &std::path::Path, name: &str) -> Option<Value> {
     Some(entry)
 }
 
-async fn list_auth_files(
+pub(crate) async fn list_auth_files(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
@@ -225,7 +309,7 @@ async fn save_auth_file_order(State(state): State<Arc<AppState>>, raw: bytes::By
         .iter()
         .filter_map(Value::as_str)
         .map(str::trim)
-        .filter(|name| !name.is_empty() && !name.contains('/') && !name.contains(".."))
+        .filter(|name| valid_name(name))
         .map(str::to_string)
         .collect();
     if names.len() != body["names"].as_array().map_or(0, Vec::len) {
@@ -261,7 +345,12 @@ async fn save_auth_file_order(State(state): State<Arc<AppState>>, raw: bytes::By
     }
 }
 
-async fn create_auth_file(State(state): State<Arc<AppState>>, raw: bytes::Bytes) -> Response {
+pub(crate) async fn create_auth_file(
+    State(state): State<Arc<AppState>>,
+    raw: bytes::Bytes,
+) -> Response {
+    match tokio::task::spawn_blocking(move || {
+    let _mutation = state.settings.composition_lock();
     let Ok(body) = serde_json::from_slice::<Value>(&raw) else {
         return json_status(StatusCode::BAD_REQUEST, json!({ "error": "invalid body" }));
     };
@@ -271,7 +360,7 @@ async fn create_auth_file(State(state): State<Arc<AppState>>, raw: bytes::Bytes)
             json!({ "error": "name is required" }),
         );
     };
-    if name.is_empty() || name.contains('/') || name.contains("..") {
+    if !valid_name(name) {
         return json_status(StatusCode::BAD_REQUEST, json!({ "error": "invalid name" }));
     }
     let mut content = body.get("content").cloned().unwrap_or(Value::Null);
@@ -279,17 +368,33 @@ async fn create_auth_file(State(state): State<Arc<AppState>>, raw: bytes::Bytes)
         return json_status(StatusCode::BAD_REQUEST, json!({ "error": error }));
     }
     if content.get("type").and_then(Value::as_str) == Some("devin") {
-        let devin_account: mahoquot_providers::DevinAccount = match serde_json::from_value(content.clone()) {
-            Ok(acct) => acct,
-            Err(_) => return json_status(StatusCode::BAD_REQUEST, json!({ "error": "invalid devin credential format" })),
-        };
+        let devin_account: mahoquot_providers::DevinAccount =
+            match serde_json::from_value(content.clone()) {
+                Ok(acct) => acct,
+                Err(_) => {
+                    return json_status(
+                        StatusCode::BAD_REQUEST,
+                        json!({ "error": "invalid devin credential format" }),
+                    )
+                }
+            };
         let validated = match devin_account.validate() {
             Ok(acct) => acct,
-            Err(e) => return json_status(StatusCode::BAD_REQUEST, json!({ "error": format!("invalid devin credential: {e}") })),
+            Err(e) => {
+                return json_status(
+                    StatusCode::BAD_REQUEST,
+                    json!({ "error": format!("invalid devin credential: {e}") }),
+                )
+            }
         };
         content = match serde_json::to_value(&validated) {
             Ok(v) => v,
-            Err(e) => return json_status(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": format!("failed to serialize normalized devin credential: {e}") })),
+            Err(e) => {
+                return json_status(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({ "error": format!("failed to serialize normalized devin credential: {e}") }),
+                )
+            }
         };
     }
     let dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
@@ -308,17 +413,18 @@ async fn create_auth_file(State(state): State<Arc<AppState>>, raw: bytes::Bytes)
             )
         }
     };
-    match write_credential_atomically(&dir.join(name), rendered.as_bytes()) {
+    match persist_credential(&state, &dir.join(name), rendered.as_bytes()) {
         Ok(()) => {
             if let Err(error) = state.rescan_pool() {
                 eprintln!("pool rescan failed after credential write: {error}");
             }
             json_status(StatusCode::OK, json!({ "status": "ok", "name": name }))
         }
-        Err(err) => json_status(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            json!({ "error": format!("failed to write auth file: {err}") }),
-        ),
+        Err(err) => *storage_error(err),
+    }
+    }).await {
+        Ok(response) => response,
+        Err(error) => json_status(StatusCode::INTERNAL_SERVER_ERROR, json!({"error":"credential_mutation_failed", "message":error.to_string()})),
     }
 }
 
@@ -454,38 +560,48 @@ pub fn resolve_auth_index(state: &AppState, wanted: &str) -> Option<String> {
     None
 }
 
-async fn delete_auth_file(
+pub(crate) async fn delete_auth_file(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    let Some(name) = params.get("name").map(|v| v.trim()) else {
-        return json_status(
-            StatusCode::BAD_REQUEST,
-            json!({ "error": "name is required" }),
-        );
-    };
-    if name.is_empty() || name.contains('/') || name.contains("..") {
-        return json_status(StatusCode::BAD_REQUEST, json!({ "error": "invalid name" }));
-    }
-    let dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
-    match std::fs::remove_file(dir.join(name)) {
-        Ok(()) => {
-            if let Err(error) = state.rescan_pool() {
-                eprintln!("pool rescan failed after credential delete: {error}");
+    match tokio::task::spawn_blocking(move || {
+        let _mutation = state.settings.composition_lock();
+        let Some(name) = params.get("name").map(|v| v.trim()) else {
+            return json_status(
+                StatusCode::BAD_REQUEST,
+                json!({ "error": "name is required" }),
+            );
+        };
+        if !valid_name(name) {
+            return json_status(StatusCode::BAD_REQUEST, json!({ "error": "invalid name" }));
+        }
+        let dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
+        match remove_credential(&state, &dir.join(name)) {
+            Ok(()) => {
+                if let Err(error) = state.rescan_pool() {
+                    eprintln!("pool rescan failed after credential delete: {error}");
+                }
+                json_status(StatusCode::OK, json!({ "status": "ok" }))
             }
-            json_status(StatusCode::OK, json!({ "status": "ok" }))
+            Err(mahoquot_registry::store::StoreError::Io(err))
+                if err.kind() == std::io::ErrorKind::NotFound =>
+            {
+                json_status(StatusCode::NOT_FOUND, json!({ "error": "auth not found" }))
+            }
+            Err(err) => *storage_error(err),
         }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            json_status(StatusCode::NOT_FOUND, json!({ "error": "auth not found" }))
-        }
-        Err(err) => json_status(
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => json_status(
             StatusCode::INTERNAL_SERVER_ERROR,
-            json!({ "error": format!("failed to delete auth file: {err}") }),
+            json!({"error":"credential_mutation_failed", "message":error.to_string()}),
         ),
     }
 }
 
-async fn auth_file_models(
+pub(crate) async fn auth_file_models(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
@@ -506,14 +622,54 @@ async fn auth_file_models(
     )
 }
 
-async fn model_definitions(Path(channel): Path<String>) -> Response {
+pub(crate) async fn model_definitions(
+    State(state): State<Arc<AppState>>,
+    Path(channel): Path<String>,
+) -> Response {
+    let pool = state.pool.load();
+    let Ok(provider_id) = mahoquot_registry::ProviderId::canonical(&channel) else {
+        return json_status(
+            StatusCode::OK,
+            json!({ "channel": channel, "models": Value::Array(vec![]) }),
+        );
+    };
+
+    let mut models = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for entry in &pool.models {
+        let has_binding = if let Ok(model_id) = mahoquot_registry::ModelId::new(&entry.id) {
+            pool.registry
+                .get_model(&model_id)
+                .map(|desc| desc.bindings.contains_key(&provider_id))
+                .unwrap_or(false)
+        } else {
+            false
+        };
+
+        let matches = has_binding
+            || (if let Ok(resolved) = pool.registry.resolve(&entry.id) {
+                resolved
+                    .eligible_bindings
+                    .iter()
+                    .any(|b| b.provider_id == provider_id)
+            } else {
+                false
+            })
+            || entry.owned_by.eq_ignore_ascii_case(provider_id.as_str());
+
+        if matches && seen.insert(entry.id.clone()) {
+            models.push(entry.id.clone());
+        }
+    }
+
     json_status(
         StatusCode::OK,
-        json!({ "channel": channel, "models": Value::Array(vec![]) }),
+        json!({ "channel": channel, "models": models }),
     )
 }
 
-async fn download_auth_file(
+pub(crate) async fn download_auth_file(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
     Query(params): Query<HashMap<String, String>>,
@@ -527,7 +683,7 @@ async fn download_auth_file(
             json!({ "error": "name is required" }),
         );
     };
-    if name.is_empty() || name.contains('/') || name.contains("..") {
+    if !valid_name(name) {
         return json_status(StatusCode::BAD_REQUEST, json!({ "error": "invalid name" }));
     }
     let dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
@@ -548,218 +704,240 @@ async fn download_auth_file(
     }
 }
 
-async fn patch_auth_file_status(
+pub(crate) async fn patch_auth_file_status(
     State(state): State<Arc<AppState>>,
     Json(body): Json<Value>,
 ) -> Response {
-    let Some(name) = body.get("name").and_then(Value::as_str) else {
-        return json_status(
-            StatusCode::BAD_REQUEST,
-            json!({ "error": "name is required" }),
-        );
-    };
-    let Some(disabled) = body.get("disabled").and_then(Value::as_bool) else {
-        return json_status(
-            StatusCode::BAD_REQUEST,
-            json!({ "error": "disabled is required" }),
-        );
-    };
-    if name.is_empty() || name.contains('/') || name.contains("..") || !is_credential_filename(name) {
-        return json_status(StatusCode::BAD_REQUEST, json!({ "error": "invalid name" }));
-    }
-    let dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
-    let path = dir.join(name);
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(raw) => raw,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return json_status(StatusCode::NOT_FOUND, json!({ "error": "auth not found" }))
-        }
-        Err(error) => {
-            return json_status(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                json!({ "error": error.to_string() }),
-            )
-        }
-    };
-    let mut value: Value = match serde_json::from_str(&raw) {
-        Ok(value) => value,
-        Err(error) => {
+    match tokio::task::spawn_blocking(move || {
+        let _mutation = state.settings.composition_lock();
+        let Some(name) = body.get("name").and_then(Value::as_str) else {
             return json_status(
                 StatusCode::BAD_REQUEST,
-                json!({ "error": error.to_string() }),
-            )
+                json!({ "error": "name is required" }),
+            );
+        };
+        let Some(disabled) = body.get("disabled").and_then(Value::as_bool) else {
+            return json_status(
+                StatusCode::BAD_REQUEST,
+                json!({ "error": "disabled is required" }),
+            );
+        };
+        if !is_credential_filename(name) {
+            return json_status(StatusCode::BAD_REQUEST, json!({ "error": "invalid name" }));
         }
-    };
-    if !value.is_object() {
-        return json_status(StatusCode::BAD_REQUEST, json!({ "error": "auth file must be a JSON object" }));
-    }
-    let legacy_codex = name.starts_with("codex-")
-        && serde_json::from_value::<mahoquot_providers::CodexAccount>(value.clone()).is_ok();
-    if !is_credential_document(&value) && !legacy_codex {
-        return json_status(StatusCode::BAD_REQUEST, json!({ "error": "invalid credential document" }));
-    }
-    if let Value::Object(fields) = &mut value {
-        fields.insert("disabled".into(), json!(disabled));
-    }
-    let rendered = match serde_json::to_string_pretty(&value) {
-        Ok(rendered) => rendered,
-        Err(error) => {
+        let dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
+        let path = dir.join(name);
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return json_status(StatusCode::NOT_FOUND, json!({ "error": "auth not found" }))
+            }
+            Err(error) => {
+                return json_status(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({ "error": error.to_string() }),
+                )
+            }
+        };
+        let mut value: Value = match serde_json::from_str(&raw) {
+            Ok(value) => value,
+            Err(error) => {
+                return json_status(
+                    StatusCode::BAD_REQUEST,
+                    json!({ "error": error.to_string() }),
+                )
+            }
+        };
+        if !value.is_object() {
+            return json_status(
+                StatusCode::BAD_REQUEST,
+                json!({ "error": "auth file must be a JSON object" }),
+            );
+        }
+        let legacy_codex = name.starts_with("codex-")
+            && serde_json::from_value::<mahoquot_providers::CodexAccount>(value.clone()).is_ok();
+        if !is_credential_document(&value) && !legacy_codex {
+            return json_status(
+                StatusCode::BAD_REQUEST,
+                json!({ "error": "invalid credential document" }),
+            );
+        }
+        if let Value::Object(fields) = &mut value {
+            fields.insert("disabled".into(), json!(disabled));
+        }
+        let rendered = match serde_json::to_string_pretty(&value) {
+            Ok(rendered) => rendered,
+            Err(error) => {
+                return json_status(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({ "error": error.to_string() }),
+                )
+            }
+        };
+        if let Err(error) = persist_credential(&state, &path, rendered.as_bytes()) {
+            return *storage_error(error);
+        }
+        if let Err(error) = state.rescan_pool() {
             return json_status(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 json!({ "error": error.to_string() }),
-            )
+            );
         }
-    };
-    if let Err(error) = write_credential_atomically(&path, rendered.as_bytes()) {
-        return json_status(
+        if !disabled {
+            let state_clone = Arc::clone(&state);
+            tokio::spawn(async move {
+                crate::quota::refresh_all_usage(&state_clone).await;
+            });
+        }
+        json_status(
+            StatusCode::OK,
+            json!({ "status": "ok", "name": name, "disabled": disabled }),
+        )
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => json_status(
             StatusCode::INTERNAL_SERVER_ERROR,
-            json!({ "error": error.to_string() }),
-        );
+            json!({"error":"credential_mutation_failed", "message":error.to_string()}),
+        ),
     }
-    if let Err(error) = state.rescan_pool() {
-        return json_status(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            json!({ "error": error.to_string() }),
-        );
-    }
-    if !disabled {
-        let state_clone = Arc::clone(&state);
-        tokio::spawn(async move {
-            crate::quota::refresh_all_usage(&state_clone).await;
-        });
-    }
-    json_status(
-        StatusCode::OK,
-        json!({ "status": "ok", "name": name, "disabled": disabled }),
-    )
 }
 
-async fn patch_auth_file_fields(
+pub(crate) async fn patch_auth_file_fields(
     State(state): State<Arc<AppState>>,
     Json(body): Json<Value>,
 ) -> Response {
-    let Some(obj) = body.as_object() else {
-        return json_status(
-            StatusCode::BAD_REQUEST,
-            json!({ "error": "invalid request body" }),
-        );
-    };
-    let Some(name) = obj.get("name").and_then(Value::as_str) else {
-        return json_status(
-            StatusCode::BAD_REQUEST,
-            json!({ "error": "name is required" }),
-        );
-    };
-    let name = name.trim();
-    if name.is_empty() || name.contains('/') || name.contains("..") {
-        return json_status(StatusCode::BAD_REQUEST, json!({ "error": "invalid name" }));
-    }
-    let dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
-    let path = dir.join(name);
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(raw) => raw,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return json_status(StatusCode::NOT_FOUND, json!({ "error": "auth not found" }))
-        }
-        Err(error) => {
-            return json_status(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                json!({ "error": error.to_string() }),
-            )
-        }
-    };
-    let mut file_value: Value = match serde_json::from_str(&raw) {
-        Ok(val) => val,
-        Err(error) => {
+    match tokio::task::spawn_blocking(move || {
+        let _mutation = state.settings.composition_lock();
+        let Some(obj) = body.as_object() else {
             return json_status(
                 StatusCode::BAD_REQUEST,
-                json!({ "error": error.to_string() }),
-            )
+                json!({ "error": "invalid request body" }),
+            );
+        };
+        let Some(name) = obj.get("name").and_then(Value::as_str) else {
+            return json_status(
+                StatusCode::BAD_REQUEST,
+                json!({ "error": "name is required" }),
+            );
+        };
+        let name = name.trim();
+        if !valid_name(name) {
+            return json_status(StatusCode::BAD_REQUEST, json!({ "error": "invalid name" }));
         }
-    };
-    let Some(target_map) = file_value.as_object_mut() else {
-        return json_status(
-            StatusCode::BAD_REQUEST,
-            json!({ "error": "auth file is not a json object" }),
-        );
-    };
+        let dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
+        let path = dir.join(name);
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return json_status(StatusCode::NOT_FOUND, json!({ "error": "auth not found" }))
+            }
+            Err(error) => {
+                return json_status(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({ "error": error.to_string() }),
+                )
+            }
+        };
+        let mut file_value: Value = match serde_json::from_str(&raw) {
+            Ok(val) => val,
+            Err(error) => {
+                return json_status(
+                    StatusCode::BAD_REQUEST,
+                    json!({ "error": error.to_string() }),
+                )
+            }
+        };
+        let Some(target_map) = file_value.as_object_mut() else {
+            return json_status(
+                StatusCode::BAD_REQUEST,
+                json!({ "error": "auth file is not a json object" }),
+            );
+        };
 
-    for (key, val) in obj {
-        if key == "name" {
-            continue;
-        }
-        let key = key.trim();
-        if key.is_empty() {
-            continue;
-        }
-        if key.contains('.') {
-            let parts: Vec<&str> = key
-                .split('.')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .collect();
-            if parts.is_empty() {
+        for (key, val) in obj {
+            if key == "name" {
                 continue;
             }
-            let mut curr = &mut *target_map;
-            for p in parts.iter().take(parts.len().saturating_sub(1)) {
-                if !curr.contains_key(*p) || !curr[*p].is_object() {
-                    curr.insert((*p).to_string(), json!({}));
+            let key = key.trim();
+            if key.is_empty() {
+                continue;
+            }
+            if key.contains('.') {
+                let parts: Vec<&str> = key
+                    .split('.')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if parts.is_empty() {
+                    continue;
                 }
-                curr = curr.get_mut(*p).unwrap().as_object_mut().unwrap();
-            }
-            let last = parts[parts.len() - 1];
-            if val.is_null() {
-                curr.remove(last);
-            } else {
-                curr.insert(last.to_string(), val.clone());
-            }
-        } else if val.is_null() {
-            target_map.remove(key);
-        } else if let Some(sub_obj) = val.as_object() {
-            let entry = target_map
-                .entry(key.to_string())
-                .or_insert_with(|| json!({}));
-            if let Some(entry_map) = entry.as_object_mut() {
-                for (sub_k, sub_v) in sub_obj {
-                    if sub_v.is_null()
-                        || (sub_v.is_string() && sub_v.as_str().unwrap().trim().is_empty())
-                    {
-                        entry_map.remove(sub_k);
-                    } else {
-                        entry_map.insert(sub_k.clone(), sub_v.clone());
+                let mut curr = &mut *target_map;
+                for p in parts.iter().take(parts.len().saturating_sub(1)) {
+                    if !curr.contains_key(*p) || !curr[*p].is_object() {
+                        curr.insert((*p).to_string(), json!({}));
                     }
+                    curr = curr.get_mut(*p).unwrap().as_object_mut().unwrap();
+                }
+                let last = parts[parts.len() - 1];
+                if val.is_null() {
+                    curr.remove(last);
+                } else {
+                    curr.insert(last.to_string(), val.clone());
+                }
+            } else if val.is_null() {
+                target_map.remove(key);
+            } else if let Some(sub_obj) = val.as_object() {
+                let entry = target_map
+                    .entry(key.to_string())
+                    .or_insert_with(|| json!({}));
+                if let Some(entry_map) = entry.as_object_mut() {
+                    for (sub_k, sub_v) in sub_obj {
+                        if sub_v.is_null()
+                            || (sub_v.is_string() && sub_v.as_str().unwrap().trim().is_empty())
+                        {
+                            entry_map.remove(sub_k);
+                        } else {
+                            entry_map.insert(sub_k.clone(), sub_v.clone());
+                        }
+                    }
+                } else {
+                    target_map.insert(key.to_string(), val.clone());
                 }
             } else {
                 target_map.insert(key.to_string(), val.clone());
             }
-        } else {
-            target_map.insert(key.to_string(), val.clone());
         }
-    }
 
-    let rendered = match serde_json::to_string_pretty(&file_value) {
-        Ok(rendered) => rendered,
-        Err(error) => {
+        let rendered = match serde_json::to_string_pretty(&file_value) {
+            Ok(rendered) => rendered,
+            Err(error) => {
+                return json_status(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({ "error": error.to_string() }),
+                )
+            }
+        };
+        if let Err(error) = persist_credential(&state, &path, rendered.as_bytes()) {
+            return *storage_error(error);
+        }
+        if let Err(error) = state.rescan_pool() {
             return json_status(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 json!({ "error": error.to_string() }),
-            )
+            );
         }
-    };
-    if let Err(error) = write_credential_atomically(&path, rendered.as_bytes()) {
-        return json_status(
+        json_status(StatusCode::OK, json!({ "status": "ok" }))
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => json_status(
             StatusCode::INTERNAL_SERVER_ERROR,
-            json!({ "error": error.to_string() }),
-        );
+            json!({"error":"credential_mutation_failed", "message":error.to_string()}),
+        ),
     }
-    if let Err(error) = state.rescan_pool() {
-        return json_status(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            json!({ "error": error.to_string() }),
-        );
-    }
-    json_status(StatusCode::OK, json!({ "status": "ok" }))
 }
 
 #[derive(serde::Serialize)]
@@ -771,7 +949,10 @@ struct VertexClaims<'a> {
     exp: u64,
 }
 
-async fn vertex_import(State(state): State<Arc<AppState>>, raw: bytes::Bytes) -> Response {
+pub(crate) async fn vertex_import(
+    State(state): State<Arc<AppState>>,
+    raw: bytes::Bytes,
+) -> Response {
     let parsed = serde_json::from_slice::<Value>(&raw).unwrap_or(Value::Null);
     let Some(file) = parsed
         .get("file")
@@ -839,7 +1020,7 @@ async fn vertex_import(State(state): State<Arc<AppState>>, raw: bytes::Bytes) ->
         }
     };
     let response = match state
-        .http_client
+        .http_client()
         .post(token_uri)
         .form(&[
             ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
@@ -922,22 +1103,30 @@ async fn vertex_import(State(state): State<Arc<AppState>>, raw: bytes::Bytes) ->
             )
         }
     };
-    if let Err(error) = write_credential_atomically(&path, rendered.as_bytes()) {
-        return json_status(
+    match tokio::task::spawn_blocking(move || {
+        let _mutation = state.settings.composition_lock();
+        if let Err(error) = persist_credential(&state, &path, rendered.as_bytes()) {
+            return *storage_error(error);
+        }
+        if let Err(error) = state.rescan_pool() {
+            return json_status(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({ "error": error.to_string() }),
+            );
+        }
+        json_status(
+            StatusCode::OK,
+            json!({ "status":"ok", "name":path.file_name().and_then(|name|name.to_str()) }),
+        )
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => json_status(
             StatusCode::INTERNAL_SERVER_ERROR,
-            json!({ "error": error.to_string() }),
-        );
+            json!({"error":"credential_mutation_failed", "message":error.to_string()}),
+        ),
     }
-    if let Err(error) = state.rescan_pool() {
-        return json_status(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            json!({ "error": error.to_string() }),
-        );
-    }
-    json_status(
-        StatusCode::OK,
-        json!({ "status":"ok", "name":path.file_name().and_then(|name|name.to_str()) }),
-    )
 }
 
 /// Cline CLI login import. Reads the WorkOS OAuth session the `cline`
@@ -982,8 +1171,12 @@ async fn cline_import(State(state): State<Arc<AppState>>) -> Response {
     let settings = cline.get("settings").unwrap_or(&Value::Null);
     let auth = settings.get("auth").unwrap_or(&Value::Null);
     let (Some(access), Some(refresh)) = (
-        auth.get("accessToken").and_then(Value::as_str).filter(|v| !v.is_empty()),
-        auth.get("refreshToken").and_then(Value::as_str).filter(|v| !v.is_empty()),
+        auth.get("accessToken")
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty()),
+        auth.get("refreshToken")
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty()),
     ) else {
         return json_status(
             StatusCode::BAD_REQUEST,
@@ -1009,16 +1202,16 @@ async fn cline_import(State(state): State<Arc<AppState>>) -> Response {
     // provider: hardcoding it here silently invents capabilities the account may
     // not have and goes stale the moment upstream changes its lineup.
     let probe = state
-        .http_client
+        .http_client()
         .get("https://api.cline.bot/api/v1/models")
         .header(header::AUTHORIZATION, format!("Bearer {access}"))
         .send()
         .await;
-    let models: Vec<String> = match probe {
+    let mut models: Vec<String> = match probe {
         Ok(response) if response.status().is_success() => {
             match models_from_catalog("cline", response).await {
                 Ok(ids) => ids,
-                Err(rejection) => return *rejection,
+                Err(rejection) => return rejection,
             }
         }
         Ok(response) => {
@@ -1034,12 +1227,32 @@ async fn cline_import(State(state): State<Arc<AppState>>) -> Response {
             )
         }
     };
+    let free_models = match crate::cline_catalog::fetch_free_models(
+        &state.http_client(),
+        "https://api.cline.bot/api/v1",
+    )
+    .await
+    {
+        Ok(models) => models,
+        Err(error) => {
+            return json_status(
+                StatusCode::BAD_GATEWAY,
+                json!({"error":format!("Cline free catalog unavailable: {error}")}),
+            )
+        }
+    };
+    let free_ids: Vec<_> = free_models
+        .iter()
+        .filter_map(|m| m.get("id").and_then(Value::as_str))
+        .collect();
+    models.retain(|id| !id.starts_with("cline-free/") && !free_ids.contains(&id.as_str()));
+    models.extend(free_ids.iter().map(|id| id.to_string()));
     let credential = json!({"type":"generic","provider":"cline","label":label,"email":email,
         "adapter":"openai-chat","auth_mode":"oauth",
         "base_url":"https://api.cline.bot/api/v1",
         "api_key":access,"refresh_token":refresh,"expired":expired,
         "token_url":"https://api.cline.bot/api/v1/auth/refresh",
-        "account_id":account_id,
+        "account_id":account_id,"cline_free_models":free_ids,
         "models":models,
         "disabled":false});
     let dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
@@ -1060,22 +1273,30 @@ async fn cline_import(State(state): State<Arc<AppState>>) -> Response {
             )
         }
     };
-    if let Err(error) = write_credential_atomically(&path, rendered.as_bytes()) {
-        return json_status(
+    match tokio::task::spawn_blocking(move || {
+        let _mutation = state.settings.composition_lock();
+        if let Err(error) = persist_credential(&state, &path, rendered.as_bytes()) {
+            return *storage_error(error);
+        }
+        if let Err(error) = state.rescan_pool() {
+            return json_status(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error":error.to_string()}),
+            );
+        }
+        json_status(
+            StatusCode::OK,
+            json!({"status":"ok","name":path.file_name().unwrap_or_default()}),
+        )
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => json_status(
             StatusCode::INTERNAL_SERVER_ERROR,
-            json!({"error":error.to_string()}),
-        );
+            json!({"error":"credential_mutation_failed", "message":error.to_string()}),
+        ),
     }
-    if let Err(error) = state.rescan_pool() {
-        return json_status(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            json!({"error":error.to_string()}),
-        );
-    }
-    json_status(
-        StatusCode::OK,
-        json!({"status":"ok","name":path.file_name().unwrap_or_default()}),
-    )
 }
 
 /// Devin CLI login import. Reads the session token written by Devin CLI
@@ -1111,7 +1332,14 @@ async fn devin_import_cli(State(state): State<Arc<AppState>>, raw: bytes::Bytes)
         };
 
         // Reject arbitrary file path fields strictly with dedicated message
-        for key in ["path", "file_path", "file", "filepath", "credentials_path", "source_path"] {
+        for key in [
+            "path",
+            "file_path",
+            "file",
+            "filepath",
+            "credentials_path",
+            "source_path",
+        ] {
             if obj.contains_key(key) {
                 return json_status(
                     StatusCode::BAD_REQUEST,
@@ -1227,7 +1455,9 @@ async fn devin_import_cli(State(state): State<Arc<AppState>>, raw: bytes::Bytes)
         );
     }
 
+    let import_state = Arc::clone(&state);
     let import_task = tokio::task::spawn_blocking(move || {
+        let _mutation = import_state.settings.composition_lock();
         let explicit = std::env::var_os(mahoquot_providers::devin::DEVIN_CREDENTIALS_PATH_ENV)
             .map(std::path::PathBuf::from);
         let xdg = std::env::var_os("XDG_DATA_HOME").map(std::path::PathBuf::from);
@@ -1291,8 +1521,11 @@ async fn devin_import_cli(State(state): State<Arc<AppState>>, raw: bytes::Bytes)
         let rendered = serde_json::to_string_pretty(&validated)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("failed serializing Devin account: {e}")))?;
 
-        mahoquot_providers::credential_file::write_credential_atomically(&target_path, rendered.as_bytes())
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("failed saving Devin account: {e}")))?;
+        persist_credential(&import_state, &target_path, rendered.as_bytes())
+            .map_err(|e| {
+                let message = format!("failed saving Devin account: {e}");
+                (storage_error(e).status(), message)
+            })?;
 
         Ok((filename, slug))
     })
@@ -1349,28 +1582,30 @@ pub(crate) fn model_ids_from_catalog(parsed: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+// Preserve the response-valued error contract shared with credential handlers.
+#[allow(clippy::result_large_err)]
 async fn models_from_catalog(
     provider: &str,
     response: reqwest::Response,
-) -> Result<Vec<String>, Box<Response>> {
+) -> Result<Vec<String>, Response> {
     let body = response.bytes().await.map_err(|error| {
-        Box::new(json_status(
+        json_status(
             StatusCode::BAD_GATEWAY,
             json!({"error": format!("{provider} model catalog unreadable: {error}"), "status": "error"}),
-        ))
+        )
     })?;
     let parsed: Value = serde_json::from_slice(&body).map_err(|error| {
-        Box::new(json_status(
+        json_status(
             StatusCode::BAD_GATEWAY,
             json!({"error": format!("{provider} model catalog is not JSON: {error}"), "status": "error"}),
-        ))
+        )
     })?;
     let ids = model_ids_from_catalog(&parsed);
     if ids.is_empty() {
-        return Err(Box::new(json_status(
+        return Err(json_status(
             StatusCode::BAD_GATEWAY,
             json!({"error": format!("{provider} returned an empty model catalog"), "status": "error"}),
-        )));
+        ));
     }
     Ok(ids)
 }
@@ -1397,7 +1632,7 @@ async fn command_code_import(
     // Plan D9 (AUTH-7): verify the key against the upstream once before it
     // can become a stored account file.
     let verification = state
-        .http_client
+        .http_client()
         .get(format!("{base_url}/models"))
         .header(header::AUTHORIZATION, format!("Bearer {api_key}"))
         .send()
@@ -1406,7 +1641,7 @@ async fn command_code_import(
         Ok(response) if response.status().is_success() => {
             match models_from_catalog("command-code", response).await {
                 Ok(ids) => ids,
-                Err(rejection) => return *rejection,
+                Err(rejection) => return rejection,
             }
         }
         Ok(response) => {
@@ -1441,22 +1676,30 @@ async fn command_code_import(
             )
         }
     };
-    if let Err(error) = write_credential_atomically(&path, rendered.as_bytes()) {
-        return json_status(
+    match tokio::task::spawn_blocking(move || {
+        let _mutation = state.settings.composition_lock();
+        if let Err(error) = persist_credential(&state, &path, rendered.as_bytes()) {
+            return *storage_error(error);
+        }
+        if let Err(error) = state.rescan_pool() {
+            return json_status(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error":error.to_string()}),
+            );
+        }
+        json_status(
+            StatusCode::OK,
+            json!({"status":"ok","name":path.file_name().and_then(|name|name.to_str())}),
+        )
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => json_status(
             StatusCode::INTERNAL_SERVER_ERROR,
-            json!({"error":error.to_string()}),
-        );
+            json!({"error":"credential_mutation_failed", "message":error.to_string()}),
+        ),
     }
-    if let Err(error) = state.rescan_pool() {
-        return json_status(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            json!({"error":error.to_string()}),
-        );
-    }
-    json_status(
-        StatusCode::OK,
-        json!({"status":"ok","name":path.file_name().and_then(|name|name.to_str())}),
-    )
 }
 
 async fn trae_import(State(state): State<Arc<AppState>>, raw: bytes::Bytes) -> Response {
@@ -1532,16 +1775,24 @@ async fn trae_import(State(state): State<Arc<AppState>>, raw: bytes::Bytes) -> R
     let dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
     let target = dir.join("monitor-trae.json");
     let rendered = serde_json::to_string_pretty(&credential).unwrap_or_default();
-    if let Err(error) = write_credential_atomically(&target, rendered.as_bytes()) {
-        return json_status(
+    match tokio::task::spawn_blocking(move || {
+        let _mutation = state.settings.composition_lock();
+        if let Err(error) = persist_credential(&state, &target, rendered.as_bytes()) {
+            return *storage_error(error);
+        }
+        json_status(
+            StatusCode::OK,
+            json!({"status":"ok","name":"monitor-trae.json"}),
+        )
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => json_status(
             StatusCode::INTERNAL_SERVER_ERROR,
-            json!({"error":error.to_string()}),
-        );
+            json!({"error":"credential_mutation_failed", "message":error.to_string()}),
+        ),
     }
-    json_status(
-        StatusCode::OK,
-        json!({"status":"ok","name":"monitor-trae.json"}),
-    )
 }
 
 async fn discover_provider_models(
@@ -1550,15 +1801,24 @@ async fn discover_provider_models(
 ) -> Response {
     let base_url = match body.get("base_url").and_then(Value::as_str) {
         Some(u) if !u.trim().is_empty() => u.trim().trim_end_matches('/'),
-        _ => return json_status(StatusCode::BAD_REQUEST, json!({"error": "base_url is required"})),
+        _ => {
+            return json_status(
+                StatusCode::BAD_REQUEST,
+                json!({"error": "base_url is required"}),
+            )
+        }
     };
-    let api_key = body.get("api_key").and_then(Value::as_str).unwrap_or("").trim();
+    let api_key = body
+        .get("api_key")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
     let target_url = if base_url.ends_with("/v1") {
         format!("{base_url}/models")
     } else {
         format!("{base_url}/v1/models")
     };
-    let mut req = state.http_client.get(&target_url);
+    let mut req = state.http_client().get(&target_url);
     if !api_key.is_empty() {
         req = req.header(header::AUTHORIZATION, format!("Bearer {api_key}"));
     }
@@ -1830,6 +2090,40 @@ mod tests {
 #[cfg(test)]
 mod reserved_file_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn discovery_uses_new_default_client_after_proxy_publication() {
+        use crate::state::task2_proxy_consumers::{bounded, Fixture, Peer};
+        use http_body_util::BodyExt;
+        let mut a = Peer::start("a").await;
+        let mut b = Peer::start("b").await;
+        let mut target = Peer::start("target").await;
+        let fixture = Fixture::new(&target.url);
+        let base_url = target.url.clone();
+        for (proxy, peer, expected) in [
+            (a.url.clone(), &mut a, "model-a"),
+            (b.url.clone(), &mut b, "model-b"),
+            ("direct".into(), &mut target, "model-target"),
+        ] {
+            fixture.proxy(&proxy);
+            let response = bounded(discover_provider_models(
+                State(fixture.state.clone()),
+                Json(json!({"base_url":base_url,"api_key":"dummy"})),
+            ))
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = bounded(response.into_body().collect())
+                .await
+                .expect("discovery body")
+                .to_bytes();
+            let body: Value = serde_json::from_slice(&bytes).expect("discovery JSON");
+            assert_eq!(body["models"], json!([expected]));
+            peer.captured("/v1/models").await;
+        }
+        a.close().await;
+        b.close().await;
+        target.close().await;
+    }
 
     #[tokio::test]
     async fn discover_provider_models_requires_base_url() {

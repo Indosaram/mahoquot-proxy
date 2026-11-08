@@ -1,6 +1,6 @@
 pub const REFRESH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 pub const REFRESH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
-pub const CLAUDE_REFRESH_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
+pub const CLAUDE_REFRESH_TOKEN_URL: &str = "https://api.anthropic.com/v1/oauth/token";
 pub const CLAUDE_REFRESH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 pub const CLINE_REFRESH_URL: &str = "https://api.cline.bot/api/v1/auth/refresh";
 
@@ -10,25 +10,6 @@ pub struct RefreshRequest {
     pub form_fields: Vec<(String, String)>,
     pub json_body: Option<serde_json::Value>,
     pub headers: Vec<(String, String)>,
-}
-
-impl RefreshRequest {
-    pub fn refresh_token(&self) -> Option<&str> {
-        if let Some(body) = &self.json_body {
-            if let Some(token) = body.get("refresh_token").and_then(|v| v.as_str()) {
-                return Some(token);
-            }
-            if let Some(token) = body.get("refreshToken").and_then(|v| v.as_str()) {
-                return Some(token);
-            }
-        }
-        for (k, v) in &self.form_fields {
-            if k == "refresh_token" || k == "refreshToken" {
-                return Some(v.as_str());
-            }
-        }
-        None
-    }
 }
 
 #[derive(Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -98,40 +79,11 @@ pub fn build_claude_refresh_request(refresh_token: &str) -> RefreshRequest {
         url: CLAUDE_REFRESH_TOKEN_URL.to_string(),
         form_fields: Vec::new(),
         json_body: Some(serde_json::json!({
-            "client_id": CLAUDE_REFRESH_CLIENT_ID,
             "grant_type": "refresh_token",
+            "client_id": CLAUDE_REFRESH_CLIENT_ID,
             "refresh_token": refresh_token,
-            "scope": "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload",
         })),
-        headers: vec![
-            ("accept".to_string(), "application/json, text/plain, */*".to_string()),
-            ("user-agent".to_string(), "axios/1.15.2".to_string()),
-        ],
-    }
-}
-
-pub fn build_claude_refresh_request_with_scope(
-    refresh_token: &str,
-    scope: Option<&str>,
-) -> RefreshRequest {
-    let mut body = serde_json::json!({
-        "client_id": CLAUDE_REFRESH_CLIENT_ID,
-        "grant_type": "refresh_token",
-        "refresh_token": refresh_token,
-    });
-    if let Some(s) = scope {
-        if let Some(obj) = body.as_object_mut() {
-            obj.insert("scope".to_string(), serde_json::Value::String(s.to_string()));
-        }
-    }
-    RefreshRequest {
-        url: CLAUDE_REFRESH_TOKEN_URL.to_string(),
-        form_fields: Vec::new(),
-        json_body: Some(body),
-        headers: vec![
-            ("accept".to_string(), "application/json, text/plain, */*".to_string()),
-            ("user-agent".to_string(), "axios/1.15.2".to_string()),
-        ],
+        headers: Vec::new(),
     }
 }
 

@@ -1,9 +1,13 @@
 mod common;
-use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 use mahoquot_types::{Health, PoolMember};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
+use common::with_loopback_peer;
 use http_body_util::BodyExt;
 use mahoquot_gateway::config::GatewayConfig;
 use mahoquot_gateway::inbound::ApiKeys;
@@ -12,13 +16,25 @@ use mahoquot_gateway::state::AppState;
 use tower::ServiceExt;
 
 fn config(auth_dir: std::path::PathBuf) -> GatewayConfig {
-    GatewayConfig {
+    let config = GatewayConfig {
         auth_dir: auth_dir.clone(),
         api_keys: ApiKeys::new(vec!["lifecycle-key".to_string()]),
         config_path: auth_dir.join("config.yaml"),
         auth_refresh_enabled: false,
         ..GatewayConfig::default()
+    };
+    mahoquot_gateway::management::settings::Settings {
+        api_keys: vec!["lifecycle-key".to_string()],
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: "lifecycle-key".to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
     }
+    .persist(&config.config_path)
+    .expect("persist management test settings");
+    config
 }
 
 fn codex_credential() -> serde_json::Value {
@@ -44,13 +60,13 @@ async fn json(response: axum::response::Response) -> serde_json::Value {
 async fn stats(app: &axum::Router) -> serde_json::Value {
     json(
         app.clone()
-            .oneshot(
+            .oneshot(with_loopback_peer(
                 Request::builder()
                     .uri("/admin/stats")
-                    .header(header::AUTHORIZATION, "Bearer lifecycle-key")
+                    .header("X-Management-Key", "lifecycle-key")
                     .body(Body::empty())
                     .unwrap(),
-            )
+            ))
             .await
             .unwrap(),
     )
@@ -63,10 +79,18 @@ async fn disabled_credentials_preserve_counters_but_cannot_route_or_advertise_mo
     let base = format!("http://{}", listener.local_addr().unwrap());
     let calls = Arc::new(AtomicUsize::new(0));
     let recorded = calls.clone();
-    let upstream = axum::Router::new().route(common::CODEX_PATH, axum::routing::post(move || {
-        recorded.fetch_add(1, Ordering::SeqCst);
-        async { ([(header::CONTENT_TYPE, "text/event-stream")], common::codex_sse("fixture")) }
-    }));
+    let upstream = axum::Router::new().route(
+        common::CODEX_PATH,
+        axum::routing::post(move || {
+            recorded.fetch_add(1, Ordering::SeqCst);
+            async {
+                (
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    common::codex_sse("fixture"),
+                )
+            }
+        }),
+    );
     let task = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
     let auth_dir = std::env::temp_dir().join(format!("quotio-lifecycle-{}", std::process::id()));
     std::fs::create_dir_all(&auth_dir).expect("auth dir");
@@ -78,78 +102,131 @@ async fn disabled_credentials_preserve_counters_but_cannot_route_or_advertise_mo
         serde_json::to_vec_pretty(&credential).unwrap(),
     )
     .expect("credential");
-    let state = Arc::new(
-        AppState::new(&config(auth_dir.clone())).expect("state"),
-    );
+    let state = Arc::new(AppState::new(&config(auth_dir.clone())).expect("state"));
     let app = create_app(state.clone());
-    state.find_member("toggle-me").unwrap().ok_count.store(9, Ordering::Relaxed);
+    state
+        .find_member("toggle-me")
+        .unwrap()
+        .ok_count
+        .store(9, Ordering::Relaxed);
     assert_eq!(stats(&app).await["accounts"].as_array().unwrap().len(), 1);
 
     let disable = app
         .clone()
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .method("PATCH")
                 .uri("/v0/management/auth-files/status")
-                .header(header::AUTHORIZATION, "Bearer lifecycle-key")
+                .header("X-Management-Key", "lifecycle-key")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     r#"{"name":"codex-toggle.json","disabled":true}"#,
                 ))
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(disable.status(), StatusCode::OK);
     assert_eq!(stats(&app).await["accounts"].as_array().unwrap().len(), 1);
-    assert_eq!(state.find_member("toggle-me").unwrap().health(), Health::Disabled);
-    assert_eq!(state.find_member("toggle-me").unwrap().ok_count.load(Ordering::Relaxed), 9);
+    assert_eq!(
+        state.find_member("toggle-me").unwrap().health(),
+        Health::Disabled
+    );
+    assert_eq!(
+        state
+            .find_member("toggle-me")
+            .unwrap()
+            .ok_count
+            .load(Ordering::Relaxed),
+        9
+    );
     assert!(state.scheduler.snapshot().order.is_empty());
-    let models = app.clone().oneshot(Request::builder().uri("/v1/models")
-        .header(header::AUTHORIZATION, "Bearer lifecycle-key").body(Body::empty()).unwrap()).await.unwrap();
-    assert!(!json(models).await["data"].as_array().unwrap().iter().any(|m| m["id"] == "gpt-5.6-sol"));
-    let chat = || Request::builder().method("POST").uri("/v1/chat/completions")
-        .header(header::AUTHORIZATION, "Bearer lifecycle-key").header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(r#"{"model":"gpt-5.6-sol","stream":true,"messages":[{"role":"user","content":"fixture"}]}"#)).unwrap();
-    let rejected = app.clone().oneshot(chat()).await.unwrap();
-    assert!(matches!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE | StatusCode::BAD_REQUEST));
-    assert_eq!(calls.load(Ordering::SeqCst), 0);
-
-    let listed = app
+    let models = app
         .clone()
         .oneshot(
             Request::builder()
-                .uri("/v0/management/auth-files")
+                .uri("/v1/models")
                 .header(header::AUTHORIZATION, "Bearer lifecycle-key")
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
+    assert!(!json(models).await["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m["id"] == "gpt-5.6-sol"));
+    let chat = || {
+        Request::builder().method("POST").uri("/v1/chat/completions")
+        .header(header::AUTHORIZATION, "Bearer lifecycle-key").header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"model":"gpt-5.6-sol","stream":true,"messages":[{"role":"user","content":"fixture"}]}"#)).unwrap()
+    };
+    let rejected = app.clone().oneshot(chat()).await.unwrap();
+    assert!(matches!(
+        rejected.status(),
+        StatusCode::SERVICE_UNAVAILABLE | StatusCode::BAD_REQUEST
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    let listed = app
+        .clone()
+        .oneshot(with_loopback_peer(
+            Request::builder()
+                .uri("/v0/management/auth-files")
+                .header("X-Management-Key", "lifecycle-key")
+                .body(Body::empty())
+                .unwrap(),
+        ))
+        .await
+        .unwrap();
     assert_eq!(json(listed).await["files"][0]["disabled"], true);
 
     let enable = app
         .clone()
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .method("PATCH")
                 .uri("/v0/management/auth-files/status")
-                .header(header::AUTHORIZATION, "Bearer lifecycle-key")
+                .header("X-Management-Key", "lifecycle-key")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     r#"{"name":"codex-toggle.json","disabled":false}"#,
                 ))
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(enable.status(), StatusCode::OK);
     assert_eq!(stats(&app).await["accounts"].as_array().unwrap().len(), 1);
-    assert_eq!(state.find_member("toggle-me").unwrap().health(), Health::Available);
-    assert_eq!(state.find_member("toggle-me").unwrap().ok_count.load(Ordering::Relaxed), 9);
-    let models = app.clone().oneshot(Request::builder().uri("/v1/models")
-        .header(header::AUTHORIZATION, "Bearer lifecycle-key").body(Body::empty()).unwrap()).await.unwrap();
-    assert!(json(models).await["data"].as_array().unwrap().iter().any(|m| m["id"] == "gpt-5.6-sol"));
+    assert_eq!(
+        state.find_member("toggle-me").unwrap().health(),
+        Health::Available
+    );
+    assert_eq!(
+        state
+            .find_member("toggle-me")
+            .unwrap()
+            .ok_count
+            .load(Ordering::Relaxed),
+        9
+    );
+    let models = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .header(header::AUTHORIZATION, "Bearer lifecycle-key")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(json(models).await["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m["id"] == "gpt-5.6-sol"));
     let routed = app.clone().oneshot(chat()).await.unwrap();
     assert_eq!(routed.status(), StatusCode::OK);
     routed.into_body().collect().await.unwrap();
@@ -168,11 +245,11 @@ async fn generic_openai_key_provider_joins_pool() {
     ));
     let create = app
         .clone()
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .method("POST")
                 .uri("/v0/management/auth-files")
-                .header(header::AUTHORIZATION, "Bearer lifecycle-key")
+                .header("X-Management-Key", "lifecycle-key")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     serde_json::json!({
@@ -191,7 +268,7 @@ async fn generic_openai_key_provider_joins_pool() {
                     .to_string(),
                 ))
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(create.status(), StatusCode::OK);
@@ -228,11 +305,11 @@ async fn vertex_import_exchanges_service_account_and_joins_google_pool() {
     let private_key = include_str!("fixtures/test-rsa-private.pem");
     let response = app
         .clone()
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .method("POST")
                 .uri("/v0/management/vertex/import")
-                .header(header::AUTHORIZATION, "Bearer lifecycle-key")
+                .header("X-Management-Key", "lifecycle-key")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     serde_json::json!({"file":serde_json::json!({
@@ -242,7 +319,7 @@ async fn vertex_import_exchanges_service_account_and_joins_google_pool() {
                     .to_string(),
                 ))
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     let status = response.status();

@@ -4,6 +4,476 @@ use serde_json::{json, Map, Value};
 use super::events::{CodexEvent, Usage};
 use super::signature_ledger::{self, ReplayScope};
 
+pub fn interactions_to_gemini(body: &Value) -> Result<Value, String> {
+    use sha2::{Digest, Sha256};
+
+    fn names(value: &Value, out: &mut std::collections::BTreeSet<String>) {
+        match value {
+            Value::Array(items) => items.iter().for_each(|item| names(item, out)),
+            Value::Object(map) => {
+                if let Some(name) = map
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|n| !n.is_empty())
+                {
+                    out.insert(name.to_string());
+                }
+                for key in [
+                    "tools",
+                    "function",
+                    "functionDeclarations",
+                    "function_declarations",
+                ] {
+                    if let Some(value) = map.get(key) {
+                        names(value, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    fn sanitize(name: &str) -> String {
+        let mut out: String = name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '-') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        if !out.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
+            out.insert(0, '_');
+        }
+        out.truncate(64);
+        out
+    }
+    fn part_list(content: &Value) -> Result<Vec<Value>, String> {
+        if let Some(text) = content.as_str() {
+            return Ok(vec![json!({"text":text})]);
+        }
+        content.as_array().ok_or("input content must be a string or array")?.iter().map(|part| {
+            let kind = part.get("type").and_then(Value::as_str).unwrap_or("");
+            let mut out = match kind {
+                "text" | "thought" => json!({"text":part.get("text").cloned().unwrap_or(Value::String(String::new()))}),
+                "image" => {
+                    let data = part.get("data").and_then(Value::as_str).ok_or("image input requires data")?;
+                    let mime = part.get("mime_type").and_then(Value::as_str).unwrap_or("image/png");
+                    json!({"inlineData":{"mimeType":mime,"data":data}})
+                }
+                "document" => {
+                    let uri = part.get("uri").and_then(Value::as_str).ok_or("document input requires uri")?;
+                    json!({"fileData":{"fileUri":uri,"mimeType":part.get("mime_type").and_then(Value::as_str).unwrap_or("application/octet-stream")}})
+                }
+                _ => return Err(format!("unsupported Interactions content type: {kind}")),
+            };
+            if kind == "thought" { out["thought"] = json!(true); }
+            if let Some(signature) = part.get("thought_signature").or_else(|| part.get("thoughtSignature")) { out["thoughtSignature"] = signature.clone(); }
+            Ok(out)
+        }).collect()
+    }
+
+    let mut original_names = std::collections::BTreeSet::new();
+    names(
+        body.get("tools").unwrap_or(&Value::Null),
+        &mut original_names,
+    );
+    let mut counts = std::collections::BTreeMap::<String, usize>::new();
+    for name in &original_names {
+        *counts.entry(sanitize(name)).or_default() += 1;
+    }
+    let mut function_names = std::collections::BTreeMap::new();
+    let mut used = std::collections::BTreeSet::new();
+    for name in original_names {
+        let base = sanitize(&name);
+        let mut mapped = base.clone();
+        if counts.get(&base).copied().unwrap_or(0) > 1 || used.contains(&mapped) {
+            for attempt in 0u64.. {
+                let digest = Sha256::digest(format!("{name}\0{attempt}").as_bytes());
+                let suffix: String = digest
+                    .iter()
+                    .take(6)
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect();
+                mapped = format!("{}_{}", &base[..base.len().min(51)], suffix);
+                if !used.contains(&mapped) {
+                    break;
+                }
+            }
+        }
+        used.insert(mapped.clone());
+        function_names.insert(name, mapped);
+    }
+
+    let mut contents = Vec::new();
+    if let Some(input) = body.get("input") {
+        if let Some(text) = input.as_str() {
+            contents.push(json!({"role":"user","parts":[{"text":text}]}));
+        } else {
+            let steps = input.as_array().ok_or("input must be a string or array")?;
+            for step in steps {
+                let kind = step.get("type").and_then(Value::as_str).unwrap_or("");
+                let (role, mut converted) = match kind {
+                    "user_input" | "model_output" | "" => (
+                        if kind == "model_output"
+                            || matches!(
+                                step.get("role").and_then(Value::as_str),
+                                Some("model" | "assistant")
+                            )
+                        {
+                            "model"
+                        } else {
+                            "user"
+                        },
+                        part_list(step.get("content").ok_or("input step requires content")?)?,
+                    ),
+                    "function_call" => {
+                        let name = step
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .ok_or("function_call requires name")?;
+                        let args = match step.get("arguments") {
+                            Some(Value::String(raw)) => {
+                                serde_json::from_str::<Value>(raw).map_err(|e| e.to_string())?
+                            }
+                            Some(value) => value.clone(),
+                            None => json!({}),
+                        };
+                        let mut part = json!({"functionCall":{"id":step.get("id").and_then(Value::as_str).ok_or("function_call requires id")?,"name":function_names.get(name).unwrap_or(&name.to_string()),"args":args}});
+                        if let Some(signature) = step
+                            .get("thought_signature")
+                            .or_else(|| step.get("signature"))
+                        {
+                            part["thoughtSignature"] = signature.clone();
+                        }
+                        ("model", vec![part])
+                    }
+                    "function_result" => {
+                        let name = step
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .ok_or("function_result requires name")?;
+                        let result = step
+                            .get("result")
+                            .or_else(|| step.get("output"))
+                            .ok_or("function_result requires result")?;
+                        let response = if result.is_object() {
+                            result.clone()
+                        } else {
+                            json!({"result":result})
+                        };
+                        (
+                            "user",
+                            vec![
+                                json!({"functionResponse":{"id":step.get("call_id").and_then(Value::as_str).ok_or("function_result requires call_id")?,"name":function_names.get(name).unwrap_or(&name.to_string()),"response":response}}),
+                            ],
+                        )
+                    }
+                    "thought" => {
+                        let mut parts = if let Some(content) = step.get("content") {
+                            part_list(content)?
+                        } else {
+                            vec![
+                                json!({"text":step.get("text").and_then(Value::as_str).unwrap_or("")}),
+                            ]
+                        };
+                        for part in &mut parts {
+                            part["thought"] = json!(true);
+                            if let Some(signature) = step
+                                .get("signature")
+                                .or_else(|| step.get("thought_signature"))
+                                .or_else(|| step.get("thoughtSignature"))
+                            {
+                                part["thoughtSignature"] = signature.clone();
+                            }
+                        }
+                        ("model", parts)
+                    }
+                    _ => return Err(format!("unsupported Interactions input type: {kind}")),
+                };
+                if let Some(last) = contents
+                    .last_mut()
+                    .filter(|last| last.get("role").and_then(Value::as_str) == Some(role))
+                {
+                    if let Some(parts) = last["parts"].as_array_mut() {
+                        parts.append(&mut converted);
+                    }
+                } else {
+                    contents.push(json!({"role":role,"parts":converted}));
+                }
+            }
+        }
+    } else {
+        return Err("missing input".into());
+    }
+
+    let mut out = json!({"contents":contents});
+    if let Some(system) = body.get("system_instruction") {
+        out["systemInstruction"] = if system.is_object() {
+            if let Some(text) = system.get("text").filter(|_| system.get("parts").is_none()) {
+                json!({"parts":[{"text":text}]})
+            } else {
+                system.clone()
+            }
+        } else {
+            json!({"parts":part_list(system)?})
+        };
+    }
+    fn camel(value: &Value) -> Value {
+        match value {
+            Value::Object(map) => Value::Object(
+                map.iter()
+                    .map(|(key, value)| {
+                        let mut words = key.split('_');
+                        let mut name = words.next().unwrap_or("").to_owned();
+                        for word in words {
+                            let mut chars = word.chars();
+                            if let Some(first) = chars.next() {
+                                name.extend(first.to_uppercase());
+                                name.extend(chars);
+                            }
+                        }
+                        (name, camel(value))
+                    })
+                    .collect(),
+            ),
+            Value::Array(items) => Value::Array(items.iter().map(camel).collect()),
+            _ => value.clone(),
+        }
+    }
+    let mut generation = body
+        .get("generation_config")
+        .map(camel)
+        .or_else(|| body.get("generationConfig").cloned())
+        .unwrap_or_else(|| json!({}));
+    if !generation.is_object() {
+        return Err("generation config must be an object".into());
+    }
+    for field in ["thinkingLevel", "thinkingBudget", "includeThoughts"] {
+        if let Some(value) = generation.as_object_mut().and_then(|map| map.remove(field)) {
+            generation["thinkingConfig"][field] = value;
+        }
+    }
+    fn summary(value: &Value) -> Option<bool> {
+        match value.as_str()?.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(true),
+            "none" => Some(false),
+            _ => None,
+        }
+    }
+    if let Some(value) = generation
+        .as_object_mut()
+        .and_then(|map| map.remove("thinkingSummaries"))
+        .as_ref()
+        .and_then(summary)
+    {
+        generation["thinkingConfig"]["includeThoughts"] = json!(value);
+    }
+    let tool_choice = body
+        .get("tool_choice")
+        .or_else(|| body.pointer("/generation_config/tool_choice"))
+        .or_else(|| body.pointer("/generationConfig/toolChoice"));
+    if let Some(map) = generation.as_object_mut() {
+        map.remove("toolChoice");
+    }
+    if let Some(reasoning) = body.get("reasoning") {
+        if let Some(effort) = reasoning
+            .get("effort")
+            .or_else(|| reasoning.get("thinking_level"))
+            .and_then(Value::as_str)
+        {
+            let effort = effort.trim().to_ascii_lowercase();
+            if effort == "auto" {
+                generation["thinkingConfig"]["thinkingBudget"] = json!(-1);
+            } else if !effort.is_empty() {
+                generation["thinkingConfig"]["thinkingLevel"] = json!(effort);
+            }
+        }
+        if let Some(value) = reasoning.get("summary").and_then(summary) {
+            generation["thinkingConfig"]["includeThoughts"] = json!(value);
+        }
+    }
+    if let Some(modalities) = body
+        .get("response_modalities")
+        .or_else(|| body.get("responseModalities"))
+        .and_then(Value::as_array)
+    {
+        let mapped: Vec<_> = modalities
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|value| value.trim().to_ascii_uppercase())
+            .filter(|value| matches!(value.as_str(), "TEXT" | "IMAGE" | "AUDIO"))
+            .collect();
+        if !mapped.is_empty() {
+            generation["responseModalities"] = json!(mapped);
+        }
+    }
+    if generation.as_object().is_some_and(|map| !map.is_empty()) {
+        out["generationConfig"] = generation;
+    }
+    if let Some(tools) = body.get("tools").and_then(Value::as_array) {
+        let mut declarations = Vec::new();
+        let mut other_tools = Vec::new();
+        for tool in tools {
+            let funcs = tool
+                .get("functionDeclarations")
+                .or_else(|| tool.get("function_declarations"))
+                .and_then(Value::as_array);
+            let direct = [tool.clone()];
+            let is_function = tool.get("type").and_then(Value::as_str) == Some("function")
+                || tool.get("name").is_some();
+            if funcs.is_none() && !is_function {
+                let mut translated = tool.clone();
+                for (snake, camel) in [
+                    ("url_context", "urlContext"),
+                    ("code_execution", "codeExecution"),
+                    ("google_search", "googleSearch"),
+                    ("web_search", "googleSearch"),
+                ] {
+                    if let Some(value) =
+                        translated.as_object_mut().and_then(|map| map.remove(snake))
+                    {
+                        translated[camel] = value;
+                    }
+                }
+                let known = ["urlContext", "codeExecution", "googleSearch"];
+                if let Some(kind) = translated.get("type").and_then(Value::as_str) {
+                    let key = match kind {
+                        "url_context" => Some("urlContext"),
+                        "code_execution" => Some("codeExecution"),
+                        "google_search" | "web_search" => Some("googleSearch"),
+                        _ => None,
+                    };
+                    if let Some(key) = key {
+                        translated =
+                            json!({key:translated.get(key).cloned().unwrap_or_else(|| json!({}))});
+                    }
+                } else if translated
+                    .as_object()
+                    .is_some_and(|map| map.keys().all(|key| !known.contains(&key.as_str())))
+                {
+                    translated = json!({"googleSearch":translated});
+                }
+                other_tools.push(translated);
+                continue;
+            }
+            for function in funcs.map(Vec::as_slice).unwrap_or(&direct) {
+                let function = function.get("function").unwrap_or(function);
+                let Some(name) = function
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.trim().is_empty())
+                else {
+                    continue;
+                };
+                let mut declaration = json!({"name":function_names.get(name).unwrap_or(&name.to_string()),"parametersJsonSchema":function.get("parametersJsonSchema").or_else(|| function.get("parameters")).cloned().unwrap_or_else(|| json!({"type":"object","properties":{}}))});
+                if let Some(description) = function.get("description") {
+                    declaration["description"] = description.clone();
+                }
+                for field in ["response", "responseJsonSchema"] {
+                    if let Some(value) = function.get(field) {
+                        declaration[field] = value.clone();
+                    }
+                }
+                declarations.push(declaration);
+            }
+        }
+        if !declarations.is_empty() {
+            other_tools.insert(0, json!({"functionDeclarations":declarations}));
+        }
+        if !other_tools.is_empty() {
+            out["tools"] = json!(other_tools);
+        }
+    }
+    if let Some(choice) = tool_choice {
+        let kind = choice
+            .as_str()
+            .or_else(|| choice.get("type").and_then(Value::as_str))
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        let mode = match kind.as_str() {
+            "none" => Some("NONE"),
+            "auto" => Some("AUTO"),
+            "required" | "any" | "function" | "tool" => Some("ANY"),
+            _ => None,
+        };
+        if let Some(mode) = mode {
+            out["toolConfig"] = json!({"functionCallingConfig":{"mode":mode}});
+            if let Some(name) = choice
+                .pointer("/function/name")
+                .or_else(|| choice.get("name"))
+                .and_then(Value::as_str)
+                .filter(|name| !name.trim().is_empty())
+            {
+                out["toolConfig"]["functionCallingConfig"]["allowedFunctionNames"] = json!([name]);
+            }
+            if mode == "NONE" {
+                out.as_object_mut().unwrap().remove("tools");
+            }
+        }
+    }
+    if let Some(function_calling) = body.pointer("/toolConfig/functionCallingConfig") {
+        out["toolConfig"] = json!({"functionCallingConfig":function_calling});
+    }
+    out["safetySettings"] = body
+        .get("safetySettings")
+        .or_else(|| body.get("safety_settings"))
+        .cloned()
+        .unwrap_or_else(|| {
+            json!([
+                {"category":"HARM_CATEGORY_HARASSMENT","threshold":"OFF"},
+                {"category":"HARM_CATEGORY_HATE_SPEECH","threshold":"OFF"},
+                {"category":"HARM_CATEGORY_SEXUALLY_EXPLICIT","threshold":"OFF"},
+                {"category":"HARM_CATEGORY_DANGEROUS_CONTENT","threshold":"OFF"},
+                {"category":"HARM_CATEGORY_CIVIC_INTEGRITY","threshold":"BLOCK_NONE"}
+            ])
+        });
+    Ok(out)
+}
+
+pub fn interactions_function_names(body: &Value) -> Vec<(String, String)> {
+    let Ok(translated) = interactions_to_gemini(body) else {
+        return Vec::new();
+    };
+    let declarations = translated
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| tool.get("functionDeclarations").and_then(Value::as_array))
+        .flatten();
+    let originals = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .flat_map(|tool| {
+            tool.get("functionDeclarations")
+                .or_else(|| tool.get("function_declarations"))
+                .and_then(Value::as_array)
+                .map(|functions| functions.iter().collect::<Vec<_>>())
+                .unwrap_or_else(|| vec![tool])
+        })
+        .filter_map(|function| {
+            let function = function.get("function").unwrap_or(function);
+            function
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
+    originals
+        .zip(declarations)
+        .filter_map(|(original, declaration)| {
+            declaration
+                .get("name")
+                .and_then(Value::as_str)
+                .map(|mapped| (original, mapped.to_owned()))
+        })
+        .collect()
+}
+
 const SIGNATURE_ID_SEPARATOR: char = '#';
 const GEMINI_SKIP_THOUGHT_SIGNATURE_VALIDATOR: &str = "skip_thought_signature_validator";
 
@@ -134,12 +604,14 @@ fn gemini_to_openai_inner(
     }
 
     // 2. Contents
+    let mut pending_calls: Vec<(String, String)> = Vec::new();
     if let Some(contents) = req.get("contents").and_then(Value::as_array) {
         for turn in contents {
             let role_str = turn.get("role").and_then(Value::as_str).unwrap_or("user");
             let is_model = role_str == "model" || role_str == "assistant";
 
             let mut text_parts = Vec::new();
+            let mut media_parts = Vec::new();
             let mut reasoning_parts = Vec::new();
             let mut reasoning_sig: Option<String> = None;
             let mut tool_calls = Vec::new();
@@ -147,6 +619,41 @@ fn gemini_to_openai_inner(
 
             if let Some(parts) = turn.get("parts").and_then(Value::as_array) {
                 for part in parts {
+                    if let Some(media) = part.get("inlineData").or_else(|| part.get("inline_data"))
+                    {
+                        let mime = media
+                            .get("mimeType")
+                            .or_else(|| media.get("mime_type"))
+                            .and_then(Value::as_str)
+                            .ok_or("inline media requires mimeType")?;
+                        if !mime.starts_with("image/") || is_model {
+                            return Err("unsupported Gemini media in conversation".into());
+                        }
+                        let data = media
+                            .get("data")
+                            .and_then(Value::as_str)
+                            .ok_or("inline media requires data")?;
+                        media_parts.push(json!({"type":"image_url","image_url":{"url":format!("data:{mime};base64,{data}")}}));
+                    }
+                    if let Some(media) = part.get("fileData").or_else(|| part.get("file_data")) {
+                        let mime = media
+                            .get("mimeType")
+                            .or_else(|| media.get("mime_type"))
+                            .and_then(Value::as_str)
+                            .ok_or("file media requires mimeType")?;
+                        let uri = media
+                            .get("fileUri")
+                            .or_else(|| media.get("file_uri"))
+                            .and_then(Value::as_str)
+                            .ok_or("file media requires fileUri")?;
+                        if !mime.starts_with("image/")
+                            || is_model
+                            || !(uri.starts_with("https://") || uri.starts_with("http://"))
+                        {
+                            return Err("unsupported Gemini file media".into());
+                        }
+                        media_parts.push(json!({"type":"image_url","image_url":{"url":uri}}));
+                    }
                     if let Some(sig) = part
                         .get("thoughtSignature")
                         .or_else(|| part.get("thought_signature"))
@@ -159,6 +666,7 @@ fn gemini_to_openai_inner(
                             reasoning_parts.push(text.to_string());
                         } else {
                             text_parts.push(text.to_string());
+                            media_parts.push(json!({"type":"text","text":text}));
                         }
                     }
                     if let Some(call) = part
@@ -176,6 +684,7 @@ fn gemini_to_openai_inner(
                         if let (Some(replay), Some(sig)) = (replay, reasoning_sig.as_ref()) {
                             replay.remember(&call_id, name, &args.to_string(), sig);
                         }
+                        pending_calls.push((name.to_string(), call_id.clone()));
                         tool_calls.push(json!({
                             "id": call_id,
                             "type": "function",
@@ -195,9 +704,26 @@ fn gemini_to_openai_inner(
                             .get("id")
                             .and_then(Value::as_str)
                             .filter(|id| !id.is_empty());
-                        let call_id = explicit_id
-                            .map(str::to_string)
-                            .unwrap_or_else(|| signature_ledger::synthetic_call_id(name));
+                        let call_id = if let Some(id) = explicit_id {
+                            if let Some(index) =
+                                pending_calls.iter().position(|(_, call_id)| call_id == id)
+                            {
+                                pending_calls.remove(index);
+                            }
+                            id.to_string()
+                        } else {
+                            let matches: Vec<usize> = pending_calls
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(index, (call_name, _))| {
+                                    (call_name == name).then_some(index)
+                                })
+                                .collect();
+                            if matches.len() != 1 {
+                                return Err("Gemini functionResponse requires an unambiguous pending call or explicit id".into());
+                            }
+                            pending_calls.remove(matches[0]).1
+                        };
                         tool_results.push(json!({
                             "role": "tool",
                             "tool_call_id": call_id,
@@ -225,7 +751,9 @@ fn gemini_to_openai_inner(
                 }
                 out_messages.push(Value::Object(m));
             } else {
-                if !text_parts.is_empty() {
+                if media_parts.iter().any(|part| part["type"] == "image_url") {
+                    out_messages.push(json!({"role":"user","content":media_parts}));
+                } else if !text_parts.is_empty() {
                     out_messages.push(json!({
                         "role": "user",
                         "content": text_parts.join("")
@@ -251,7 +779,10 @@ fn gemini_to_openai_inner(
             {
                 for func in funcs {
                     let name = func.get("name").and_then(Value::as_str).unwrap_or("");
-                    let desc = func.get("description").and_then(Value::as_str).unwrap_or("");
+                    let desc = func
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
                     let params = func
                         .get("parameters")
                         .cloned()
@@ -530,7 +1061,10 @@ fn openai_to_gemini_inner(
     // Antigravity threads reasoning state per conversation, so a replayed
     // signature is only accepted under the session that produced it. The id is
     // the caller's stable scope id, never anything forwarded from ingress.
-    if let Some(session_id) = replay.map(ReplayScope::session_id).filter(|id| !id.is_empty()) {
+    if let Some(session_id) = replay
+        .map(ReplayScope::session_id)
+        .filter(|id| !id.is_empty())
+    {
         request.insert("sessionId".to_string(), json!(session_id));
     }
 
@@ -627,7 +1161,8 @@ fn openai_to_gemini_inner(
                     sanitize_claude_schema_for_gemini(&mut parameters)
                         .map_err(|error| format!("tools[{index}].function.parameters: {error}"))?;
                 } else {
-                    sanitize_gemini_schema(&mut parameters);
+                    sanitize_gemini_schema(&mut parameters)
+                        .map_err(|error| format!("tools[{index}].function.parameters: {error}"))?;
                 }
                 Ok(json!({
                     "name": f.get("name").and_then(Value::as_str).unwrap_or(""),
@@ -668,26 +1203,17 @@ const GEMINI_UNSUPPORTED_SCHEMA_KEYS: &[&str] = &[
     "maxProperties",
 ];
 
-fn sanitize_gemini_schema(value: &mut Value) {
-    match value {
-        Value::Object(map) => {
-            for key in GEMINI_UNSUPPORTED_SCHEMA_KEYS {
-                map.remove(*key);
-            }
-            if let Some(one) = map.remove("oneOf") {
-                map.entry("anyOf").or_insert(one);
-            }
-            for child in map.values_mut() {
-                sanitize_gemini_schema(child);
-            }
+fn sanitize_gemini_schema(value: &mut Value) -> Result<(), String> {
+    if let Value::Object(map) = value {
+        for key in GEMINI_UNSUPPORTED_SCHEMA_KEYS {
+            map.remove(*key);
         }
-        Value::Array(items) => {
-            for item in items {
-                sanitize_gemini_schema(item);
-            }
+        if let Some(one) = map.remove("oneOf") {
+            map.entry("anyOf").or_insert(one);
         }
-        _ => {}
+        super::tool_schema::visit_schema_children(map, &mut sanitize_gemini_schema)?;
     }
+    Ok(())
 }
 
 // Unlike the legacy Gemini JSON walk, visit only schema positions: a tool may
@@ -744,16 +1270,17 @@ fn openai_to_antigravity_inner(
     // Anthropic. Keep this repair out of native Gemini and non-Claude models.
     let request = openai_to_gemini_inner(body, model.starts_with("claude-"), replay)?;
 
-    // The envelope carries the client-identity fields the real Antigravity
-    // client sends; CLIProxyAPI and OpenCodex both mirror them.
-    Ok(json!({
-        "model": model,
-        "userAgent": "antigravity",
-        "requestType": "agent",
-        "project": project_id,
-        "requestId": format!("agent-{}", uuid::Uuid::new_v4()),
-        "request": request,
-    }))
+    // Same wrapper the native Gemini path uses, so the two ingresses cannot
+    // drift on userAgent, requestType, or the computeRequestID slash form.
+    Ok(crate::v1beta::wrap_for_antigravity(
+        model, project_id, &request,
+    ))
+}
+
+pub fn openai_request_uses_claude(body: &Value) -> bool {
+    body.get("model")
+        .and_then(Value::as_str)
+        .is_some_and(|model| model.starts_with("claude-"))
 }
 
 pub fn gemini_json_to_openai(body: &Value, model: &str, created: i64) -> Value {
@@ -989,6 +1516,7 @@ pub struct GeminiDecoder {
     tool_index: u64,
     usage: Option<Usage>,
     completed: bool,
+    saw_finish_reason: bool,
     pending_signature: Option<String>,
     replay: Option<ReplayScope>,
 }
@@ -1149,26 +1677,26 @@ impl GeminiDecoder {
             }
         }
 
-        if candidate
-            .get("finishReason")
-            .and_then(Value::as_str)
-            .is_some()
-        {
-            if candidate.get("finishReason").and_then(Value::as_str) == Some("MAX_TOKENS") {
+        if let Some(reason) = candidate.get("finishReason").and_then(Value::as_str) {
+            if reason == "MAX_TOKENS" {
                 out.push(CodexEvent::OutputLimitReached);
             }
-            out.push(CodexEvent::Completed {
-                usage: self.usage.take(),
-            });
-            self.completed = true;
+            self.saw_finish_reason = true;
         }
     }
 
     pub fn finish(&mut self, out: &mut Vec<CodexEvent>) {
-        if !self.completed {
-            self.completed = true;
+        if self.completed {
+            return;
+        }
+        self.completed = true;
+        if self.saw_finish_reason {
             out.push(CodexEvent::Completed {
                 usage: self.usage.take(),
+            });
+        } else {
+            out.push(CodexEvent::Failed {
+                message: "stream truncated before finish reason".to_string(),
             });
         }
     }
@@ -1437,8 +1965,7 @@ mod signature_tests {
 
         let ledger = signature_ledger::SignatureLedger::in_memory();
         let replay = ledger.scope("gemini-3.7-flash-high", "session-json-park");
-        let out =
-            gemini_json_to_openai_with_replay(&response, "gemini-3.7-flash-high", 0, &replay);
+        let out = gemini_json_to_openai_with_replay(&response, "gemini-3.7-flash-high", 0, &replay);
         let id = out["choices"][0]["message"]["tool_calls"][0]["id"]
             .as_str()
             .expect("tool call id");
@@ -1596,14 +2123,22 @@ mod signature_tests {
             "messages": [{ "role": "user", "content": "hello" }]
         });
 
-        let out = openai_to_antigravity_with_replay(&body, "project-1", &replay).expect("translate");
+        let out =
+            openai_to_antigravity_with_replay(&body, "project-1", &replay).expect("translate");
         assert_eq!(out["request"]["sessionId"], "session-antigravity");
         assert_eq!(out["project"], "project-1");
+        assert_eq!(out["userAgent"], "antigravity");
+        assert_eq!(out["requestType"], crate::v1beta::ANTIGRAVITY_REQUEST_TYPE);
+        let id = out["requestId"].as_str().unwrap();
+        let (label, rest) = id.split_once('/').unwrap();
+        assert_eq!(label, crate::v1beta::ANTIGRAVITY_REQUEST_TYPE);
+        assert_eq!(rest.split('/').count(), 4, "{id}");
         assert!(out.get("sessionId").is_none());
-        assert!(openai_to_antigravity(&body, "project-1")
-            .expect("translate")["request"]
-            .get("sessionId")
-            .is_none());
+        assert!(
+            openai_to_antigravity(&body, "project-1").expect("translate")["request"]
+                .get("sessionId")
+                .is_none()
+        );
     }
 
     #[test]
@@ -1612,6 +2147,7 @@ mod signature_tests {
             let mut decoder = GeminiDecoder::new();
             let mut out = Vec::new();
             decoder.decode(payload.to_string().as_bytes(), &mut out);
+            decoder.finish(&mut out);
             out.into_iter().find_map(|event| match event {
                 CodexEvent::Completed { usage } => usage,
                 _ => None,
@@ -1627,7 +2163,10 @@ mod signature_tests {
             }
         }))
         .expect("usage");
-        assert!(reported.cached_tokens_known, "a reported zero is a measurement");
+        assert!(
+            reported.cached_tokens_known,
+            "a reported zero is a measurement"
+        );
         assert_eq!(reported.cached_tokens, 0);
         assert!(!reported.cache_write_tokens_known);
 
@@ -2027,6 +2566,24 @@ mod signature_tests {
     }
 
     #[test]
+    fn malformed_tool_schema_returns_error_without_panicking() {
+        for parameters in [
+            json!({"type": "object", "properties": []}),
+            json!({"type": "object", "anyOf": {}}),
+            json!({"type": "object", "properties": {"nested": {"allOf": {}}}}),
+        ] {
+            let body = json!({
+                "model": "gemini-3-flash",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"type": "function", "function": {
+                    "name": "test", "parameters": parameters
+                }}]
+            });
+            assert!(openai_to_gemini(&body).is_err());
+        }
+    }
+
+    #[test]
     fn tool_choice_mode_maps_correctly() {
         let body_req = json!({
             "model": "gemini-3-flash",
@@ -2140,6 +2697,88 @@ mod signature_tests {
         assert_eq!(
             contents[1]["parts"][0]["functionResponse"]["name"],
             "lookup"
+        );
+    }
+
+    #[test]
+    fn split_stop_and_trailing_usage_retains_usage_at_eof() {
+        let mut decoder = GeminiDecoder::new();
+        let mut events = Vec::new();
+        decoder.decode(
+            br#"{"candidates":[{"content":{"parts":[{"text":"hello"}]},"finishReason":"STOP"}]}"#,
+            &mut events,
+        );
+        // Completed must not be emitted on STOP alone; delayed until decoder EOF.
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, CodexEvent::Completed { .. })),
+            "Completed should be delayed until decoder finish(): {events:?}"
+        );
+        assert_eq!(events, vec![CodexEvent::TextDelta("hello".to_string())]);
+
+        // Trailing usage frame arrives after STOP
+        decoder.decode(
+            br#"{"usageMetadata":{"promptTokenCount":700,"candidatesTokenCount":60,"totalTokenCount":760,"thoughtsTokenCount":16,"cachedContentTokenCount":0}}"#,
+            &mut events,
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, CodexEvent::Completed { .. })),
+            "Completed must still wait for EOF finish(): {events:?}"
+        );
+
+        // Decoder EOF triggers final Completed with retained trailing usage
+        decoder.finish(&mut events);
+        let completed_events: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, CodexEvent::Completed { .. }))
+            .collect();
+        assert_eq!(
+            completed_events.len(),
+            1,
+            "exactly one Completed event must be emitted"
+        );
+        match completed_events[0] {
+            CodexEvent::Completed { usage: Some(ref u) } => {
+                assert_eq!(u.prompt_tokens, 700);
+                assert_eq!(u.completion_tokens, 60);
+                assert_eq!(u.total_tokens, 760);
+                assert_eq!(u.reasoning_tokens, 16);
+                assert_eq!(u.cached_tokens, 0);
+                assert!(u.cached_tokens_known);
+            }
+            other => panic!("expected Completed with usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn truncated_stream_without_finish_reason_fails_at_eof() {
+        let mut decoder = GeminiDecoder::new();
+        let mut events = Vec::new();
+        decoder.decode(
+            br#"{"candidates":[{"content":{"parts":[{"text":"partial cut"}]}}]}"#,
+            &mut events,
+        );
+        assert_eq!(
+            events,
+            vec![CodexEvent::TextDelta("partial cut".to_string())]
+        );
+
+        // Stream EOF without finishReason
+        decoder.finish(&mut events);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, CodexEvent::Failed { .. })),
+            "truncated stream without finishReason must emit Failed at EOF: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, CodexEvent::Completed { .. })),
+            "truncated stream must not emit Completed: {events:?}"
         );
     }
 }

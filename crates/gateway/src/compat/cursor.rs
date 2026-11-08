@@ -306,9 +306,12 @@ impl CursorDecoder {
                 eprintln!("cursor-frame len={} head={}", payload.len(), head.join(" "));
             }
             let Ok(message) = proto::AgentServerMessage::decode(payload.as_slice()) else {
-                if std::env::var_os("MAHOQUOT_EXEC_TRACE").is_some() {
-                    let hex: Vec<String> =
-                        payload.iter().take(160).map(|b| format!("{b:02x}")).collect();
+                if exec_trace_enabled() {
+                    let hex: Vec<String> = payload
+                        .iter()
+                        .take(160)
+                        .map(|b| format!("{b:02x}"))
+                        .collect();
                     eprintln!(
                         "mahoquot exec trace: undecodable frame len={} bytes={}",
                         payload.len(),
@@ -317,13 +320,16 @@ impl CursorDecoder {
                 }
                 continue;
             };
-            if std::env::var_os("MAHOQUOT_EXEC_TRACE").is_some() {
+            if exec_trace_enabled() {
                 if let Some(proto::agent_server_message::Message::ExecServerMessage(exec)) =
                     &message.message
                 {
                     if exec.message.is_none() {
-                        let hex: Vec<String> =
-                            payload.iter().take(200).map(|b| format!("{b:02x}")).collect();
+                        let hex: Vec<String> = payload
+                            .iter()
+                            .take(200)
+                            .map(|b| format!("{b:02x}"))
+                            .collect();
                         eprintln!(
                             "mahoquot exec trace: undecoded exec id={} len={} bytes={}",
                             exec.id,
@@ -467,8 +473,8 @@ impl CursorDecoder {
         );
     }
 
-    fn reply_to_exec(&mut self, message: proto::ExecServerMessage, out: &mut Vec<CodexEvent>) {
-        if std::env::var_os("MAHOQUOT_EXEC_TRACE").is_some() {
+    fn reply_to_exec(&mut self, message: proto::ExecServerMessage, _out: &mut Vec<CodexEvent>) {
+        if exec_trace_enabled() {
             let tag = match &message.message {
                 Some(proto::exec_server_message::Message::WriteArgs(_)) => "write",
                 Some(proto::exec_server_message::Message::DeleteArgs(_)) => "delete",
@@ -496,9 +502,8 @@ impl CursorDecoder {
                     return;
                 };
                 let bytes = bytes::Bytes::from(connect_frame(&frame.encode_to_vec(), 0));
-                if tx.blocking_send(bytes).is_err() {
-                    return;
-                }
+                // A closed reply channel means the stream is gone; further frames are moot.
+                let _ = tx.blocking_send(bytes);
             };
             match super::exec_bridge::forward_stream(&message, &mut send) {
                 Ok(true) => {}
@@ -510,6 +515,8 @@ impl CursorDecoder {
                 }
             }
         };
+        // The reply must not run on the stream task: a long exec would starve
+        // the response loop and stall the client's idle timer.
         if tokio::runtime::Handle::try_current().is_ok() {
             tokio::task::spawn_blocking(work);
         } else {
@@ -570,8 +577,10 @@ impl CursorDecoder {
     }
 
     pub fn finish(&mut self, out: &mut Vec<CodexEvent>) {
+        // EOF without a terminal frame means the stream was truncated. Reporting
+        // Completed here would turn a partial response into a silent success.
         if !self.completed {
-            self.complete(out);
+            self.fail("cursor stream ended before completion", out);
         }
     }
 }
@@ -929,7 +938,10 @@ mod exec_write_tests {
             panic!("expected a successful write");
         };
         assert_eq!(written, "BRIDGE_WRITE_OK\n");
-        assert_eq!(success.file_content_after_write.as_deref(), Some(written.as_str()));
+        assert_eq!(
+            success.file_content_after_write.as_deref(),
+            Some(written.as_str())
+        );
     }
 
     #[test]
@@ -1048,9 +1060,10 @@ mod exec_shell_tests {
     #[test]
     fn output_is_reported_while_the_command_runs() {
         let mut chunks = Vec::new();
-        let (stdout, _, code, _) = exec_shell_run(&args("printf one; printf two", 10), &mut |_, text| {
-            chunks.push(text.to_string())
-        });
+        let (stdout, _, code, _) =
+            exec_shell_run(&args("printf one; printf two", 10), &mut |_, text| {
+                chunks.push(text.to_string())
+            });
         assert_eq!(code, 0);
         assert_eq!(stdout, "onetwo");
         assert_eq!(chunks.concat(), "onetwo");
@@ -1068,6 +1081,38 @@ mod exec_shell_tests {
     fn truncation_is_announced_to_the_model() {
         let (stdout, stderr, code, _) = exec_shell_run(
             &args("head -c 250000 /dev/zero | tr '\\0' 'a'", 30),
+            &mut |_, _| {},
+        );
+        assert_eq!(code, 0);
+        assert!(stdout.len() <= EXEC_OUTPUT_LIMIT);
+        assert!(stderr.contains("truncated at 200000 bytes"));
+    }
+
+    #[test]
+    fn invalid_utf8_is_drained_instead_of_held_back() {
+        // A byte that can never start a UTF-8 sequence used to stay in the carry
+        // buffer forever, so binary output grew it without bound.
+        let mut carry = vec![0xFFu8; 4];
+        let _ = take_utf8(&mut carry);
+        assert!(carry.is_empty(), "invalid bytes must not accumulate");
+    }
+
+    #[test]
+    fn a_split_multibyte_character_waits_for_its_continuation() {
+        // The buffered tail must survive until the rest of the character arrives.
+        let bytes = "한".as_bytes();
+        let mut carry = vec![bytes[0]];
+        assert_eq!(take_utf8(&mut carry), "");
+        assert_eq!(carry, vec![bytes[0]]);
+        carry.extend_from_slice(&bytes[1..]);
+        assert_eq!(take_utf8(&mut carry), "한");
+        assert!(carry.is_empty());
+    }
+
+    #[test]
+    fn a_flooding_command_completes_with_bounded_output() {
+        let (stdout, stderr, code, _) = exec_shell_run(
+            &args("head -c 4000000 /dev/zero | tr '\\0' 'b'", 60),
             &mut |_, _| {},
         );
         assert_eq!(code, 0);
@@ -1254,7 +1299,7 @@ pub(crate) fn exec_write(args: &proto::WriteArgs) -> proto::exec_client_message:
                     })
                 }
                 Err(error) => {
-                    if std::env::var_os("MAHOQUOT_EXEC_TRACE").is_some() {
+                    if exec_trace_enabled() {
                         eprintln!(
                             "mahoquot exec trace: write failed path={} err={error}",
                             path.display()
@@ -1376,7 +1421,9 @@ pub(crate) fn exec_grep(args: &proto::GrepArgs) -> proto::exec_client_message::M
             })),
         }),
         Err(error) => proto::exec_client_message::Message::GrepResult(proto::GrepResult {
-            result: Some(proto::grep_result::Result::Error(proto::GrepFailure { error })),
+            result: Some(proto::grep_result::Result::Error(proto::GrepFailure {
+                error,
+            })),
         }),
     }
 }
@@ -1419,9 +1466,7 @@ fn exec_search_tool() -> ExecSearchTool {
     }
 }
 
-fn exec_grep_search(
-    args: &proto::GrepArgs,
-) -> Result<proto::GrepUnionResult, String> {
+fn exec_grep_search(args: &proto::GrepArgs) -> Result<proto::GrepUnionResult, String> {
     let root = match args.path.as_deref().filter(|path| !path.trim().is_empty()) {
         Some(path) => exec_resolve(path)?,
         None => exec_root(),
@@ -1657,6 +1702,8 @@ pub(crate) fn exec_shell_run(
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout as u64);
     let mut stdout_raw = Vec::new();
     let mut stderr_raw = Vec::new();
+    let mut stdout_capped = false;
+    let mut stderr_capped = false;
     let mut stdout_carry = Vec::new();
     let mut stderr_carry = Vec::new();
     let mut open = 2;
@@ -1668,12 +1715,20 @@ pub(crate) fn exec_shell_run(
         }
         match rx.recv_timeout(remaining.min(std::time::Duration::from_millis(250))) {
             Ok((is_err, chunk)) => {
-                let (raw, carry) = if is_err {
-                    (&mut stderr_raw, &mut stderr_carry)
+                let (raw, carry, capped) = if is_err {
+                    (&mut stderr_raw, &mut stderr_carry, &mut stderr_capped)
                 } else {
-                    (&mut stdout_raw, &mut stdout_carry)
+                    (&mut stdout_raw, &mut stdout_carry, &mut stdout_capped)
                 };
-                raw.extend_from_slice(&chunk);
+                // Keep the retained copy bounded while the live copy still streams in
+                // full; a chatty command must not grow the sidecar without limit.
+                let room = EXEC_OUTPUT_LIMIT.saturating_sub(raw.len());
+                if chunk.len() > room {
+                    raw.extend_from_slice(&chunk[..room]);
+                    *capped = true;
+                } else {
+                    raw.extend_from_slice(&chunk);
+                }
                 carry.extend_from_slice(&chunk);
                 let text = take_utf8(carry);
                 if !text.is_empty() {
@@ -1692,10 +1747,17 @@ pub(crate) fn exec_shell_run(
     }
     let mut stdout = String::from_utf8_lossy(&stdout_raw).to_string();
     let mut stderr = String::from_utf8_lossy(&stderr_raw).to_string();
+    // Trim any partial multi-byte character left by the byte cap before reporting it.
     if exec_truncate(&mut stdout) {
-        stderr.push_str("\n[stdout truncated at 200000 bytes by the gateway executor]");
+        stdout_capped = true;
     }
     if exec_truncate(&mut stderr) {
+        stderr_capped = true;
+    }
+    if stdout_capped {
+        stderr.push_str("\n[stdout truncated at 200000 bytes by the gateway executor]");
+    }
+    if stderr_capped {
         stderr.push_str("\n[stderr truncated at 200000 bytes by the gateway executor]");
     }
     let code = status.and_then(|status| status.code()).unwrap_or(-1);
@@ -1703,22 +1765,40 @@ pub(crate) fn exec_shell_run(
 }
 
 fn take_utf8(carry: &mut Vec<u8>) -> String {
-    match std::str::from_utf8(carry) {
-        Ok(text) => {
-            let owned = text.to_string();
-            carry.clear();
-            owned
-        }
-        Err(error) => {
-            let valid = error.valid_up_to();
-            if valid == 0 {
-                return String::new();
+    // Convert everything that is decidable now and keep only a genuinely incomplete
+    // trailing sequence, so invalid bytes cannot accumulate in the carry buffer.
+    let mut out = String::new();
+    let mut consumed = 0;
+    loop {
+        match std::str::from_utf8(&carry[consumed..]) {
+            Ok(text) => {
+                out.push_str(text);
+                consumed = carry.len();
+                break;
             }
-            let owned = String::from_utf8_lossy(&carry[..valid]).to_string();
-            carry.drain(..valid);
-            owned
+            Err(error) => {
+                let valid = error.valid_up_to();
+                if valid > 0 {
+                    out.push_str(
+                        std::str::from_utf8(&carry[consumed..consumed + valid])
+                            .expect("valid_up_to bounds a valid prefix"),
+                    );
+                    consumed += valid;
+                }
+                match error.error_len() {
+                    // A truncated multi-byte sequence may still be completed by the next
+                    // chunk, so leave it buffered.
+                    None => break,
+                    Some(len) => {
+                        out.push('\u{FFFD}');
+                        consumed += len;
+                    }
+                }
+            }
         }
     }
+    carry.drain(..consumed);
+    out
 }
 
 pub(crate) fn shell_result_message(
@@ -1776,4 +1856,11 @@ pub(crate) fn exec_shell(args: &proto::ShellArgs) -> proto::exec_client_message:
     proto::exec_client_message::Message::ShellResult(proto::ShellResult {
         result: Some(outcome),
     })
+}
+
+pub(crate) fn exec_trace_enabled() -> bool {
+    matches!(
+        std::env::var("MAHOQUOT_EXEC_TRACE").as_deref(),
+        Ok("1") | Ok("true")
+    )
 }

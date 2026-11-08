@@ -288,6 +288,7 @@ pub struct HistoryEventPage {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PruneResult {
     pub deleted_events: u64,
+    pub deleted_cap_events: u64,
     pub chunks: u64,
     pub logical_size_bytes: u64,
     pub size_cap_satisfied: bool,
@@ -526,7 +527,16 @@ impl HistoryService {
                             .dropped_events
                             .fetch_add(rejected as u64, Ordering::Relaxed);
                     }
+                    let write_started = std::time::Instant::now();
                     let result = worker_store.insert_batch(&accepted);
+                    if std::env::var("MAHOQUOT_QA_LOOPBACK_ONLY").as_deref() == Ok("1") {
+                        tracing::info!("history_observation={}", serde_json::json!({
+                            "event": "commit", "event_ids": accepted.iter().map(|event| &event.event_id).collect::<Vec<_>>(),
+                            "write_ms": write_started.elapsed().as_secs_f64() * 1000.0,
+                            "written": result.as_ref().ok(), "rejected": rejected,
+                            "queue_depth": worker_health.queue_depth.load(Ordering::Relaxed),
+                        }));
+                    }
                     match result {
                         Ok(written) => {
                             worker_health
@@ -555,6 +565,15 @@ impl HistoryService {
                         }
                     }
                     for reply in flushes {
+                        if std::env::var("MAHOQUOT_QA_LOOPBACK_ONLY").as_deref() == Ok("1") {
+                            tracing::info!("history_observation={}", serde_json::json!({
+                                "event": "flush", "queue_depth": worker_health.queue_depth.load(Ordering::Relaxed),
+                                "enqueued": worker_health.enqueued_events.load(Ordering::Relaxed),
+                                "written": worker_health.written_events.load(Ordering::Relaxed),
+                                "dropped": worker_health.dropped_events.load(Ordering::Relaxed),
+                                "failures": worker_health.database_failures.load(Ordering::Relaxed),
+                            }));
+                        }
                         let _ = reply.send(());
                     }
                 }
@@ -569,17 +588,25 @@ impl HistoryService {
     }
 
     pub fn enqueue(&self, event: UsageEvent) -> bool {
+        let hub = crate::resp::global_redis_hub();
+        if hub.enabled() && hub.usage_statistics_enabled() {
+            if let Ok(payload) = serde_json::to_vec(&event) {
+                hub.enqueue_usage(bytes::Bytes::from(payload));
+            }
+        }
         let Some(sender) = &self.sender else {
             self.drop_event("request history is unavailable");
             return false;
         };
+        // Reserve depth before publishing: the ingest thread may receive immediately.
+        self.health.queue_depth.fetch_add(1, Ordering::Relaxed);
         match sender.try_send(IngestCommand::Event(event)) {
             Ok(()) => {
                 self.health.enqueued_events.fetch_add(1, Ordering::Relaxed);
-                self.health.queue_depth.fetch_add(1, Ordering::Relaxed);
                 true
             }
             Err(error) => {
+                self.health.queue_depth.fetch_sub(1, Ordering::Relaxed);
                 self.drop_event(match error {
                     mpsc::TrySendError::Full(_) => "request history queue is full",
                     mpsc::TrySendError::Disconnected(_) => "request history queue is disconnected",
@@ -1941,6 +1968,20 @@ fn prune_events(
     let chunk_size = i64::try_from(policy.chunk_size)
         .map_err(|_| HistoryError::ValueOutOfRange("prune_chunk_size"))?;
     let mut result = PruneResult::default();
+    loop {
+        let deleted = connection.execute(
+            "DELETE FROM cline_cap_events WHERE id IN (
+                SELECT id FROM cline_cap_events WHERE reset_at_unix <= ?1
+                ORDER BY reset_at_unix, id LIMIT ?2
+             )",
+            params![now_ms.div_euclid(1000), chunk_size],
+        )?;
+        if deleted == 0 {
+            break;
+        }
+        result.deleted_cap_events += deleted as u64;
+        result.chunks += 1;
+    }
     if let Some(retention) = policy.retention {
         let retention_ms = i64::try_from(retention.as_millis()).unwrap_or(i64::MAX);
         let cutoff = now_ms.saturating_sub(retention_ms);
@@ -1964,6 +2005,27 @@ fn prune_events(
 
     if let Some(max_size_bytes) = policy.max_size_bytes {
         while logical_database_size(connection)? > max_size_bytes {
+            // Preserve the effective live reset restored for each lane. Only
+            // observations dominated by another row are disposable.
+            let deleted_caps = connection.execute(
+                "DELETE FROM cline_cap_events WHERE id IN (
+                    SELECT older.id FROM cline_cap_events older
+                    WHERE EXISTS (
+                        SELECT 1 FROM cline_cap_events newer
+                        WHERE newer.account_identifier = older.account_identifier
+                          AND newer.model = older.model
+                          AND (newer.reset_at_unix > older.reset_at_unix
+                            OR (newer.reset_at_unix = older.reset_at_unix AND newer.id > older.id))
+                    )
+                    ORDER BY older.cap_at_ms, older.id LIMIT ?1
+                 )",
+                [chunk_size],
+            )?;
+            if deleted_caps > 0 {
+                result.deleted_cap_events += deleted_caps as u64;
+                result.chunks += 1;
+                continue;
+            }
             let deleted = connection.execute(
                 "DELETE FROM usage_events WHERE id IN (
                     SELECT id FROM usage_events ORDER BY occurred_at_ms, id LIMIT ?1
@@ -2047,8 +2109,8 @@ pub fn sha256(input: &[u8]) -> [u8; 32] {
     ];
     for chunk in message.as_chunks::<64>().0 {
         let mut words = [0_u32; 64];
-        for (index, bytes) in chunk.as_chunks::<4>().0.iter().enumerate() {
-            words[index] = u32::from_be_bytes(*bytes);
+        for (word, bytes) in words.iter_mut().zip(chunk.as_chunks::<4>().0) {
+            *word = u32::from_be_bytes(*bytes);
         }
         for index in 16..64 {
             let s0 = words[index - 15].rotate_right(7)
@@ -2089,7 +2151,7 @@ pub fn sha256(input: &[u8]) -> [u8; 32] {
     }
     let mut digest = [0_u8; 32];
     for (chunk, value) in digest.as_chunks_mut::<4>().0.iter_mut().zip(state) {
-        *chunk = value.to_be_bytes();
+        chunk.copy_from_slice(&value.to_be_bytes());
     }
     digest
 }
@@ -2995,6 +3057,131 @@ mod extended_tests {
             .cline_caps(&["cline-user-z@example".to_string()])
             .unwrap();
         assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn prune_expires_cline_caps() {
+        let path = TestPath::new(&format!("cap-prune-{}", uuid::Uuid::new_v4()));
+        let history = ready(&path.0);
+        history
+            .insert(&event(EventFixture {
+                event_id: "retained",
+                occurred_at_ms: 10_000,
+                account: "a",
+                provider: "p",
+                model: "m",
+                key: "k",
+                status_code: 200,
+                input_tokens: 1,
+                output_tokens: 1,
+                cached_input_tokens: 0,
+            }))
+            .unwrap();
+        for reset in [8, 9, 10, 11] {
+            history
+                .record_cline_cap(&ClineCapEvent {
+                    account_identifier: "a".into(),
+                    model: "m".into(),
+                    cap_at_ms: 1,
+                    reset_at_unix: reset,
+                    credit_driven: false,
+                })
+                .unwrap();
+        }
+        let result = history
+            .prune_with_policy(
+                10_000,
+                PrunePolicy {
+                    retention: Some(Duration::from_secs(1)),
+                    max_size_bytes: None,
+                    chunk_size: 2,
+                },
+            )
+            .unwrap();
+        assert_eq!(result.deleted_cap_events, 3);
+        assert_eq!(result.deleted_events, 0);
+        assert_eq!(result.chunks, 2);
+        assert_eq!(history.totals().unwrap().requests, 1);
+        let disk = Connection::open(&path.0).unwrap();
+        let remaining: Vec<i64> = disk
+            .prepare("SELECT reset_at_unix FROM cline_cap_events ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(remaining, [11]);
+    }
+
+    #[test]
+    fn size_pruning_reclaims_duplicate_caps_and_preserves_live_reset() {
+        let path = TestPath::new(&format!("cap-size-{}", uuid::Uuid::new_v4()));
+        let history = ready(&path.0);
+        history
+            .insert(&event(EventFixture {
+                event_id: "retained",
+                occurred_at_ms: 10_000,
+                account: "a",
+                provider: "p",
+                model: "m",
+                key: "k",
+                status_code: 200,
+                input_tokens: 1,
+                output_tokens: 1,
+                cached_input_tokens: 0,
+            }))
+            .unwrap();
+        let baseline = history
+            .prune_with_policy(
+                10_000,
+                PrunePolicy {
+                    retention: None,
+                    max_size_bytes: None,
+                    chunk_size: 2,
+                },
+            )
+            .unwrap()
+            .logical_size_bytes;
+        for index in 0..12 {
+            history
+                .record_cline_cap(&ClineCapEvent {
+                    account_identifier: "x".repeat(4096),
+                    model: "m".into(),
+                    cap_at_ms: index,
+                    reset_at_unix: 100 + index,
+                    credit_driven: false,
+                })
+                .unwrap();
+        }
+        let result = history
+            .prune_with_policy(
+                10_000,
+                PrunePolicy {
+                    retention: None,
+                    max_size_bytes: Some(baseline + 8192),
+                    chunk_size: 2,
+                },
+            )
+            .unwrap();
+        assert!(result.deleted_cap_events > 0);
+        assert_eq!(result.deleted_events, 0);
+        assert!(result.size_cap_satisfied);
+        assert_eq!(history.totals().unwrap().requests, 1);
+        let disk = Connection::open(&path.0).unwrap();
+        let remaining: u64 = disk
+            .query_row("SELECT COUNT(*) FROM cline_cap_events", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(remaining, 12 - result.deleted_cap_events);
+        let effective_reset: i64 = disk
+            .query_row(
+                "SELECT MAX(reset_at_unix) FROM cline_cap_events",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(effective_reset, 111);
     }
 
     #[test]

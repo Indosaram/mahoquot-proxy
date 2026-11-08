@@ -275,12 +275,12 @@ async fn unknown_model_without_loaded_open_binding_is_local_model_not_found() {
     assert_eq!(capture.hits.load(Ordering::SeqCst), 0);
 }
 
-/// The google /v1/responses path normalises Responses input into chat messages
-/// and buffers the reply into one JSON object, so it cannot honour stream:true.
-/// It must refuse explicitly rather than hand a waiting SSE client a buffered
-/// body.
+/// Task 9 replaced the buffered Google adapter: /v1/responses for a Google
+/// model is translated to the provider's own stream and rendered locally as
+/// Responses SSE, so `stream: true` is honoured rather than refused, and the
+/// request does reach the provider.
 #[tokio::test]
-async fn google_responses_refuses_streaming_instead_of_answering_buffered() {
+async fn google_responses_streams_instead_of_refusing() {
     let dir = TempAuthDir::new("responses-stream");
     let (upstream, capture) = spawn_capture_fixture().await;
     dir.write(
@@ -300,17 +300,13 @@ async fn google_responses_refuses_streaming_instead_of_answering_buffered() {
         .await
         .unwrap();
 
-    let status = response.status();
-    let body: serde_json::Value = response.json().await.unwrap();
-    assert_eq!(
-        status,
+    assert_ne!(
+        response.status(),
         StatusCode::BAD_REQUEST,
-        "a stream request must not be answered with a buffered object: {body}"
+        "a Google Responses stream must not be refused"
     );
-    assert_eq!(body["error"]["param"], "stream");
-    assert_eq!(
-        capture.hits.load(Ordering::SeqCst),
-        0,
-        "the request must be refused before any upstream call"
+    assert!(
+        capture.hits.load(Ordering::SeqCst) >= 1,
+        "the request must reach the provider"
     );
 }

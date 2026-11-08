@@ -17,6 +17,7 @@ const CONTRACT_SCHEMA: &str = include_str!("../../../docs/management-contract-v1
 const CONTRACT_EXAMPLES: &str = include_str!("../../../docs/examples/management-contract-v1.json");
 
 const TEST_API_KEY: &str = "test-config-mgmt-key";
+const TEST_MANAGEMENT_KEY: &str = "test-config-management-secret";
 
 struct TestContext {
     auth_dir: PathBuf,
@@ -40,6 +41,11 @@ fn setup_test_context(tag: &str) -> TestContext {
             .as_nanos()
     ));
     std::fs::create_dir_all(&auth_dir).expect("create test auth dir");
+    std::fs::write(
+        auth_dir.join("config.yaml"),
+        format!("remote-management:\n  secret-key: {TEST_MANAGEMENT_KEY}\n"),
+    )
+    .expect("write management test secret");
 
     let config = GatewayConfig {
         auth_dir: auth_dir.clone(),
@@ -58,10 +64,10 @@ async fn send_request(
     uri: &str,
     body: Option<Value>,
 ) -> (StatusCode, Value) {
-    let mut req_builder = Request::builder()
-        .method(method)
-        .uri(uri)
-        .header(header::AUTHORIZATION, format!("Bearer {TEST_API_KEY}"));
+    let mut req_builder = Request::builder().method(method).uri(uri).header(
+        header::AUTHORIZATION,
+        format!("Bearer {TEST_MANAGEMENT_KEY}"),
+    );
 
     let req_body = if let Some(b) = body {
         req_builder = req_builder.header(header::CONTENT_TYPE, "application/json");
@@ -70,7 +76,7 @@ async fn send_request(
         Body::empty()
     };
 
-    let req = req_builder.body(req_body).expect("request build");
+    let req = common::with_loopback_peer(req_builder.body(req_body).expect("request build"));
     let resp = app.clone().oneshot(req).await.expect("service oneshot");
     let status = resp.status();
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
@@ -79,11 +85,13 @@ async fn send_request(
 }
 
 async fn send_request_unauthed(app: &axum::Router, method: Method, uri: &str) -> StatusCode {
-    let req = Request::builder()
-        .method(method)
-        .uri(uri)
-        .body(Body::empty())
-        .expect("request build");
+    let req = common::with_loopback_peer(
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(Body::empty())
+            .expect("request build"),
+    );
     let resp = app.clone().oneshot(req).await.expect("service oneshot");
     resp.status()
 }
@@ -120,6 +128,79 @@ fn contract_schema_and_examples_are_versioned_and_complete() {
             "missing example capability {capability}"
         );
     }
+}
+
+#[tokio::test]
+async fn full_config_retry_change_updates_active_member_and_preserves_old_snapshot() {
+    let ctx = setup_test_context("retry-publication");
+    std::fs::write(
+        ctx.auth_dir.join("codex-fixture.json"),
+        json!({
+            "type":"codex", "access_token":"fixture", "account_id":"fixture",
+            "email":"fixture@example.invalid", "expired":"2099-01-01T00:00:00Z",
+            "id_token":"i", "last_refresh":"", "refresh_token":"r", "request_retry":2
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let state = Arc::new(AppState::new(&ctx.config).unwrap());
+    let old = state.pool.load_full();
+    let app = create_app(state.clone());
+    let mut next = (*state.settings.current()).clone();
+    next.codex_api_key =
+        serde_json::from_value(json!([{"api-key":"fixture", "request-retry":0}])).unwrap();
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        app.clone().oneshot(common::with_loopback_peer(
+            Request::put("/v0/management/config.yaml")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {TEST_MANAGEMENT_KEY}"),
+                )
+                .header(header::CONTENT_TYPE, "application/yaml")
+                .body(Body::from(serde_yaml::to_string(&next).unwrap()))
+                .unwrap(),
+        )),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        response.into_body().collect(),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .to_bytes();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&bytes).unwrap(),
+        json!({"ok":true,"changed":["config"]})
+    );
+    let active = state.pool.load_full();
+    assert!(!Arc::ptr_eq(&active.members[0], &old.members[0]));
+    assert_eq!(active.members[0].request_retry_override(), Some(0));
+    assert_eq!(old.members[0].request_retry_override(), Some(2));
+    assert_eq!(
+        state.settings.current().codex_api_key[0].retry_for_key("fixture"),
+        Some(Some(0))
+    );
+    let disk =
+        mahoquot_gateway::management::settings::Settings::load(&ctx.config.config_path).unwrap();
+    assert_eq!(
+        disk.codex_api_key[0].retry_for_key("fixture"),
+        Some(Some(0))
+    );
+    assert_eq!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            send_request_unauthed(&app, Method::PUT, "/v0/management/config.yaml")
+        )
+        .await
+        .unwrap(),
+        StatusCode::UNAUTHORIZED
+    );
 }
 
 #[test]
@@ -806,10 +887,6 @@ async fn test_all_10_config_endpoints_survive_restart_persistence() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_unauthenticated_requests_are_rejected() {
-    let ctx = setup_test_context("unauthed");
-    let state = Arc::new(AppState::new(&ctx.config).expect("app state"));
-    let app = create_app(state);
-
     let endpoints = vec![
         "/v0/management/force-model-prefix",
         "/v0/management/max-retry-credentials",
@@ -824,6 +901,9 @@ async fn test_unauthenticated_requests_are_rejected() {
     ];
 
     for endpoint in endpoints {
+        let ctx = setup_test_context(&format!("unauthed-{}", endpoint.replace('/', "_")));
+        let state = Arc::new(AppState::new(&ctx.config).expect("fresh app state per probe"));
+        let app = create_app(state);
         let status = send_request_unauthed(&app, Method::GET, endpoint).await;
         assert_eq!(
             status,

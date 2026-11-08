@@ -5,7 +5,9 @@ use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mahoquot_providers::credential_file::write_credential_atomically;
-use mahoquot_providers::refresh_exec::{apply_refresh_to_file, execute_refresh_spec, RefreshError};
+use mahoquot_providers::refresh_exec::{
+    apply_refresh_to_value, execute_refresh_spec, RefreshError,
+};
 use mahoquot_providers::{
     derive_identity_slug, is_antigravity_model, load_antigravity_account, AntigravityAccount,
     ClaudeAccount, CodexAccount, CursorAccount, KiroAccount, LoadError, VertexAccount,
@@ -135,6 +137,7 @@ pub enum ProviderKind {
     Zcode,
     Vertex,
     Devin,
+    OpenCode,
     Generic,
 }
 
@@ -148,10 +151,11 @@ pub enum ProviderAccount {
     Zcode(ZcodeAccount),
     Vertex(VertexAccount),
     Devin(mahoquot_providers::DevinAccount),
+    OpenCode(mahoquot_providers::OpenCodeAccount),
     Generic(GenericAccount),
 }
 
-#[derive(Clone, Debug, Default, serde::Deserialize)]
+#[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
 pub struct GenericAccount {
     #[serde(default)]
     pub identity_slug: String,
@@ -259,6 +263,7 @@ impl ProviderKind {
             ProviderKind::Vertex => {
                 mahoquot_providers::vertex::is_vertex_model_in_snapshot(snapshot, model)
             }
+            ProviderKind::OpenCode => true,
             ProviderKind::Devin => false,
             ProviderKind::Generic => true,
         }
@@ -273,6 +278,7 @@ impl ProviderKind {
             ProviderKind::Kiro => "kiro",
             ProviderKind::Zcode => "zcode",
             ProviderKind::Vertex => "google-vertex",
+            ProviderKind::OpenCode => "opencode",
             ProviderKind::Devin => "devin",
             ProviderKind::Generic => "generic",
         }
@@ -280,6 +286,7 @@ impl ProviderKind {
 
     pub fn from_type_str(value: &str) -> Option<Self> {
         match value {
+            "kimi" | "kimi-ai" | "kimi.com" | "kimi.ai" => Some(Self::Generic),
             "codex" => Some(Self::Codex),
             "antigravity" => Some(Self::Antigravity),
             "claude" | "anthropic" => Some(Self::Claude),
@@ -287,7 +294,9 @@ impl ProviderKind {
             "kiro" => Some(Self::Kiro),
             "zcode" => Some(Self::Zcode),
             "vertex" | "google-vertex" => Some(Self::Vertex),
+            "opencode" => Some(Self::OpenCode),
             "devin" => Some(Self::Devin),
+            "meta" => Some(Self::Generic),
             "generic" => Some(Self::Generic),
             _ => None,
         }
@@ -529,7 +538,7 @@ mod provider_kind_contract_tests {
     }
 
     #[test]
-    fn cline_credential_is_normalized_with_surface_headers_and_free_deepseek() {
+    fn cline_credential_is_normalized_with_surface_headers_without_inventing_models() {
         let value: serde_json::Value = serde_json::from_str(
             r#"{"provider":"cline","adapter":"openai-chat","base_url":"https://api.cline.bot/api/v1","models":["z-ai/glm-5.3-flash"]}"#,
         )
@@ -551,10 +560,7 @@ mod provider_kind_contract_tests {
             Some("cline-cli")
         );
         assert!(account.static_headers.contains_key("X-Task-ID"));
-        assert!(account
-            .models
-            .contains(&"cline-free/deepseek-v4.1-flash".to_string()));
-        assert!(account.models.contains(&"z-ai/glm-5.3-flash".to_string()));
+        assert_eq!(account.models, vec!["z-ai/glm-5.3-flash"]);
     }
 
     #[test]
@@ -698,6 +704,39 @@ mod provider_kind_contract_tests {
     }
 
     #[test]
+    fn successful_refresh_lifts_the_auth_failure_bench() {
+        let member = AccountMember::for_test(ProviderAccount::Codex(CodexAccount {
+            email: "test@example.com".to_string(),
+            ..Default::default()
+        }));
+
+        // A rejected refresh benches the account for re-authentication.
+        member.set_health(Health::AuthFailed);
+        assert_eq!(member.health(), Health::AuthFailed);
+
+        // Rotating the credential back into a working state must make the
+        // account routable again, or the refresh accomplishes nothing.
+        assert!(member.clear_auth_failure());
+        assert_eq!(member.health(), Health::Available);
+
+        // Idempotent: clearing an already-healthy account is a no-op.
+        assert!(!member.clear_auth_failure());
+        assert_eq!(member.health(), Health::Available);
+    }
+
+    #[test]
+    fn successful_refresh_never_overrides_an_operator_disable() {
+        let member = AccountMember::for_test(ProviderAccount::Codex(CodexAccount {
+            email: "test@example.com".to_string(),
+            ..Default::default()
+        }));
+        member.set_health(Health::Disabled);
+
+        assert!(!member.clear_auth_failure());
+        assert_eq!(member.health(), Health::Disabled);
+    }
+
+    #[test]
     fn group_cooldowns_survive_a_credential_rescan() {
         let account = AntigravityAccount {
             email: "test@example.com".to_string(),
@@ -790,6 +829,7 @@ impl ProviderAccount {
             Self::Kiro(_) => ProviderKind::Kiro,
             Self::Zcode(_) => ProviderKind::Zcode,
             Self::Vertex(_) => ProviderKind::Vertex,
+            Self::OpenCode(_) => ProviderKind::OpenCode,
             Self::Devin(_) => ProviderKind::Devin,
             Self::Generic(_) => ProviderKind::Generic,
         }
@@ -807,6 +847,7 @@ impl ProviderAccount {
             Self::Kiro(a) => a.access_token.clone(),
             Self::Zcode(a) => a.access_token.clone(),
             Self::Vertex(a) => a.access_token.clone(),
+            Self::OpenCode(a) => a.api_key.clone(),
             Self::Devin(a) => a.access_token.clone(),
             Self::Generic(a) => a.api_key.clone(),
         }
@@ -845,6 +886,7 @@ impl ProviderAccount {
             Self::Kiro(a) => a.refresh_token.clone(),
             Self::Zcode(a) => a.refresh_token.clone(),
             Self::Vertex(_) => String::new(),
+            Self::OpenCode(_) => String::new(),
             Self::Devin(_) => String::new(),
             Self::Generic(a) => a.refresh_token.clone(),
         }
@@ -873,7 +915,9 @@ impl ProviderAccount {
             // Cline CLI login (WorkOS OAuth) carries a short-lived JWT and a
             // server-side refresh; expiry gates re-auth like other OAuth.
             Self::Generic(a) if a.provider == "cline" => expired_at_is_past(&a.expired, now_unix),
+            Self::Generic(a) if a.provider == "meta" => a.api_key.is_empty(),
             Self::Vertex(a) => a.is_expired(now_unix),
+            Self::OpenCode(a) => a.is_expired(now_unix),
             Self::Devin(_) => false,
             // A MiMo Free account holds a bootstrap JWT rather than a pasted
             // key, so it expires and re-bootstraps like an OAuth credential.
@@ -891,18 +935,25 @@ impl ProviderAccount {
             Self::Claude(a) => {
                 let mut headers = match &a.api_key {
                     Some(key) => vec![("x-api-key".to_string(), key.clone())],
-                    None => {
-                        let mut oauth = vec![(
+                    None => vec![
+                        (
                             "authorization".to_string(),
                             format!("Bearer {}", a.access_token),
-                        )];
-                        oauth.extend(
-                            mahoquot_providers::claude::AGENT_SDK_IDENTITY_HEADERS
-                                .iter()
-                                .map(|(name, value)| (name.to_string(), value.to_string())),
-                        );
-                        oauth
-                    }
+                        ),
+                        (
+                            "user-agent".to_string(),
+                            "@anthropic-ai/sdk/0.74.0".to_string(),
+                        ),
+                        ("x-app".to_string(), "cli".to_string()),
+                        ("x-stainless-lang".to_string(), "js".to_string()),
+                        (
+                            "x-stainless-package-version".to_string(),
+                            "0.74.0".to_string(),
+                        ),
+                        ("x-stainless-os".to_string(), "macos".to_string()),
+                        ("x-stainless-arch".to_string(), "arm64".to_string()),
+                        ("x-stainless-runtime".to_string(), "node".to_string()),
+                    ],
                 };
                 headers.extend(vec![
                     (
@@ -1011,6 +1062,7 @@ impl ProviderAccount {
                 headers
             }
             Self::Vertex(a) => a.build_upstream_headers(),
+            Self::OpenCode(a) => a.build_upstream_headers(),
             Self::Devin(a) => vec![
                 (
                     "authorization".to_string(),
@@ -1022,7 +1074,27 @@ impl ProviderAccount {
                 ),
                 ("connect-protocol-version".to_string(), "1".to_string()),
             ],
+            Self::Generic(a) if a.provider == "xai" => {
+                let native = mahoquot_providers::xai::XaiAccount {
+                    auth_mode: a.auth_mode.clone(),
+                    api_key: a.api_key.clone(),
+                    base_url: a.base_url.clone(),
+                    static_headers: a.static_headers.clone(),
+                    ..Default::default()
+                };
+                let base = native.base_url_for(mahoquot_providers::xai::Transport::Chat, None);
+                native.headers(
+                    mahoquot_providers::xai::Transport::Chat,
+                    base,
+                    false,
+                    mahoquot_providers::xai::CLIENT_VERSION,
+                )
+            }
             Self::Generic(a) => {
+                if a.provider == "meta" {
+                    return mahoquot_providers::meta::api_headers(&a.api_key, true)
+                        .unwrap_or_default();
+                }
                 let mut headers =
                     vec![("content-type".to_string(), "application/json".to_string())];
                 if a.adapter == "anthropic" {
@@ -1075,6 +1147,7 @@ impl ProviderAccount {
         match self {
             Self::Antigravity(a) => Some(a.project_id.clone()),
             Self::Vertex(a) => Some(a.effective_project_id().to_string()),
+            Self::OpenCode(_) => None,
             Self::Generic(a) if !a.project_id.is_empty() => Some(a.project_id.clone()),
             _ => None,
         }
@@ -1085,7 +1158,7 @@ impl ProviderAccount {
             Self::Antigravity(a) => {
                 mahoquot_providers::build_antigravity_refresh_request(&a.refresh_token)
             }
-            Self::Claude(a) => mahoquot_providers::refresh::build_claude_refresh_request_with_scope(&a.refresh_token, None),
+            Self::Claude(a) => mahoquot_providers::build_claude_refresh_request(&a.refresh_token),
             Self::Cursor(a) => mahoquot_providers::build_cursor_refresh_request(&a.refresh_token),
             Self::Kiro(a) => match a.auth_mode {
                 mahoquot_providers::KiroAuthMode::Social => {
@@ -1106,7 +1179,12 @@ impl ProviderAccount {
             Self::Generic(a) if a.provider == "cline" => {
                 mahoquot_providers::build_cline_refresh_request(&a.refresh_token)
             }
-            Self::Generic(a) if matches!(a.provider.as_str(), "xai" | "kimi") => {
+            Self::Generic(a) if a.provider == "xai" => {
+                mahoquot_providers::xai::refresh_request(&a.refresh_token, &a.token_url)
+            }
+            Self::Generic(a)
+                if a.provider == "kimi" || (a.auth_mode == "oauth" && !a.token_url.is_empty()) =>
+            {
                 mahoquot_providers::RefreshRequest {
                     url: a.token_url.clone(),
                     form_fields: vec![
@@ -1120,6 +1198,7 @@ impl ProviderAccount {
             }
             Self::Generic(_) => mahoquot_providers::build_refresh_request(""),
             Self::Vertex(_) => mahoquot_providers::build_refresh_request(""),
+            Self::OpenCode(_) => mahoquot_providers::build_refresh_request(""),
             other => mahoquot_providers::build_refresh_request(&other.refresh_token()),
         }
     }
@@ -1179,6 +1258,12 @@ pub fn model_quota_group<'a>(provider: &str, model: &'a str) -> Option<&'a str> 
 /// name, which always comes from provider display text.
 const ACCOUNT_BENCH_SCOPE: &str = "\u{0}account";
 
+/// Bench-scope key for a single-model cooldown. The NUL prefix keeps it apart
+/// from provider quota-group names.
+fn model_bench_key(model: &str) -> String {
+    format!("\u{0}model:{model}")
+}
+
 /// Why an account, or one of its quota groups, is benched.
 ///
 /// A deadline alone cannot describe a bench: a plan cap and a transient rate
@@ -1207,8 +1292,11 @@ pub(crate) fn split_date_suffix(model: &str) -> Option<&str> {
 }
 
 pub struct AccountMember {
+    pub home_lease: Option<Arc<crate::home::HomeLease>>,
     pub id: String,
     pub file_path: PathBuf,
+    request_retry_override: Option<i64>,
+    config_retry_override: Option<Option<i64>>,
     pub inner: RwLock<ProviderAccount>,
     pub health: Arc<RwLock<Health>>,
     /// Per-quota-group cooldown deadlines (unix ms) for providers that meter
@@ -1231,6 +1319,7 @@ pub struct AccountMember {
     pub upstream_override: Option<String>,
     /// Usage-polling-only base; falls back to `upstream_override` when unset.
     pub usage_override: Option<String>,
+    pub proxy_url: Option<String>,
     pub ok_count: Arc<AtomicU64>,
     pub fail_count: Arc<AtomicU64>,
     pub refresh_lock: Arc<tokio::sync::Mutex<()>>,
@@ -1241,7 +1330,6 @@ pub struct AccountMember {
     pub cline_trackers: crate::cline_usage::ClineTrackers,
     pub devin_catalog: arc_swap::ArcSwapOption<crate::devin_catalog::DevinAccountCatalogState>,
     pub devin_discovery_seq: Arc<AtomicU64>,
-    pub claude_device_id: String,
 }
 
 impl PoolMember for AccountMember {
@@ -1274,14 +1362,12 @@ impl AccountMember {
     }
 
     pub fn for_test_with_id(id: impl Into<String>, inner: ProviderAccount) -> Self {
-        let claude_device_id = if inner.kind() == ProviderKind::Claude {
-            generate_claude_device_id()
-        } else {
-            String::new()
-        };
         Self {
+            home_lease: None,
             id: id.into(),
             file_path: PathBuf::from("/dev/null"),
+            request_retry_override: None,
+            config_retry_override: None,
             inner: RwLock::new(inner),
             health: Arc::new(RwLock::new(Health::Available)),
             group_cooldowns: Arc::new(RwLock::new(BTreeMap::new())),
@@ -1291,6 +1377,7 @@ impl AccountMember {
             last_activity: Arc::new(std::sync::Mutex::new(tokio::time::Instant::now())),
             upstream_override: None,
             usage_override: None,
+            proxy_url: None,
             ok_count: Arc::new(AtomicU64::new(0)),
             fail_count: Arc::new(AtomicU64::new(0)),
             refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -1299,22 +1386,7 @@ impl AccountMember {
             cline_trackers: crate::cline_usage::ClineTrackers::from_env(),
             devin_catalog: arc_swap::ArcSwapOption::empty(),
             devin_discovery_seq: Arc::new(AtomicU64::new(0)),
-            claude_device_id,
         }
-    }
-
-    pub fn for_test_with_claude_device_id(
-        id: impl Into<String>,
-        inner: ProviderAccount,
-        device_id: impl Into<String>,
-    ) -> Self {
-        let mut member = Self::for_test_with_id(id, inner);
-        member.claude_device_id = device_id.into();
-        member
-    }
-
-    pub fn claude_device_id(&self) -> &str {
-        &self.claude_device_id
     }
 
     pub fn begin_activity(self: &Arc<Self>) -> AccountActivity {
@@ -1372,6 +1444,38 @@ impl AccountMember {
             return true;
         }
         false
+    }
+
+    /// Clear the auth-failure bench after the credential refreshed successfully.
+    ///
+    /// `AuthFailed` is otherwise only reverted by a process restart, so an
+    /// account whose token was rotated back into a working state stayed
+    /// unroutable forever and the rotation accomplished nothing observable.
+    /// `Disabled` is an operator decision and is never cleared here.
+    pub fn clear_auth_failure(&self) -> bool {
+        let mut guard = self
+            .health
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if matches!(*guard, Health::AuthFailed) {
+            *guard = Health::Available;
+            return true;
+        }
+        false
+    }
+
+    /// Whether the account is benched pending re-authentication.
+    ///
+    /// A rejected refresh grant is terminal, so retrying it on a timer cannot
+    /// succeed and only risks the identity provider locking the client out.
+    pub fn is_auth_failed(&self) -> bool {
+        matches!(
+            *self
+                .health
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            Health::AuthFailed
+        )
     }
 
     pub fn cline_trackers(&self) -> &crate::cline_usage::ClineTrackers {
@@ -1608,6 +1712,27 @@ impl AccountMember {
         usage.model_availability.clone()
     }
 
+    /// Catalog facts the Antigravity request labels need for `model`.
+    ///
+    /// The catalog is keyed by variant id (`gemini-3.8-flash-low`), and each
+    /// variant maps to its own enum, so an exact lookup is the only correct
+    /// one; a prefix or family match would report another variant's enum.
+    pub fn antigravity_catalog_entry(
+        &self,
+        model: &str,
+    ) -> Option<crate::usage::ModelAvailability> {
+        if self.kind() != ProviderKind::Antigravity {
+            return None;
+        }
+        let stripped = model.strip_prefix("antigravity/").unwrap_or(model);
+        let usage = self.usage.read().unwrap_or_else(|p| p.into_inner());
+        let discovered = usage.model_availability.as_ref()?;
+        discovered
+            .get(model)
+            .or_else(|| discovered.get(stripped))
+            .cloned()
+    }
+
     pub fn supports_antigravity_model(&self, model: &str) -> bool {
         if self.kind() != ProviderKind::Antigravity || self.is_manually_disabled() {
             return false;
@@ -1641,8 +1766,11 @@ impl AccountMember {
         new_catalog: Option<Arc<crate::devin_catalog::DevinAccountCatalogState>>,
     ) -> Self {
         Self {
+            home_lease: self.home_lease.clone(),
             id: self.id.clone(),
             file_path: self.file_path.clone(),
+            request_retry_override: self.request_retry_override,
+            config_retry_override: self.config_retry_override,
             inner: RwLock::new(self.inner.read().unwrap_or_else(|p| p.into_inner()).clone()),
             health: Arc::clone(&self.health),
             group_cooldowns: Arc::clone(&self.group_cooldowns),
@@ -1652,6 +1780,7 @@ impl AccountMember {
             last_activity: Arc::clone(&self.last_activity),
             upstream_override: self.upstream_override.clone(),
             usage_override: self.usage_override.clone(),
+            proxy_url: self.proxy_url.clone(),
             ok_count: Arc::clone(&self.ok_count),
             fail_count: Arc::clone(&self.fail_count),
             refresh_lock: Arc::clone(&self.refresh_lock),
@@ -1660,7 +1789,6 @@ impl AccountMember {
             cline_trackers: self.cline_trackers.clone(),
             devin_catalog: arc_swap::ArcSwapOption::new(new_catalog),
             devin_discovery_seq: Arc::clone(&self.devin_discovery_seq),
-            claude_device_id: self.claude_device_id.clone(),
         }
     }
 
@@ -1680,6 +1808,9 @@ impl AccountMember {
             ProviderAccount::Antigravity(_) => "https://api.antigravity.dev".to_string(),
             ProviderAccount::Kiro(_) => "https://api.kiro.dev".to_string(),
             ProviderAccount::Vertex(_) => "https://api.vertex.dev".to_string(),
+            ProviderAccount::OpenCode(_) => {
+                mahoquot_providers::opencode::OPENCODE_UPSTREAM_BASE.to_string()
+            }
         }
     }
 
@@ -1835,6 +1966,7 @@ impl AccountMember {
             ProviderAccount::Kiro(a) => Some(a.email.clone()),
             ProviderAccount::Zcode(a) => Some(a.email.clone()),
             ProviderAccount::Vertex(a) => Some(a.email.clone()),
+            ProviderAccount::OpenCode(_) => None,
             ProviderAccount::Devin(a) => a.email.clone(),
             ProviderAccount::Generic(_) => None,
         }
@@ -1848,6 +1980,20 @@ impl AccountMember {
         match &*guard {
             ProviderAccount::Codex(a) => Some(a.account_id.clone()),
             ProviderAccount::Claude(a) => Some(a.account_id.clone()),
+            _ => None,
+        }
+    }
+
+    pub fn xai_account(&self) -> Option<mahoquot_providers::xai::XaiAccount> {
+        let guard = self
+            .inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match &*guard {
+            ProviderAccount::Generic(account) if account.provider == "xai" => {
+                let json = serde_json::to_value(account).ok()?;
+                mahoquot_providers::xai::XaiAccount::from_record(&json).ok()
+            }
             _ => None,
         }
     }
@@ -1869,6 +2015,7 @@ impl AccountMember {
             ProviderAccount::Vertex(account) => account.disabled,
             ProviderAccount::Zcode(account) => account.disabled,
             ProviderAccount::Devin(account) => account.disabled,
+            ProviderAccount::OpenCode(account) => account.disabled,
             ProviderAccount::Codex(_) => false,
         }
     }
@@ -1894,6 +2041,9 @@ impl AccountMember {
                 .read()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             match &*guard {
+                ProviderAccount::Generic(account) if account.provider == "xai" => {
+                    account.models.iter().any(|candidate| candidate == model)
+                }
                 ProviderAccount::Generic(account) => {
                     account.models.is_empty()
                         || account.models.iter().any(|candidate| candidate == model)
@@ -1952,20 +2102,6 @@ impl AccountMember {
         *guard = health;
     }
 
-    /// Whether the account is benched pending re-authentication.
-    ///
-    /// A rejected refresh grant is terminal, so retrying it on a timer cannot
-    /// succeed and only risks the identity provider locking the client out.
-    pub fn is_auth_failed(&self) -> bool {
-        matches!(
-            *self
-                .health
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-            Health::AuthFailed
-        )
-    }
-
     /// The quota group `model` bills against on this account, if its provider
     /// meters model families separately.
     pub fn quota_group_for<'a>(&self, model: &'a str) -> Option<&'a str> {
@@ -2009,14 +2145,32 @@ impl AccountMember {
     /// Whether this account may currently serve `model`, considering only the
     /// per-group cooldowns. Account-wide health is checked separately.
     pub fn group_available(&self, model: &str, now_unix_ms: i64) -> bool {
-        let Some(group) = self.quota_group_for(model) else {
-            return true;
-        };
         let guard = self
             .group_cooldowns
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // A documented model/overage-scoped rejection benches only that model.
+        if guard
+            .get(&model_bench_key(model))
+            .is_some_and(|until| *until > now_unix_ms)
+        {
+            return false;
+        }
+        let Some(group) = self.quota_group_for(model) else {
+            return true;
+        };
         guard.get(group).is_none_or(|until| *until <= now_unix_ms)
+    }
+
+    /// Bench exactly one model on this account (Claude overage/model-scoped
+    /// rejection), leaving the account and its other models routable.
+    pub fn set_model_cooldown(&self, model: &str, until_unix_ms: i64) {
+        let mut guard = self
+            .group_cooldowns
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let slot = guard.entry(model_bench_key(model)).or_insert(until_unix_ms);
+        *slot = (*slot).max(until_unix_ms);
     }
 
     /// The benched-group reset (unix secs) for `model`, when this account's
@@ -2127,7 +2281,10 @@ impl AccountMember {
     /// first use and persisted so it survives restarts. It is deliberately
     /// random rather than derived from the machine, which would be a stable
     /// device fingerprint.
-    fn ensure_mimo_client_id(&self) -> Result<(String, String), RefreshError> {
+    async fn ensure_mimo_client_id(
+        &self,
+        settings: Option<Arc<crate::management::store::SettingsStore>>,
+    ) -> Result<(String, String), RefreshError> {
         let (token_url, client_id) = {
             let guard = self
                 .inner
@@ -2152,13 +2309,14 @@ impl AccountMember {
         let content = std::fs::read_to_string(&self.file_path)?;
         let mut root: serde_json::Value =
             serde_json::from_str(&content).map_err(|e| RefreshError::Parse(e.to_string()))?;
+        let expected = root.clone();
         root.as_object_mut()
             .ok_or_else(|| RefreshError::Parse("root is not a JSON object".to_string()))?
             .insert(
                 "client_id".to_string(),
                 serde_json::Value::String(fresh.clone()),
             );
-        write_credential_atomically(&self.file_path, root.to_string().as_bytes())?;
+        commit_refresh(self.file_path.clone(), Some(expected), root, settings).await?;
         self.reload_from_file()
             .map_err(|e| RefreshError::Parse(e.to_string()))?;
         Ok((bootstrap_url, fresh))
@@ -2264,12 +2422,32 @@ impl AccountMember {
         refresh_url: &str,
         presented_token: Option<&str>,
     ) -> Result<bool, RefreshError> {
+        self.refresh_with_store(client, refresh_url, presented_token, None)
+            .await
+    }
+
+    pub(crate) async fn refresh_with_store(
+        &self,
+        client: &reqwest::Client,
+        refresh_url: &str,
+        presented_token: Option<&str>,
+        settings: Option<Arc<crate::management::store::SettingsStore>>,
+    ) -> Result<bool, RefreshError> {
         // Relay keys are static; there is nothing to refresh and the token
         // endpoint would only reject the empty grant.
         if self.relay_api_key().is_some() || self.kind() == ProviderKind::Devin {
             return Ok(false);
         }
+        if presented_token.is_some() {
+            tracing::debug!(name: "reactive_refresh_entered", account = self.id());
+        }
         let _guard = self.refresh_lock.lock().await;
+
+        // A rescan can publish another member while this file's rotation is
+        // in flight. Re-read its committed generation before testing expiry
+        // or choosing a grant; the mutex alone does not update that snapshot.
+        self.reload_from_file()
+            .map_err(|error| RefreshError::Parse(error.to_string()))?;
 
         let now_unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2284,6 +2462,80 @@ impl AccountMember {
             return Ok(false);
         }
 
+        if self.provider_name() == "meta" {
+            return crate::compat::meta::refresh_member(self, client, presented_token, settings)
+                .await
+                .map_err(RefreshError::Parse);
+        }
+
+        if mahoquot_providers::kimi::is_provider(&self.provider_name()) {
+            'kimi: {
+                let raw = tokio::fs::read(&self.file_path).await?;
+                let mut credential: serde_json::Value = serde_json::from_slice(&raw)
+                    .map_err(|error| RefreshError::Parse(error.to_string()))?;
+                let expected = credential.clone();
+                let domain = mahoquot_providers::kimi::credential_domain(&credential);
+                let token_url = credential
+                    .get("token_url")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("{}/api/oauth/token", domain.oauth_host()));
+                // A credential whose token endpoint is not Kimi's own OAuth path is a
+                // generic OAuth contract; refresh it through the shared path below.
+                let Some(oauth_host) = token_url.strip_suffix("/api/oauth/token") else {
+                    break 'kimi;
+                };
+                let api_base = self
+                    .upstream_override
+                    .clone()
+                    .or_else(|| self.generic_base_url())
+                    .unwrap_or_else(|| domain.api_base().to_string());
+                let native = mahoquot_providers::kimi::KimiClient::with_endpoints(
+                    client.clone(),
+                    oauth_host,
+                    &api_base,
+                    mahoquot_providers::kimi::device_identity(&credential),
+                );
+                let grant = credential
+                    .get("refresh_token")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| RefreshError::Parse("missing refresh token".into()))?;
+                let update = native
+                    .refresh_tokens(grant)
+                    .await
+                    .map_err(|error| match error {
+                        mahoquot_providers::kimi::Error::Http(code) => RefreshError::Status {
+                            code,
+                            body: "Kimi refresh rejected".into(),
+                        },
+                        other => RefreshError::Parse(other.to_string()),
+                    })?;
+                update
+                    .apply(&mut credential, now_unix)
+                    .map_err(|error| RefreshError::Parse(error.to_string()))?;
+                credential = commit_refresh(
+                    self.file_path.clone(),
+                    Some(expected),
+                    credential,
+                    settings.clone(),
+                )
+                .await?;
+                self.reload_from_file()
+                    .map_err(|error| RefreshError::Parse(error.to_string()))?;
+                match native.fetch_models(&self.access_token()).await {
+                    Ok(models) => {
+                        let expected = credential.clone();
+                        credential["models"] = serde_json::json!(models);
+                        commit_refresh(self.file_path.clone(), Some(expected), credential, settings.clone()).await?;
+                        self.reload_from_file()
+                            .map_err(|error| RefreshError::Parse(error.to_string()))?;
+                    }
+                    Err(_) => tracing::warn!(account = self.id(), "Kimi catalog refresh failed; retained previous models and committed tokens"),
+                }
+                return Ok(true);
+            }
+        }
+
         let spec = self
             .inner
             .read()
@@ -2294,6 +2546,37 @@ impl AccountMember {
         } else {
             spec.url.as_str()
         };
+        // Capture the grant generation before issuing network requests.
+        let mimo = if self.generic_adapter().as_deref() == Some("mimo-free") {
+            Some(self.ensure_mimo_client_id(settings.clone()).await?)
+        } else {
+            None
+        };
+        let expected: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(&self.file_path).await?)
+                .map_err(|error| RefreshError::Parse(error.to_string()))?;
+        let expected_access = match self.kind() {
+            ProviderKind::Generic => expected.get("api_key"),
+            ProviderKind::Vertex => expected
+                .get("access_token")
+                .or_else(|| expected.get("api_key")),
+            _ => expected.get("access_token"),
+        };
+        if (self.kind() != ProviderKind::Vertex
+            && expected
+                .get("refresh_token")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                != self.refresh_token())
+            || expected_access
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                != self.access_token()
+        {
+            return Err(RefreshError::Parse(
+                "credential grant changed before refresh".into(),
+            ));
+        }
         let tokens = if self.kind() == ProviderKind::Vertex {
             let (token_url, email, private_key, private_key_id) = {
                 let account = self
@@ -2305,6 +2588,18 @@ impl AccountMember {
                         "vertex account kind mismatch".to_string(),
                     ));
                 };
+                let snapshot: mahoquot_providers::VertexAccount =
+                    serde_json::from_value(expected.clone())
+                        .map_err(|error| RefreshError::Parse(error.to_string()))?;
+                if snapshot.effective_token_url() != account.effective_token_url()
+                    || snapshot.effective_email() != account.effective_email()
+                    || snapshot.effective_private_key() != account.effective_private_key()
+                    || snapshot.private_key_id != account.private_key_id
+                {
+                    return Err(RefreshError::Parse(
+                        "Vertex identity changed before refresh".into(),
+                    ));
+                }
                 (
                     account.effective_token_url().to_string(),
                     account.effective_email().to_string(),
@@ -2320,8 +2615,7 @@ impl AccountMember {
                 private_key_id.as_deref(),
             )
             .await?
-        } else if self.generic_adapter().as_deref() == Some("mimo-free") {
-            let (bootstrap_url, client_id) = self.ensure_mimo_client_id()?;
+        } else if let Some((bootstrap_url, client_id)) = mimo {
             mahoquot_providers::execute_mimo_bootstrap(client, &bootstrap_url, &client_id, now_unix)
                 .await?
         } else if self.kind() == ProviderKind::Generic && self.provider_name() == "cline" {
@@ -2337,12 +2631,142 @@ impl AccountMember {
         } else {
             execute_refresh_spec(client, url, &spec).await?
         };
-        apply_refresh_to_file(&self.file_path, &tokens, now_unix)?;
+        let mut credential = expected.clone();
+        apply_refresh_to_value(&mut credential, &tokens, now_unix)?;
+        if self.kind() == ProviderKind::Vertex {
+            // api_key aliases access_token: retaining both makes serde reject
+            // the refreshed file as a duplicate field on the next load.
+            credential.as_object_mut().unwrap().remove("api_key");
+        }
+        commit_refresh(self.file_path.clone(), Some(expected), credential, settings).await?;
         if let Err(e) = self.reload_from_file() {
             return Err(RefreshError::Parse(e.to_string()));
         }
+        self.clear_auth_failure();
         Ok(true)
     }
+}
+
+/// Merge a provider update into the current credential under the same coordinator
+/// used by management writers. No network await occurs while the guard is held.
+/// None is reserved for onboarding a file observed to be absent.
+pub(crate) async fn commit_refresh(
+    path: std::path::PathBuf,
+    expected: Option<serde_json::Value>,
+    candidate: serde_json::Value,
+    settings: Option<Arc<crate::management::store::SettingsStore>>,
+) -> Result<serde_json::Value, RefreshError> {
+    tokio::task::spawn_blocking(move || {
+        let _mutation = settings
+            .as_ref()
+            .map(|settings| settings.composition_lock());
+        let current = match std::fs::read(&path) {
+            Ok(bytes) => Some(
+                serde_json::from_slice::<serde_json::Value>(&bytes)
+                    .map_err(|error| RefreshError::Parse(error.to_string()))?,
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(RefreshError::Io(error)),
+        };
+        let conflict =
+            || RefreshError::Parse("credential changed or deleted during refresh".into());
+        let merged = match (expected, current) {
+            (None, None) => candidate,
+            (Some(expected), Some(mut current)) => {
+                // Identity, grant and routing changes invalidate the network result;
+                // cosmetic edits deliberately do not. Compare optional values too.
+                for key in [
+                    "type",
+                    "provider",
+                    "identity_slug",
+                    "email",
+                    "account_id",
+                    "refresh_token",
+                    "dca_token",
+                    "access_token",
+                    "api_key",
+                    "client_id",
+                    "token_url",
+                    "base_url",
+                    "upstream_override",
+                    "auth_kind",
+                    "adapter",
+                    "private_key",
+                    "private_key_id",
+                    "client_email",
+                    "service_account",
+                    "token_uri",
+                    "auth_mode",
+                    "client_secret",
+                    "region",
+                ] {
+                    if current.get(key) != expected.get(key) {
+                        return Err(conflict());
+                    }
+                }
+                let object = current.as_object_mut().ok_or_else(conflict)?;
+                for key in [
+                    "access_token",
+                    "api_key",
+                    "refresh_token",
+                    "id_token",
+                    "expired",
+                    "last_refresh",
+                    "timestamp",
+                    "client_id",
+                    "models",
+                    "dca_token",
+                    "token_type",
+                    "expires_in",
+                    "dca_expires_at",
+                    "dca_expired",
+                    "auth_kind",
+                    "base_url",
+                    "email",
+                    "name",
+                    "subs_tier_name",
+                    "subs_tier_id",
+                    "is_subs_active",
+                    "has_payment_method",
+                    "require_payment",
+                    "can_subscribe",
+                ] {
+                    if candidate.get(key) != expected.get(key) {
+                        match candidate.get(key) {
+                            Some(value) => {
+                                object.insert(key.into(), value.clone());
+                            }
+                            None => {
+                                object.remove(key);
+                            }
+                        }
+                    }
+                }
+                current
+            }
+            _ => return Err(conflict()),
+        };
+        let rendered = serde_json::to_vec_pretty(&merged)
+            .map_err(|error| RefreshError::Parse(error.to_string()))?;
+        if let Some(store) = settings
+            .as_ref()
+            .and_then(|settings| settings.storage_manager())
+        {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| RefreshError::Parse("invalid credential filename".into()))?;
+            save_account_to_store(&store, name, &rendered)
+                .map_err(|error| RefreshError::Parse(error.to_string()))?;
+            if path == store.auth_dir().join(name) {
+                return Ok(merged);
+            }
+        }
+        write_credential_atomically(&path, &rendered).map_err(RefreshError::Io)?;
+        Ok(merged)
+    })
+    .await
+    .map_err(|error| RefreshError::Parse(error.to_string()))?
 }
 
 /// Provider credentials all carry an ISO-8601 `expired`; the older Codex and
@@ -2359,10 +2783,8 @@ fn expired_at_is_past(expired: &str, now_unix: i64) -> bool {
 /// `403 ... only available via Cline product surfaces`, so a cline credential
 /// must carry the Cline client surface headers. The account pipeline writes
 /// files without them, which strands every newly enrolled account outside the
-/// free deepseek route (glm is unaffected). Normalize at load time: fill the
-/// canonical surface headers without ever overwriting authored ones, and make
-/// the free deepseek slug eligible for any cline account that declares a
-/// model list at all (an empty list already serves every model).
+/// free routes. Normalize surface headers at load time without inventing model
+/// availability; the official catalog discovery owns the free model list.
 fn normalize_cline_generic(account: &mut GenericAccount) {
     if account.provider != "cline" {
         return;
@@ -2386,16 +2808,15 @@ fn normalize_cline_generic(account: &mut GenericAccount) {
             .static_headers
             .insert("X-Task-ID".to_string(), uuid::Uuid::new_v4().to_string());
     }
-    const FREE_DEEPSEEK: &str = "cline-free/deepseek-v4.1-flash";
-    if !account.models.is_empty() && !account.models.iter().any(|model| model == FREE_DEEPSEEK) {
-        account.models.push(FREE_DEEPSEEK.to_string());
-    }
 }
 
 fn provider_account_from_value(
     kind: ProviderKind,
-    value: serde_json::Value,
+    mut value: serde_json::Value,
 ) -> Result<ProviderAccount, serde_json::Error> {
+    mahoquot_providers::kimi::normalize_credential(&mut value)
+        .map_err(|error| <serde_json::Error as serde::de::Error>::custom(error.to_string()))?;
+    mahoquot_providers::xai::normalize_record(&mut value);
     Ok(match kind {
         ProviderKind::Codex => ProviderAccount::Codex(serde_json::from_value(value)?),
         ProviderKind::Antigravity => ProviderAccount::Antigravity(serde_json::from_value(value)?),
@@ -2404,8 +2825,17 @@ fn provider_account_from_value(
         ProviderKind::Kiro => ProviderAccount::Kiro(serde_json::from_value(value)?),
         ProviderKind::Zcode => ProviderAccount::Zcode(serde_json::from_value(value)?),
         ProviderKind::Vertex => ProviderAccount::Vertex(serde_json::from_value(value)?),
+        ProviderKind::OpenCode => ProviderAccount::OpenCode(serde_json::from_value(value)?),
         ProviderKind::Devin => ProviderAccount::Devin(serde_json::from_value(value)?),
         ProviderKind::Generic => {
+            let value = if value.get("type").and_then(serde_json::Value::as_str) == Some("meta") {
+                let native: mahoquot_providers::meta::MetaAccount = serde_json::from_value(value)?;
+                mahoquot_providers::meta::routing_record(&native).map_err(|error| {
+                    serde_json::Error::io(std::io::Error::other(error.to_string()))
+                })?
+            } else {
+                value
+            };
             let mut account: GenericAccount = serde_json::from_value(value)?;
             normalize_cline_generic(&mut account);
             ProviderAccount::Generic(account)
@@ -2422,6 +2852,7 @@ fn set_identity_slug(account: &mut ProviderAccount, slug: String) {
         ProviderAccount::Kiro(a) => a.identity_slug = slug,
         ProviderAccount::Zcode(a) => a.identity_slug = slug,
         ProviderAccount::Vertex(a) => a.identity_slug = slug,
+        ProviderAccount::OpenCode(a) => a.identity_slug = slug,
         ProviderAccount::Devin(a) => a.identity_slug = slug,
         ProviderAccount::Generic(a) => a.identity_slug = slug,
     }
@@ -2436,6 +2867,7 @@ fn identity_slug_of(account: &ProviderAccount) -> &str {
         ProviderAccount::Kiro(a) => &a.identity_slug,
         ProviderAccount::Zcode(a) => &a.identity_slug,
         ProviderAccount::Vertex(a) => &a.identity_slug,
+        ProviderAccount::OpenCode(a) => &a.identity_slug,
         ProviderAccount::Devin(a) => &a.identity_slug,
         ProviderAccount::Generic(a) => &a.identity_slug,
     }
@@ -2444,6 +2876,51 @@ fn identity_slug_of(account: &ProviderAccount) -> &str {
 #[cfg(test)]
 mod identity_tests {
     use super::*;
+
+    #[test]
+    fn retry_override_survives_credential_load_and_snapshot() {
+        let dir = std::env::temp_dir().join(format!(
+            "mahoquot-retry-override-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp auth dir");
+        let path = dir.join("codex-retry.json");
+        std::fs::write(
+            &path,
+            r#"{"type":"codex","access_token":"t","account_id":"a","email":"u@example.com","expired":"2099-01-01T00:00:00Z","id_token":"i","last_refresh":"","refresh_token":"r","unknown-retained-test-field":true,"request_retry":2,"request-retry":4}"#,
+        )
+        .expect("write credential");
+
+        let members = load_account_members(&dir).expect("load accounts");
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].request_retry_override(), Some(2));
+        let snapshot = members[0].clone_for_snapshot(None);
+        assert_eq!(snapshot.request_retry_override(), Some(2));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn retry_override_alias_and_invalid_values_follow_canonical_precedence() {
+        for (raw, expected) in [
+            (r#"{"request-retry":3}"#, Some(3)),
+            (r#"{"request_retry":0,"request-retry":3}"#, Some(0)),
+            (r#"{"request_retry":-1,"request-retry":3}"#, None),
+            (r#"{"request_retry":"bad","request-retry":3}"#, Some(3)),
+            (r#"{"request_retry":" 0 "}"#, Some(0)),
+            (r#"{"request_retry":2.9}"#, Some(2)),
+            (r#"{"request_retry":-0.5}"#, Some(0)),
+            (r#"{"request_retry":2.9,"request-retry":3}"#, Some(2)),
+            (r#"{"request_retry":" -1 ","request-retry":3}"#, None),
+            (r#"{"request_retry":true,"request-retry":" 3 "}"#, Some(3)),
+            (r#"{"request_retry":-1}"#, None),
+            (r#"{"request_retry":"bad"}"#, None),
+            (r#"{}"#, None),
+        ] {
+            let value: serde_json::Value = serde_json::from_str(raw).expect("metadata JSON");
+            assert_eq!(request_retry_override(&value), expected, "{raw}");
+        }
+    }
 
     #[test]
     fn pool_order_respects_the_account_order_manifest() {
@@ -2548,76 +3025,6 @@ mod identity_tests {
         assert_eq!(members[0].id, "user@example.com");
         std::fs::remove_dir_all(dir).ok();
     }
-
-    #[test]
-    fn claude_device_id_validation_and_generation() {
-        let dev_id = generate_claude_device_id();
-        assert_eq!(dev_id.len(), 64);
-        assert!(is_valid_claude_device_id(&dev_id));
-        assert!(!is_valid_claude_device_id("too-short"));
-        assert!(!is_valid_claude_device_id(&"g".repeat(64)));
-    }
-
-    #[test]
-    fn claude_device_identities_storage_roundtrip() {
-        let dir = std::env::temp_dir().join(format!("device-id-test-{}", rand::random::<u64>()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(CLAUDE_DEVICE_IDENTITY_STORE);
-
-        let mut store = BTreeMap::new();
-        let dev1 = generate_claude_device_id();
-        let dev2 = generate_claude_device_id();
-        store.insert("acc1".to_string(), dev1.clone());
-        store.insert("acc2".to_string(), dev2.clone());
-
-        save_claude_device_identities(&path, &store).unwrap();
-        let loaded = load_claude_device_identities(&path).unwrap();
-        assert_eq!(loaded.get("acc1"), Some(&dev1));
-        assert_eq!(loaded.get("acc2"), Some(&dev2));
-        std::fs::remove_dir_all(dir).ok();
-    }
-}
-
-pub const CLAUDE_DEVICE_IDENTITY_STORE: &str = "claude-device-identity.json";
-
-pub fn is_valid_claude_device_id(s: &str) -> bool {
-    s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
-}
-
-pub fn generate_claude_device_id() -> String {
-    use rand::RngCore;
-    let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    let mut s = String::with_capacity(64);
-    for b in bytes {
-        use std::fmt::Write;
-        let _ = write!(s, "{:02x}", b);
-    }
-    s
-}
-
-pub fn load_claude_device_identities(path: &Path) -> std::io::Result<BTreeMap<String, String>> {
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
-        Err(error) => return Err(error),
-    };
-    serde_json::from_str(&content)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
-}
-
-pub fn save_claude_device_identities(
-    path: &Path,
-    store: &BTreeMap<String, String>,
-) -> Result<(), std::io::Error> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    if !parent.as_os_str().is_empty() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let json = serde_json::to_string_pretty(store)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-    write_credential_atomically(path, json.as_bytes())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
 }
 
 /// The filename prefix is the reliable provider signal, not the `type` field:
@@ -2629,6 +3036,10 @@ fn classify_credential(file_path: &Path, declared_type: &str) -> Option<Provider
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or_default();
+
+    if name.starts_with("kimi-") || name.starts_with("kimi-ai-") || name.starts_with("meta-") {
+        return Some(ProviderKind::Generic);
+    }
 
     for kind in [
         ProviderKind::Codex,
@@ -2649,6 +3060,24 @@ fn classify_credential(file_path: &Path, declared_type: &str) -> Option<Provider
     }
 
     ProviderKind::from_type_str(declared_type)
+}
+
+pub(crate) fn request_retry_override(value: &serde_json::Value) -> Option<i64> {
+    let parsed = value
+        .get("request_retry")
+        .and_then(parse_retry_integer)
+        .or_else(|| value.get("request-retry").and_then(parse_retry_integer));
+    parsed.filter(|retry| *retry >= 0)
+}
+
+fn parse_retry_integer(value: &serde_json::Value) -> Option<i64> {
+    match value {
+        serde_json::Value::Number(number) => number
+            .as_i64()
+            .or_else(|| number.as_f64().map(|value| value as i64)),
+        serde_json::Value::String(value) => value.trim().parse().ok(),
+        _ => None,
+    }
 }
 
 pub const ACCOUNT_ORDER_FILE: &str = ".mahoquot-account-order.json";
@@ -2697,15 +3126,8 @@ pub fn load_account_members(auth_dir: &Path) -> anyhow::Result<Vec<Arc<AccountMe
     let files = list_all_auth_files(auth_dir)
         .map_err(|e| anyhow::anyhow!("failed to list auth files in {:?}: {}", auth_dir, e))?;
 
-    let identity_store_path = auth_dir.join(CLAUDE_DEVICE_IDENTITY_STORE);
-    let mut identity_store = load_claude_device_identities(&identity_store_path)?;
-    let mut identity_store_dirty = false;
-
     let mut members = Vec::with_capacity(files.len());
     for file_path in files {
-        if file_path == identity_store_path {
-            continue;
-        }
         let content = match std::fs::read_to_string(&file_path) {
             Ok(content) => content,
             Err(e) => {
@@ -2739,6 +3161,8 @@ pub fn load_account_members(auth_dir: &Path) -> anyhow::Result<Vec<Arc<AccountMe
             continue;
         };
 
+        let request_retry_override = request_retry_override(&value);
+
         let upstream_override = value
             .get("upstream_override")
             .and_then(|v| v.as_str())
@@ -2751,7 +3175,8 @@ pub fn load_account_members(auth_dir: &Path) -> anyhow::Result<Vec<Arc<AccountMe
                 | ProviderKind::Cursor
                 | ProviderKind::Kiro
                 | ProviderKind::Zcode
-                | ProviderKind::Vertex => None,
+                | ProviderKind::Vertex
+                | ProviderKind::OpenCode => None,
             })
             .map(str::to_string);
 
@@ -2760,8 +3185,12 @@ pub fn load_account_members(auth_dir: &Path) -> anyhow::Result<Vec<Arc<AccountMe
             .and_then(|v| v.as_str())
             .map(str::to_string);
 
-        let credential_device_id = value.get("device_id").and_then(serde_json::Value::as_str).map(str::to_owned);
-        let credential_account_id = value.get("account_id").and_then(serde_json::Value::as_str).map(str::to_owned);
+        let proxy_url = value
+            .get("proxy_url")
+            .or_else(|| value.get("proxy"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+
         let mut inner = match provider_account_from_value(kind, value) {
             Ok(inner) => inner,
             Err(e) => {
@@ -2852,41 +3281,12 @@ pub fn load_account_members(auth_dir: &Path) -> anyhow::Result<Vec<Arc<AccountMe
                 .to_string()
         };
 
-        let claude_device_id = if kind == ProviderKind::Claude {
-            let from_cred = credential_device_id.as_deref()
-                .filter(|s| is_valid_claude_device_id(s))
-                .map(str::to_string);
-
-            let from_store = identity_store
-                .get(&id)
-                .cloned()
-                .filter(|s| is_valid_claude_device_id(s))
-                .or_else(|| {
-                    credential_account_id.as_deref()
-                        .and_then(|acc| identity_store.get(acc).cloned())
-                        .filter(|s| is_valid_claude_device_id(s))
-                });
-
-            if let Some(dev_id) = from_cred.or(from_store) {
-                dev_id
-            } else {
-                let new_id = generate_claude_device_id();
-                identity_store.insert(id.clone(), new_id.clone());
-                if let Some(acc) = credential_account_id.as_deref() {
-                    if !acc.is_empty() {
-                        identity_store.insert(acc.to_string(), new_id.clone());
-                    }
-                }
-                identity_store_dirty = true;
-                new_id
-            }
-        } else {
-            String::new()
-        };
-
         members.push(Arc::new(AccountMember {
+            home_lease: None,
+            config_retry_override: None,
             id,
             file_path,
+            request_retry_override,
             inner: RwLock::new(inner),
             health: Arc::new(RwLock::new(if is_disabled {
                 Health::Disabled
@@ -2900,6 +3300,7 @@ pub fn load_account_members(auth_dir: &Path) -> anyhow::Result<Vec<Arc<AccountMe
             last_activity: Arc::new(std::sync::Mutex::new(tokio::time::Instant::now())),
             upstream_override,
             usage_override,
+            proxy_url,
             ok_count: Arc::new(AtomicU64::new(0)),
             fail_count: Arc::new(AtomicU64::new(0)),
             refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -2908,13 +3309,134 @@ pub fn load_account_members(auth_dir: &Path) -> anyhow::Result<Vec<Arc<AccountMe
             cline_trackers: crate::cline_usage::ClineTrackers::from_env(),
             devin_catalog: arc_swap::ArcSwapOption::empty(),
             devin_discovery_seq: Arc::new(AtomicU64::new(0)),
-            claude_device_id,
         }));
     }
 
-    if identity_store_dirty && !auth_dir.as_os_str().is_empty() {
-        save_claude_device_identities(&identity_store_path, &identity_store)?;
+    Ok(members)
+}
+
+impl AccountMember {
+    pub fn request_retry_override(&self) -> Option<i64> {
+        self.config_retry_override
+            .unwrap_or(self.request_retry_override)
     }
 
-    Ok(members)
+    pub(crate) fn apply_config_retry(&mut self, settings: &crate::management::settings::Settings) {
+        let entries = match self.provider_name().as_str() {
+            "gemini" | "antigravity" => &settings.gemini_api_key,
+            "claude" => &settings.claude_api_key,
+            "codex" => &settings.codex_api_key,
+            "xai" => &settings.xai_api_key,
+            "vertex" => &settings.vertex_api_key,
+            "interactions" => &settings.interactions_api_key,
+            _ => &settings.openai_compatibility,
+        };
+        let key = self.access_token();
+        self.config_retry_override = entries.iter().find_map(|entry| entry.retry_for_key(&key));
+    }
+
+    /// Builds a routable member from a credential Home dispatched. The
+    /// credential goes through the exact same parser as an on-disk auth file
+    /// (written to a private, process-owned scratch directory), so a Home
+    /// account behaves identically to a local one; the Home id is kept.
+    pub fn from_home(
+        id: String,
+        provider: &str,
+        credential: serde_json::Value,
+    ) -> Result<Self, String> {
+        if id.trim().is_empty() {
+            return Err("Home credential id is empty".into());
+        }
+        let mut credential = credential;
+        let object = credential
+            .as_object_mut()
+            .ok_or_else(|| "Home credential must be a JSON object".to_string())?;
+        object
+            .entry("identity_slug")
+            .or_insert_with(|| serde_json::Value::String(id.clone()));
+        let kind = ProviderKind::from_type_str(provider)
+            .or_else(|| {
+                object
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(ProviderKind::from_type_str)
+            })
+            .ok_or_else(|| format!("unknown Home provider {provider}"))?;
+        let scratch = std::env::temp_dir().join(format!(
+            "mahoquot-home-auth-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
+        let safe_id: String = id
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let file = scratch.join(format!("{}-{safe_id}.json", kind.as_str()));
+        let loaded = (|| {
+            std::fs::write(
+                &file,
+                serde_json::to_vec(&credential).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+            load_account_members(&scratch).map_err(|e| e.to_string())
+        })();
+        let _ = std::fs::remove_dir_all(&scratch);
+        let member = loaded?
+            .into_iter()
+            .next()
+            .ok_or_else(|| "Home credential does not match its provider schema".to_string())?;
+        let mut member = Arc::try_unwrap(member)
+            .map_err(|_| "Home credential member unexpectedly shared".to_string())?;
+        member.id = id;
+        Ok(member)
+    }
+}
+
+static ACTIVE_STORAGE_MANAGER: std::sync::RwLock<
+    Option<Arc<mahoquot_registry::store::StorageManager>>,
+> = std::sync::RwLock::new(None);
+
+pub fn set_active_storage_manager(store: Option<Arc<mahoquot_registry::store::StorageManager>>) {
+    *ACTIVE_STORAGE_MANAGER.write().unwrap() = store;
+}
+
+pub fn active_storage_manager() -> Option<Arc<mahoquot_registry::store::StorageManager>> {
+    ACTIVE_STORAGE_MANAGER.read().unwrap().clone()
+}
+
+pub fn save_account_to_store(
+    store: &mahoquot_registry::store::StorageManager,
+    filename: &str,
+    content: &[u8],
+) -> anyhow::Result<()> {
+    let key = format!("auths/{}", filename.trim_start_matches('/'));
+    store
+        .put(&key, content)
+        .map_err(|e| anyhow::Error::new(e).context("failed to persist account to store"))
+}
+
+pub fn delete_account_from_store(
+    store: &mahoquot_registry::store::StorageManager,
+    filename: &str,
+) -> anyhow::Result<()> {
+    let key = format!("auths/{}", filename.trim_start_matches('/'));
+    store
+        .delete(&key)
+        .map_err(|e| anyhow::Error::new(e).context("failed to delete account from store"))
+}
+
+pub fn load_account_members_from_store(
+    store: &mahoquot_registry::store::StorageManager,
+) -> anyhow::Result<Vec<Arc<AccountMember>>> {
+    store
+        .sync_all_to_spool()
+        .map_err(|e| anyhow::Error::new(e).context("failed to sync store to spool"))?;
+    load_account_members(&store.auth_dir())
 }

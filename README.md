@@ -94,21 +94,6 @@ For comprehensive details on catalog format, signing keys, key rotation, publica
 - **Strict Round-Robin (`round_robin`)**: Requests rotate evenly across healthy accounts matching the requested model. Unhealthy accounts enter cooldown and bypass selection until restored.
 - **Fill First (`fill_first`)**: Directs traffic to the first available healthy account until its rate limit or quota is exhausted, then fails over to subsequent accounts in pool order.
 
-## Claude Account Safety
-
-Claude subscriptions (OAuth) are the risky lane; Claude API keys (`x-api-key`, a Claude credential file with `api_key` set, imported with `POST /auth-files/import`) are the sanctioned one.
-
-- **`claude-route-mode`**: `oauth_first` (default, unchanged order), `api_key_first` (API-key accounts are tried before OAuth accounts), `api_key_only` (OAuth accounts never receive a request). `api_key_first` is a preference: an existing session binding can still land on an OAuth account. Only `api_key_only` guarantees no OAuth use.
-- **`claude-api-key-budgets`**: `{<account id>: <units per calendar month, UTC>}`. Units are weighted tokens, `input + output + cache_write + cache_read / 10`, summed from the request history since the first of the month. Convert a dollar budget with the current price sheet for the models you use. This is a rough threshold, not Anthropic's billing. If the history cannot be read, budgeted accounts are skipped (fail closed).
-- **Suspected accounts**: a Claude 400/401/403 whose message reads like enforcement (organization disabled, terms of service, credential only authorized for Claude Code, etc.), or a second plain 403 within 10 minutes, puts the account on `claude-suspected-accounts` and returns the upstream error to the client without trying another account. Clear it with `DELETE /v0/management/accounts/{id}/suspected` after checking the account.
-- **Session pinning**: Claude OAuth sessions are pinned to one account in `claude-affinity.store` in the auth directory (6 h idle TTL). A pinned account in a cooldown under 2 minutes answers `429` with `retry-after` instead of moving the session. Transient 5xx/529 failover serves one turn elsewhere without moving the pin. `x-client-request-id` is not a session key on Claude-only routes.
-- **Warmup**: Claude probes skip 01:00-08:00 local time, wait 3-25 minutes (fixed per account and window) after a reset, and run once per window. Turning `warmup.providers.claude.enabled` off is still the quietest option.
-- **`claude-account-egress`**: `{<account id>: <http|https|socks5|socks5h URL>}` sends that account's traffic through its own proxy. An entry that does not build is refused at save; one that fails at boot keeps the account out of rotation instead of using the host IP.
-- **Client profile**: with cloaking on (default), OAuth requests present the Claude Agent SDK (TypeScript) identity in `crates/providers/src/claude.rs` (`AGENT_SDK_IDENTITY_HEADERS`, fixture `crates/gateway/tests/fixtures/agent_sdk_wire.json`). `disable-claude-cloak-mode: true` sends only auth, version, `anthropic-beta: oauth-2025-04-20` plus the client's betas and the client's own identity headers, without the injected system line or cache breakpoints.
-  - **Recapture after an Agent SDK upgrade**: install the new `@anthropic-ai/claude-agent-sdk`, point `ANTHROPIC_BASE_URL` at a local listener with a dummy token, send one request twice, keep the headers equal in both runs (drop `x-claude-code-session-id`, never copy the billing block or `metadata.user_id`), then update the constant and the fixture together.
-- **Visibility**: `/stats` account entries for Claude carry a `claude` object (route mode, suspected reason/time, pinned sessions, probes in 24 h, egress host only).
-- **Measurement**: `scripts/claude_switch_cache.sql` (run with `sqlite3 -readonly`) reports account switches inside sessions and their cache-write share for a time window.
-
 ## Desktop App Integration
 
 If running alongside the Mahoquot desktop monitor app, you can point the app to a custom proxy build using:

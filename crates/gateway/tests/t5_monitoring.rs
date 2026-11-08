@@ -24,7 +24,7 @@ async fn persisted_history_and_logs_are_exposed_after_state_recreation() {
         config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
-    let first = AppState::new(&config).expect("first state");
+    let first = AppState::new(&common::managed_ref(&config)).expect("first state");
     first
         .telemetry
         .record_with_account(1_800, "codex", Some("codex"), true);
@@ -34,17 +34,17 @@ async fn persisted_history_and_logs_are_exposed_after_state_recreation() {
         r#"{"provider":"codex","status":200}"#,
     );
 
-    let restored = Arc::new(AppState::new(&config).expect("restored state"));
+    let restored = Arc::new(AppState::new(&common::managed_ref(&config)).expect("restored state"));
     let app = create_app(restored);
     let stats = app
         .clone()
-        .oneshot(
+        .oneshot(common::with_loopback_peer(
             Request::builder()
                 .uri("/admin/stats")
                 .header(header::AUTHORIZATION, "Bearer history-key")
                 .body(Body::empty())
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(stats.status(), StatusCode::OK);
@@ -53,13 +53,13 @@ async fn persisted_history_and_logs_are_exposed_after_state_recreation() {
     assert_eq!(stats_json["history"][0]["requests"], 1);
 
     let logs = app
-        .oneshot(
+        .oneshot(common::with_loopback_peer(
             Request::builder()
                 .uri("/v0/management/logs")
                 .header(header::AUTHORIZATION, "Bearer history-key")
                 .body(Body::empty())
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(logs.status(), StatusCode::OK);
@@ -83,13 +83,13 @@ async fn logs_endpoint_serves_the_live_tail_while_file_logging_is_off() {
         config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
-    let state = Arc::new(AppState::new(&config).expect("state"));
+    let state = Arc::new(AppState::new(&common::managed_ref(&config)).expect("state"));
     let app = create_app(Arc::clone(&state));
 
     // A management edit lands in the live tail even with file logging off.
     let edit = app
         .clone()
-        .oneshot(
+        .oneshot(common::with_loopback_peer(
             Request::builder()
                 .method("PUT")
                 .uri("/v0/management/logs-max-total-size-mb")
@@ -97,20 +97,20 @@ async fn logs_endpoint_serves_the_live_tail_while_file_logging_is_off() {
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"value": 5}"#))
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(edit.status(), StatusCode::OK);
 
     let logs = app
         .clone()
-        .oneshot(
+        .oneshot(common::with_loopback_peer(
             Request::builder()
                 .uri("/v0/management/logs")
                 .header("authorization", "Bearer tail-key")
                 .body(Body::empty())
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(logs.status(), StatusCode::OK);
@@ -128,13 +128,13 @@ async fn logs_endpoint_serves_the_live_tail_while_file_logging_is_off() {
     // File-backed error-log routes still refuse while logging is disabled.
     let error_logs = app
         .clone()
-        .oneshot(
+        .oneshot(common::with_loopback_peer(
             Request::builder()
                 .uri("/v0/management/request-error-logs")
                 .header("authorization", "Bearer tail-key")
                 .body(Body::empty())
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(error_logs.status(), StatusCode::BAD_REQUEST);
@@ -142,25 +142,25 @@ async fn logs_endpoint_serves_the_live_tail_while_file_logging_is_off() {
     // And clearing empties the live tail too.
     let cleared = app
         .clone()
-        .oneshot(
+        .oneshot(common::with_loopback_peer(
             Request::builder()
                 .method("DELETE")
                 .uri("/v0/management/logs")
                 .header("authorization", "Bearer tail-key")
                 .body(Body::empty())
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(cleared.status(), StatusCode::OK);
     let after = app
-        .oneshot(
+        .oneshot(common::with_loopback_peer(
             Request::builder()
                 .uri("/v0/management/logs")
                 .header("authorization", "Bearer tail-key")
                 .body(Body::empty())
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     let after_json: serde_json::Value =
@@ -211,7 +211,12 @@ async fn streamed_requests_record_bytes_and_tokens_at_stream_end() {
     let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_port = upstream_listener.local_addr().unwrap().port();
     tokio::spawn(async move {
-        axum::serve(upstream_listener, mock_app).await.unwrap();
+        axum::serve(
+            upstream_listener,
+            (mock_app).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
     let upstream_uri = format!("http://127.0.0.1:{upstream_port}");
 
@@ -227,12 +232,17 @@ async fn streamed_requests_record_bytes_and_tokens_at_stream_end() {
         max_failover: 3,
         ..GatewayConfig::default()
     };
-    let state = Arc::new(AppState::new(&config).expect("state"));
+    let state = Arc::new(AppState::new(&common::managed_ref(&config)).expect("state"));
     let app = create_app(Arc::clone(&state));
     let gw_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let gw_port = gw_listener.local_addr().unwrap().port();
     tokio::spawn(async move {
-        axum::serve(gw_listener, app).await.unwrap();
+        axum::serve(
+            gw_listener,
+            (app).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
 
     // When: a client streams the request to completion
@@ -295,7 +305,7 @@ async fn streamed_requests_record_bytes_and_tokens_at_stream_end() {
     assert_eq!(account["total_tokens"], 15);
 
     state.telemetry.flush().expect("flush token usage");
-    let restored = AppState::new(&config)
+    let restored = AppState::new(&common::managed_ref(&config))
         .expect("restored token state")
         .get_stats();
     assert_eq!(restored.accounts[0].input_tokens, 10);

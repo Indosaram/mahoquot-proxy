@@ -2,16 +2,32 @@
 //! through the management API (import, onboarding) must appear in the live
 //! account pool without restarting the gateway.
 
+mod common;
+
 use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
+use common::with_loopback_peer;
 use http_body_util::BodyExt;
 use mahoquot_gateway::config::GatewayConfig;
 use mahoquot_gateway::inbound::ApiKeys;
 use mahoquot_gateway::routes::create_app;
 use mahoquot_gateway::state::AppState;
 use tower::ServiceExt;
+
+fn persist_management(auth_dir: &std::path::Path, key: &str) {
+    mahoquot_gateway::management::settings::Settings {
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: key.to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(&auth_dir.join("config.yaml"))
+    .expect("persist management settings");
+}
 
 fn claude_credential_json() -> serde_json::Value {
     serde_json::json!({
@@ -52,17 +68,18 @@ async fn an_imported_credential_appears_in_the_live_pool_without_restart() {
         config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
+    persist_management(&auth_dir, "rescan-key");
     let app = create_app(Arc::new(AppState::new(&config).expect("state")));
 
     let stats = app
         .clone()
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .uri("/admin/stats")
-                .header(header::AUTHORIZATION, "Bearer rescan-key")
+                .header("X-Management-Key", "rescan-key")
                 .body(Body::empty())
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     let before = body_json(stats).await;
@@ -71,11 +88,11 @@ async fn an_imported_credential_appears_in_the_live_pool_without_restart() {
     // when a second credential is imported through the management API
     let import = app
         .clone()
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .method("POST")
                 .uri("/v0/management/auth-files")
-                .header(header::AUTHORIZATION, "Bearer rescan-key")
+                .header("X-Management-Key", "rescan-key")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     serde_json::json!({
@@ -85,20 +102,20 @@ async fn an_imported_credential_appears_in_the_live_pool_without_restart() {
                     .to_string(),
                 ))
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(import.status(), StatusCode::OK);
 
     // then the live pool reports both accounts on the very next read
     let stats = app
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .uri("/admin/stats")
-                .header(header::AUTHORIZATION, "Bearer rescan-key")
+                .header("X-Management-Key", "rescan-key")
                 .body(Body::empty())
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     let after = body_json(stats).await;
@@ -134,32 +151,33 @@ async fn a_deleted_credential_leaves_the_live_pool_without_restart() {
         config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
+    persist_management(&auth_dir, "rescan-key");
     let app = create_app(Arc::new(AppState::new(&config).expect("state")));
 
     // when the credential file is deleted through the management API
     let delete = app
         .clone()
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .method("DELETE")
                 .uri("/v0/management/auth-files?name=codex-seed.json")
-                .header(header::AUTHORIZATION, "Bearer rescan-key")
+                .header("X-Management-Key", "rescan-key")
                 .body(Body::empty())
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(delete.status(), StatusCode::OK);
 
     // then the live pool reports zero accounts on the very next read
     let stats = app
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .uri("/admin/stats")
-                .header(header::AUTHORIZATION, "Bearer rescan-key")
+                .header("X-Management-Key", "rescan-key")
                 .body(Body::empty())
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     let after = body_json(stats).await;
@@ -183,6 +201,7 @@ async fn cors_allows_the_authorization_header_explicitly_for_webviews() {
         config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
+    persist_management(&auth_dir, "cors-key");
     let app = create_app(Arc::new(AppState::new(&config).expect("state")));
 
     // when a preflight from the desktop webview origin arrives

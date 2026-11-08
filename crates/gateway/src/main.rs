@@ -1,3 +1,44 @@
+fn init_storage_manager(
+    auth_dir: &std::path::Path,
+) -> Result<
+    Option<Arc<mahoquot_registry::store::StorageManager>>,
+    mahoquot_registry::store::StoreError,
+> {
+    use mahoquot_registry::store::{
+        BackendConfig, GitStore, ObjectStore, PostgresStore, StorageBackend, StorageManager,
+        StoreOptions,
+    };
+
+    let options = StoreOptions::from_env(auth_dir)?;
+    let (backend, spool): (Arc<dyn StorageBackend>, std::path::PathBuf) = match options.config {
+        BackendConfig::Postgres { dsn, schema, spool } => {
+            info!(schema = ?schema, spool = %spool.display(), "enabling postgres-backed storage");
+            (Arc::new(PostgresStore::try_new(dsn, schema)?), spool)
+        }
+        BackendConfig::Object {
+            endpoint,
+            bucket,
+            access_key,
+            secret_key,
+            prefix,
+            spool,
+        } => {
+            info!(endpoint = %endpoint, bucket = %bucket, prefix = %prefix, spool = %spool.display(), "enabling object-backed storage");
+            let store = ObjectStore::new(endpoint, bucket, access_key, secret_key, prefix)?;
+            (Arc::new(store), spool)
+        }
+        BackendConfig::Git { repository, spool } => {
+            info!(repository = %repository.display(), spool = %spool.display(), "enabling git-backed storage");
+            let remote = std::env::var("GITSTORE_GIT_URL").unwrap_or_default();
+            let branch = std::env::var("GITSTORE_GIT_BRANCH").ok();
+            (Arc::new(GitStore::new(repository, remote, branch)), spool)
+        }
+        BackendConfig::Local { .. } => return Ok(None),
+    };
+
+    Ok(Some(Arc::new(StorageManager::new(backend, spool)?)))
+}
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -10,12 +51,91 @@ use mahoquot_gateway::config::{
 use mahoquot_gateway::inbound::ApiKeys;
 use mahoquot_gateway::management::settings::Settings;
 use mahoquot_gateway::routes::create_app;
-use mahoquot_gateway::server::run_server;
+use mahoquot_gateway::server::{run_protocol_server, ProtocolListener};
 use mahoquot_gateway::state::AppState;
 use mahoquot_types::Strategy;
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
+
+fn prepare_storage(
+    mgr: &mahoquot_registry::store::StorageManager,
+    config: &mut GatewayConfig,
+) -> anyhow::Result<()> {
+    if mgr.backend().get("config/config.yaml")?.is_none() && config.config_path.exists() {
+        let bytes = std::fs::read(&config.config_path)?;
+        mgr.put("config/config.yaml", &bytes)?;
+    }
+    if mgr.list("auths")?.is_empty() && config.auth_dir.exists() {
+        for entry in std::fs::read_dir(&config.auth_dir)? {
+            let path = entry?.path();
+            if path.is_file() {
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default();
+                if name.ends_with(".json") && !name.starts_with('.') {
+                    let bytes = std::fs::read(&path)?;
+                    mahoquot_gateway::account::save_account_to_store(mgr, name, &bytes)?;
+                }
+            }
+        }
+    }
+    mgr.sync_all_to_spool()?;
+    std::fs::create_dir_all(mgr.auth_dir())?;
+    config.auth_dir = mgr.auth_dir();
+    if mgr.config_path().exists() {
+        config.config_path = mgr.config_path();
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod storage_startup_tests {
+    use super::*;
+    use mahoquot_registry::store::{StorageBackend, StorageManager, StoreError};
+
+    struct FailedBackend;
+    impl StorageBackend for FailedBackend {
+        fn get(&self, _: &str) -> Result<Option<Vec<u8>>, StoreError> {
+            Err(StoreError::Unavailable("fixture unavailable".into()))
+        }
+        fn put(&self, _: &str, _: &[u8]) -> Result<(), StoreError> {
+            panic!("failed read must not seed the backend")
+        }
+        fn delete(&self, _: &str) -> Result<(), StoreError> {
+            panic!("startup must not delete credentials")
+        }
+        fn list(&self, _: &str) -> Result<Vec<String>, StoreError> {
+            Err(StoreError::Unavailable("fixture unavailable".into()))
+        }
+    }
+
+    #[test]
+    fn unavailable_store_aborts_before_config_or_auth_projection_changes() {
+        let root = std::env::temp_dir().join(format!("storage-startup-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("auth")).unwrap();
+        let mut config = GatewayConfig {
+            auth_dir: root.join("auth"),
+            config_path: root.join("config.yaml"),
+            ..Default::default()
+        };
+        std::fs::write(&config.config_path, b"api-keys: [fixture]").unwrap();
+        let original_auth = config.auth_dir.clone();
+        let original_config = config.config_path.clone();
+        let store = StorageManager::new(Arc::new(FailedBackend), root.join("spool")).unwrap();
+        let result = prepare_storage(&store, &mut config);
+        assert!(result.is_err());
+        assert_eq!(config.auth_dir, original_auth);
+        assert_eq!(config.config_path, original_config);
+        assert_eq!(
+            std::fs::read(config.config_path).unwrap(),
+            b"api-keys: [fixture]"
+        );
+        assert!(!store.auth_dir().exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -51,6 +171,38 @@ pub enum Commands {
         /// Directory storing provider credential JSON files
         #[arg(long, env = "AUTH_DIR")]
         auth_dir: PathBuf,
+    },
+    /// Discover local AI gateways and CPA instances on the LAN
+    Discover {
+        /// Timeout in seconds for LAN discovery
+        #[arg(long, default_value_t = 3)]
+        timeout: u64,
+
+        /// Output discovered gateways in JSON format
+        #[arg(long)]
+        json: bool,
+
+        /// DNS-SD service type for LAN discovery
+        #[arg(long, default_value = "_ai-gateway._tcp")]
+        service_type: String,
+    },
+    /// Interactive terminal management UI
+    Tui {
+        /// Base URL of management API for TUI client mode
+        #[arg(
+            long,
+            env = "MANAGEMENT_BASE_URL",
+            default_value = "http://127.0.0.1:18801"
+        )]
+        management_base_url: String,
+
+        /// Management API secret key / password
+        #[arg(long, env = "MANAGEMENT_PASSWORD")]
+        password: Option<String>,
+
+        /// Start an embedded local server in standalone mode
+        #[arg(long)]
+        standalone: bool,
     },
 }
 
@@ -176,6 +328,10 @@ impl ServeArgs {
                 .ok()
                 .map(PathBuf::from)
                 .filter(|value| !value.as_os_str().is_empty()),
+            oauth_callback_port_offset: std::env::var("MAHOQUOT_OAUTH_CALLBACK_PORT_OFFSET")
+                .ok()
+                .and_then(|value| value.parse::<u16>().ok())
+                .unwrap_or(mahoquot_gateway::config::DEFAULT_OAUTH_CALLBACK_PORT_OFFSET),
         })
     }
 }
@@ -296,12 +452,72 @@ async fn main() -> anyhow::Result<()> {
             return Ok(mahoquot_gateway::compat::exec_bridge::serve(address.trim()).await?);
         }
     }
+    // Both aws-lc-rs and ring are compiled into rustls through dependencies,
+    // so rustls cannot pick a process default on its own; libraries that use
+    // the default (webrtc DTLS for realtime media) would panic. Install the
+    // ring provider every explicit config in this binary already uses.
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
     let cli = Cli::parse();
 
     let serve_args = match cli.command {
         Some(Commands::Serve(args)) => args,
         Some(Commands::Doctor { auth_dir, config }) => return run_doctor(auth_dir, config),
         Some(Commands::Accounts { auth_dir }) => return run_accounts(auth_dir),
+        Some(Commands::Discover {
+            timeout,
+            json,
+            service_type,
+        }) => {
+            let browse_type = service_type.clone();
+            let discovered = tokio::task::spawn_blocking(move || {
+                let isolation = mahoquot_gateway::discovery::IsolatedDiscovery::from_env()?;
+                mahoquot_gateway::discovery::RealBrowser::with_isolation(isolation)
+                    .browse_with_timeout(
+                        &browse_type,
+                        mahoquot_gateway::discovery::DEFAULT_DOMAIN,
+                        std::time::Duration::from_secs(timeout.max(1)),
+                    )
+            })
+            .await?
+            .map_err(anyhow::Error::msg)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&discovered)?);
+            } else if discovered.is_empty() {
+                println!(
+                    "Scanning LAN for AI Gateways ({})... (timeout {}s)",
+                    service_type, timeout
+                );
+                println!("\nNo AI gateways found on local network.");
+            } else {
+                println!(
+                    "\nFound {} AI Gateway(s) on local network:\n",
+                    discovered.len()
+                );
+                for (i, gw) in discovered.iter().enumerate() {
+                    println!(
+                        "[{}] {} (Product: {}, Port: {})",
+                        i + 1,
+                        gw.instance_name,
+                        gw.product,
+                        gw.port
+                    );
+                }
+            }
+            return Ok(());
+        }
+        Some(Commands::Tui {
+            management_base_url,
+            password,
+            standalone,
+        }) => {
+            let client = mahoquot_gateway::tui::ManagementClient::new(
+                management_base_url,
+                password.unwrap_or_default(),
+            );
+            let state = mahoquot_gateway::tui::TuiState::new(client, standalone, None);
+            mahoquot_gateway::tui::run_interactive_tui(state).await?;
+            return Ok(());
+        }
         None => cli.serve_args,
     };
 
@@ -311,6 +527,13 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.log_level)),
+        )
+        // Colour only an interactive terminal: piped/supervised logs (and
+        // NO_COLOR) stay plain so field values like `decision="deny"` are
+        // matchable verbatim.
+        .with_ansi(
+            std::io::IsTerminal::is_terminal(&std::io::stdout())
+                && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty()),
         )
         .init();
 
@@ -322,7 +545,140 @@ async fn main() -> anyhow::Result<()> {
         "starting mahoquot-gateway"
     );
 
-    let state = Arc::new(AppState::new(&config)?);
+    let mut config = config;
+    let storage_mgr = if std::env::var("HOME_JWT").is_ok_and(|jwt| !jwt.trim().is_empty()) {
+        None
+    } else {
+        tokio::task::block_in_place(|| init_storage_manager(&config.auth_dir))?
+    };
+    if let Some(ref mgr) = storage_mgr {
+        tokio::task::block_in_place(|| prepare_storage(mgr, &mut config))?;
+    }
+    let mut home_sync_worker = None;
+    if let Ok(jwt) = std::env::var("HOME_JWT") {
+        if !jwt.trim().is_empty() {
+            let home_config = mahoquot_gateway::home::config_from_jwt(&jwt, None)
+                .map_err(|e| anyhow::anyhow!("invalid HOME_JWT: {e:?}"))?;
+            let client = mahoquot_gateway::home::HomeClient::new(home_config);
+            let worker = mahoquot_gateway::home::HomeSyncWorker::new(client.clone());
+            let handle = worker.spawn();
+            home_sync_worker = Some((worker, handle));
+            mahoquot_gateway::home::set_active_home_client(Some(client));
+        }
+    }
+
+    if let Some(ref mgr) = storage_mgr {
+        mahoquot_gateway::account::set_active_storage_manager(Some(Arc::clone(mgr)));
+    }
+    let mut app_state = AppState::new(&config)?;
+    println!("gateway strategy={:?}", app_state.router.strategy());
+    let plugin_settings = app_state.settings.current().plugins.clone();
+    if plugin_settings.enabled {
+        let host = Arc::new(mahoquot_gateway::plugins::loader::PluginHost::new(
+            Arc::new(|_plugin_id, method, request| {
+                if method == mahoquot_gateway::plugins::abi::METHOD_HOST_LOG {
+                    let payload: serde_json::Value =
+                        serde_json::from_slice(request).map_err(|error| {
+                            mahoquot_gateway::plugins::abi::PluginError {
+                                code: "invalid_host_log".to_string(),
+                                message: error.to_string(),
+                                retryable: false,
+                                http_status: Some(400),
+                            }
+                        })?;
+                    info!(plugin_message = %payload.get("message").and_then(serde_json::Value::as_str).unwrap_or(""), "plugin log");
+                }
+                Ok(serde_json::json!({"ok":true,"result":{}})
+                    .to_string()
+                    .into_bytes())
+            }),
+        ));
+        let plugins_dir = if plugin_settings.dir.trim().is_empty() {
+            PathBuf::from("plugins")
+        } else {
+            PathBuf::from(plugin_settings.dir)
+        };
+        mahoquot_gateway::plugins::loader::load_plugins_from_directory(&host, &plugins_dir);
+        if let Ok(id) = std::env::var("MAHOQUOT_QA_PLUGIN_BUSY") {
+            let extension = if cfg!(target_os = "macos") {
+                ".dylib"
+            } else if cfg!(target_os = "windows") {
+                ".dll"
+            } else {
+                ".so"
+            };
+            let path = plugins_dir.join(format!("{id}{extension}"));
+            if path.is_file() {
+                let _ = host.load_plugin(&id, &path, "fixture");
+            }
+        }
+        app_state.set_plugin_host(Some(host));
+    }
+    // Relay dispatch reads the Home client from AppState; mirror the active
+    // process-wide client here so Home-authoritative dispatch is reachable.
+    app_state.home = mahoquot_gateway::home::get_active_home_client();
+    let state = Arc::new(app_state);
+    let cline_catalog = mahoquot_gateway::cline_catalog::spawn(Arc::clone(&state));
+    if let Some(client) = mahoquot_gateway::home::get_active_home_client() {
+        client.bind_settings(&state.settings);
+    }
+    if let Some(ref mgr) = storage_mgr {
+        state.settings.set_storage_manager(Arc::clone(mgr));
+    }
+
+    // Bind fallible async listener resources before creating an advertiser.
+    let listener = TcpListener::bind((bind_addr.as_str(), config.port)).await?;
+    let attempts = state.api_keys.management_attempts();
+    let listener = ProtocolListener::new(listener, &state.settings)
+        .await?
+        .with_management_context(Arc::clone(&state.settings), attempts);
+    let discovery_bind = bind_addr.clone();
+    let discovery_port = config.port;
+    let discovery_auth = config.auth_dir.clone();
+    let discovery_path = config.config_path.clone();
+    let mut discovery_mgr = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let isolation = mahoquot_gateway::discovery::IsolatedDiscovery::from_env()
+            .map_err(anyhow::Error::msg)?;
+        let isolated_discovery = isolation.is_some();
+        let mut discovery_mgr =
+            mahoquot_gateway::discovery::DiscoveryManager::with_isolation(isolation);
+        let discovery_cfg = if let Ok(content) = std::fs::read_to_string(&discovery_path) {
+            if let Ok(val) = serde_yaml::from_str::<serde_json::Value>(&content) {
+                if let Some(disc) = val.get("discovery") {
+                    serde_json::from_value::<mahoquot_gateway::discovery::DiscoveryConfig>(
+                        disc.clone(),
+                    )
+                    .unwrap_or_default()
+                } else {
+                    mahoquot_gateway::discovery::DiscoveryConfig::default()
+                }
+            } else {
+                mahoquot_gateway::discovery::DiscoveryConfig::default()
+            }
+        } else {
+            mahoquot_gateway::discovery::DiscoveryConfig::default()
+        };
+
+        if discovery_cfg.enabled {
+            let ifaces = mahoquot_gateway::discovery::query_system_interfaces();
+            let applied = discovery_mgr.apply_config(
+                &discovery_cfg,
+                Some(&discovery_bind),
+                discovery_port,
+                false,
+                &ifaces,
+                Some(&discovery_auth),
+            );
+            if isolated_discovery && !applied {
+                anyhow::bail!(
+                    "isolated discovery startup failed: {:?}",
+                    discovery_mgr.last_error()
+                );
+            }
+        }
+        Ok(discovery_mgr)
+    })
+    .await??;
     mahoquot_gateway::warmup::spawn_warmup_loop(state.clone(), std::time::Duration::from_secs(15));
     // Resume each Cline account's 24h token budget from the durable history
     // so a restart does not hand back a partially spent budget.
@@ -353,9 +709,9 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&state),
         mahoquot_gateway::registry::catalog_refresh_check_interval(),
     );
-    // Rotates OAuth grants ahead of expiry. This relay mints refresh tokens
-    // whose lifetime equals the access-token lifetime, so reactive refresh
-    // presents a dead grant and the account is lost with invalid_grant.
+    // Rotates OAuth credentials ahead of expiry. Every other refresh trigger is
+    // reactive, so an identity provider that expires its refresh token with the
+    // access token turns the first post-expiry attempt into a terminal failure.
     let pre_expiry_refresh =
         mahoquot_gateway::pre_expiry_refresh::spawn_from_env(Arc::clone(&state));
     mahoquot_gateway::egress_supervisor::spawn_egress_supervisor(
@@ -363,37 +719,24 @@ async fn main() -> anyhow::Result<()> {
         std::time::Duration::from_secs(10),
     );
     let app = create_app(state.clone());
-    // Claude API-key budgets are read from the request history; the affinity
-    // store keeps Claude sessions pinned across restarts.
-    let claude_budget_refresher =
-        mahoquot_gateway::claude_budget::BudgetTracker::spawn_refresher(Arc::clone(&state));
-    let claude_affinity_worker = mahoquot_gateway::affinity_store::AffinityStore::spawn_persistence(
-        Arc::clone(&state.claude_affinity),
-        std::time::Duration::from_secs(5),
-        Arc::new(tokio::sync::Notify::new()),
-    );
 
-    let listener = TcpListener::bind((bind_addr.as_str(), config.port)).await?;
     info!(bind_addr = %bind_addr, port = config.port, "listening");
 
     let shutdown = state.shutdown.clone();
-    let result = run_server(listener, app, async move { shutdown.notified().await }).await;
+    let result = run_protocol_server(listener, app, async move { shutdown.notified().await }).await;
     // Cancel the poller before the final snapshot: a refresh that is still in
     // flight must not write behind the flush, and neither task may outlive the
     // server.
+    if let Some((worker, handle)) = home_sync_worker {
+        worker.stop();
+        let _ = handle.await;
+    }
     usage_poller.shutdown().await;
     catalog_refresh.shutdown().await;
+    cline_catalog.shutdown().await;
     pre_expiry_refresh.shutdown().await;
     flush_worker.shutdown().await;
-    claude_budget_refresher.abort();
-    claude_affinity_worker.abort();
-    let now_unix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    if let Err(error) = state.claude_affinity.flush_blocking(now_unix) {
-        warn!(%error, "failed to persist claude affinity at shutdown");
-    }
+    let discovery_result = tokio::task::spawn_blocking(move || discovery_mgr.shutdown()).await;
     // Final snapshot before the process exits, so a replay that arrived inside
     // the coalescing window is not lost.
     state.signature_ledger.shutdown();
@@ -403,5 +746,14 @@ async fn main() -> anyhow::Result<()> {
     {
         let _ = state.signature_ledger.flush_blocking();
     }
-    result
+    let discovery_result = discovery_result
+        .map_err(anyhow::Error::from)
+        .and_then(|value| value.map_err(anyhow::Error::msg));
+    match (result, discovery_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(server), Err(discovery)) => Err(anyhow::anyhow!(
+            "server: {server}; discovery cleanup: {discovery}"
+        )),
+    }
 }

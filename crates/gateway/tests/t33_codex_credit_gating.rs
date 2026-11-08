@@ -44,15 +44,20 @@ async fn management_endpoints_mutate_and_persist_opt_in() {
     let json_2 = create_auth_file_json("codex-2", "acc_2", "tok_2", None);
     std::fs::write(temp_dir.join("codex-1.json"), json_1).unwrap();
     std::fs::write(temp_dir.join("codex-2.json"), json_2).unwrap();
-    std::fs::write(temp_dir.join("antigravity-duplicate.json"), json!({
-        "type": "antigravity",
-        "identity_slug": "codex-1",
-        "access_token": "other-token",
-        "refresh_token": "other-refresh",
-        "project_id": "test-project",
-        "email": "other@example.test",
-        "expired": "2099-01-01T00:00:00Z"
-    }).to_string()).unwrap();
+    std::fs::write(
+        temp_dir.join("antigravity-duplicate.json"),
+        json!({
+            "type": "antigravity",
+            "identity_slug": "codex-1",
+            "access_token": "other-token",
+            "refresh_token": "other-refresh",
+            "project_id": "test-project",
+            "email": "other@example.test",
+            "expired": "2099-01-01T00:00:00Z"
+        })
+        .to_string(),
+    )
+    .unwrap();
 
     let claude_json = serde_json::json!({
         "type": "claude",
@@ -65,183 +70,266 @@ async fn management_endpoints_mutate_and_persist_opt_in() {
     std::fs::write(&config_path, "logging-to-file: false\n").unwrap();
 
     let state = Arc::new(
-        AppState::new(&GatewayConfig {
+        AppState::new(&common::managed_ref(&GatewayConfig {
             auth_dir: temp_dir.clone(),
             config_path: config_path.clone(),
             api_keys: mahoquot_gateway::inbound::ApiKeys::from_env_value("test-key"),
             auth_refresh_enabled: false,
             ..GatewayConfig::default()
-        })
+        }))
         .unwrap(),
     );
     let app = create_app(Arc::clone(&state));
-    assert_eq!(state.find_member("codex-1").unwrap().kind(), mahoquot_gateway::account::ProviderKind::Antigravity);
+    assert_eq!(
+        state.find_member("codex-1").unwrap().kind(),
+        mahoquot_gateway::account::ProviderKind::Antigravity
+    );
 
     let res = app
         .clone()
-        .oneshot(
+        .oneshot(common::with_loopback_peer(
             axum::http::Request::get("/v0/management/accounts/credits")
                 .header("authorization", "Bearer test-key")
                 .body(Body::empty())
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    let body: Value = serde_json::from_slice(&axum::body::to_bytes(res.into_body(), 100_000).await.unwrap()).unwrap();
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(res.into_body(), 100_000)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
     assert_eq!(body["ids"], json!([]));
-    assert!(!state.settings.current().is_codex_account_credit_enabled("codex-1"));
+    assert!(!state
+        .settings
+        .current()
+        .is_codex_account_credit_enabled("codex-1"));
 
     let res = app
         .clone()
-        .oneshot(
+        .oneshot(common::with_loopback_peer(
             axum::http::Request::put("/v0/management/accounts/credits")
                 .header("authorization", "Bearer test-key")
                 .header("content-type", "application/json")
-                .body(Body::from(json!({
-                    "id": "codex-1",
-                    "credits_after_limit": true
-                }).to_string()))
+                .body(Body::from(
+                    json!({
+                        "id": "codex-1",
+                        "credits_after_limit": true
+                    })
+                    .to_string(),
+                ))
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    let body: Value = serde_json::from_slice(&axum::body::to_bytes(res.into_body(), 100_000).await.unwrap()).unwrap();
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(res.into_body(), 100_000)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
     assert_eq!(body["ok"], true);
     assert_eq!(body["id"], "codex-1");
     assert_eq!(body["credits_after_limit"], true);
     assert_eq!(body["creditsAfterLimit"], true);
-    assert!(state.settings.current().is_codex_account_credit_enabled("codex-1"));
-    assert!(!state.settings.current().is_codex_account_credit_enabled("codex-2"));
+    assert!(state
+        .settings
+        .current()
+        .is_codex_account_credit_enabled("codex-1"));
+    assert!(!state
+        .settings
+        .current()
+        .is_codex_account_credit_enabled("codex-2"));
 
     let saved_yaml = std::fs::read_to_string(&config_path).unwrap();
-    assert!(saved_yaml.contains("credit-codex-account-ids:"), "persisted to yaml: {saved_yaml}");
-    assert!(saved_yaml.contains("codex-1"), "persisted to yaml: {saved_yaml}");
+    assert!(
+        saved_yaml.contains("credit-codex-account-ids:"),
+        "persisted to yaml: {saved_yaml}"
+    );
+    assert!(
+        saved_yaml.contains("codex-1"),
+        "persisted to yaml: {saved_yaml}"
+    );
 
     let res = app
         .clone()
-        .oneshot(
+        .oneshot(common::with_loopback_peer(
             axum::http::Request::put("/api/codex-auth/accounts/credits")
                 .header("authorization", "Bearer test-key")
                 .header("content-type", "application/json")
-                .body(Body::from(json!({
-                    "id": "codex-1",
-                    "creditsAfterLimit": false
-                }).to_string()))
+                .body(Body::from(
+                    json!({
+                        "id": "codex-1",
+                        "creditsAfterLimit": false
+                    })
+                    .to_string(),
+                ))
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    assert!(!state.settings.current().is_codex_account_credit_enabled("codex-1"));
+    assert!(!state
+        .settings
+        .current()
+        .is_codex_account_credit_enabled("codex-1"));
 
     let res = app
         .clone()
-        .oneshot(
+        .oneshot(common::with_loopback_peer(
             axum::http::Request::put("/v0/management/accounts/credits")
                 .header("authorization", "Bearer test-key")
                 .header("content-type", "application/json")
-                .body(Body::from(json!({
-                    "id": "../traversal",
-                    "credits_after_limit": true
-                }).to_string()))
+                .body(Body::from(
+                    json!({
+                        "id": "../traversal",
+                        "credits_after_limit": true
+                    })
+                    .to_string(),
+                ))
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
 
     let res = app
         .clone()
-        .oneshot(
+        .oneshot(common::with_loopback_peer(
             axum::http::Request::put("/v0/management/accounts/credits")
                 .header("authorization", "Bearer test-key")
                 .header("content-type", "application/json")
-                .body(Body::from(json!({
-                    "id": "claude-1",
-                    "credits_after_limit": true
-                }).to_string()))
+                .body(Body::from(
+                    json!({
+                        "id": "claude-1",
+                        "credits_after_limit": true
+                    })
+                    .to_string(),
+                ))
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
 
     let res = app
         .clone()
-        .oneshot(
+        .oneshot(common::with_loopback_peer(
             axum::http::Request::put("/v0/management/accounts/credits")
                 .header("authorization", "Bearer test-key")
                 .header("content-type", "application/json")
-                .body(Body::from(json!({
-                    "id": "nonexistent-account",
-                    "credits_after_limit": true
-                }).to_string()))
+                .body(Body::from(
+                    json!({
+                        "id": "nonexistent-account",
+                        "credits_after_limit": true
+                    })
+                    .to_string(),
+                ))
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
 
     let res = app
         .clone()
-        .oneshot(
+        .oneshot(common::with_loopback_peer(
             axum::http::Request::put("/v0/management/accounts/credits")
                 .header("authorization", "Bearer test-key")
                 .header("content-type", "application/json")
-                .body(Body::from(json!({
-                    "all": true
-                }).to_string()))
+                .body(Body::from(
+                    json!({
+                        "all": true
+                    })
+                    .to_string(),
+                ))
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    let body: Value = serde_json::from_slice(&axum::body::to_bytes(res.into_body(), 100_000).await.unwrap()).unwrap();
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(res.into_body(), 100_000)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
     assert_eq!(body["ok"], true);
     assert_eq!(body["all"], true);
-    assert!(state.settings.current().is_codex_account_credit_enabled("codex-1"));
-    assert!(state.settings.current().is_codex_account_credit_enabled("codex-2"));
-    assert!(!state.settings.current().is_codex_account_credit_enabled("claude-1"));
-    assert!(!state.settings.current().is_codex_account_credit_enabled("codex-3-new"));
+    assert!(state
+        .settings
+        .current()
+        .is_codex_account_credit_enabled("codex-1"));
+    assert!(state
+        .settings
+        .current()
+        .is_codex_account_credit_enabled("codex-2"));
+    assert!(!state
+        .settings
+        .current()
+        .is_codex_account_credit_enabled("claude-1"));
+    assert!(!state
+        .settings
+        .current()
+        .is_codex_account_credit_enabled("codex-3-new"));
 
     let res = app
         .clone()
-        .oneshot(
+        .oneshot(common::with_loopback_peer(
             axum::http::Request::put("/v0/management/accounts/credits")
                 .header("authorization", "Bearer test-key")
                 .header("content-type", "application/json")
-                .body(Body::from(json!({
-                    "all": "non-bool"
-                }).to_string()))
+                .body(Body::from(
+                    json!({
+                        "all": "non-bool"
+                    })
+                    .to_string(),
+                ))
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
 
     let res = app
         .clone()
-        .oneshot(
+        .oneshot(common::with_loopback_peer(
             axum::http::Request::put("/v0/management/accounts/credits")
                 .header("authorization", "Bearer test-key")
                 .header("content-type", "application/json")
-                .body(Body::from(json!({
-                    "all": false
-                }).to_string()))
+                .body(Body::from(
+                    json!({
+                        "all": false
+                    })
+                    .to_string(),
+                ))
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    let body: Value = serde_json::from_slice(&axum::body::to_bytes(res.into_body(), 100_000).await.unwrap()).unwrap();
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(res.into_body(), 100_000)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
     assert_eq!(body["ok"], true);
     assert_eq!(body["all"], false);
     assert_eq!(body["ids"], json!([]));
     assert!(body["ids"].as_array().unwrap().is_empty());
-    assert!(!state.settings.current().is_codex_account_credit_enabled("codex-1"));
-    assert!(!state.settings.current().is_codex_account_credit_enabled("codex-2"));
+    assert!(!state
+        .settings
+        .current()
+        .is_codex_account_credit_enabled("codex-1"));
+    assert!(!state
+        .settings
+        .current()
+        .is_codex_account_credit_enabled("codex-2"));
 
     std::fs::remove_dir_all(temp_dir).ok();
 }
@@ -283,14 +371,14 @@ async fn exhausted_codex_account_with_credits_off_is_excluded_from_selection() {
     std::fs::write(&config_path, "logging-to-file: false\n").unwrap();
 
     let state = Arc::new(
-        AppState::new(&GatewayConfig {
+        AppState::new(&common::managed_ref(&GatewayConfig {
             auth_dir: temp_dir.clone(),
             config_path,
             api_keys: mahoquot_gateway::inbound::ApiKeys::from_env_value("test-key"),
             auth_refresh_enabled: false,
             strategy: Strategy::FillFirst,
             ..GatewayConfig::default()
-        })
+        }))
         .unwrap(),
     );
 
@@ -311,16 +399,19 @@ async fn exhausted_codex_account_with_credits_off_is_excluded_from_selection() {
 
     let app = create_app(Arc::clone(&state));
 
-    assert!(!state.settings.current().is_codex_account_credit_enabled("codex-1"));
+    assert!(!state
+        .settings
+        .current()
+        .is_codex_account_credit_enabled("codex-1"));
     let res = app
         .clone()
-        .oneshot(
+        .oneshot(common::with_loopback_peer(
             axum::http::Request::post("/v1/chat/completions")
                 .header("authorization", "Bearer test-key")
                 .header("content-type", "application/json")
                 .body(Body::from(common::session_request("sess-1")))
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
 
@@ -333,17 +424,20 @@ async fn exhausted_codex_account_with_credits_off_is_excluded_from_selection() {
             s.set_codex_account_credit_use("codex-1".to_string(), true);
         })
         .unwrap();
-    assert!(state.settings.current().is_codex_account_credit_enabled("codex-1"));
+    assert!(state
+        .settings
+        .current()
+        .is_codex_account_credit_enabled("codex-1"));
 
     let res = app
         .clone()
-        .oneshot(
+        .oneshot(common::with_loopback_peer(
             axum::http::Request::post("/v1/chat/completions")
                 .header("authorization", "Bearer test-key")
                 .header("content-type", "application/json")
                 .body(Body::from(common::session_request("sess-2")))
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
 
@@ -391,14 +485,14 @@ async fn authoritative_overage_limit_is_never_bypassed_by_credits_on() {
     std::fs::write(&config_path, "logging-to-file: false\n").unwrap();
 
     let state = Arc::new(
-        AppState::new(&GatewayConfig {
+        AppState::new(&common::managed_ref(&GatewayConfig {
             auth_dir: temp_dir.clone(),
             config_path,
             api_keys: mahoquot_gateway::inbound::ApiKeys::from_env_value("test-key"),
             auth_refresh_enabled: false,
             strategy: Strategy::FillFirst,
             ..GatewayConfig::default()
-        })
+        }))
         .unwrap(),
     );
 
@@ -423,20 +517,23 @@ async fn authoritative_overage_limit_is_never_bypassed_by_credits_on() {
             s.set_codex_account_credit_use("codex-hard".to_string(), true);
         })
         .unwrap();
-    assert!(state.settings.current().is_codex_account_credit_enabled("codex-hard"));
+    assert!(state
+        .settings
+        .current()
+        .is_codex_account_credit_enabled("codex-hard"));
     assert!(member.usage_snapshot().is_codex_hard_limit_reached());
 
     let app = create_app(Arc::clone(&state));
 
     let res = app
         .clone()
-        .oneshot(
+        .oneshot(common::with_loopback_peer(
             axum::http::Request::post("/v1/chat/completions")
                 .header("authorization", "Bearer test-key")
                 .header("content-type", "application/json")
                 .body(Body::from(common::session_request("sess-hard")))
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
 
@@ -456,14 +553,14 @@ async fn model_matching_contract_isolates_exhausted_group_buckets() {
     std::fs::write(&config_path, "logging-to-file: false\n").unwrap();
 
     let state = Arc::new(
-        AppState::new(&GatewayConfig {
+        AppState::new(&common::managed_ref(&GatewayConfig {
             auth_dir: temp_dir.clone(),
             config_path,
             api_keys: mahoquot_gateway::inbound::ApiKeys::from_env_value("test-key"),
             auth_refresh_enabled: false,
             strategy: Strategy::FillFirst,
             ..GatewayConfig::default()
-        })
+        }))
         .unwrap(),
     );
 
@@ -491,10 +588,19 @@ async fn model_matching_contract_isolates_exhausted_group_buckets() {
         ..Default::default()
     });
 
-    assert!(!state.settings.current().is_codex_account_credit_enabled("codex-mm"));
-    assert!(member.usage_snapshot().is_codex_included_quota_exhausted(Some("bengalfox"), now));
-    assert!(member.usage_snapshot().is_codex_included_quota_exhausted(Some("gpt-5.3-codex-spark"), now));
-    assert!(!member.usage_snapshot().is_codex_included_quota_exhausted(Some("gpt-5.6-sol"), now));
+    assert!(!state
+        .settings
+        .current()
+        .is_codex_account_credit_enabled("codex-mm"));
+    assert!(member
+        .usage_snapshot()
+        .is_codex_included_quota_exhausted(Some("bengalfox"), now));
+    assert!(member
+        .usage_snapshot()
+        .is_codex_included_quota_exhausted(Some("gpt-5.3-codex-spark"), now));
+    assert!(!member
+        .usage_snapshot()
+        .is_codex_included_quota_exhausted(Some("gpt-5.6-sol"), now));
 
     std::fs::remove_dir_all(temp_dir).ok();
 }
@@ -561,7 +667,7 @@ async fn failover_skips_exhausted_codex_account_when_credits_off() {
     std::fs::write(&config_path, "logging-to-file: false\n").unwrap();
 
     let state = Arc::new(
-        AppState::new(&GatewayConfig {
+        AppState::new(&common::managed_ref(&GatewayConfig {
             auth_dir: temp_dir.clone(),
             config_path,
             api_keys: mahoquot_gateway::inbound::ApiKeys::from_env_value("test-key"),
@@ -569,7 +675,7 @@ async fn failover_skips_exhausted_codex_account_when_credits_off() {
             strategy: Strategy::FillFirst,
             max_failover: 2,
             ..GatewayConfig::default()
-        })
+        }))
         .unwrap(),
     );
 
@@ -591,13 +697,13 @@ async fn failover_skips_exhausted_codex_account_when_credits_off() {
 
     let _ = app
         .clone()
-        .oneshot(
+        .oneshot(common::with_loopback_peer(
             axum::http::Request::post("/v1/chat/completions")
                 .header("authorization", "Bearer test-key")
                 .header("content-type", "application/json")
                 .body(Body::from(common::session_request("sess-fail-1")))
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
 
@@ -613,13 +719,13 @@ async fn failover_skips_exhausted_codex_account_when_credits_off() {
 
     let res = app
         .clone()
-        .oneshot(
+        .oneshot(common::with_loopback_peer(
             axum::http::Request::post("/v1/chat/completions")
                 .header("authorization", "Bearer test-key")
                 .header("content-type", "application/json")
                 .body(Body::from(common::session_request("sess-fail-2")))
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
 

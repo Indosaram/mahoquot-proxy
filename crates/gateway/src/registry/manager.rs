@@ -86,6 +86,7 @@ pub struct CatalogManager {
     lkg_cache: LkgCache,
     status: Arc<RwLock<CatalogStatus>>,
     http_client: reqwest::Client,
+    proxy_snapshot: RwLock<Option<Arc<ArcSwap<crate::proxy_policy::ProxySnapshot>>>>,
     unified_runtime:
         Arc<RwLock<Option<std::sync::Weak<crate::runtime_state::UnifiedRuntimeState>>>>,
     last_sig_etag: Arc<RwLock<Option<String>>>,
@@ -99,6 +100,10 @@ pub struct CatalogManager {
 pub type RuntimeCatalog = CatalogManager;
 
 impl CatalogManager {
+    pub fn bind_proxy(&self, proxy: Arc<ArcSwap<crate::proxy_policy::ProxySnapshot>>) {
+        *self.proxy_snapshot.write().expect("proxy binding lock") = Some(proxy);
+    }
+
     /// Boot the catalog manager synchronously following the offline-first loading order:
     /// 1. Embedded fallback catalog is loaded.
     /// 2. If valid LKG exists on disk with version >= embedded, LKG is adopted.
@@ -174,6 +179,7 @@ impl CatalogManager {
         record_cache_source(&metrics, active.source());
 
         let http_client = reqwest::Client::builder()
+            .no_proxy()
             .timeout(config.request_timeout)
             .build()
             .unwrap_or_default();
@@ -186,6 +192,7 @@ impl CatalogManager {
             lkg_cache,
             status: Arc::new(RwLock::new(status)),
             http_client,
+            proxy_snapshot: RwLock::new(None),
             unified_runtime: Arc::new(RwLock::new(None)),
             last_sig_etag: Arc::new(RwLock::new(None)),
             last_cat_etag: Arc::new(RwLock::new(None)),
@@ -231,6 +238,11 @@ impl CatalogManager {
     /// Return the active catalog source.
     pub fn active_source(&self) -> CatalogSource {
         self.current_snapshot().source()
+    }
+
+    /// Return the active catalog generated_at unix timestamp if known.
+    pub fn active_created_unix(&self) -> u64 {
+        self.status().generated_at.unwrap_or(0)
     }
 
     /// Return a copy of the current status.
@@ -346,7 +358,11 @@ impl CatalogManager {
             .and_then(|r| r.upgrade());
         if let Some(runtime) = runtime {
             runtime
-                .update_registry_with_commit(composed, commit)
+                .update_registry_with_created_and_commit(
+                    composed,
+                    envelope.generated_at as i64,
+                    commit,
+                )
                 .map_err(|err| CatalogError::InvalidState(err.to_string()))?;
         } else {
             commit().map_err(|err| CatalogError::InvalidState(err.to_string()))?;
@@ -526,7 +542,16 @@ impl CatalogManager {
         now: u64,
     ) -> Result<Arc<RegistrySnapshot>, CatalogError> {
         // 1. Fetch detached signature envelope with optional conditional GET
-        let mut sig_req = self.http_client.get(signature_url);
+        let client = self
+            .proxy_snapshot
+            .read()
+            .expect("proxy binding lock")
+            .as_ref()
+            .map(|proxy| proxy.load().default_client.clone())
+            .unwrap_or_else(|| self.http_client.clone());
+        let mut sig_req = client
+            .get(signature_url)
+            .timeout(self.config.request_timeout);
         if let Ok(guard) = self.last_sig_etag.read() {
             if let Some(ref etag) = *guard {
                 sig_req = sig_req.header(reqwest::header::IF_NONE_MATCH, etag);
@@ -563,7 +588,7 @@ impl CatalogManager {
         let envelope = CatalogEnvelope::from_json(&sig_text)?;
 
         // 2. Fetch catalog payload with optional conditional GET
-        let mut cat_req = self.http_client.get(catalog_url);
+        let mut cat_req = client.get(catalog_url).timeout(self.config.request_timeout);
         if let Ok(guard) = self.last_cat_etag.read() {
             if let Some(ref etag) = *guard {
                 cat_req = cat_req.header(reqwest::header::IF_NONE_MATCH, etag);
@@ -804,6 +829,59 @@ pub fn refresh_is_due(last_refresh_at: Option<u64>, now: u64, interval_secs: u64
 #[cfg(test)]
 mod refresh_poll_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn catalog_proxy_refresh_reads_replacement_snapshot_on_wire() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("proxy bind");
+        let proxy_port = listener.local_addr().expect("proxy addr").port();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+            let tx = tx.clone();
+            async move {
+                tx.send(uri.to_string()).await.expect("capture");
+                axum::http::StatusCode::NOT_FOUND
+            }
+        });
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    stop_rx.await.expect("stop");
+                })
+                .await
+                .expect("serve");
+        });
+        let manager = CatalogManager::boot(CatalogConfig::default(), 1_700_000_000);
+        let mut settings = crate::management::settings::Settings {
+            proxy_url: "http://127.0.0.1:18850".into(),
+            ..Default::default()
+        };
+        let proxy = Arc::new(ArcSwap::from_pointee(
+            crate::proxy_policy::ProxySnapshot::from_settings(&settings).expect("old snapshot"),
+        ));
+        manager.bind_proxy(Arc::clone(&proxy));
+        settings.proxy_url = format!("http://127.0.0.1:{proxy_port}");
+        proxy.store(Arc::new(
+            crate::proxy_policy::ProxySnapshot::from_settings(&settings).expect("new snapshot"),
+        ));
+        let result = manager
+            .fetch_and_apply_inner(
+                "http://127.0.0.1:18851/catalog",
+                "http://127.0.0.1:18851/catalog-signature-new",
+                1_700_000_000,
+            )
+            .await;
+        assert!(matches!(result, Err(CatalogError::RemoteUnpublished)));
+        let captured = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("capture deadline")
+            .expect("capture");
+        assert!(captured.contains("/catalog-signature-new"));
+        stop_tx.send(()).expect("shutdown");
+        server.await.expect("join");
+    }
 
     #[test]
     fn a_never_refreshed_catalog_is_due_immediately() {

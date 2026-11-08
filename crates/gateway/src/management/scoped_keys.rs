@@ -182,50 +182,57 @@ async fn patch_scoped_key(
     let settings = Arc::clone(&state.settings);
     let tracker = Arc::clone(&state.scoped_keys);
     let task = tokio::task::spawn_blocking(move || {
-      let mut updated_view: Option<ScopedKeyView> = None;
-      let result = settings.mutate(|s| {
-        if let Some(key) = s.scoped_api_keys.iter_mut().find(|k| k.id == id) {
-            if let Some(entry) = tracker.get(&key.key_identifier) {
-                key.token_used = key.token_used.max(entry.token_used());
-            }
-            if let Some(name) = payload.name {
-                key.name = name.trim().to_string();
-            }
-            if let Some(raw) = payload.raw_key {
-                let trimmed = raw.trim().to_string();
-                if !trimmed.is_empty() {
-                    key.key_identifier = stable_key_identifier(&trimmed);
-                    key.key_prefix = format!("{}...", key_prefix_source(&trimmed));
-                    key.raw_key = Some(trimmed);
+        let mut updated_view: Option<ScopedKeyView> = None;
+        let result = settings.mutate(|s| {
+            if let Some(key) = s.scoped_api_keys.iter_mut().find(|k| k.id == id) {
+                if let Some(entry) = tracker.get(&key.key_identifier) {
+                    key.token_used = key.token_used.max(entry.token_used());
                 }
+                if let Some(name) = payload.name {
+                    key.name = name.trim().to_string();
+                }
+                if let Some(raw) = payload.raw_key {
+                    let trimmed = raw.trim().to_string();
+                    if !trimmed.is_empty() {
+                        key.key_identifier = stable_key_identifier(&trimmed);
+                        key.key_prefix = format!("{}...", key_prefix_source(&trimmed));
+                        key.raw_key = Some(trimmed);
+                    }
+                }
+                if let Some(providers) = payload.allowed_providers {
+                    key.allowed_providers = providers;
+                }
+                if let Some(accounts) = payload.allowed_accounts {
+                    key.allowed_accounts = accounts;
+                }
+                if let Some(models) = payload.allowed_models {
+                    key.allowed_models = models;
+                }
+                if let Some(limit) = payload.token_limit {
+                    key.token_limit = limit;
+                }
+                if let Some(active) = payload.is_active {
+                    key.is_active = active;
+                }
+                if let Some(expires) = payload.expires_at_ms {
+                    key.expires_at_ms = expires;
+                }
+                updated_view = Some(ScopedKeyView::from_key(key, None));
             }
-            if let Some(providers) = payload.allowed_providers {
-                key.allowed_providers = providers;
-            }
-            if let Some(accounts) = payload.allowed_accounts {
-                key.allowed_accounts = accounts;
-            }
-            if let Some(models) = payload.allowed_models {
-                key.allowed_models = models;
-            }
-            if let Some(limit) = payload.token_limit {
-                key.token_limit = limit;
-            }
-            if let Some(active) = payload.is_active {
-                key.is_active = active;
-            }
-            if let Some(expires) = payload.expires_at_ms {
-                key.expires_at_ms = expires;
-            }
-            updated_view = Some(ScopedKeyView::from_key(key, None));
-        }
-    });
+        });
 
-      (result, updated_view)
-    }).await;
+        (result, updated_view)
+    })
+    .await;
     let (result, updated_view) = match task {
         Ok(result) => result,
-        Err(err) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("scoped key write task failed: {err}")}))).into_response(),
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("scoped key write task failed: {err}")})),
+            )
+                .into_response()
+        }
     };
     match result {
         Ok(_) => match updated_view {
@@ -253,18 +260,25 @@ async fn patch_scoped_key(
 async fn delete_scoped_key(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
     let settings = Arc::clone(&state.settings);
     let task = tokio::task::spawn_blocking(move || {
-      let mut found = false;
-      let result = settings.mutate(|s| {
-        let initial_len = s.scoped_api_keys.len();
-        s.scoped_api_keys.retain(|k| k.id != id);
-        found = s.scoped_api_keys.len() < initial_len;
-    });
+        let mut found = false;
+        let result = settings.mutate(|s| {
+            let initial_len = s.scoped_api_keys.len();
+            s.scoped_api_keys.retain(|k| k.id != id);
+            found = s.scoped_api_keys.len() < initial_len;
+        });
 
-      (result, found)
-    }).await;
+        (result, found)
+    })
+    .await;
     let (result, found) = match task {
         Ok(result) => result,
-        Err(err) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("scoped key write task failed: {err}")}))).into_response(),
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("scoped key write task failed: {err}")})),
+            )
+                .into_response()
+        }
     };
     match result {
         Ok(_) => {

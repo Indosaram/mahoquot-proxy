@@ -134,7 +134,8 @@ impl GeminiChunkRenderer {
                 return;
             };
 
-            let mut part = json!({"functionCall":{"id":tool.call_id,"name":tool.name,"args":parsed}});
+            let mut part =
+                json!({"functionCall":{"id":tool.call_id,"name":tool.name,"args":parsed}});
             if let Some(signature) = self
                 .replay
                 .as_ref()
@@ -214,7 +215,15 @@ impl GeminiChunkRenderer {
                     return out;
                 }
                 self.terminated = true;
-                out.push(self.frame_for(json!([]), Some(if self.output_limit_reached { "MAX_TOKENS" } else { "STOP" }), usage.as_ref()));
+                out.push(self.frame_for(
+                    json!([]),
+                    Some(if self.output_limit_reached {
+                        "MAX_TOKENS"
+                    } else {
+                        "STOP"
+                    }),
+                    usage.as_ref(),
+                ));
                 out
             }
             CodexEvent::Failed { message } => {
@@ -237,7 +246,11 @@ impl GeminiChunkRenderer {
             return out;
         }
         self.terminated = true;
-        let finish = if self.output_limit_reached { "MAX_TOKENS" } else { "STOP" };
+        let finish = if self.output_limit_reached {
+            "MAX_TOKENS"
+        } else {
+            "STOP"
+        };
         out.push(self.frame_for(json!([]), Some(finish), None));
         out
     }
@@ -305,6 +318,26 @@ impl ChunkRenderer {
         let mut out = Vec::new();
         self.role_prelude(&mut out);
         out
+    }
+
+    /// Keepalive for a quiet upstream on the `chat.completion.chunk` path.
+    ///
+    /// Only the Anthropic renderer emitted a keepalive, so `/v1/chat/completions`
+    /// callers sat in byte silence for the whole thinking phase of a long turn.
+    /// Clients that bound provider silence (mhc cancels after an idle timeout)
+    /// killed the request even though the upstream was healthy.
+    ///
+    /// The frame still carries a real `choices[0].delta` because mhc only re-arms
+    /// its idle bound on a public event, not on SSE comments: an empty delta is
+    /// classified as progress and deliberately does not reset the timer.
+    pub fn tick(&mut self) -> Bytes {
+        if self.terminated {
+            return Bytes::new();
+        }
+        let mut out = Vec::new();
+        self.role_prelude(&mut out);
+        out.push(self.chunk(json!({}), None));
+        out.concat().into()
     }
 
     pub fn render(&mut self, event: CodexEvent) -> Vec<Bytes> {
@@ -406,17 +439,9 @@ impl ChunkRenderer {
         if self.terminated {
             return Vec::new();
         }
-        self.terminated = true;
-        let mut out = Vec::new();
-        self.role_prelude(&mut out);
-        let reason = if self.saw_tool_call {
-            "tool_calls"
-        } else {
-            "stop"
-        };
-        out.push(self.chunk(json!({}), Some(reason)));
-        out.push(Bytes::from_static(DONE_FRAME));
-        out
+        self.render(CodexEvent::Failed {
+            message: "upstream stream ended before completion".into(),
+        })
     }
 }
 
@@ -532,7 +557,7 @@ impl Aggregator {
 
     /// Gemini-native shape for the `/v1beta` surface, which nests text under
     /// `candidates[].content.parts[]` instead of `choices[]`.
-    pub fn into_gemini(self) -> Value {
+    pub fn into_gemini(self) -> Result<Value, String> {
         let replay = self.replay;
         let mut renderer = match replay {
             Some(replay) => {
@@ -543,7 +568,11 @@ impl Aggregator {
         let mut parts = Vec::new();
         for event in self.native_events {
             for frame in renderer.render(event) {
-                let payload: Value = serde_json::from_slice(&frame[6..]).expect("renderer emits JSON");
+                let payload: Value =
+                    serde_json::from_slice(&frame[6..]).expect("renderer emits JSON");
+                if let Some(error) = payload.pointer("/error/message").and_then(Value::as_str) {
+                    return Err(error.to_string());
+                }
                 if let Some(emitted) = payload
                     .pointer("/candidates/0/content/parts")
                     .and_then(Value::as_array)
@@ -554,6 +583,9 @@ impl Aggregator {
         }
         for frame in renderer.close_unterminated() {
             let payload: Value = serde_json::from_slice(&frame[6..]).expect("renderer emits JSON");
+            if let Some(error) = payload.pointer("/error/message").and_then(Value::as_str) {
+                return Err(error.to_string());
+            }
             if let Some(emitted) = payload
                 .pointer("/candidates/0/content/parts")
                 .and_then(Value::as_array)
@@ -585,7 +617,7 @@ impl Aggregator {
                 payload["usageMetadata"]["cachedContentTokenCount"] = json!(usage.cached_tokens);
             }
         }
-        payload
+        Ok(payload)
     }
 
     /// Canonical OpenAI Responses shape for the `/v1/responses` surface,
@@ -647,19 +679,38 @@ mod openai_stream_tests {
         for value in [None, Some(0), Some(17)] {
             // Given normalized usage retaining upstream presence.
             let usage = Usage {
-                prompt_tokens: 30, completion_tokens: 2, total_tokens: 32,
-                cached_tokens: value.unwrap_or(0), cached_tokens_known: value.is_some(),
-                cache_write_tokens: value.unwrap_or(0), cache_write_tokens_known: value.is_some(),
+                prompt_tokens: 30,
+                completion_tokens: 2,
+                total_tokens: 32,
+                cached_tokens: value.unwrap_or(0),
+                cached_tokens_known: value.is_some(),
+                cache_write_tokens: value.unwrap_or(0),
+                cache_write_tokens_known: value.is_some(),
                 reasoning_tokens: 0,
             };
             // When rendered to client usage.
             let wire = usage_value(&usage);
             // Then missing fields stay absent while genuine zeros survive.
-            assert_eq!(wire.pointer("/prompt_tokens_details/cached_tokens").and_then(Value::as_u64), value);
-            assert_eq!(wire.pointer("/prompt_tokens_details/cache_write_tokens").and_then(Value::as_u64), value);
+            assert_eq!(
+                wire.pointer("/prompt_tokens_details/cached_tokens")
+                    .and_then(Value::as_u64),
+                value
+            );
+            assert_eq!(
+                wire.pointer("/prompt_tokens_details/cache_write_tokens")
+                    .and_then(Value::as_u64),
+                value
+            );
             let mut aggregate = Aggregator::new("gemini".into(), 1);
             aggregate.push(CodexEvent::Completed { usage: Some(usage) });
-            assert_eq!(aggregate.into_gemini().pointer("/usageMetadata/cachedContentTokenCount").and_then(Value::as_u64), value);
+            assert_eq!(
+                aggregate
+                    .into_gemini()
+                    .expect("valid usage")
+                    .pointer("/usageMetadata/cachedContentTokenCount")
+                    .and_then(Value::as_u64),
+                value
+            );
         }
     }
 
@@ -855,7 +906,7 @@ mod gemini_stream_tests {
             output_index: 0,
             delta: "{\"city\":\"Seoul\"}".to_string(),
         });
-        let out = agg.into_gemini();
+        let out = agg.into_gemini().expect("valid tool call");
 
         let parts = out["candidates"][0]["content"]["parts"]
             .as_array()
@@ -874,7 +925,6 @@ mod gemini_stream_tests {
             "finishReason must stay inside the Gemini enum: {out}"
         );
     }
-
 }
 
 #[cfg(test)]
@@ -890,5 +940,47 @@ mod open_frame_tests {
         assert!(frame.starts_with("data: "), "not an SSE frame: {frame}");
         assert!(frame.contains("\"role\":\"assistant\""), "no role: {frame}");
         assert!(renderer.open().is_empty(), "role chunk repeated");
+    }
+
+    #[test]
+    fn tick_keeps_a_chat_stream_alive_without_terminating_it() {
+        // A long thinking phase upstream sends no events at all. Before the
+        // tick existed the chat path emitted nothing either, so clients that
+        // bound provider silence cancelled a healthy request (mhc's 5m idle
+        // guard produced `status: 499` at the gateway).
+        let mut renderer = ChunkRenderer::new("cursor/claude-opus-5.5".to_string(), 7, false);
+        let first = renderer.tick();
+        let frame = String::from_utf8_lossy(&first);
+        assert!(frame.starts_with("data: "), "not an SSE frame: {frame}");
+        assert!(
+            frame.contains("\"object\":\"chat.completion.chunk\""),
+            "keepalive must stay a chat chunk: {frame}"
+        );
+        assert!(
+            frame.contains("\"choices\""),
+            "keepalive must carry a choice so clients re-arm their idle bound: {frame}"
+        );
+        assert!(
+            !renderer.terminated(),
+            "a keepalive must not end the stream"
+        );
+        // The first tick also carries the role prelude, later ticks must not.
+        let second = String::from_utf8_lossy(&renderer.tick()).into_owned();
+        assert!(second.starts_with("data: "), "not an SSE frame: {second}");
+        assert!(
+            !second.contains("\"role\":\"assistant\""),
+            "role chunk repeated by keepalive: {second}"
+        );
+    }
+
+    #[test]
+    fn tick_stops_once_the_stream_is_terminated() {
+        let mut renderer = ChunkRenderer::new("cursor/x".to_string(), 7, false);
+        renderer.render(CodexEvent::Completed { usage: None });
+        assert!(renderer.terminated());
+        assert!(
+            renderer.tick().is_empty(),
+            "a terminated stream must not emit keepalives"
+        );
     }
 }

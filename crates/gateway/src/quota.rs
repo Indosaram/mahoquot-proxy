@@ -1,5 +1,4 @@
 use std::collections::{BTreeSet, HashMap};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -7,8 +6,8 @@ use crate::account::{AccountMember, ProviderKind};
 use crate::state::AppState;
 use crate::usage::{
     parse_clinepass_usage_summary, parse_cursor_usage_summary, parse_inferx_balance,
-    parse_kiro_usage_summary, parse_xai_billing_credits,
-    ResetCredit, WhamResetCreditList, WhamUsage,
+    parse_kiro_usage_summary, parse_xai_billing_credits, ResetCredit, WhamResetCreditList,
+    WhamUsage,
 };
 
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
@@ -321,7 +320,9 @@ async fn refresh_account_usage_inner(
                 .as_deref()
                 .map(|base| format!("{}/auth/usage-summary", base.trim_end_matches('/')))
                 .unwrap_or_else(|| CURSOR_USAGE_URL.to_string());
-            let client = state.client_for_member(member);
+            let client = state.try_client_for_member(member).map_err(|error| {
+                QuotaError::Upstream(format!("proxy client construction failed: {error}"))
+            })?;
             refresh_json_usage(member, &client, &url, parse_cursor_usage_summary).await
         }
         ProviderKind::Kiro => {
@@ -330,23 +331,52 @@ async fn refresh_account_usage_inner(
                 .as_deref()
                 .map(|base| format!("{}/getUsageLimits", base.trim_end_matches('/')))
                 .unwrap_or_else(|| KIRO_USAGE_URL.to_string());
-            let client = state.client_for_member(member);
+            let client = state.try_client_for_member(member).map_err(|error| {
+                QuotaError::Upstream(format!("proxy client construction failed: {error}"))
+            })?;
             refresh_json_usage(member, &client, &url, parse_kiro_usage_summary).await
         }
         ProviderKind::Zcode => refresh_zcode_usage(state, member).await,
         ProviderKind::Vertex => Err(QuotaError::Unsupported),
+        ProviderKind::OpenCode => Ok(()),
         ProviderKind::Devin => Err(QuotaError::Unsupported),
         ProviderKind::Generic => refresh_generic_usage(state, member).await,
     }
 }
 
-/// Generic accounts expose no per-provider quota API, except two hardcoded
-/// adapters: ClinePass (a `cline-pass` account on the canonical Cline
-/// endpoint reports the three subscription windows from `usage-limits`) and
-/// InferX (a prepaid marketplace whose `/v1/balance` reports a wallet in
-/// microcredits). Both authenticate with the account's own API key as bearer
-/// auth. Everything else stays Unsupported so the UI renders "unknown"
-/// instead of a fake 0%.
+/// Generic accounts expose no per-provider quota API, except hardcoded
+/// adapters: Z.AI / Zhipu coding-plan keys (`/api/monitor/usage/quota/limit`),
+/// ClinePass, InferX, and xAI. Everything else stays Unsupported so the UI
+/// renders "unknown" instead of a fake 0%.
+fn coding_plan_quota_url(provider: &str, base: &str) -> Option<String> {
+    let origin = coding_plan_origin(base)
+        .or_else(|| coding_plan_default_origin(provider).map(str::to_string))?;
+    Some(format!("{origin}/api/monitor/usage/quota/limit"))
+}
+
+fn coding_plan_origin(base: &str) -> Option<String> {
+    let trimmed = base.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let url = reqwest::Url::parse(trimmed).ok()?;
+    let host = url.host_str()?.to_ascii_lowercase();
+    if host == "api.z.ai" || host == "open.bigmodel.cn" {
+        return Some(format!("{}://{host}", url.scheme()));
+    }
+    None
+}
+
+fn coding_plan_default_origin(provider: &str) -> Option<&'static str> {
+    match provider.to_ascii_lowercase().as_str() {
+        "zai" | "glm" => Some("https://api.z.ai"),
+        "zhipu-bigmodel" | "zhipu-bigmodel-coding" => Some("https://open.bigmodel.cn"),
+        _ => None,
+    }
+}
+
+/// Generic accounts expose no per-provider quota API, except the adapters
+/// above. Authentication is the account's own API key.
 async fn refresh_generic_usage(
     state: &AppState,
     member: &Arc<AccountMember>,
@@ -367,7 +397,9 @@ async fn refresh_generic_usage(
             return Err(QuotaError::Unsupported);
         }
         let url = format!("{}/balance", base.trim_end_matches('/'));
-        let client = state.client_for_member(member);
+        let client = state.try_client_for_member(member).map_err(|error| {
+            QuotaError::Upstream(format!("proxy client construction failed: {error}"))
+        })?;
         return refresh_json_usage(member, &client, &url, |body, now| {
             parse_inferx_balance(body, now).unwrap_or_default()
         })
@@ -378,16 +410,49 @@ async fn refresh_generic_usage(
     // Grok Chat, Build and the CLI; the Grok CLI's own usage view reads it from
     // the CLI chat proxy with the same OAuth bearer the relay uses.
     if provider.eq_ignore_ascii_case("xai") {
+        // Billing never refreshes the OAuth grant. Swallowing a failed refresh
+        // made an expired access token look like a permanent rejection.
         let url = member
             .usage_override
             .as_deref()
             .map(|base| format!("{}/v1/billing?format=credits", base.trim_end_matches('/')))
             .unwrap_or_else(|| XAI_USAGE_URL.to_string());
-        let client = state.client_for_member(member);
-        return refresh_json_usage(member, &client, &url, |body, now| {
+        let client = state.try_client_for_member(member).map_err(|error| {
+            QuotaError::Upstream(format!("proxy client construction failed: {error}"))
+        })?;
+        if state.auth_refresh_enabled && member.is_expired(now_unix()) {
+            state
+                .refresh_member(member, None)
+                .await
+                .map_err(|error| QuotaError::Upstream(format!("refresh failed: {error}")))?;
+        }
+        let used = member.access_token();
+        let parse = |body: &serde_json::Value, now: i64| {
             parse_xai_billing_credits(body, now).unwrap_or_default()
-        })
-        .await;
+        };
+        let first = refresh_json_usage(member, &client, &url, parse).await;
+        if state.auth_refresh_enabled && first.as_ref().is_err_and(credential_rejection) {
+            state
+                .refresh_member(member, Some(&used))
+                .await
+                .map_err(|error| QuotaError::Upstream(format!("refresh failed: {error}")))?;
+            return refresh_json_usage(member, &client, &url, parse).await;
+        }
+        return first;
+    }
+
+    let quota_base = member
+        .usage_override
+        .clone()
+        .or_else(|| member.upstream_override.clone())
+        .or_else(|| member.generic_base_url())
+        .unwrap_or_default();
+    if let Some(url) = coding_plan_quota_url(&provider, &quota_base) {
+        let client = state.try_client_for_member(member).map_err(|error| {
+            QuotaError::Upstream(format!("proxy client construction failed: {error}"))
+        })?;
+        return refresh_json_usage(member, &client, &url, crate::usage::parse_coding_plan_quota)
+            .await;
     }
 
     let is_clinepass = provider.eq_ignore_ascii_case("cline-pass")
@@ -408,7 +473,9 @@ async fn refresh_generic_usage(
     } else {
         return Err(QuotaError::Unsupported);
     };
-    let client = state.client_for_member(member);
+    let client = state.try_client_for_member(member).map_err(|error| {
+        QuotaError::Upstream(format!("proxy client construction failed: {error}"))
+    })?;
     refresh_json_usage(member, &client, &url, |body, now| {
         parse_clinepass_usage_summary(body, now).unwrap_or_default()
     })
@@ -418,60 +485,17 @@ async fn refresh_generic_usage(
 /// ZCode plan quota comes from the gateway's billing control plane: a direct
 /// `billing/balance` probe with the plan JWT and the client identity headers
 /// (minus X-ZCode-Agent) plus the per-install device id — the same call the
-/// desktop client makes. Accounts that cannot probe yet (old credentials, WAF
-/// challenge) fall back to scraping the desktop app's balance logs.
+/// desktop client makes. Global desktop logs have no verified account binding
+/// and must not replace a member's quota when its authenticated probe fails.
 async fn refresh_zcode_usage(
     state: &AppState,
     member: &Arc<AccountMember>,
 ) -> Result<(), QuotaError> {
-    let now_unix = now_unix();
-    match try_zcode_balance_probe(state, member, now_unix).await {
-        Ok(()) => return Ok(()),
-        Err(QuotaError::Unauthorized) => return Err(QuotaError::Unauthorized),
-        Err(_) => {}
-    }
-    let logs_dir = std::env::var("ZCODE_LOGS_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_default();
-            PathBuf::from(home).join(".zcode/v2/logs")
-        });
-    if !logs_dir.is_dir() {
-        return Err(QuotaError::Unsupported);
-    }
-    let scan = tokio::task::spawn_blocking(
-        move || -> Result<Vec<crate::usage::ZcodeBalanceEntry>, QuotaError> {
-        let mut entries: Vec<PathBuf> = std::fs::read_dir(&logs_dir)
-            .map_err(|error| QuotaError::Upstream(format!(
-                "ZCode desktop logs not readable at {}: {error} (is the ZCode desktop app installed?)",
-                logs_dir.display()
-            )))?
-            .flatten()
-            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "log"))
-            .map(|entry| entry.path())
-            .collect();
-        entries.sort();
-        let newest = entries
-            .pop()
-            .ok_or_else(|| QuotaError::Upstream("no ZCode desktop logs found".to_string()))?;
-        let text = std::fs::read_to_string(&newest)
-            .map_err(|error| QuotaError::Upstream(error.to_string()))?;
-        crate::usage::extract_zcode_balances(&text)
-            .ok_or_else(|| QuotaError::Upstream(
-                "no plan balance entry found in ZCode desktop logs - open the ZCode desktop app once".to_string(),
-            ))
-    })
-    .await
-    .map_err(|error| QuotaError::Upstream(error.to_string()))?;
-    scan.map(|balances| {
-        let usage = crate::usage::zcode_balances_usage(&balances, now_unix);
-        member.set_usage(usage);
-    })
+    try_zcode_balance_probe(state, member, now_unix()).await
 }
 
 /// One billing/balance probe against the plan gateway's control plane.
-/// `Unauthorized` on a 4xx (terminal — no log-scan fallback), other failures
-/// let the caller fall back to the desktop-log scrape.
+/// Failures preserve the previous account-specific snapshot.
 async fn try_zcode_balance_probe(
     state: &AppState,
     member: &Arc<AccountMember>,
@@ -496,7 +520,9 @@ async fn try_zcode_balance_probe(
         urlencode_component(mahoquot_providers::zcode::ZCODE_APP_VERSION),
         urlencode_component(&platform),
     );
-    let client = state.client_for_member(member);
+    let client = state.try_client_for_member(member).map_err(|error| {
+        QuotaError::Upstream(format!("proxy client construction failed: {error}"))
+    })?;
     let mut request = client.get(&url).timeout(Duration::from_secs(20));
     for (name, value) in mahoquot_providers::zcode::plan_billing_headers(
         &jwt,
@@ -551,7 +577,10 @@ async fn try_zcode_balance_probe(
             period_end_unix: row.period_end_unix.unwrap_or(0),
         })
         .collect::<Vec<_>>();
-    let usage = crate::usage::zcode_balances_usage(&entries, now_unix);
+    let mut usage = crate::usage::zcode_balances_usage(&entries, now_unix);
+    usage.refreshed_at_unix = Some(now_unix);
+    usage.refresh_status = Some("ok".to_string());
+    usage.last_refresh_error = None;
     member.set_usage(usage);
     Ok(())
 }
@@ -595,6 +624,34 @@ fn urlencode_component(value: &str) -> String {
     out
 }
 
+/// A 401/403 from a usage endpoint, keeping the provider's own reason. The
+/// generic text hid causes the operator acts on differently, such as an xAI
+/// account blocked for exhausted credits versus a revoked login.
+fn rejected_usage_error(status: reqwest::StatusCode, body: &str) -> QuotaError {
+    let reason = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("error")
+                .and_then(|error| error.as_str().or_else(|| error.get("message")?.as_str()))
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| body.trim().chars().take(200).collect());
+    if reason.is_empty() {
+        QuotaError::Unauthorized
+    } else {
+        QuotaError::Upstream(format!("credentials rejected ({status}): {reason}"))
+    }
+}
+
+fn credential_rejection(error: &QuotaError) -> bool {
+    match error {
+        QuotaError::Unauthorized => true,
+        QuotaError::Upstream(message) => message.starts_with("credentials rejected"),
+        _ => false,
+    }
+}
+
 async fn refresh_json_usage(
     member: &Arc<AccountMember>,
     client: &reqwest::Client,
@@ -615,7 +672,8 @@ async fn refresh_json_usage(
         .map_err(|error| QuotaError::Upstream(error.to_string()))?;
     let status = response.status();
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        return Err(QuotaError::Unauthorized);
+        let body = response.text().await.unwrap_or_default();
+        return Err(rejected_usage_error(status, &body));
     }
     if !status.is_success() {
         return Err(QuotaError::Upstream(format!(
@@ -626,8 +684,16 @@ async fn refresh_json_usage(
         .json::<serde_json::Value>()
         .await
         .map_err(|error| QuotaError::Upstream(error.to_string()))?;
-    let usage = parser(&body, now_unix);
-    member.set_usage(usage.clone());
+    let mut usage = parser(&body, now_unix);
+    if usage.observed_at_unix.is_none() {
+        return Err(QuotaError::Upstream(
+            "quota payload had no usage".to_string(),
+        ));
+    }
+    usage.refreshed_at_unix = Some(now_unix);
+    usage.refresh_status = Some("ok".to_string());
+    usage.last_refresh_error = None;
+    member.set_usage(usage);
     Ok(())
 }
 
@@ -672,7 +738,9 @@ async fn try_claude_usage(state: &AppState, member: &Arc<AccountMember>) -> Resu
                 "relay account has no upstream_override".into(),
             ));
         }
-        let client = state.client_for_member(member);
+        let client = state.try_client_for_member(member).map_err(|error| {
+            QuotaError::Upstream(format!("proxy client construction failed: {error}"))
+        })?;
         let mut last_missing: Option<String> = None;
         for base in bases {
             let resp = client
@@ -719,8 +787,7 @@ async fn try_claude_usage(state: &AppState, member: &Arc<AccountMember>) -> Resu
                     cost_usd: totals.total_cost_usd,
                 },
             );
-            let mut usage =
-                crate::usage::parse_relay_account_usage(&payload, totals, samples, now);
+            let mut usage = crate::usage::parse_relay_account_usage(&payload, totals, samples, now);
             // Without these, `set_usage` inherits the previous failure's status
             // and error text, so one transient send error stays on screen forever.
             usage.refreshed_at_unix = Some(now);
@@ -744,7 +811,9 @@ async fn try_claude_usage(state: &AppState, member: &Arc<AccountMember>) -> Resu
         .unwrap_or(CLAUDE_API_BASE)
         .trim_end_matches('/');
 
-    let client = state.client_for_member(member);
+    let client = state.try_client_for_member(member).map_err(|error| {
+        QuotaError::Upstream(format!("proxy client construction failed: {error}"))
+    })?;
     let resp = client
         .get(format!("{base}{CLAUDE_USAGE_PATH}"))
         .header("Authorization", format!("Bearer {token}"))
@@ -847,7 +916,9 @@ async fn try_antigravity_quota(
         .ok()
         .and_then(|u| u.model_availability.clone());
 
-    let client = state.client_for_member(member);
+    let client = state.try_client_for_member(member).map_err(|error| {
+        QuotaError::Upstream(format!("proxy client construction failed: {error}"))
+    })?;
     let resp = client
         .post(&url)
         .header("Authorization", format!("Bearer {token}"))
@@ -967,13 +1038,28 @@ async fn try_antigravity_quota(
             if let Ok(models_data) = resp.json::<serde_json::Value>().await {
                 let mut models_map = std::collections::BTreeMap::new();
                 if let Some(models_obj) = models_data.get("models").and_then(|v| v.as_object()) {
-                    for model_id in models_obj.keys() {
+                    for (model_id, details) in models_obj {
+                        let text = |key: &str| {
+                            details
+                                .get(key)
+                                .and_then(|v| v.as_str())
+                                .filter(|v| !v.is_empty())
+                                .map(str::to_string)
+                        };
                         models_map.insert(
                             model_id.clone(),
                             crate::usage::ModelAvailability {
                                 available: Some(true),
                                 available_at: None,
                                 credits_would_enable: None,
+                                // `ModelDetails.model` is the enum the client
+                                // echoes in `labels.model_enum`. Keeping it
+                                // keyed by the variant id is what makes the
+                                // lookup variant-accurate.
+                                model_enum: text("model"),
+                                api_provider: text("apiProvider"),
+                                model_provider: text("modelProvider"),
+                                display_name: text("displayName"),
                             },
                         );
                     }
@@ -996,8 +1082,9 @@ async fn try_antigravity_quota(
     member.set_usage(usage);
 
     if availability_changed {
-        state.runtime.trigger_coalesced_refresh()
-            .map_err(|error| QuotaError::Upstream(format!("model catalog publication failed: {error}")))?;
+        state.runtime.trigger_coalesced_refresh().map_err(|error| {
+            QuotaError::Upstream(format!("model catalog publication failed: {error}"))
+        })?;
     }
     Ok(())
 }
@@ -1017,7 +1104,9 @@ async fn refresh_codex_usage(
         .as_deref()
         .map(|base| format!("{}/backend-api/wham/usage", base.trim_end_matches('/')))
         .unwrap_or_else(|| CODEX_USAGE_URL.to_string());
-    let client = state.client_for_member(member);
+    let client = state.try_client_for_member(member).map_err(|error| {
+        QuotaError::Upstream(format!("proxy client construction failed: {error}"))
+    })?;
     let mut req = client
         .get(usage_url)
         .header("Authorization", format!("Bearer {token}"))
@@ -1095,7 +1184,9 @@ async fn fetch_codex_reset_credits(
             )
         })
         .unwrap_or_else(|| CODEX_RESET_CREDITS_URL.to_string());
-    let client = state.client_for_member(member);
+    let client = state.try_client_for_member(member).map_err(|error| {
+        QuotaError::Upstream(format!("proxy client construction failed: {error}"))
+    })?;
     let mut req = client
         .get(url)
         .header("Authorization", format!("Bearer {token}"))
@@ -1142,7 +1233,9 @@ async fn try_consume_reset_credit(
             )
         })
         .unwrap_or_else(|| CODEX_RESET_URL.to_string());
-    let client = state.client_for_member(member);
+    let client = state.try_client_for_member(member).map_err(|error| {
+        QuotaError::Upstream(format!("proxy client construction failed: {error}"))
+    })?;
     let mut req = client
         .post(reset_url)
         .header("Authorization", format!("Bearer {token}"))
@@ -1331,6 +1424,13 @@ pub fn spawn_usage_poller(state: Arc<AppState>, every: Duration) -> UsagePollerH
                 _ = ticker.tick() => {}
                 _ = stop_signal.notified() => break,
             }
+            // While Home coordinates this node it owns credential state and
+            // quota (Task 32), so local accounts are not polled upstream. A
+            // configured Home client counts even before its first sync, so the
+            // immediate first tick does not race the initial Home handshake.
+            if crate::home::get_active_home_client().is_some_and(|home| home.enabled()) {
+                continue;
+            }
             // The refresh itself is cancellable: a shutdown during a long poll
             // must not hold the process open for the whole upstream timeout.
             tokio::select! {
@@ -1355,6 +1455,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn model_quota_reset_restores_only_the_due_model() {
+        use crate::account::{AccountMember, GenericAccount, ProviderAccount};
+        use mahoquot_types::{Health, PoolMember};
+
+        let member = AccountMember::for_test(ProviderAccount::Generic(GenericAccount {
+            identity_slug: "quota-reset".into(),
+            provider: "claude".into(),
+            adapter: "anthropic".into(),
+            models: vec!["claude-sonnet-4-6".into(), "claude-haiku-4-5".into()],
+            ..Default::default()
+        }));
+        let affected = "claude-sonnet-4-6";
+        let other = "claude-haiku-4-5";
+        let now = 1_000_000;
+        let reset = now + 60_000;
+        assert!(member.group_available(affected, now));
+        member.set_model_cooldown(affected, reset);
+        assert!(!member.group_available(affected, now));
+        assert!(!member.group_available(affected, reset - 1));
+        assert!(member.group_available(other, reset - 1));
+        assert_eq!(member.earliest_group_cooldown_ms(now), Some(reset));
+        assert!(member.group_available(affected, reset));
+        assert!(member.group_available(affected, reset + 1));
+        assert_eq!(member.earliest_group_cooldown_ms(reset), None);
+        assert_eq!(member.health(), Health::Available);
+
+        // Expiration is model-specific, not an account-wide clear operation.
+        member.set_model_cooldown(other, reset + 60_000);
+        assert!(member.group_available(affected, reset));
+        assert!(!member.group_available(other, reset));
+        assert_eq!(
+            member.earliest_group_cooldown_ms(reset),
+            Some(reset + 60_000)
+        );
+    }
+
+    #[test]
     fn redeem_ids_are_v4_shaped_and_unique() {
         let a = uuid_v4();
         let b = uuid_v4();
@@ -1370,6 +1507,89 @@ mod tests {
             codex_usage_status_error(reqwest::StatusCode::TOO_MANY_REQUESTS),
             Some(QuotaError::RateLimited)
         ));
+    }
+
+    #[test]
+    fn rejected_usage_keeps_the_provider_reason() {
+        // xAI blocks an out-of-credit account with 403; the reason, not a
+        // generic credential failure, is what the operator has to act on.
+        let error = rejected_usage_error(
+            reqwest::StatusCode::FORBIDDEN,
+            r#"{"code":"personal-team-blocked:spending-limit","error":"You have run out of credits"}"#,
+        );
+        assert_eq!(
+            error.to_string(),
+            "credentials rejected (403 Forbidden): You have run out of credits"
+        );
+        let nested = rejected_usage_error(
+            reqwest::StatusCode::UNAUTHORIZED,
+            r#"{"error":{"message":"token revoked"}}"#,
+        );
+        assert_eq!(
+            nested.to_string(),
+            "credentials rejected (401 Unauthorized): token revoked"
+        );
+        assert_eq!(
+            rejected_usage_error(reqwest::StatusCode::UNAUTHORIZED, "  "),
+            QuotaError::Unauthorized
+        );
+    }
+
+    #[tokio::test]
+    async fn quota_consumer_does_not_dial_direct_after_proxy_build_failure() {
+        struct TempAuthDir(std::path::PathBuf);
+        impl Drop for TempAuthDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let upstream = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 18858))
+            .await
+            .expect("mock upstream bind");
+        let upstream_url = "http://127.0.0.1:18858";
+        let dir = std::env::temp_dir().join(format!("mahoquot-quota-proxy-{}", uuid_v4()));
+        std::fs::create_dir_all(&dir).expect("create auth dir");
+        let _auth_dir = TempAuthDir(dir.clone());
+        let credential = serde_json::json!({
+            "type": "generic",
+            "identity_slug": "inferx-proxy-failure",
+            "provider": "inferx",
+            "label": "InferX",
+            "adapter": "openai-chat",
+            "base_url": upstream_url,
+            "upstream_override": "http://127.0.0.1:18858",
+            "api_key": "fixture-key",
+            "models": ["inferx/test"],
+            "proxy_url": "ftp://invalid-proxy",
+        });
+        std::fs::write(
+            dir.join("generic-inferx.json"),
+            serde_json::to_vec(&credential).expect("serialize credential"),
+        )
+        .expect("write credential");
+        let config = crate::config::GatewayConfig {
+            auth_dir: dir.clone(),
+            config_path: dir.join("config.yaml"),
+            ..crate::config::GatewayConfig::default()
+        };
+        let state = Arc::new(AppState::new(&config).expect("state"));
+        let member = state.pool.load_full().members[0].clone();
+
+        match tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                result = refresh_account_usage(&state, &member) => {
+                    assert!(matches!(result, Err(QuotaError::Upstream(message)) if message.starts_with("proxy client construction failed:")));
+                }
+                accepted = upstream.accept() => {
+                    let _ = accepted.expect("mock upstream accept");
+                    panic!("quota consumer must not bypass the invalid proxy and dial direct");
+                }
+            }
+        }).await {
+            Ok(()) => {}
+            Err(_) => panic!("quota consumer did not finish within its test deadline"),
+        }
     }
 
     #[test]
@@ -1543,12 +1763,16 @@ mod tests {
     #[test]
     fn retain_poll_backoff_drops_removed_accounts() {
         let (state, dir) = temp_poller_state();
-        retain_poll_backoff(&state, &["gone".to_string(), "live".to_string()].into_iter().collect());
+        retain_poll_backoff(
+            &state,
+            &["gone".to_string(), "live".to_string()]
+                .into_iter()
+                .collect(),
+        );
         assert!(set_poll_backoff(&state, "gone", 9_999));
         assert!(set_poll_backoff(&state, "live", 9_999));
 
-        let active: std::collections::BTreeSet<String> =
-            ["live".to_string()].into_iter().collect();
+        let active: std::collections::BTreeSet<String> = ["live".to_string()].into_iter().collect();
         assert_eq!(retain_poll_backoff(&state, &active), 1);
         assert_eq!(poll_backoff_until(&state, "gone"), None);
         assert_eq!(poll_backoff_until(&state, "live"), Some(9_999));
@@ -1558,5 +1782,34 @@ mod tests {
         );
         assert_eq!(poll_backoff_until(&state, "gone"), None);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn xai_credential_rejection_is_retried_as_a_refresh_not_a_permanent_block() {
+        assert!(credential_rejection(&QuotaError::Unauthorized));
+        assert!(credential_rejection(&QuotaError::Upstream(
+            "credentials rejected (401): Invalid or expired credentials".into()
+        )));
+        assert!(!credential_rejection(&QuotaError::Upstream(
+            "quota endpoint returned 500".into()
+        )));
+        assert!(!credential_rejection(&QuotaError::RateLimited));
+    }
+
+    #[test]
+    fn coding_plan_quota_url_follows_the_account_origin() {
+        assert_eq!(
+            coding_plan_quota_url(
+                "zhipu-bigmodel-coding",
+                "https://open.bigmodel.cn/api/coding/paas/v4"
+            )
+            .as_deref(),
+            Some("https://open.bigmodel.cn/api/monitor/usage/quota/limit")
+        );
+        assert_eq!(
+            coding_plan_quota_url("zai", "").as_deref(),
+            Some("https://api.z.ai/api/monitor/usage/quota/limit")
+        );
+        assert!(coding_plan_quota_url("openrouter", "https://openrouter.ai/api/v1").is_none());
     }
 }

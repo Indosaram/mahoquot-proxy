@@ -5,8 +5,22 @@ use crate::account::LoadError;
 
 /// Functional, not cosmetic: the upstream gates on this string. A generic client
 /// UA (e.g. google-api-nodejs-client) is answered with 429 RESOURCE_EXHAUSTED
-/// where this one is answered normally. Verified against live credentials.
-pub const ANTIGRAVITY_USER_AGENT: &str = "antigravity/cli/1.4.0 (aidev_client; os_type=darwin; arch=arm64; cl=1000494485; auth_method=consumer)";
+/// where this one is answered normally.
+///
+/// The client binary formats `antigravity` / `cli` / version and
+/// `aidev_client; os_type=%s; arch=%s; cl=%d; auth_method=%s`.
+///
+/// Captures of its HTTP requests pinned two points of this string: the 1.4.12
+/// client sent `cl=1010700967`, the 1.5.0 client sent `cl=1013440158`. Each
+/// captured value equals the `google_src/files/<cl>/depot` path baked into the
+/// matching binary, so that path is the source of the `cl` field. The installed
+/// 1.5.1 binary (`Language server version: 1.5.1` in its log) carries
+/// `google_src/files/1014269460`, so its UA `cl` is `1014269460` — derived from
+/// the 1.4.12/1.5.0 capture correspondence rather than captured directly.
+///
+/// The `cl/...` in `go version -m` is the Go toolchain's changelist, not the
+/// application one: for the 1.5.1 binary it reads `cl/1012564305`.
+pub const ANTIGRAVITY_USER_AGENT: &str = "antigravity/cli/1.5.1 (aidev_client; os_type=darwin; arch=arm64; cl=1014269460; auth_method=consumer)";
 
 /// Consumer (non-enterprise) credentials MUST use the `daily-` host for
 /// generation. The prod host answers 403 SUBSCRIPTION_REQUIRED for them, since

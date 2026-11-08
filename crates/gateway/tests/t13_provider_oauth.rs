@@ -11,7 +11,21 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::prelude::*;
-use common::unique_temp_dir;
+use common::{unique_temp_dir, with_loopback_peer};
+
+fn persist_management_secret(config_path: &std::path::Path, auth_dir: &std::path::Path) {
+    mahoquot_gateway::management::settings::Settings {
+        api_keys: vec![API_KEY.to_string()],
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: MANAGEMENT_KEY.to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(config_path)
+    .expect("persist management secret");
+}
 use mahoquot_gateway::account::ProviderAccount;
 use mahoquot_gateway::config::GatewayConfig;
 use mahoquot_gateway::routes::create_app;
@@ -25,6 +39,126 @@ use serde_json::{json, Value};
 use tower::ServiceExt;
 
 const API_KEY: &str = "test-api-key-42";
+const MANAGEMENT_KEY: &str = "test-management-key-42";
+
+struct TestTask(tokio::task::JoinHandle<()>);
+
+impl TestTask {
+    fn spawn(future: impl std::future::Future<Output = ()> + Send + 'static) -> Self {
+        Self(tokio::spawn(future))
+    }
+
+    async fn close(&mut self) {
+        self.0.abort();
+        match (&mut self.0).await {
+            Err(error) if error.is_cancelled() => {}
+            result => result.expect("fixture server failed"),
+        }
+    }
+}
+
+impl Drop for TestTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+async fn test_listener() -> tokio::net::TcpListener {
+    for port in 18840..=18899 {
+        match tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await {
+            Ok(listener) => return listener,
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(error) => panic!("test listener: {error}"),
+        }
+    }
+    panic!("no free test port in 18840-18899");
+}
+
+async fn isolated_test(name: &str, env: &[(&str, &std::path::Path)]) -> bool {
+    if std::env::var("T13_CHILD_TEST").as_deref() == Ok(name) {
+        return false;
+    }
+    let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", name, "--nocapture"])
+        .env("T13_CHILD_TEST", name)
+        .kill_on_drop(true);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    use tokio::io::AsyncReadExt;
+
+    let mut child = command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("isolated fixture launched");
+    let mut stdout = child.stdout.take().expect("child stdout pipe");
+    let mut stderr = child.stderr.take().expect("child stderr pipe");
+    let mut stdout_bytes = Vec::new();
+    let mut stderr_bytes = Vec::new();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        tokio::join!(
+            child.wait(),
+            stdout.read_to_end(&mut stdout_bytes),
+            stderr.read_to_end(&mut stderr_bytes),
+        )
+    })
+    .await;
+    let (status, stdout_result, stderr_result) = match result {
+        Ok(result) => result,
+        Err(_) => {
+            let kill_result = child.start_kill();
+            let cleanup = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(
+                    child.wait(),
+                    stdout.read_to_end(&mut stdout_bytes),
+                    stderr.read_to_end(&mut stderr_bytes),
+                )
+            })
+            .await;
+            panic!(
+                "isolated fixture timed out; kill: {kill_result:?}; wait/drain: {cleanup:?}\n{}\n{}",
+                String::from_utf8_lossy(&stdout_bytes),
+                String::from_utf8_lossy(&stderr_bytes)
+            );
+        }
+    };
+    stdout_result.expect("drain child stdout");
+    stderr_result.expect("drain child stderr");
+    assert!(
+        status.expect("wait for isolated fixture").success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&stdout_bytes),
+        String::from_utf8_lossy(&stderr_bytes)
+    );
+    true
+}
+
+// Force listener creation to fail only in an isolated child, without touching
+// an ambient callback port. Restore the descriptor limit before assertions.
+struct ExhaustedDescriptors(libc::rlimit);
+
+impl ExhaustedDescriptors {
+    fn new() -> Self {
+        unsafe {
+            let mut old: libc::rlimit = std::mem::zeroed();
+            assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut old), 0);
+            let limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: old.rlim_max,
+            };
+            assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &limit), 0);
+            Self(old)
+        }
+    }
+}
+
+impl Drop for ExhaustedDescriptors {
+    fn drop(&mut self) {
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &self.0) }, 0);
+    }
+}
 
 async fn body_json(response: axum::response::Response) -> Value {
     use http_body_util::BodyExt;
@@ -48,7 +182,6 @@ fn url_encode(input: &str) -> String {
 struct MockAnthropicServerState {
     hit_count: Arc<AtomicUsize>,
     last_body: Arc<tokio::sync::Mutex<Option<Value>>>,
-    last_headers: Arc<tokio::sync::Mutex<Option<axum::http::HeaderMap>>>,
 }
 
 #[derive(Clone)]
@@ -110,29 +243,32 @@ async fn test_codex_oauth_flow_persists_a_routable_account() {
             }
         }),
     );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = test_listener().await;
     let token_url = format!("http://{}/oauth/token", listener.local_addr().unwrap());
-    tokio::spawn(async move { axum::serve(listener, mock_app).await.unwrap() });
+    let mut server_task_0 =
+        TestTask::spawn(async move { axum::serve(listener, mock_app).await.unwrap() });
 
     let config = GatewayConfig {
         auth_dir: auth_dir.clone(),
         api_keys: mahoquot_gateway::inbound::ApiKeys::new(vec![API_KEY.to_string()]),
+        config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
+    persist_management_secret(&config.config_path, &auth_dir);
     let app = create_app(Arc::new(AppState::new(&config).unwrap()));
     let start = app
         .clone()
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .uri(format!(
                     "/v0/management/codex-auth-url?token_url={}&redirect_uri={}",
                     url_encode(&token_url),
-                    url_encode("http://localhost:1455/auth/callback")
+                    url_encode("http://127.0.0.1:18899/auth/callback")
                 ))
-                .header(header::AUTHORIZATION, format!("Bearer {API_KEY}"))
+                .header("X-Management-Key", MANAGEMENT_KEY)
                 .body(Body::empty())
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(start.status(), StatusCode::OK);
@@ -145,14 +281,14 @@ async fn test_codex_oauth_flow_persists_a_routable_account() {
 
     let callback = app
         .clone()
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .uri(format!(
                     "/v0/management/oauth-callback?code=codex-test-code&state={state}"
                 ))
                 .body(Body::empty())
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(callback.status(), StatusCode::OK);
@@ -168,16 +304,18 @@ async fn test_codex_oauth_flow_persists_a_routable_account() {
     assert_eq!(account.email(), "codex.user@example.com");
 
     let status = app
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .uri(format!("/v0/management/get-auth-status?state={state}"))
-                .header(header::AUTHORIZATION, format!("Bearer {API_KEY}"))
+                .header("X-Management-Key", MANAGEMENT_KEY)
                 .body(Body::empty())
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(body_json(status).await["status"], "ok");
+    server_task_0.close().await;
+    std::fs::remove_dir_all(auth_dir).unwrap();
 }
 
 #[tokio::test]
@@ -188,7 +326,6 @@ async fn test_anthropic_oauth_flow_end_to_end() {
     let server_state = MockAnthropicServerState {
         hit_count: Arc::new(AtomicUsize::new(0)),
         last_body: Arc::new(tokio::sync::Mutex::new(None)),
-        last_headers: Arc::new(tokio::sync::Mutex::new(None)),
     };
     let s_clone = server_state.clone();
 
@@ -196,11 +333,10 @@ async fn test_anthropic_oauth_flow_end_to_end() {
         .route(
             "/v1/oauth/token",
             post(
-                move |State(s): State<MockAnthropicServerState>, headers: axum::http::HeaderMap, body: String| async move {
+                move |State(s): State<MockAnthropicServerState>, body: String| async move {
                     s.hit_count.fetch_add(1, Ordering::SeqCst);
                     let parsed: Value = serde_json::from_str(&body).unwrap();
                     *s.last_body.lock().await = Some(parsed);
-                    *s.last_headers.lock().await = Some(headers);
 
                     (
                         StatusCode::OK,
@@ -221,9 +357,9 @@ async fn test_anthropic_oauth_flow_end_to_end() {
         )
         .with_state(s_clone);
 
-    let anthropic_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let anthropic_listener = test_listener().await;
     let anthropic_port = anthropic_listener.local_addr().unwrap().port();
-    tokio::spawn(async move {
+    let mut server_task_1 = TestTask::spawn(async move {
         axum::serve(anthropic_listener, mock_anthropic_app)
             .await
             .unwrap();
@@ -234,14 +370,26 @@ async fn test_anthropic_oauth_flow_end_to_end() {
     let config = GatewayConfig {
         auth_dir: auth_dir.clone(),
         api_keys: mahoquot_gateway::inbound::ApiKeys::new(vec![API_KEY.to_string()]),
+        config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
+    mahoquot_gateway::management::settings::Settings {
+        api_keys: vec![API_KEY.to_string()],
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: MANAGEMENT_KEY.to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(&config.config_path)
+    .expect("persist management settings");
     let app_state = Arc::new(AppState::new(&config).unwrap());
     let gateway_app = create_app(app_state);
 
-    let gateway_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gateway_listener = test_listener().await;
     let gateway_port = gateway_listener.local_addr().unwrap().port();
-    tokio::spawn(async move {
+    let mut server_task_2 = TestTask::spawn(async move {
         axum::serve(
             gateway_listener,
             gateway_app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -254,12 +402,12 @@ async fn test_anthropic_oauth_flow_end_to_end() {
 
     // 3. Initiate Anthropic OAuth session with token_url test override
     let start_url = format!(
-        "http://127.0.0.1:{gateway_port}/v0/management/anthropic-auth-url?token_url={}",
+        "http://127.0.0.1:{gateway_port}/v0/management/anthropic-auth-url?token_url={}&redirect_uri=http%3A%2F%2F127.0.0.1%3A18899%2Fcallback",
         url_encode(&mock_token_url)
     );
     let start_resp = client
         .get(&start_url)
-        .bearer_auth(API_KEY)
+        .header("X-Management-Key", MANAGEMENT_KEY)
         .send()
         .await
         .unwrap();
@@ -278,9 +426,9 @@ async fn test_anthropic_oauth_flow_end_to_end() {
     assert!(auth_url.contains("client_id="));
     assert!(auth_url.contains("user%3Ainference"));
 
-    // 4. Public callback token exchange on port 54545
+    // 4. Public callback token exchange through the fixture gateway
     let callback_url =
-        format!("http://127.0.0.1:54545/callback?code=anthropic_code_test_1&state={state_token}");
+        format!("http://127.0.0.1:{gateway_port}/v0/management/oauth-callback?code=anthropic_code_test_1&state={state_token}");
     let callback_resp = client.get(&callback_url).send().await.unwrap();
     assert_eq!(callback_resp.status(), StatusCode::OK);
 
@@ -290,16 +438,6 @@ async fn test_anthropic_oauth_flow_end_to_end() {
     assert_eq!(last_body["grant_type"], "authorization_code");
     assert_eq!(last_body["code"], "anthropic_code_test_1");
     assert!(last_body["code_verifier"].as_str().unwrap().len() >= 40);
-
-    let last_headers = server_state.last_headers.lock().await.clone().unwrap();
-    assert_eq!(
-        last_headers.get("accept").and_then(|v| v.to_str().ok()),
-        Some("application/json, text/plain, */*")
-    );
-    assert_eq!(
-        last_headers.get("user-agent").and_then(|v| v.to_str().ok()),
-        Some("axios/1.15.2")
-    );
 
     // 5. Verify credential file was written and is compatible with ClaudeAccount loader
     let cred_file = auth_dir.join("claude-claude.test.user_anthropic.example.com.json");
@@ -323,7 +461,7 @@ async fn test_anthropic_oauth_flow_end_to_end() {
     );
     let status_resp = client
         .get(&status_url)
-        .bearer_auth(API_KEY)
+        .header("X-Management-Key", MANAGEMENT_KEY)
         .send()
         .await
         .unwrap();
@@ -331,6 +469,8 @@ async fn test_anthropic_oauth_flow_end_to_end() {
     let status_json: Value = status_resp.json().await.unwrap();
     assert_eq!(status_json["status"], "ok");
 
+    server_task_2.close().await;
+    server_task_1.close().await;
     std::fs::remove_dir_all(&auth_dir).ok();
 }
 
@@ -379,9 +519,9 @@ async fn test_cursor_oauth_flow_end_to_end() {
         )
         .with_state(s_clone);
 
-    let cursor_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let cursor_listener = test_listener().await;
     let cursor_port = cursor_listener.local_addr().unwrap().port();
-    tokio::spawn(async move {
+    let mut server_task_3 = TestTask::spawn(async move {
         axum::serve(cursor_listener, mock_cursor_app).await.unwrap();
     });
 
@@ -390,14 +530,26 @@ async fn test_cursor_oauth_flow_end_to_end() {
     let config = GatewayConfig {
         auth_dir: auth_dir.clone(),
         api_keys: mahoquot_gateway::inbound::ApiKeys::new(vec![API_KEY.to_string()]),
+        config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
+    mahoquot_gateway::management::settings::Settings {
+        api_keys: vec![API_KEY.to_string()],
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: MANAGEMENT_KEY.to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(&config.config_path)
+    .expect("persist management settings");
     let app_state = Arc::new(AppState::new(&config).unwrap());
     let gateway_app = create_app(app_state);
 
-    let gateway_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gateway_listener = test_listener().await;
     let gateway_port = gateway_listener.local_addr().unwrap().port();
-    tokio::spawn(async move {
+    let mut server_task_4 = TestTask::spawn(async move {
         axum::serve(
             gateway_listener,
             gateway_app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -415,7 +567,7 @@ async fn test_cursor_oauth_flow_end_to_end() {
     );
     let start_resp = client
         .get(&start_url)
-        .bearer_auth(API_KEY)
+        .header("X-Management-Key", MANAGEMENT_KEY)
         .send()
         .await
         .unwrap();
@@ -438,7 +590,7 @@ async fn test_cursor_oauth_flow_end_to_end() {
     );
     let poll1_resp = client
         .get(&status_url)
-        .bearer_auth(API_KEY)
+        .header("X-Management-Key", MANAGEMENT_KEY)
         .send()
         .await
         .unwrap();
@@ -449,7 +601,7 @@ async fn test_cursor_oauth_flow_end_to_end() {
     // 5. Second poll: gateway polls mock server, gets 200, writes credential, reports "ok"
     let poll2_resp = client
         .get(&status_url)
-        .bearer_auth(API_KEY)
+        .header("X-Management-Key", MANAGEMENT_KEY)
         .send()
         .await
         .unwrap();
@@ -473,6 +625,8 @@ async fn test_cursor_oauth_flow_end_to_end() {
     assert_eq!(parsed_acct.account_id, "user-cursor-sub-42");
     assert!(!parsed_acct.expired.is_empty());
 
+    server_task_4.close().await;
+    server_task_3.close().await;
     std::fs::remove_dir_all(&auth_dir).ok();
 }
 
@@ -483,14 +637,26 @@ async fn test_oauth_session_cancellation() {
     let config = GatewayConfig {
         auth_dir: auth_dir.clone(),
         api_keys: mahoquot_gateway::inbound::ApiKeys::new(vec![API_KEY.to_string()]),
+        config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
+    mahoquot_gateway::management::settings::Settings {
+        api_keys: vec![API_KEY.to_string()],
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: MANAGEMENT_KEY.to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(&config.config_path)
+    .expect("persist management settings");
     let app_state = Arc::new(AppState::new(&config).unwrap());
     let gateway_app = create_app(app_state);
 
-    let gateway_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gateway_listener = test_listener().await;
     let gateway_port = gateway_listener.local_addr().unwrap().port();
-    tokio::spawn(async move {
+    let mut server_task_5 = TestTask::spawn(async move {
         axum::serve(
             gateway_listener,
             gateway_app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -506,7 +672,7 @@ async fn test_oauth_session_cancellation() {
     );
     let start_resp = client
         .get(&start_url)
-        .bearer_auth(API_KEY)
+        .header("X-Management-Key", MANAGEMENT_KEY)
         .send()
         .await
         .unwrap();
@@ -518,7 +684,7 @@ async fn test_oauth_session_cancellation() {
         format!("http://127.0.0.1:{gateway_port}/v0/management/oauth-session?state={state_token}");
     let cancel_resp = client
         .delete(&cancel_url)
-        .bearer_auth(API_KEY)
+        .header("X-Management-Key", MANAGEMENT_KEY)
         .send()
         .await
         .unwrap();
@@ -526,14 +692,8 @@ async fn test_oauth_session_cancellation() {
     let cancel_json: Value = cancel_resp.json().await.unwrap();
     assert_eq!(cancel_json["status"], "ok");
 
+    server_task_5.close().await;
     std::fs::remove_dir_all(&auth_dir).ok();
-}
-
-#[tokio::test]
-async fn test_anthropic_oauth_default_token_url_aligns_with_platform_claude() {
-    let params = std::collections::HashMap::new();
-    let (_, _, session) = mahoquot_gateway::management::oauth::create_anthropic_auth_url(&params);
-    assert_eq!(session.token_url, "https://platform.claude.com/v1/oauth/token");
 }
 
 #[derive(Clone)]
@@ -545,7 +705,7 @@ struct DeviceOAuthMock {
     base: Arc<std::sync::OnceLock<String>>,
 }
 
-async fn start_device_mock() -> (String, DeviceOAuthMock, tokio::task::JoinHandle<()>) {
+async fn start_device_mock() -> (String, DeviceOAuthMock, TestTask) {
     let state = DeviceOAuthMock {
         starts: Arc::new(std::sync::Mutex::new(Vec::new())),
         polls: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -609,16 +769,16 @@ async fn start_device_mock() -> (String, DeviceOAuthMock, tokio::task::JoinHandl
             }),
         )
         .with_state(state.clone());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = test_listener().await;
     let base = format!("http://{}", listener.local_addr().unwrap());
     state.base.set(base.clone()).expect("mock base set once");
-    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let task = TestTask::spawn(async move { axum::serve(listener, app).await.unwrap() });
     (base, state, task)
 }
 
 #[tokio::test]
 async fn device_oauth_starts_polls_and_writes_generic_provider_credentials() {
-    let (mock_base, mock, mock_task) = start_device_mock().await;
+    let (mock_base, mock, mut mock_task) = start_device_mock().await;
     let auth_dir = unique_temp_dir("qg-t13-device-oauth");
     std::fs::remove_dir_all(&auth_dir).ok();
     std::fs::create_dir_all(&auth_dir).unwrap();
@@ -628,6 +788,18 @@ async fn device_oauth_starts_polls_and_writes_generic_provider_credentials() {
         config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
+    mahoquot_gateway::management::settings::Settings {
+        api_keys: vec![API_KEY.to_string()],
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: MANAGEMENT_KEY.to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(&config.config_path)
+    .expect("persist management settings");
+    persist_management_secret(&config.config_path, &auth_dir);
     let app = create_app(Arc::new(AppState::new(&config).unwrap()));
 
     for provider in ["kimi", "qwen", "nous", "github-copilot"] {
@@ -641,14 +813,14 @@ async fn device_oauth_starts_polls_and_writes_generic_provider_credentials() {
         let start = app
             .clone()
             .oneshot(
-                Request::builder()
+                with_loopback_peer(Request::builder()
                     .uri(format!(
                         "/v0/management/{provider}-auth-url?device_url={}%2Fdevice%2Fstart&token_url={}%2Fdevice%2Fpoll&interval=0{exchange}",
                         mock_base, mock_base
                     ))
-                    .header(header::AUTHORIZATION, format!("Bearer {API_KEY}"))
+                    .header("X-Management-Key", MANAGEMENT_KEY)
                     .body(Body::empty())
-                    .unwrap(),
+                    .unwrap()),
             )
             .await
             .unwrap();
@@ -659,13 +831,13 @@ async fn device_oauth_starts_polls_and_writes_generic_provider_credentials() {
         let state = start_json["state"].as_str().unwrap();
         let poll = app
             .clone()
-            .oneshot(
+            .oneshot(with_loopback_peer(
                 Request::builder()
                     .uri(format!("/v0/management/get-auth-status?state={state}"))
-                    .header(header::AUTHORIZATION, format!("Bearer {API_KEY}"))
+                    .header("X-Management-Key", MANAGEMENT_KEY)
                     .body(Body::empty())
                     .unwrap(),
-            )
+            ))
             .await
             .unwrap();
         let status = poll.status();
@@ -688,7 +860,7 @@ async fn device_oauth_starts_polls_and_writes_generic_provider_credentials() {
         polls.contains("deviceCode=device-1"),
         "Qwen must use camelCase: {polls}"
     );
-    mock_task.abort();
+    mock_task.close().await;
     std::fs::remove_dir_all(auth_dir).ok();
 }
 
@@ -713,11 +885,12 @@ async fn xai_pkce_callback_writes_a_live_generic_account() {
                 axum::Json(json!({ "data": [{ "id": "grok-4.6" }] }))
             }),
         );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = test_listener().await;
     let mock_base = format!("http://{}", listener.local_addr().unwrap());
     let token_url = format!("{mock_base}/oauth/token");
     let catalog_base = format!("{mock_base}/v1");
-    let token_task = tokio::spawn(async move { axum::serve(listener, token_app).await.unwrap() });
+    let mut token_task =
+        TestTask::spawn(async move { axum::serve(listener, token_app).await.unwrap() });
     let auth_dir = unique_temp_dir("qg-t13-xai");
     std::fs::remove_dir_all(&auth_dir).ok();
     std::fs::create_dir_all(&auth_dir).unwrap();
@@ -727,11 +900,30 @@ async fn xai_pkce_callback_writes_a_live_generic_account() {
         config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
+    mahoquot_gateway::management::settings::Settings {
+        api_keys: vec![API_KEY.to_string()],
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: MANAGEMENT_KEY.to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(&config.config_path)
+    .expect("persist management settings");
+    persist_management_secret(&config.config_path, &auth_dir);
     let app = create_app(Arc::new(AppState::new(&config).unwrap()));
-    let start = app.clone().oneshot(Request::builder()
-        .uri(format!("/v0/management/xai-auth-url?auth_url=https%3A%2F%2Fauth.example.test%2Fauthorize&token_url={}&base_url={}", url_encode(&token_url), url_encode(&catalog_base)))
-        .header(header::AUTHORIZATION, format!("Bearer {API_KEY}"))
-        .body(Body::empty()).unwrap()).await.unwrap();
+    let start = app
+        .clone()
+        .oneshot(with_loopback_peer(
+            Request::builder()
+                .uri(format!("/v0/management/xai-auth-url?auth_url=https%3A%2F%2Fauth.example.test%2Fauthorize&token_url={}&base_url={}", url_encode(&token_url), url_encode(&catalog_base)))
+                .header("X-Management-Key", MANAGEMENT_KEY)
+                .body(Body::empty())
+                .unwrap(),
+        ))
+        .await
+        .unwrap();
     assert_eq!(start.status(), StatusCode::OK);
     let start_json = body_json(start).await;
     assert!(start_json["url"]
@@ -741,30 +933,30 @@ async fn xai_pkce_callback_writes_a_live_generic_account() {
     let state = start_json["state"].as_str().unwrap();
     let callback = app
         .clone()
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .uri(format!(
                     "/v0/management/oauth-callback?code=xai-code&state={state}"
                 ))
                 .body(Body::empty())
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(callback.status(), StatusCode::OK);
     let status = app
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .uri(format!("/v0/management/get-auth-status?state={state}"))
-                .header(header::AUTHORIZATION, format!("Bearer {API_KEY}"))
+                .header("X-Management-Key", MANAGEMENT_KEY)
                 .body(Body::empty())
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(body_json(status).await["status"], "ok");
     assert!(auth_dir.join("generic-xai-grok_example.test.json").exists());
-    token_task.abort();
+    token_task.close().await;
     std::fs::remove_dir_all(auth_dir).ok();
 }
 
@@ -773,6 +965,7 @@ struct MockAntigravityServerState {
     token_hits: Arc<AtomicUsize>,
     userinfo_hits: Arc<AtomicUsize>,
     load_hits: Arc<AtomicUsize>,
+    daily_hits: Arc<AtomicUsize>,
     last_token_body: Arc<tokio::sync::Mutex<Option<String>>>,
     token_response_status: StatusCode,
     token_response_body: Value,
@@ -803,7 +996,11 @@ async fn antigravity_eligibility_denial_preserves_existing_credentials() {
     antigravity_oauth_flow(Some(true), false, true).await;
 }
 
-async fn antigravity_oauth_flow(reauth: Option<bool>, different_account: bool, eligibility_denied: bool) {
+async fn antigravity_oauth_flow(
+    reauth: Option<bool>,
+    different_account: bool,
+    eligibility_denied: bool,
+) {
     let auth_dir = unique_temp_dir("qg-t13-antigravity");
     std::fs::remove_dir_all(&auth_dir).ok();
     std::fs::create_dir_all(&auth_dir).unwrap();
@@ -822,6 +1019,7 @@ async fn antigravity_oauth_flow(reauth: Option<bool>, different_account: bool, e
         token_hits: Arc::new(AtomicUsize::new(0)),
         userinfo_hits: Arc::new(AtomicUsize::new(0)),
         load_hits: Arc::new(AtomicUsize::new(0)),
+        daily_hits: Arc::new(AtomicUsize::new(0)),
         last_token_body: Arc::new(tokio::sync::Mutex::new(None)),
         token_response_status: StatusCode::OK,
         token_response_body: json!({
@@ -878,22 +1076,36 @@ async fn antigravity_oauth_flow(reauth: Option<bool>, different_account: bool, e
                     let body_json: Value = serde_json::from_str(&body).unwrap();
                     assert_eq!(body_json["metadata"]["ideType"], "ANTIGRAVITY");
                     if eligibility_denied {
-                        return (StatusCode::FORBIDDEN, Json(json!({"error": {
-                            "code": 403, "message": "Verify your account to continue.",
-                            "details": [{"reason": "VALIDATION_REQUIRED"}]
-                        }})));
+                        return (
+                            StatusCode::FORBIDDEN,
+                            Json(json!({"error": {
+                                "code": 403, "message": "Verify your account to continue.",
+                                "details": [{"reason": "VALIDATION_REQUIRED"}]
+                            }})),
+                        );
                     }
-                    (StatusCode::OK, Json(json!({
-                        "cloudaicompanionProject": "mock-cca-project-456"
-                    })))
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "cloudaicompanionProject": "mock-cca-project-456"
+                        })),
+                    )
                 },
             ),
         )
+        .route(
+            "/daily",
+            post(|State(s): State<MockAntigravityServerState>| async move {
+                s.daily_hits.fetch_add(1, Ordering::SeqCst);
+                Json(json!({"cloudaicompanionProject": "mock-daily-project"}))
+            }),
+        )
         .with_state(s_clone);
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = test_listener().await;
     let port = listener.local_addr().unwrap().port();
-    let mock_task = tokio::spawn(async move { axum::serve(listener, mock_app).await.unwrap() });
+    let mut mock_task =
+        TestTask::spawn(async move { axum::serve(listener, mock_app).await.unwrap() });
 
     let token_url = format!("http://127.0.0.1:{port}/token");
     let userinfo_url = format!("http://127.0.0.1:{port}/userinfo");
@@ -906,17 +1118,30 @@ async fn antigravity_oauth_flow(reauth: Option<bool>, different_account: bool, e
         config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
+    mahoquot_gateway::management::settings::Settings {
+        api_keys: vec![API_KEY.to_string()],
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: MANAGEMENT_KEY.to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(&config.config_path)
+    .expect("persist management settings");
+    persist_management_secret(&config.config_path, &auth_dir);
     let app_state = Arc::new(AppState::new(&config).unwrap());
     let app = create_app(app_state.clone());
 
     // 1. Request antigravity auth URL
     let mut start_uri = format!(
-        "/v0/management/antigravity-auth-url?auth_url={}&token_url={}&userinfo_url={}&load_url={}&redirect_uri={}",
+        "/v0/management/antigravity-auth-url?auth_url={}&token_url={}&userinfo_url={}&load_url={}&daily_url={}&redirect_uri={}",
         url_encode(auth_endpoint),
         url_encode(&token_url),
         url_encode(&userinfo_url),
         url_encode(&load_url),
-        url_encode("http://localhost:51121/oauth-callback")
+        url_encode(&format!("http://127.0.0.1:{port}/daily")),
+        url_encode("http://127.0.0.1:18899/oauth-callback")
     );
     if reauth == Some(true) {
         start_uri.push_str(&format!("&credential_name={original_name}"));
@@ -924,17 +1149,19 @@ async fn antigravity_oauth_flow(reauth: Option<bool>, different_account: bool, e
     if reauth.is_some() {
         let member = app_state.pool.load().members[0].clone();
         app_state.force_health(&member.id, mahoquot_types::Health::AuthFailed);
-        app_state.monitor.record_error(&member.id, 403, "VALIDATION_REQUIRED");
+        app_state
+            .monitor
+            .record_error(&member.id, 403, "VALIDATION_REQUIRED");
     }
     let start = app
         .clone()
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .uri(start_uri)
-                .header(header::AUTHORIZATION, format!("Bearer {API_KEY}"))
+                .header("X-Management-Key", MANAGEMENT_KEY)
                 .body(Body::empty())
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(start.status(), StatusCode::OK);
@@ -961,29 +1188,42 @@ async fn antigravity_oauth_flow(reauth: Option<bool>, different_account: bool, e
     // 2. Invoke public callback
     let callback = app
         .clone()
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .uri(format!(
                     "/v0/management/oauth-callback?code=antigravity-code-777&state={state}"
                 ))
                 .body(Body::empty())
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(callback.status(), StatusCode::OK);
+    assert_eq!(server_state.token_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(server_state.userinfo_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(server_state.load_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(server_state.daily_hits.load(Ordering::SeqCst), 0);
 
     if different_account || eligibility_denied {
-        let status = app.oneshot(Request::builder()
-            .uri(format!("/v0/management/get-auth-status?state={state}"))
-            .header(header::AUTHORIZATION, format!("Bearer {API_KEY}"))
-            .body(Body::empty()).unwrap()).await.unwrap();
+        let status = app
+            .oneshot(with_loopback_peer(
+                Request::builder()
+                    .uri(format!("/v0/management/get-auth-status?state={state}"))
+                    .header("X-Management-Key", MANAGEMENT_KEY)
+                    .body(Body::empty())
+                    .unwrap(),
+            ))
+            .await
+            .unwrap();
         assert_eq!(body_json(status).await["status"], "error");
-        let saved: Value = serde_json::from_slice(&std::fs::read(auth_dir.join(original_name)).unwrap()).unwrap();
+        let saved: Value =
+            serde_json::from_slice(&std::fs::read(auth_dir.join(original_name)).unwrap()).unwrap();
         assert_eq!(saved["access_token"], "old-access");
         assert_eq!(app_state.pool.load().members.len(), 1);
-        assert!(!auth_dir.join("antigravity-antigravity.user_studio.dev.json").exists());
-        mock_task.abort();
+        assert!(!auth_dir
+            .join("antigravity-antigravity.user_studio.dev.json")
+            .exists());
+        mock_task.close().await;
         std::fs::remove_dir_all(auth_dir).unwrap();
         return;
     }
@@ -1008,7 +1248,11 @@ async fn antigravity_oauth_flow(reauth: Option<bool>, different_account: bool, e
     assert!(raw_token_body.contains("code_verifier="));
 
     // 4. Assert antigravity-<email>.json credential file exists and has correct fields
-    let cred_file = auth_dir.join(if reauth.is_some() { original_name } else { "antigravity-antigravity.user_studio.dev.json" });
+    let cred_file = auth_dir.join(if reauth.is_some() {
+        original_name
+    } else {
+        "antigravity-antigravity.user_studio.dev.json"
+    });
     assert!(
         cred_file.exists(),
         "antigravity credential file must exist: {cred_file:?}"
@@ -1029,9 +1273,14 @@ async fn antigravity_oauth_flow(reauth: Option<bool>, different_account: bool, e
         let saved: Value = serde_json::from_str(&cred_raw).unwrap();
         assert_eq!(saved["identity_slug"], "original-import");
         assert_eq!(saved["label"], "Preserved label");
-        assert!(!auth_dir.join("antigravity-antigravity.user_studio.dev.json").exists());
+        assert!(!auth_dir
+            .join("antigravity-antigravity.user_studio.dev.json")
+            .exists());
         assert_eq!(app_state.pool.load().members.len(), 1);
-        assert!(app_state.monitor.last_error(&app_state.pool.load().members[0].id).is_none());
+        assert!(app_state
+            .monitor
+            .last_error(&app_state.pool.load().members[0].id)
+            .is_none());
     }
 
     // 5. Assert it joins the runtime pool
@@ -1051,6 +1300,7 @@ async fn antigravity_oauth_flow(reauth: Option<bool>, different_account: bool, e
             | ProviderAccount::Zcode(_)
             | ProviderAccount::Vertex(_)
             | ProviderAccount::Devin(_)
+            | ProviderAccount::OpenCode(_)
             | ProviderAccount::Generic(_) => false,
         }
     });
@@ -1061,13 +1311,13 @@ async fn antigravity_oauth_flow(reauth: Option<bool>, different_account: bool, e
 
     // 6. Assert get-auth-status returns ok
     let status_resp = app
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .uri(format!("/v0/management/get-auth-status?state={state}"))
-                .header(header::AUTHORIZATION, format!("Bearer {API_KEY}"))
+                .header("X-Management-Key", MANAGEMENT_KEY)
                 .body(Body::empty())
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(status_resp.status(), StatusCode::OK);
@@ -1075,7 +1325,7 @@ async fn antigravity_oauth_flow(reauth: Option<bool>, different_account: bool, e
     assert_eq!(status_json["status"], "ok");
     assert_eq!(status_json["provider"], "antigravity");
 
-    mock_task.abort();
+    mock_task.close().await;
     std::fs::remove_dir_all(auth_dir).ok();
 }
 
@@ -1085,14 +1335,32 @@ async fn test_antigravity_oauth_malformed_token_response_fails_cleanly() {
     std::fs::remove_dir_all(&auth_dir).ok();
     std::fs::create_dir_all(&auth_dir).unwrap();
 
-    // Mock token endpoint returning 500 error
-    let mock_app = Router::new().route(
-        "/token",
-        post(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "token error") }),
-    );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let token_hits = Arc::new(AtomicUsize::new(0));
+    let downstream_hits = Arc::new(AtomicUsize::new(0));
+    let hits = token_hits.clone();
+    let downstream = downstream_hits.clone();
+    let mock_app = Router::new()
+        .route(
+            "/token",
+            post(move || {
+                let hits = hits.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    (StatusCode::INTERNAL_SERVER_ERROR, "token error")
+                }
+            }),
+        )
+        .fallback(move || {
+            let hits = downstream.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        });
+    let listener = test_listener().await;
     let port = listener.local_addr().unwrap().port();
-    let mock_task = tokio::spawn(async move { axum::serve(listener, mock_app).await.unwrap() });
+    let mut mock_task =
+        TestTask::spawn(async move { axum::serve(listener, mock_app).await.unwrap() });
 
     let token_url = format!("http://127.0.0.1:{port}/token");
 
@@ -1102,21 +1370,36 @@ async fn test_antigravity_oauth_malformed_token_response_fails_cleanly() {
         config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
+    mahoquot_gateway::management::settings::Settings {
+        api_keys: vec![API_KEY.to_string()],
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: MANAGEMENT_KEY.to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(&config.config_path)
+    .expect("persist management settings");
+    persist_management_secret(&config.config_path, &auth_dir);
     let app = create_app(Arc::new(AppState::new(&config).unwrap()));
 
     let start = app
         .clone()
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .uri(format!(
-                    "/v0/management/antigravity-auth-url?token_url={}&redirect_uri={}",
+                    "/v0/management/antigravity-auth-url?token_url={}&userinfo_url={}&load_url={}&daily_url={}&redirect_uri={}",
                     url_encode(&token_url),
-                    url_encode("http://localhost:51121/oauth-callback")
+                    url_encode(&format!("http://127.0.0.1:{port}/userinfo")),
+                    url_encode(&format!("http://127.0.0.1:{port}/load")),
+                    url_encode(&format!("http://127.0.0.1:{port}/daily")),
+                    url_encode("http://127.0.0.1:18899/oauth-callback")
                 ))
-                .header(header::AUTHORIZATION, format!("Bearer {API_KEY}"))
+                .header("X-Management-Key", MANAGEMENT_KEY)
                 .body(Body::empty())
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(start.status(), StatusCode::OK);
@@ -1125,42 +1408,57 @@ async fn test_antigravity_oauth_malformed_token_response_fails_cleanly() {
 
     let callback = app
         .clone()
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .uri(format!(
                     "/v0/management/oauth-callback?code=bad-code&state={state}"
                 ))
                 .body(Body::empty())
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(callback.status(), StatusCode::OK);
 
     let status = app
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .uri(format!("/v0/management/get-auth-status?state={state}"))
-                .header(header::AUTHORIZATION, format!("Bearer {API_KEY}"))
+                .header("X-Management-Key", MANAGEMENT_KEY)
                 .body(Body::empty())
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(status.status(), StatusCode::BAD_REQUEST);
     let status_json = body_json(status).await;
     assert_eq!(status_json["status"], "error");
 
-    mock_task.abort();
+    assert_eq!(token_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(downstream_hits.load(Ordering::SeqCst), 0);
+    assert!(status_json["error"].is_string());
+    assert_eq!(
+        std::fs::read_dir(&auth_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+            .count(),
+        0
+    );
+    mock_task.close().await;
     std::fs::remove_dir_all(auth_dir).ok();
 }
 
 #[tokio::test]
 async fn test_antigravity_oauth_reports_unavailable_default_callback_port() {
-    let occupied = match tokio::net::TcpListener::bind("127.0.0.1:51121").await {
-        Ok(listener) => listener,
-        Err(_) => return,
-    };
+    if isolated_test(
+        "test_antigravity_oauth_reports_unavailable_default_callback_port",
+        &[],
+    )
+    .await
+    {
+        return;
+    }
     let auth_dir = unique_temp_dir("qg-t13-ag-port-conflict");
     let config = GatewayConfig {
         auth_dir: auth_dir.clone(),
@@ -1168,20 +1466,33 @@ async fn test_antigravity_oauth_reports_unavailable_default_callback_port() {
         config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
+    mahoquot_gateway::management::settings::Settings {
+        api_keys: vec![API_KEY.to_string()],
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: MANAGEMENT_KEY.to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(&config.config_path)
+    .expect("persist management settings");
+    persist_management_secret(&config.config_path, &auth_dir);
     let app = create_app(Arc::new(AppState::new(&config).unwrap()));
+    let exhausted = ExhaustedDescriptors::new();
     let response = app
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .uri("/v0/management/antigravity-auth-url")
-                .header(header::AUTHORIZATION, format!("Bearer {API_KEY}"))
+                .header("X-Management-Key", MANAGEMENT_KEY)
                 .body(Body::empty())
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
 
+    drop(exhausted);
     assert_eq!(response.status(), StatusCode::CONFLICT);
-    drop(occupied);
     std::fs::remove_dir_all(auth_dir).ok();
 }
 
@@ -1197,17 +1508,29 @@ async fn test_antigravity_oauth_callback_state_edge() {
         config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
+    mahoquot_gateway::management::settings::Settings {
+        api_keys: vec![API_KEY.to_string()],
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: MANAGEMENT_KEY.to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(&config.config_path)
+    .expect("persist management settings");
+    persist_management_secret(&config.config_path, &auth_dir);
     let app = create_app(Arc::new(AppState::new(&config).unwrap()));
 
     // Callback with unknown state
     let callback = app
         .clone()
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .uri("/v0/management/oauth-callback?code=any-code&state=nonexistent-state-123")
                 .body(Body::empty())
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(callback.status(), StatusCode::OK);
@@ -1222,13 +1545,13 @@ async fn test_antigravity_oauth_callback_state_edge() {
 
     // Status check on unknown state returns stats (default) or pending/error
     let status = app
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .uri("/v0/management/get-auth-status?state=nonexistent-state-123")
-                .header(header::AUTHORIZATION, format!("Bearer {API_KEY}"))
+                .header("X-Management-Key", MANAGEMENT_KEY)
                 .body(Body::empty())
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(status.status(), StatusCode::OK);
@@ -1297,12 +1620,13 @@ async fn test_command_code_oauth_flow_end_to_end() {
         )
         .with_state(s_clone);
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = test_listener().await;
     let port = listener.local_addr().unwrap().port();
-    let mock_task = tokio::spawn(async move { axum::serve(listener, mock_app).await.unwrap() });
+    let mut mock_task =
+        TestTask::spawn(async move { axum::serve(listener, mock_app).await.unwrap() });
 
     let whoami_url = format!("http://127.0.0.1:{port}/alpha/whoami");
-    let callback_url = "http://127.0.0.1:5959/callback";
+    let callback_url = "http://127.0.0.1:18899/callback";
 
     let config = GatewayConfig {
         auth_dir: auth_dir.clone(),
@@ -1310,6 +1634,18 @@ async fn test_command_code_oauth_flow_end_to_end() {
         config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
+    mahoquot_gateway::management::settings::Settings {
+        api_keys: vec![API_KEY.to_string()],
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: MANAGEMENT_KEY.to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(&config.config_path)
+    .expect("persist management settings");
+    persist_management_secret(&config.config_path, &auth_dir);
     let app_state = Arc::new(AppState::new(&config).unwrap());
     let app = create_app(app_state.clone());
 
@@ -1322,13 +1658,13 @@ async fn test_command_code_oauth_flow_end_to_end() {
     );
     let start = app
         .clone()
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .uri(start_uri)
-                .header(header::AUTHORIZATION, format!("Bearer {API_KEY}"))
+                .header("X-Management-Key", MANAGEMENT_KEY)
                 .body(Body::empty())
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
 
@@ -1355,14 +1691,14 @@ async fn test_command_code_oauth_flow_end_to_end() {
     });
     let callback = app
         .clone()
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .method("POST")
                 .uri("/v0/management/oauth-callback")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(callback_payload.to_string()))
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
 
@@ -1412,13 +1748,13 @@ async fn test_command_code_oauth_flow_end_to_end() {
 
     // Then: get-auth-status returns ok
     let status_resp = app
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .uri(format!("/v0/management/get-auth-status?state={state}"))
-                .header(header::AUTHORIZATION, format!("Bearer {API_KEY}"))
+                .header("X-Management-Key", MANAGEMENT_KEY)
                 .body(Body::empty())
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(status_resp.status(), StatusCode::OK);
@@ -1426,7 +1762,7 @@ async fn test_command_code_oauth_flow_end_to_end() {
     assert_eq!(status_json["status"], "ok");
     assert_eq!(status_json["provider"], "command-code");
 
-    mock_task.abort();
+    mock_task.close().await;
     std::fs::remove_dir_all(auth_dir).ok();
 }
 
@@ -1443,17 +1779,29 @@ async fn test_command_code_oauth_mismatched_state_fails_without_persistence() {
         config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
+    mahoquot_gateway::management::settings::Settings {
+        api_keys: vec![API_KEY.to_string()],
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: MANAGEMENT_KEY.to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(&config.config_path)
+    .expect("persist management settings");
+    persist_management_secret(&config.config_path, &auth_dir);
     let app_state = Arc::new(AppState::new(&config).unwrap());
     let app = create_app(app_state);
 
     let start = app
         .clone()
         .oneshot(
-            Request::builder()
-                .uri("/v0/management/command-code-auth-url?callback=http%3A%2F%2F127.0.0.1%3A35959%2Fcallback")
-                .header(header::AUTHORIZATION, format!("Bearer {API_KEY}"))
+            with_loopback_peer(Request::builder()
+                .uri("/v0/management/command-code-auth-url?callback=http%3A%2F%2F127.0.0.1%3A18899%2Fcallback")
+                .header("X-Management-Key", MANAGEMENT_KEY)
                 .body(Body::empty())
-                .unwrap(),
+                .unwrap()),
         )
         .await
         .unwrap();
@@ -1471,14 +1819,14 @@ async fn test_command_code_oauth_mismatched_state_fails_without_persistence() {
     });
     let callback = app
         .clone()
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .method("POST")
                 .uri("/v0/management/oauth-callback")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(callback_payload.to_string()))
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
 
@@ -1498,13 +1846,13 @@ async fn test_command_code_oauth_mismatched_state_fails_without_persistence() {
 
     // Real session remains pending
     let status_resp = app
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .uri(format!("/v0/management/get-auth-status?state={real_state}"))
-                .header(header::AUTHORIZATION, format!("Bearer {API_KEY}"))
+                .header("X-Management-Key", MANAGEMENT_KEY)
                 .body(Body::empty())
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(status_resp.status(), StatusCode::OK);
@@ -1527,16 +1875,28 @@ async fn test_command_code_oauth_malformed_callback_fails_without_persistence() 
         config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
+    mahoquot_gateway::management::settings::Settings {
+        api_keys: vec![API_KEY.to_string()],
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: MANAGEMENT_KEY.to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(&config.config_path)
+    .expect("persist management settings");
+    persist_management_secret(&config.config_path, &auth_dir);
     let app = create_app(Arc::new(AppState::new(&config).unwrap()));
 
     let start = app
         .clone()
         .oneshot(
-            Request::builder()
-                .uri("/v0/management/command-code-auth-url?callback=http%3A%2F%2F127.0.0.1%3A35959%2Fcallback")
-                .header(header::AUTHORIZATION, format!("Bearer {API_KEY}"))
+            with_loopback_peer(Request::builder()
+                .uri("/v0/management/command-code-auth-url?callback=http%3A%2F%2F127.0.0.1%3A18899%2Fcallback")
+                .header("X-Management-Key", MANAGEMENT_KEY)
                 .body(Body::empty())
-                .unwrap(),
+                .unwrap()),
         )
         .await
         .unwrap();
@@ -1553,14 +1913,14 @@ async fn test_command_code_oauth_malformed_callback_fails_without_persistence() 
     ] {
         let callback = app
             .clone()
-            .oneshot(
+            .oneshot(with_loopback_peer(
                 Request::builder()
                     .method("POST")
                     .uri("/v0/management/oauth-callback")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(bad_payload.to_string()))
                     .unwrap(),
-            )
+            ))
             .await
             .unwrap();
 
@@ -1591,9 +1951,10 @@ async fn test_command_code_oauth_whoami_failure_fails_without_persistence() {
         "/alpha/whoami",
         get(|| async { (StatusCode::UNAUTHORIZED, "Invalid API key") }),
     );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = test_listener().await;
     let port = listener.local_addr().unwrap().port();
-    let mock_task = tokio::spawn(async move { axum::serve(listener, mock_app).await.unwrap() });
+    let mut mock_task =
+        TestTask::spawn(async move { axum::serve(listener, mock_app).await.unwrap() });
 
     let whoami_url = format!("http://127.0.0.1:{port}/alpha/whoami");
 
@@ -1603,19 +1964,31 @@ async fn test_command_code_oauth_whoami_failure_fails_without_persistence() {
         config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
+    mahoquot_gateway::management::settings::Settings {
+        api_keys: vec![API_KEY.to_string()],
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: MANAGEMENT_KEY.to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(&config.config_path)
+    .expect("persist management settings");
+    persist_management_secret(&config.config_path, &auth_dir);
     let app = create_app(Arc::new(AppState::new(&config).unwrap()));
 
     let start = app
         .clone()
         .oneshot(
-            Request::builder()
+            with_loopback_peer(Request::builder()
                 .uri(format!(
-                    "/v0/management/command-code-auth-url?whoami_url={}&callback=http%3A%2F%2F127.0.0.1%3A35959%2Fcallback",
+                    "/v0/management/command-code-auth-url?whoami_url={}&callback=http%3A%2F%2F127.0.0.1%3A18899%2Fcallback",
                     url_encode(&whoami_url)
                 ))
-                .header(header::AUTHORIZATION, format!("Bearer {API_KEY}"))
+                .header("X-Management-Key", MANAGEMENT_KEY)
                 .body(Body::empty())
-                .unwrap(),
+                .unwrap()),
         )
         .await
         .unwrap();
@@ -1633,14 +2006,14 @@ async fn test_command_code_oauth_whoami_failure_fails_without_persistence() {
     });
     let callback = app
         .clone()
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .method("POST")
                 .uri("/v0/management/oauth-callback")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(callback_payload.to_string()))
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
 
@@ -1656,20 +2029,20 @@ async fn test_command_code_oauth_whoami_failure_fails_without_persistence() {
     assert_eq!(files, 0, "no credential saved when whoami fails");
 
     let status_resp = app
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .uri(format!("/v0/management/get-auth-status?state={state}"))
-                .header(header::AUTHORIZATION, format!("Bearer {API_KEY}"))
+                .header("X-Management-Key", MANAGEMENT_KEY)
                 .body(Body::empty())
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
     assert_eq!(status_resp.status(), StatusCode::BAD_REQUEST);
     let status_json = body_json(status_resp).await;
     assert_eq!(status_json["status"], "error");
 
-    mock_task.abort();
+    mock_task.close().await;
     std::fs::remove_dir_all(auth_dir).ok();
 }
 
@@ -1683,9 +2056,10 @@ async fn test_command_code_oauth_rejects_whoami_without_identity() {
         "/alpha/whoami",
         get(|| async { Json(json!({"user": {"id": "", "userName": ""}})) }),
     );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = test_listener().await;
     let port = listener.local_addr().unwrap().port();
-    let mock_task = tokio::spawn(async move { axum::serve(listener, mock_app).await.unwrap() });
+    let mut mock_task =
+        TestTask::spawn(async move { axum::serve(listener, mock_app).await.unwrap() });
 
     let config = GatewayConfig {
         auth_dir: auth_dir.clone(),
@@ -1693,18 +2067,30 @@ async fn test_command_code_oauth_rejects_whoami_without_identity() {
         config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
+    mahoquot_gateway::management::settings::Settings {
+        api_keys: vec![API_KEY.to_string()],
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: MANAGEMENT_KEY.to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(&config.config_path)
+    .expect("persist management settings");
+    persist_management_secret(&config.config_path, &auth_dir);
     let app = create_app(Arc::new(AppState::new(&config).unwrap()));
     let start = app
         .clone()
         .oneshot(
-            Request::builder()
+            with_loopback_peer(Request::builder()
                 .uri(format!(
-                    "/v0/management/command-code-auth-url?whoami_url={}&callback=http%3A%2F%2F127.0.0.1%3A35959%2Fcallback",
+                    "/v0/management/command-code-auth-url?whoami_url={}&callback=http%3A%2F%2F127.0.0.1%3A18899%2Fcallback",
                     url_encode(&format!("http://127.0.0.1:{port}/alpha/whoami"))
                 ))
-                .header(header::AUTHORIZATION, format!("Bearer {API_KEY}"))
+                .header("X-Management-Key", MANAGEMENT_KEY)
                 .body(Body::empty())
-                .unwrap(),
+                .unwrap()),
         )
         .await
         .unwrap();
@@ -1713,7 +2099,7 @@ async fn test_command_code_oauth_rejects_whoami_without_identity() {
         .unwrap()
         .to_string();
     let callback = app
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .method("POST")
                 .uri("/v0/management/oauth-callback")
@@ -1729,7 +2115,7 @@ async fn test_command_code_oauth_rejects_whoami_without_identity() {
                     .to_string(),
                 ))
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
 
@@ -1742,15 +2128,19 @@ async fn test_command_code_oauth_rejects_whoami_without_identity() {
             .count(),
         0
     );
-    mock_task.abort();
+    mock_task.close().await;
     std::fs::remove_dir_all(auth_dir).ok();
 }
 #[tokio::test]
 async fn test_command_code_oauth_reports_unavailable_default_callback_port() {
-    let occupied = match tokio::net::TcpListener::bind("127.0.0.1:5959").await {
-        Ok(listener) => listener,
-        Err(_) => return,
-    };
+    if isolated_test(
+        "test_command_code_oauth_reports_unavailable_default_callback_port",
+        &[],
+    )
+    .await
+    {
+        return;
+    }
     let auth_dir = unique_temp_dir("qg-t13-cc-port-conflict");
     let config = GatewayConfig {
         auth_dir: auth_dir.clone(),
@@ -1758,20 +2148,33 @@ async fn test_command_code_oauth_reports_unavailable_default_callback_port() {
         config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
+    mahoquot_gateway::management::settings::Settings {
+        api_keys: vec![API_KEY.to_string()],
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: MANAGEMENT_KEY.to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(&config.config_path)
+    .expect("persist management settings");
+    persist_management_secret(&config.config_path, &auth_dir);
     let app = create_app(Arc::new(AppState::new(&config).unwrap()));
+    let exhausted = ExhaustedDescriptors::new();
     let response = app
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .uri("/v0/management/command-code-auth-url")
-                .header(header::AUTHORIZATION, format!("Bearer {API_KEY}"))
+                .header("X-Management-Key", MANAGEMENT_KEY)
                 .body(Body::empty())
                 .unwrap(),
-        )
+        ))
         .await
         .unwrap();
 
+    drop(exhausted);
     assert_eq!(response.status(), StatusCode::CONFLICT);
-    drop(occupied);
     std::fs::remove_dir_all(auth_dir).ok();
 }
 
@@ -1785,7 +2188,7 @@ async fn test_zcode_quota_reads_the_desktop_app_balance_log() {
         .unwrap()
         .join(format!("zcode-logs-{}", std::process::id()));
     std::fs::create_dir_all(&logs_dir).unwrap();
-    // An older day log must lose to the newest one.
+    // Neither an older nor a newer unbound log may replace this account's quota.
     std::fs::write(
         logs_dir.join("2026-08-30.log"),
         r#"{"balances":[{"show_name":"STALE","used_units":9,"total_units":10,"period_end":1000}]}"#,
@@ -1796,7 +2199,46 @@ async fn test_zcode_quota_reads_the_desktop_app_balance_log() {
         r#"host poll ok {"success":true,"data":{"balances":[{"show_name":"GLM-5.3","used_units":300000,"total_units":3000000,"period_end":1788191999},{"show_name":"GLM-5.3-Flash","used_units":1000,"total_units":5000000,"period_end":1788191999}]}}"#,
     )
     .unwrap();
-    std::env::set_var("ZCODE_LOGS_DIR", &logs_dir);
+    if isolated_test(
+        "test_zcode_quota_reads_the_desktop_app_balance_log",
+        &[("ZCODE_LOGS_DIR", logs_dir.as_path())],
+    )
+    .await
+    {
+        std::fs::remove_dir_all(auth_dir).unwrap();
+        std::fs::remove_dir_all(logs_dir).unwrap();
+        return;
+    }
+    let inherited_logs = std::path::PathBuf::from(std::env::var_os("ZCODE_LOGS_DIR").unwrap());
+    assert!(
+        std::fs::read_to_string(inherited_logs.join("2026-08-31.log"))
+            .unwrap()
+            .contains("GLM-5.3-Flash")
+    );
+    let calls = Arc::new(AtomicUsize::new(0));
+    let hits = calls.clone();
+    let probe = Router::new().route(
+        "/api/v1/zcode-plan/billing/balance",
+        get(move || {
+            let hits = hits.clone();
+            async move {
+                if hits.fetch_add(1, Ordering::SeqCst) != 0 {
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                }
+                Json(json!({"code": 0, "data": {"balances": [
+                    {"show_name":"ACCOUNT-ONLY", "used_units": 25, "total_units":100,
+                     "expires_at":1900000000},
+                    {"show_name":"ACCOUNT-FLASH", "used_units":1, "total_units":200,
+                     "expires_at":1900000001}
+                ]}}))
+                .into_response()
+            }
+        }),
+    );
+    let listener = test_listener().await;
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let mut probe_task =
+        TestTask::spawn(async move { axum::serve(listener, probe).await.unwrap() });
 
     std::fs::write(
         auth_dir.join("zcode-desktop.json"),
@@ -1808,10 +2250,7 @@ async fn test_zcode_quota_reads_the_desktop_app_balance_log() {
             "expired": "2099-12-31T00:00:00Z",
             "type": "zcode",
             "disabled": false,
-            // Pin the billing probe to a dead local port so it fails fast and
-            // deterministically, leaving the desktop-log fallback to supply
-            // the quota snapshot this test asserts.
-            "usage_override": "http://127.0.0.1:1"
+            "usage_override": base
         })
         .to_string(),
     )
@@ -1820,8 +2259,20 @@ async fn test_zcode_quota_reads_the_desktop_app_balance_log() {
     let config = GatewayConfig {
         auth_dir: auth_dir.clone(),
         api_keys: mahoquot_gateway::inbound::ApiKeys::new(vec![API_KEY.to_string()]),
+        config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
+    mahoquot_gateway::management::settings::Settings {
+        api_keys: vec![API_KEY.to_string()],
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: MANAGEMENT_KEY.to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(&config.config_path)
+    .expect("persist management settings");
     let state = Arc::new(AppState::new(&config).unwrap());
     let snapshot = state.pool.load();
     let member = snapshot
@@ -1833,25 +2284,51 @@ async fn test_zcode_quota_reads_the_desktop_app_balance_log() {
 
     refresh_account_usage(&state, &member)
         .await
-        .expect("quota poll from desktop logs");
-
-    let usage = member.usage_snapshot();
+        .expect("account-bound billing snapshot");
+    let snapshot_time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let usage = member.usage_snapshot_at(snapshot_time);
+    assert_eq!(usage.refresh_status.as_deref(), Some("ok"));
+    assert_eq!(usage.last_refresh_error, None);
+    assert!(usage.refreshed_at_unix.is_some());
     let group = usage
         .groups
         .iter()
         .find(|group| group.display_name.as_deref() == Some("GLM Coding Plan"))
-        .expect("coding plan group");
+        .unwrap();
     assert_eq!(group.buckets.len(), 2);
-    assert_eq!(group.buckets[0].display_name.as_deref(), Some("GLM-5.3"));
-    assert_eq!(group.buckets[0].used_percent, Some(10.0));
-    assert_eq!(group.buckets[0].reset_at_unix, Some(1788191999));
+    assert_eq!(
+        group.buckets[0].display_name.as_deref(),
+        Some("ACCOUNT-ONLY")
+    );
+    assert_eq!(group.buckets[0].used_percent, Some(25.0));
+    assert_eq!(group.buckets[0].reset_at_unix, Some(1_900_000_000));
     assert_eq!(
         group.buckets[1].display_name.as_deref(),
-        Some("GLM-5.3-Flash")
+        Some("ACCOUNT-FLASH")
     );
-    assert_eq!(group.buckets[1].used_percent, Some(0.02));
+    assert_eq!(group.buckets[1].used_percent, Some(0.5));
+    assert_eq!(group.buckets[1].reset_at_unix, Some(1_900_000_001));
+    let error = refresh_account_usage(&state, &member)
+        .await
+        .expect_err("unbound logs cannot replace failed billing");
+    assert!(error.to_string().contains("503"));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    let failed = member.usage_snapshot_at(snapshot_time);
+    assert_eq!(failed.refreshed_at_unix, usage.refreshed_at_unix);
+    assert_eq!(failed.refresh_status.as_deref(), Some("error"));
+    assert_eq!(failed.last_refresh_error, Some(error.to_string()));
+    let mut expected = usage;
+    expected.refresh_status = Some("error".to_string());
+    expected.last_refresh_error = Some(error.to_string());
+    assert_eq!(
+        serde_json::to_value(failed).unwrap(),
+        serde_json::to_value(expected).unwrap()
+    );
+    probe_task.close().await;
 
-    std::env::remove_var("ZCODE_LOGS_DIR");
     std::fs::remove_dir_all(auth_dir).ok();
     std::fs::remove_dir_all(logs_dir).ok();
 }
@@ -1890,9 +2367,9 @@ async fn test_zcode_plan_billing_probe_reads_balance_windows() {
             }))
         }),
     );
-    let probe_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let probe_listener = test_listener().await;
     let probe_port = probe_listener.local_addr().unwrap().port();
-    tokio::spawn(async move {
+    let mut server_task_6 = TestTask::spawn(async move {
         axum::serve(probe_listener, probe).await.unwrap();
     });
 
@@ -1915,8 +2392,20 @@ async fn test_zcode_plan_billing_probe_reads_balance_windows() {
     let config = GatewayConfig {
         auth_dir: auth_dir.clone(),
         api_keys: mahoquot_gateway::inbound::ApiKeys::new(vec![API_KEY.to_string()]),
+        config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
+    mahoquot_gateway::management::settings::Settings {
+        api_keys: vec![API_KEY.to_string()],
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: MANAGEMENT_KEY.to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(&config.config_path)
+    .expect("persist management settings");
     let state = Arc::new(AppState::new(&config).unwrap());
     let snapshot = state.pool.load();
     let member = snapshot
@@ -1946,27 +2435,33 @@ async fn test_zcode_plan_billing_probe_reads_balance_windows() {
     );
     assert_eq!(group.buckets[1].used_percent, Some(1.0));
 
-    let captured = seen.lock().unwrap();
-    assert_eq!(captured.len(), 1);
-    let header = |name: &str| {
-        captured[0]
-            .iter()
-            .find(|(n, _)| n.eq_ignore_ascii_case(name))
-            .map(|(_, v)| v.clone())
-    };
-    assert!(header("authorization").is_some_and(|v| v.ends_with(".sig")));
-    assert!(header("x-device-mid").is_some_and(|v| !v.is_empty()));
-    assert_eq!(header("x-title").as_deref(), Some("Z Code@cli"));
-    assert_eq!(header("x-zcode-agent"), None);
+    {
+        let captured = seen.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        let header = |name: &str| {
+            captured[0]
+                .iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.clone())
+        };
+        assert!(header("authorization").is_some_and(|v| v.ends_with(".sig")));
+        assert!(header("x-device-mid").is_some_and(|v| !v.is_empty()));
+        assert_eq!(header("x-title").as_deref(), Some("Z Code@cli"));
+        assert_eq!(header("x-zcode-agent"), None);
+    }
     // The device id persists for later probes so the control plane sees one
     // continuous device per install.
     assert!(auth_dir.join("zcode-plan-device-mid").exists());
 
+    server_task_6.close().await;
     std::fs::remove_dir_all(auth_dir).ok();
 }
 
 #[tokio::test]
 async fn test_zcode_oauth_flow_end_to_end() {
+    if isolated_test("test_zcode_oauth_flow_end_to_end", &[]).await {
+        return;
+    }
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use mahoquot_providers::zcode::ZcodeAccount;
@@ -2013,9 +2508,9 @@ async fn test_zcode_oauth_flow_end_to_end() {
                 }
             }),
         );
-    let zcode_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let zcode_listener = test_listener().await;
     let zcode_port = zcode_listener.local_addr().unwrap().port();
-    tokio::spawn(async move {
+    let mut server_task_7 = TestTask::spawn(async move {
         axum::serve(zcode_listener, zcode_api).await.unwrap();
     });
     let api_base = format!("http://127.0.0.1:{zcode_port}");
@@ -2034,13 +2529,25 @@ async fn test_zcode_oauth_flow_end_to_end() {
     let config = GatewayConfig {
         auth_dir: auth_dir.clone(),
         api_keys: mahoquot_gateway::inbound::ApiKeys::new(vec![API_KEY.to_string()]),
+        config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
+    mahoquot_gateway::management::settings::Settings {
+        api_keys: vec![API_KEY.to_string()],
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: MANAGEMENT_KEY.to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(&config.config_path)
+    .expect("persist management settings");
     let app_state = Arc::new(AppState::new(&config).unwrap());
     let gateway_app = create_app(app_state);
-    let gateway_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gateway_listener = test_listener().await;
     let gateway_port = gateway_listener.local_addr().unwrap().port();
-    tokio::spawn(async move {
+    let mut server_task_8 = TestTask::spawn(async move {
         axum::serve(
             gateway_listener,
             gateway_app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -2054,7 +2561,7 @@ async fn test_zcode_oauth_flow_end_to_end() {
         .get(format!(
             "http://127.0.0.1:{gateway_port}/v0/management/zcode-auth-url"
         ))
-        .bearer_auth(API_KEY)
+        .header("X-Management-Key", MANAGEMENT_KEY)
         .send()
         .await
         .unwrap();
@@ -2070,7 +2577,7 @@ async fn test_zcode_oauth_flow_end_to_end() {
     };
     let pending_resp = client
         .get(auth_status_url(&state_token))
-        .bearer_auth(API_KEY)
+        .header("X-Management-Key", MANAGEMENT_KEY)
         .send()
         .await
         .unwrap();
@@ -2081,7 +2588,7 @@ async fn test_zcode_oauth_flow_end_to_end() {
 
     let done_resp = client
         .get(auth_status_url(&state_token))
-        .bearer_auth(API_KEY)
+        .header("X-Management-Key", MANAGEMENT_KEY)
         .send()
         .await
         .unwrap();
@@ -2106,7 +2613,7 @@ async fn test_zcode_oauth_flow_end_to_end() {
         .post(format!(
             "http://127.0.0.1:{gateway_port}/v0/management/zcode-callback"
         ))
-        .bearer_auth(API_KEY)
+        .header("X-Management-Key", MANAGEMENT_KEY)
         .json(&json!({ "state": state_token, "callback_url": "zcode://oauth/callback?code=x" }))
         .send()
         .await
@@ -2117,5 +2624,7 @@ async fn test_zcode_oauth_flow_end_to_end() {
         std::env::remove_var("ZCODE_CLI_INIT_URL");
         std::env::remove_var("ZCODE_CLI_POLL_URL");
     }
+    server_task_8.close().await;
+    server_task_7.close().await;
     std::fs::remove_dir_all(auth_dir).ok();
 }

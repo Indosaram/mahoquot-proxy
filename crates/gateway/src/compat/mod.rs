@@ -1,10 +1,12 @@
 pub mod claude;
+pub mod cursor;
+pub mod cursor_proto;
 pub mod exec_bridge;
 pub mod exec_ops;
-pub mod cursor;
-mod cursor_proto;
 pub mod devin;
 pub mod devin_proto;
+pub mod meta;
+pub mod xai;
 pub mod zcode;
 
 #[doc(hidden)]
@@ -73,6 +75,7 @@ pub fn cursor_is_get_blob_reply(frame: &[u8], expected_id: u32) -> bool {
 }
 pub mod events;
 pub mod gemini;
+pub mod kimi;
 pub mod kiro;
 pub mod mimo;
 pub mod render;
@@ -160,13 +163,14 @@ pub async fn open_stream(
     }
 }
 
-/// Upper bound on the Anthropic preamble buffered while looking for an early
-/// `error` event; real preambles (`message_start` + `ping`) are well below it.
-const ANTHROPIC_PREAMBLE_CAP: usize = 64 * 1024;
+/// Upper bound on the Anthropic preamble buffered while looking for the first
+/// visible output. The preamble includes any leading thinking blocks, so it is
+/// sized for long reasoning rather than just `message_start` + `ping`.
+const ANTHROPIC_PREAMBLE_CAP: usize = 1024 * 1024;
 
 /// What the leading complete SSE frames of an Anthropic stream say.
 enum AnthropicPreamble {
-    /// Only `message_start` / `ping` so far; more bytes are needed.
+    /// Only `message_start` / `ping` / thinking so far; more bytes are needed.
     Pending,
     /// A content-bearing event arrived; the stream is genuinely served.
     Served,
@@ -193,7 +197,29 @@ fn classify_anthropic_preamble(buf: &[u8]) -> AnthropicPreamble {
             return AnthropicPreamble::Served;
         };
         match value.get("type").and_then(Value::as_str) {
-            Some("message_start") | Some("ping") => continue,
+            Some("message_start")
+            | Some("ping")
+            | Some("message_delta")
+            | Some("content_block_stop") => continue,
+            // Reasoning is not a deliverable answer: an upstream that thinks
+            // and then stops without text or a tool call must stay retryable.
+            Some("content_block_start")
+                if matches!(
+                    value["content_block"]["type"].as_str(),
+                    Some("thinking") | Some("redacted_thinking")
+                ) =>
+            {
+                continue
+            }
+            Some("content_block_delta")
+                if matches!(
+                    value["delta"]["type"].as_str(),
+                    Some("thinking_delta") | Some("signature_delta")
+                ) =>
+            {
+                continue
+            }
+            Some("message_stop") => return AnthropicPreamble::Failed(empty_message_reason(&text)),
             Some("error") => {
                 let error = value.get("error");
                 let kind = error
@@ -221,12 +247,33 @@ fn classify_anthropic_preamble(buf: &[u8]) -> AnthropicPreamble {
     AnthropicPreamble::Pending
 }
 
-/// Opens an Anthropic SSE stream, holding back only its preamble until the
-/// first content-bearing event. Relays such as CCAPI report a spent account on
-/// streaming requests as HTTP 200 + `message_start` + `event: error`; surfacing
-/// that as `Err` before any byte is committed lets the relay fail over to the
-/// next account instead of handing the client a rate-limit error. On deadline
-/// or cap the buffered bytes are released unchanged.
+/// Failure reason for an upstream message that finished with neither text nor
+/// a tool call. `unavailable` routes it through ordinary failover without
+/// cooling the account down.
+fn empty_message_reason(text: &str) -> String {
+    let stop_reason = text
+        .split("\n\n")
+        .filter_map(|frame| {
+            let data: String = frame
+                .lines()
+                .filter_map(|line| line.strip_prefix("data:"))
+                .map(str::trim_start)
+                .collect();
+            serde_json::from_str::<Value>(&data).ok()
+        })
+        .filter(|value| value["type"] == "message_delta")
+        .find_map(|value| value["delta"]["stop_reason"].as_str().map(str::to_string))
+        .unwrap_or_else(|| "<missing>".to_string());
+    format!("unavailable: upstream message ended without text or tool calls (stop_reason={stop_reason})")
+}
+
+/// Opens an Anthropic SSE stream, holding back its preamble (including leading
+/// thinking) until the first text or tool-call event. Relays such as CCAPI
+/// report a spent account on streaming requests as HTTP 200 + `message_start` +
+/// `event: error`, and Claude sometimes stops after thinking alone; surfacing
+/// either as `Err` before any byte is committed lets the relay fail over to the
+/// next account instead of serving an error or an empty 200. On deadline or cap
+/// the buffered bytes are released unchanged.
 pub async fn open_anthropic_stream(
     resp: reqwest::Response,
     deadline: std::time::Duration,
@@ -255,239 +302,19 @@ async fn hold_anthropic_preamble(
             Ok(Some(Ok(chunk))) => buf.extend_from_slice(&chunk),
             Ok(Some(Err(err))) => return Err(err.to_string()),
             Ok(None) => {
-                let ended: UpstreamStream = Box::pin(futures::stream::empty());
-                return Ok((buf.freeze(), ended));
-            }
-            Err(_) => return Ok((buf.freeze(), stream)),
-        }
-    }
-}
-
-/// Upper bound on the Codex/OpenAI-compatible preamble buffered while looking
-/// for the first content-bearing event. A healthy turn emits its first text or
-/// tool call well below it; past the cap the stream is released unchanged so a
-/// reasoning-heavy turn never stalls behind a fixed buffer.
-const CODEX_PREAMBLE_CAP: usize = 32 * 1024;
-
-/// What the leading complete SSE frames of an OpenAI-shaped stream say.
-enum CodexPreamble {
-    /// Nothing content-bearing yet; more bytes are needed.
-    Pending,
-    /// Text, reasoning-free content, or a tool call arrived; the stream is served.
-    Served,
-    /// The upstream closed (or reported completion) without ever emitting
-    /// content. Callers fail over instead of handing the client an empty turn.
-    Empty,
-}
-
-fn codex_frame_has_content(value: &Value) -> Option<bool> {
-    if value.as_str() == Some("[DONE]") {
-        return Some(false);
-    }
-    if let Some(choices) = value.get("choices").and_then(Value::as_array) {
-        for choice in choices {
-            // Legacy completions put the text directly on the choice.
-            if choice
-                .get("text")
-                .and_then(Value::as_str)
-                .is_some_and(|text| !text.trim().is_empty())
-            {
-                return Some(true);
-            }
-            for holder in ["delta", "message"] {
-                let Some(part) = choice.get(holder) else {
-                    continue;
+                // A truncated tail frame may still hold the decisive event.
+                buf.extend_from_slice(b"\n\n");
+                return match classify_anthropic_preamble(&buf) {
+                    AnthropicPreamble::Failed(reason) => Err(reason),
+                    AnthropicPreamble::Pending => Err(
+                        "unavailable: upstream stream ended before any text or tool calls"
+                            .to_string(),
+                    ),
+                    AnthropicPreamble::Served => {
+                        let ended: UpstreamStream = Box::pin(futures::stream::empty());
+                        Ok((buf.freeze(), ended))
+                    }
                 };
-                if part
-                    .get("content")
-                    .and_then(Value::as_str)
-                    .is_some_and(|text| !text.trim().is_empty())
-                {
-                    return Some(true);
-                }
-                // A refusal is an answer the user must see; never discard it.
-                if part
-                    .get("refusal")
-                    .and_then(Value::as_str)
-                    .is_some_and(|text| !text.trim().is_empty())
-                {
-                    return Some(true);
-                }
-                if part
-                    .get("tool_calls")
-                    .and_then(Value::as_array)
-                    .is_some_and(|calls| !calls.is_empty())
-                {
-                    return Some(true);
-                }
-            }
-            if choice.get("finish_reason").is_some_and(|r| !r.is_null()) {
-                return Some(false);
-            }
-        }
-        return Some(false);
-    }
-    match value.get("type").and_then(Value::as_str) {
-        Some("response.output_text.delta") => Some(
-            value
-                .get("delta")
-                .and_then(Value::as_str)
-                .is_some_and(|text| !text.is_empty()),
-        ),
-        Some("response.output_item.added") => Some(
-            value
-                .pointer("/item/type")
-                .and_then(Value::as_str)
-                .is_some_and(|kind| kind == "function_call"),
-        ),
-        Some("response.function_call_arguments.delta") => Some(
-            value
-                .get("delta")
-                .and_then(Value::as_str)
-                .is_some_and(|delta| !delta.is_empty()),
-        ),
-        // Reasoning is deliberately not content: a stream that spends its whole
-        // turn thinking and then stops is the case this gate exists to catch.
-        Some("response.reasoning_summary_text.delta") | Some("response.reasoning_text.delta") => {
-            Some(false)
-        }
-        Some("response.created") | Some("response.in_progress") => Some(false),
-        // A completed turn normally carried its text as deltas. Trust the final
-        // document only as a rescue for an upstream that suppressed them.
-        Some("response.completed") => Some(
-            value
-                .pointer("/response/output")
-                .and_then(Value::as_array)
-                .is_some_and(|items| {
-                    items.iter().any(|item| {
-                        item.get("type").and_then(Value::as_str) == Some("function_call")
-                            || item
-                                .get("content")
-                                .and_then(Value::as_array)
-                                .is_some_and(|parts| {
-                                    parts.iter().any(|part| {
-                                        part.get("text")
-                                            .and_then(Value::as_str)
-                                            .is_some_and(|text| !text.trim().is_empty())
-                                    })
-                                })
-                    })
-                }),
-        ),
-        Some("response.incomplete") | Some("response.cancelled") => Some(false),
-        // An explicit error frame is the stream's answer: let it through so the
-        // existing classifier maps rate limits and auth failures as before
-        // instead of being flattened into an "empty response".
-        Some("error") | Some("response.failed") => Some(true),
-        _ => None,
-    }
-}
-
-fn classify_codex_preamble(buf: &[u8]) -> CodexPreamble {
-    let text = String::from_utf8_lossy(buf).replace("\r\n", "\n");
-    let mut frames: Vec<&str> = text.split("\n\n").collect();
-    // The trailing piece is an incomplete frame; judge it once its delimiter lands.
-    frames.pop();
-    let mut terminal = false;
-    for frame in frames {
-        let data: String = frame
-            .lines()
-            .filter_map(|line| line.strip_prefix("data:"))
-            .map(str::trim_start)
-            .collect();
-        if data.trim().is_empty() {
-            continue;
-        }
-        let trimmed = data.trim();
-        if trimmed == "[DONE]" {
-            terminal = true;
-            continue;
-        }
-        let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
-            // Unparseable payloads are not evidence of content, but they are not
-            // evidence of an empty turn either: let the stream through.
-            return CodexPreamble::Served;
-        };
-        if codex_frame_has_content(&value) == Some(true) {
-            return CodexPreamble::Served;
-        }
-        if value
-            .get("type")
-            .and_then(Value::as_str)
-            .is_some_and(|kind| {
-                matches!(
-                    kind,
-                    "response.completed" | "response.incomplete" | "response.cancelled"
-                )
-            })
-        {
-            terminal = true;
-            continue;
-        }
-        if value
-            .get("choices")
-            .and_then(Value::as_array)
-            .is_some_and(|choices| {
-                choices
-                    .iter()
-                    .any(|c| c.get("finish_reason").is_some_and(|r| !r.is_null()))
-            })
-        {
-            terminal = true;
-        }
-    }
-    if terminal {
-        CodexPreamble::Empty
-    } else {
-        CodexPreamble::Pending
-    }
-}
-
-/// Opens an OpenAI-shaped stream, holding back its preamble until the first
-/// content-bearing event. Upstreams in this pool answer with HTTP 200 and a
-/// short, well-formed stream that carries a role prelude, reasoning deltas, and
-/// a terminal event but no text and no tool call. Relaying that verbatim makes
-/// the client consume an empty turn; surfacing `Err` before any byte is
-/// committed lets the relay fail over to another account instead. On deadline,
-/// cap, or a closed-but-content-bearing stream the buffered bytes are released
-/// unchanged.
-pub async fn open_codex_stream(
-    resp: reqwest::Response,
-    deadline: std::time::Duration,
-) -> Result<(Bytes, UpstreamStream), String> {
-    let (first, stream) = open_stream(resp, Protocol::Codex).await?;
-    hold_codex_preamble(first, stream, deadline).await
-}
-
-async fn hold_codex_preamble(
-    first: Bytes,
-    mut stream: UpstreamStream,
-    deadline: std::time::Duration,
-) -> Result<(Bytes, UpstreamStream), String> {
-    let until = tokio::time::Instant::now() + deadline;
-    let mut buf = bytes::BytesMut::from(&first[..]);
-    loop {
-        match classify_codex_preamble(&buf) {
-            CodexPreamble::Served => return Ok((buf.freeze(), stream)),
-            CodexPreamble::Empty => {
-                return Err(
-                    "empty_response: upstream stream ended without text or tool calls".to_string(),
-                )
-            }
-            CodexPreamble::Pending if buf.len() >= CODEX_PREAMBLE_CAP => {
-                return Ok((buf.freeze(), stream))
-            }
-            CodexPreamble::Pending => {}
-        }
-        match tokio::time::timeout_at(until, stream.next()).await {
-            Ok(Some(Ok(chunk))) => buf.extend_from_slice(&chunk),
-            Ok(Some(Err(err))) => return Err(err.to_string()),
-            // End of stream with nothing content-bearing: this turn is empty by
-            // construction, so fail over rather than commit it to the client.
-            Ok(None) => {
-                return Err(
-                    "empty_response: upstream stream ended without text or tool calls".to_string(),
-                )
             }
             Err(_) => return Ok((buf.freeze(), stream)),
         }
@@ -521,45 +348,6 @@ pub(crate) fn extend_nonstream_bounded(raw: &mut Vec<u8>, chunk: &[u8]) -> Resul
     Ok(())
 }
 
-/// The model id an upstream envelope declares as the one it actually served.
-///
-/// Codex answers `response.created`/`response.completed` with its own
-/// `response.model`, and that value is authoritative: the backend may answer a
-/// request for one id with a different one (its safety-buffering path answers
-/// `gpt-6-astra` with the faster `gpt-6-luna` surface and announces that plan in
-/// `x-codex-safety-buffering-faster-model`). Nothing in this gateway rewrites
-/// that field, so it is the only place a caller can learn that the id it asked
-/// for was not the id that ran.
-pub fn served_codex_model(buf: &[u8]) -> Option<String> {
-    let text = std::str::from_utf8(buf).ok()?;
-    for block in text.split("\n\n") {
-        for line in block.lines() {
-            let Some(data) = line.strip_prefix("data:") else {
-                continue;
-            };
-            let Ok(value) = serde_json::from_str::<Value>(data.trim()) else {
-                continue;
-            };
-            if !matches!(
-                value.get("type").and_then(Value::as_str),
-                Some("response.created" | "response.completed" | "response.in_progress")
-            ) {
-                continue;
-            }
-            if let Some(model) = value
-                .get("response")
-                .and_then(|response| response.get("model"))
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|model| !model.is_empty())
-            {
-                return Some(model.to_string());
-            }
-        }
-    }
-    None
-}
-
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Protocol {
     Codex,
@@ -568,6 +356,19 @@ pub enum Protocol {
     Kiro,
     Cursor,
     Devin,
+}
+
+impl Protocol {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Antigravity => "antigravity",
+            Self::Anthropic => "anthropic",
+            Self::Kiro => "kiro",
+            Self::Cursor => "cursor",
+            Self::Devin => "devin",
+        }
+    }
 }
 
 pub struct ProtocolSession {
@@ -767,8 +568,16 @@ impl StreamRenderer {
         }
     }
 
+    fn open(&mut self) -> Vec<Bytes> {
+        match self {
+            Self::OpenAi(renderer) => renderer.open(),
+            _ => Vec::new(),
+        }
+    }
+
     fn tick(&mut self) -> Bytes {
         match self {
+            Self::OpenAi(renderer) => renderer.tick(),
             Self::Anthropic(renderer) => renderer.tick(),
             _ => Bytes::new(),
         }
@@ -802,9 +611,7 @@ pub fn streaming_body(params: StreamingBodyParams) -> Body {
     let parser = ProtocolParser::with_session(&session);
     let renderer = match shape {
         ReplyShape::Gemini => StreamRenderer::Gemini(Box::new(match session.replay {
-            Some(replay) => {
-                GeminiChunkRenderer::with_replay(model, created, replay)
-            }
+            Some(replay) => GeminiChunkRenderer::with_replay(model, created, replay),
             None => GeminiChunkRenderer::new(model, created),
         })),
         ReplyShape::Anthropic => StreamRenderer::Anthropic(Box::new(
@@ -827,6 +634,9 @@ pub fn streaming_body(params: StreamingBodyParams) -> Body {
     state.parser.push(&first, &mut events);
     for event in events {
         handle_stream_event(event, &mut state, upstream_capture.as_ref());
+    }
+    if session.protocol == Protocol::Cursor && state.pending.is_empty() {
+        state.pending.extend(state.renderer.open());
     }
 
     Body::from_stream(futures::stream::unfold(
@@ -854,11 +664,11 @@ pub fn streaming_body(params: StreamingBodyParams) -> Body {
                     }
                     continue;
                 }
-                let next = tokio::time::timeout(STREAM_IDLE_TICK, state.upstream.next()).await;
-                let next = match next {
+                let next = match tokio::time::timeout(STREAM_IDLE_TICK, state.upstream.next()).await {
                     Ok(item) => item,
                     Err(_) => {
                         let frame = state.renderer.tick();
+                        state.last_emit = std::time::Instant::now();
                         if !frame.is_empty() {
                             state.pending.push_back(frame);
                         }
@@ -910,6 +720,9 @@ fn handle_stream_event(
     state: &mut TranslateState,
     upstream_capture: Option<&Arc<std::sync::Mutex<Option<crate::usage::ResponseTokenUsage>>>>,
 ) {
+    if state.renderer.terminated() {
+        return;
+    }
     capture_stream_usage(&event, upstream_capture);
     state.pending.extend(state.renderer.render(event));
 }
@@ -1052,7 +865,7 @@ pub fn aggregate(
         None => match shape {
             ReplyShape::Chat => Ok(aggregator.into_completion()),
             ReplyShape::TextCompletion => Ok(aggregator.into_text_completion()),
-            ReplyShape::Gemini => Ok(aggregator.into_gemini()),
+            ReplyShape::Gemini => aggregator.into_gemini(),
             ReplyShape::Anthropic => Ok(aggregator.into_completion()),
             ReplyShape::Responses => aggregator.into_responses(),
         },
@@ -1183,46 +996,6 @@ pub fn error_stream_body(message: &str) -> Body {
 }
 
 #[cfg(test)]
-mod served_model_tests {
-    use super::served_codex_model;
-
-    fn frame(kind: &str, model: &str) -> String {
-        format!(
-            "event: {kind}\ndata: {{\"type\":\"{kind}\",\"response\":{{\"id\":\"resp_1\",\"model\":\"{model}\"}}}}\n\n"
-        )
-    }
-
-    #[test]
-    fn reads_the_model_the_upstream_declares_it_served() {
-        let stream = format!(
-            "{}{}",
-            frame("response.created", "gpt-6-luna"),
-            frame("response.completed", "gpt-6-luna")
-        );
-        assert_eq!(served_codex_model(stream.as_bytes()).as_deref(), Some("gpt-6-luna"));
-    }
-
-    /// The whole point of the tap: a request for one model answered by another
-    /// must be readable from the upstream's own envelope.
-    #[test]
-    fn reports_a_model_that_differs_from_the_requested_one() {
-        let stream = frame("response.created", "gpt-6-luna");
-        assert_ne!(
-            served_codex_model(stream.as_bytes()).as_deref(),
-            Some("gpt-6-astra")
-        );
-    }
-
-    #[test]
-    fn ignores_frames_that_do_not_carry_a_model() {
-        let stream = "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"OK\"}\n\n";
-        assert_eq!(served_codex_model(stream.as_bytes()), None);
-        assert_eq!(served_codex_model(b""), None);
-        assert_eq!(served_codex_model(b"not an event stream"), None);
-    }
-}
-
-#[cfg(test)]
 mod bounded_stream_tests {
     use super::*;
     use std::collections::VecDeque;
@@ -1240,10 +1013,7 @@ mod bounded_stream_tests {
     impl Stream for CountingSource {
         type Item = reqwest::Result<Bytes>;
 
-        fn poll_next(
-            mut self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<Option<Self::Item>> {
+        fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
             self.polls.fetch_add(1, Ordering::SeqCst);
             match self.chunks.pop_front() {
                 Some(chunk) => Poll::Ready(Some(Ok(chunk))),
@@ -1260,7 +1030,10 @@ mod bounded_stream_tests {
 
     /// Drives a `streaming_body` that must terminate on its very first chunk,
     /// returning the rendered body text plus the source's poll and drop counts.
-    async fn drain_after_terminal_first(first: Bytes, protocol: Protocol) -> (String, usize, usize) {
+    async fn drain_after_terminal_first(
+        first: Bytes,
+        protocol: Protocol,
+    ) -> (String, usize, usize) {
         let polls = Arc::new(AtomicUsize::new(0));
         let drops = Arc::new(AtomicUsize::new(0));
         let source = CountingSource {
@@ -1308,19 +1081,33 @@ mod bounded_stream_tests {
             polls, 0,
             "the upstream must not be polled after the limit failure"
         );
-        assert_eq!(drops, 1, "the upstream must be dropped when the stream ends");
+        assert_eq!(
+            drops, 1,
+            "the upstream must be dropped when the stream ends"
+        );
     }
 
     #[tokio::test]
     async fn a_kiro_frame_limit_failure_stops_polling_and_drops_the_upstream() {
-        let mut prelude = (kiro::MAX_KIRO_FRAME_BYTES as u32 + 1).to_be_bytes().to_vec();
+        let mut prelude = (kiro::MAX_KIRO_FRAME_BYTES as u32 + 1)
+            .to_be_bytes()
+            .to_vec();
         prelude.extend_from_slice(&0u32.to_be_bytes());
         prelude.extend_from_slice(&0u32.to_be_bytes());
         let (text, polls, drops) =
             drain_after_terminal_first(Bytes::from(prelude), Protocol::Kiro).await;
-        assert!(text.contains("error"), "expected a terminal error frame: {text}");
-        assert_eq!(polls, 0, "the upstream must not be polled after the frame limit");
-        assert_eq!(drops, 1, "the upstream must be dropped when the stream ends");
+        assert!(
+            text.contains("error"),
+            "expected a terminal error frame: {text}"
+        );
+        assert_eq!(
+            polls, 0,
+            "the upstream must not be polled after the frame limit"
+        );
+        assert_eq!(
+            drops, 1,
+            "the upstream must be dropped when the stream ends"
+        );
     }
 
     #[tokio::test]
@@ -1329,18 +1116,30 @@ mod bounded_stream_tests {
         prelude.extend_from_slice(&(cursor::MAX_CURSOR_FRAME_BYTES as u32 + 1).to_be_bytes());
         let (text, polls, drops) =
             drain_after_terminal_first(Bytes::from(prelude), Protocol::Cursor).await;
-        assert!(text.contains("error"), "expected a terminal error frame: {text}");
-        assert_eq!(polls, 0, "the upstream must not be polled after the frame limit");
-        assert_eq!(drops, 1, "the upstream must be dropped when the stream ends");
+        assert!(
+            text.contains("error"),
+            "expected a terminal error frame: {text}"
+        );
+        assert_eq!(
+            polls, 0,
+            "the upstream must not be polled after the frame limit"
+        );
+        assert_eq!(
+            drops, 1,
+            "the upstream must be dropped when the stream ends"
+        );
     }
 
     fn chunks(parts: &[&'static str]) -> UpstreamStream {
-        let items: Vec<reqwest::Result<Bytes>> =
-            parts.iter().map(|p| Ok(Bytes::from_static(p.as_bytes()))).collect();
+        let items: Vec<reqwest::Result<Bytes>> = parts
+            .iter()
+            .map(|p| Ok(Bytes::from_static(p.as_bytes())))
+            .collect();
         Box::pin(futures::stream::iter(items))
     }
 
-    const MESSAGE_START: &str = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\"}}\n\n";
+    const MESSAGE_START: &str =
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\"}}\n\n";
 
     #[tokio::test]
     async fn a_200_stream_that_opens_with_a_rate_limit_error_fails_over() {
@@ -1358,7 +1157,8 @@ mod bounded_stream_tests {
 
     #[tokio::test]
     async fn a_served_stream_releases_every_buffered_byte_in_order() {
-        let block = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0}\n\n";
+        let block =
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0}\n\n";
         let tail = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         let (first, mut rest) = hold_anthropic_preamble(
             Bytes::from_static(MESSAGE_START.as_bytes()),
@@ -1368,7 +1168,10 @@ mod bounded_stream_tests {
         .await
         .expect("served stream");
         assert_eq!(first, Bytes::from(format!("{MESSAGE_START}{block}")));
-        assert_eq!(rest.next().await.unwrap().unwrap(), Bytes::from_static(tail.as_bytes()));
+        assert_eq!(
+            rest.next().await.unwrap().unwrap(),
+            Bytes::from_static(tail.as_bytes())
+        );
         assert!(rest.next().await.is_none());
     }
 
@@ -1404,126 +1207,60 @@ mod bounded_stream_tests {
         }
     }
 
-    const CODEX_PRELUDE: &str = "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r\",\"status\":\"in_progress\"}}\n\nevent: response.in_progress\ndata: {\"type\":\"response.in_progress\"}\n\n";
-
-    const CODEX_REASONING: &str = "event: response.reasoning_summary_text.delta\ndata: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"pondering\"}\n\n";
-
-    const CODEX_COMPLETED_EMPTY: &str = "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"output\":[]}}\n\n";
-
     #[tokio::test]
-    async fn a_codex_envelope_without_text_or_tool_calls_fails_over() {
-        // The observed failure: HTTP 200, reasoning and a terminal event, no
-        // text, no tool call. Relaying it verbatim costs the client a turn.
-        for tail in [CODEX_COMPLETED_EMPTY, ""] {
-            let result = hold_codex_preamble(
-                Bytes::from_static(CODEX_PRELUDE.as_bytes()),
-                chunks(&[CODEX_REASONING, tail]),
-                std::time::Duration::from_secs(5),
-            )
-            .await;
-            let reason = result.err().expect("an empty turn must fail over");
-            assert!(reason.starts_with("empty_response: "), "{reason}");
-        }
-    }
-
-    #[tokio::test]
-    async fn a_codex_stream_that_closes_mid_prelude_fails_over() {
-        let result = hold_codex_preamble(
-            Bytes::from_static(CODEX_PRELUDE.as_bytes()),
-            chunks(&[]),
-            std::time::Duration::from_secs(5),
-        )
-        .await;
-        assert!(
-            result.is_err(),
-            "a prelude with no content is an empty turn"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_served_codex_stream_releases_every_buffered_byte_in_order() {
-        let text = "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n";
-        let (first, mut rest) = hold_codex_preamble(
-            Bytes::from_static(CODEX_PRELUDE.as_bytes()),
-            chunks(&[CODEX_REASONING, text, CODEX_COMPLETED_EMPTY]),
+    async fn a_message_that_stops_after_thinking_alone_fails_over() {
+        let frames = [
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"hm\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":96}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ];
+        let reason = hold_anthropic_preamble(
+            Bytes::from_static(MESSAGE_START.as_bytes()),
+            chunks(&frames),
             std::time::Duration::from_secs(5),
         )
         .await
-        .expect("a text delta serves the stream");
+        .err()
+        .expect("an empty finish must reach the failover path");
+        assert!(reason.starts_with("unavailable: "), "{reason}");
+        assert!(reason.contains("stop_reason=end_turn"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_ends_without_any_content_fails_over() {
+        let reason = hold_anthropic_preamble(
+            Bytes::from_static(MESSAGE_START.as_bytes()),
+            chunks(&[]),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .err()
+        .expect("a bare message_start must not be served");
+        assert!(reason.starts_with("unavailable: "), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn thinking_followed_by_text_is_released_whole() {
+        let thinking = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n";
+        let text = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n";
+        let tail = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        let (first, mut rest) = hold_anthropic_preamble(
+            Bytes::from_static(MESSAGE_START.as_bytes()),
+            chunks(&[thinking, text, tail]),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("text after thinking is a served answer");
         assert_eq!(
             first,
-            Bytes::from(format!("{CODEX_PRELUDE}{CODEX_REASONING}{text}"))
+            Bytes::from(format!("{MESSAGE_START}{thinking}{text}"))
         );
         assert_eq!(
             rest.next().await.unwrap().unwrap(),
-            Bytes::from_static(CODEX_COMPLETED_EMPTY.as_bytes())
+            Bytes::from_static(tail.as_bytes())
         );
-        assert!(rest.next().await.is_none());
-    }
-
-    #[tokio::test]
-    async fn a_codex_tool_call_serves_the_stream() {
-        let tool = "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"c\",\"name\":\"shell\"}}\n\n";
-        let (first, _) = hold_codex_preamble(
-            Bytes::from_static(CODEX_PRELUDE.as_bytes()),
-            chunks(&[tool]),
-            std::time::Duration::from_secs(5),
-        )
-        .await
-        .expect("a tool call serves the stream");
-        assert!(first.ends_with(tool.as_bytes()));
-    }
-
-    #[tokio::test]
-    async fn chat_completions_envelopes_use_the_same_contract() {
-        let role = "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n";
-        let stop = "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
-        let empty = hold_codex_preamble(
-            Bytes::from_static(role.as_bytes()),
-            chunks(&[stop]),
-            std::time::Duration::from_secs(5),
-        )
-        .await;
-        assert!(
-            empty.is_err(),
-            "a role prelude and a stop is still an empty answer"
-        );
-
-        let text = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n";
-        let (first, _) = hold_codex_preamble(
-            Bytes::from_static(role.as_bytes()),
-            chunks(&[text, stop]),
-            std::time::Duration::from_secs(5),
-        )
-        .await
-        .expect("content serves the stream");
-        assert!(first.ends_with(text.as_bytes()));
-    }
-
-    #[tokio::test]
-    async fn a_codex_refusal_is_served_not_discarded() {
-        let refusal = "data: {\"choices\":[{\"index\":0,\"delta\":{\"refusal\":\"I can't help with that.\"}}]}\n\n";
-        let (first, _) = hold_codex_preamble(
-            Bytes::from_static(refusal.as_bytes()),
-            chunks(&[]),
-            std::time::Duration::from_secs(5),
-        )
-        .await
-        .expect("a refusal is an answer the client must see");
-        assert_eq!(first, Bytes::from_static(refusal.as_bytes()));
-    }
-
-    #[tokio::test]
-    async fn an_unparseable_codex_preamble_is_released_unchanged() {
-        let weird = "data: not json at all\n\n";
-        let (first, _) = hold_codex_preamble(
-            Bytes::from_static(weird.as_bytes()),
-            chunks(&[]),
-            std::time::Duration::from_secs(5),
-        )
-        .await
-        .expect("an unknown payload must not be mistaken for an empty turn");
-        assert_eq!(first, Bytes::from_static(weird.as_bytes()));
     }
 
     #[test]

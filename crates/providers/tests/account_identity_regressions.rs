@@ -5,7 +5,10 @@ fn r25_filename_identity_preserves_arbitrary_suffixes_and_legacy_codex_plans() {
     for (name, expected) in [
         ("claude-work.json", "claude-work"),
         ("claude-personal.json", "claude-personal"),
-        ("generic-command-code-key-one.json", "generic-command-code-key-one"),
+        (
+            "generic-command-code-key-one.json",
+            "generic-command-code-key-one",
+        ),
         ("codex-user-name.json", "user-name"),
         ("codex-user-name-pro.json", "user-name"),
         ("codex-user-name-plus.json", "user-name"),

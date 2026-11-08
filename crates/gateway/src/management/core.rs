@@ -1,3 +1,21 @@
+pub(crate) fn publish_retry_metadata(state: &AppState) {
+    let _publication = state.settings.composition_lock();
+    let settings = state.settings.current();
+    state.pool.rcu(|current| {
+        let mut next = (**current).clone();
+        next.members = current
+            .members
+            .iter()
+            .map(|member| {
+                let mut next = member.clone_for_snapshot(member.devin_catalog_state());
+                next.apply_config_retry(&settings);
+                Arc::new(next)
+            })
+            .collect();
+        next
+    });
+}
+
 use std::sync::Arc;
 
 use axum::extract::State;
@@ -14,8 +32,8 @@ fn json_status(status: StatusCode, body: Value) -> Response {
 }
 
 async fn get_config(State(state): State<Arc<AppState>>) -> Response {
-    let settings = state.settings.current();
-    match serde_json::to_value(&*settings) {
+    let settings = state.settings.configured();
+    match serde_json::to_value(&settings) {
         Ok(value) => json_status(StatusCode::OK, redact(value)),
         Err(err) => json_status(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -102,13 +120,13 @@ async fn get_config_yaml(State(state): State<Arc<AppState>>) -> Response {
     let path = state.settings.path();
     match std::fs::read_to_string(path) {
         Ok(raw) => {
-            let settings = state.settings.current();
+            let settings = state.settings.configured();
             let secret = settings.remote_management.secret_key.clone();
             // The fallback shape: the same settings with the secret blanked and
             // rendered by serde, so it cannot carry the value regardless of how
             // the on-disk document was laid out.
             let normalized = {
-                let mut blanked = (*settings).clone();
+                let mut blanked = settings;
                 blanked.remote_management.secret_key.clear();
                 serde_yaml::to_string(&blanked).unwrap_or_else(|_| "remote-management: {}\n".into())
             };
@@ -178,7 +196,10 @@ async fn put_config_yaml(State(state): State<Arc<AppState>>, raw: bytes::Bytes) 
         // Upstream reports which document sections it rewrote, and a
         // whole-config write is always reported as the single "config"
         // section regardless of what actually differed.
-        Ok(_) => json_status(StatusCode::OK, json!({ "ok": true, "changed": ["config"] })),
+        Ok(_) => {
+            state.sync_routing_strategy();
+            json_status(StatusCode::OK, json!({ "ok": true, "changed": ["config"] }))
+        }
         Err(super::settings::SettingsError::Validation(err)) => json_status(
             StatusCode::BAD_REQUEST,
             json!({ "error": "validation_error", "message": err.to_string() }),
@@ -194,14 +215,7 @@ async fn put_config_yaml(State(state): State<Arc<AppState>>, raw: bytes::Bytes) 
     }
 }
 
-async fn get_latest_version() -> Response {
-    json_status(
-        StatusCode::OK,
-        json!({ "latest-version": format!("v{}", super::gate::cpa_version()) }),
-    )
-}
-
-async fn reset_quota(State(state): State<Arc<AppState>>, raw: bytes::Bytes) -> Response {
+pub(crate) async fn reset_quota(State(state): State<Arc<AppState>>, raw: bytes::Bytes) -> Response {
     let Ok(body) = serde_json::from_slice::<Value>(&raw) else {
         return json_status(
             StatusCode::BAD_REQUEST,
@@ -257,27 +271,6 @@ async fn reset_quota(State(state): State<Arc<AppState>>, raw: bytes::Bytes) -> R
     }
 }
 
-/// Upstream proxies an arbitrary upstream call here. Without a configured
-/// target this build has nothing to forward to, and upstream answers the same
-/// way when its own auth manager is unavailable.
-async fn api_call(raw: bytes::Bytes) -> Response {
-    let parsed = serde_json::from_slice::<Value>(&raw).unwrap_or(Value::Null);
-    let has_method = parsed
-        .get("method")
-        .and_then(Value::as_str)
-        .is_some_and(|m| !m.trim().is_empty());
-    if !has_method {
-        return json_status(
-            StatusCode::BAD_REQUEST,
-            json!({ "error": "missing method" }),
-        );
-    }
-    json_status(
-        StatusCode::SERVICE_UNAVAILABLE,
-        json!({ "error": "core auth manager unavailable" }),
-    )
-}
-
 async fn shutdown(State(state): State<Arc<AppState>>) -> Response {
     state.shutdown.notify_waiters();
     json_status(StatusCode::OK, json!({ "status": "draining" }))
@@ -287,10 +280,15 @@ pub fn core_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/config", get(get_config))
         .route("/config.yaml", get(get_config_yaml).put(put_config_yaml))
-        .route("/latest-version", get(get_latest_version))
-        .route("/api-call", post(api_call))
+        .route("/latest-version", get(super::store::v8::latest_version))
+        .route("/api-call", post(super::store::v8::api_call))
+        .route(
+            "/auth-files/refresh",
+            post(super::store::v8::refresh_credentials),
+        )
         .route("/reset-quota", post(reset_quota))
         .route("/shutdown", post(shutdown))
+        .merge(super::store::quotas::routes())
 }
 
 #[cfg(test)]

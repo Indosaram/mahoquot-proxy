@@ -27,26 +27,6 @@ pub const CLAUDE_BETA_HEADER: &str =
 pub const CLAUDE_UPSTREAM_BASE: &str = "https://api.anthropic.com";
 pub const CLAUDE_MESSAGES_PATH: &str = "/v1/messages";
 
-/// One client identity for every OAuth account: the Claude Agent SDK
-/// (TypeScript) 0.3.296 as it runs on this Linux x64 host, taken from two
-/// captured runs whose identity headers were byte-identical. Per-session values
-/// (`x-claude-code-session-id`) and transport headers are deliberately absent.
-/// Update all values together from a fresh capture; never mix versions.
-pub const AGENT_SDK_IDENTITY_HEADERS: &[(&str, &str)] = &[
-    (
-        "user-agent",
-        "claude-cli/2.1.296 (external, sdk-ts, agent-sdk/0.3.296)",
-    ),
-    ("x-app", "cli"),
-    ("anthropic-dangerous-direct-browser-access", "true"),
-    ("x-stainless-lang", "js"),
-    ("x-stainless-package-version", "0.128.0"),
-    ("x-stainless-os", "Linux"),
-    ("x-stainless-arch", "x64"),
-    ("x-stainless-runtime", "node"),
-    ("x-stainless-runtime-version", "v26.3.0"),
-];
-
 use mahoquot_registry::{embedded_snapshot, ProviderContribution, ProviderId, RegistrySnapshot};
 
 pub fn provider_id() -> ProviderId {

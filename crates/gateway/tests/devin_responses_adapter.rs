@@ -15,9 +15,7 @@ pub mod compat {
 #[path = "../src/compat/responses.rs"]
 mod responses;
 
-use responses::{
-    responses_response, responses_to_openai, ResponsesError, ResponsesStreamRenderer,
-};
+use responses::{responses_response, responses_to_openai, ResponsesError, ResponsesStreamRenderer};
 
 fn parse_sse_frames(frames: &[Bytes]) -> Vec<(String, Value)> {
     let mut results = Vec::new();
@@ -144,11 +142,16 @@ fn test_request_base64_vision_accepted_and_remote_url_rejected() {
         ]
     });
     let chat = responses_to_openai(&valid_req).expect("base64 vision accepted");
-    let parts = chat["messages"][0]["content"].as_array().expect("content parts");
+    let parts = chat["messages"][0]["content"]
+        .as_array()
+        .expect("content parts");
     assert_eq!(parts.len(), 2);
     assert_eq!(parts[0]["type"], "text");
     assert_eq!(parts[1]["type"], "image_url");
-    assert_eq!(parts[1]["image_url"]["url"], "data:image/png;base64,iVBORw0KGgo=");
+    assert_eq!(
+        parts[1]["image_url"]["url"],
+        "data:image/png;base64,iVBORw0KGgo="
+    );
 
     let remote_req = json!({
         "model": "devin/glm-5-2",
@@ -174,7 +177,9 @@ fn test_request_unsupported_remote_stateful_and_background_features_rejected() {
         "input": "continue"
     });
     let err = responses_to_openai(&req_prev_id).expect_err("previous_response_id rejected");
-    assert!(err.to_string().contains("previous_response_id is not supported"));
+    assert!(err
+        .to_string()
+        .contains("previous_response_id is not supported"));
 
     // 2. background: true
     let req_background = json!({
@@ -222,9 +227,15 @@ fn test_request_function_tools_and_tool_choice_mapping() {
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0]["type"], "function");
     assert_eq!(tools[0]["function"]["name"], "get_current_weather");
-    assert_eq!(tools[0]["function"]["description"], "Get weather for location");
+    assert_eq!(
+        tools[0]["function"]["description"],
+        "Get weather for location"
+    );
     assert_eq!(chat["tool_choice"]["type"], "function");
-    assert_eq!(chat["tool_choice"]["function"]["name"], "get_current_weather");
+    assert_eq!(
+        chat["tool_choice"]["function"]["name"],
+        "get_current_weather"
+    );
 }
 
 #[test]
@@ -236,7 +247,9 @@ fn test_request_unsupported_tool_types_rejected() {
             "tools": [{"type": tool_type}]
         });
         let err = responses_to_openai(&req).expect_err("non-function tool must be rejected");
-        assert!(err.to_string().contains("only function tools are supported"));
+        assert!(err
+            .to_string()
+            .contains("only function tools are supported"));
     }
 }
 
@@ -270,8 +283,14 @@ fn test_request_valid_multi_turn_tool_history() {
 
     assert_eq!(messages[1]["role"], "assistant");
     assert_eq!(messages[1]["tool_calls"][0]["id"], "call_stock_001");
-    assert_eq!(messages[1]["tool_calls"][0]["function"]["name"], "lookup_ticker");
-    assert_eq!(messages[1]["tool_calls"][0]["function"]["arguments"], "{\"symbol\":\"AAPL\"}");
+    assert_eq!(
+        messages[1]["tool_calls"][0]["function"]["name"],
+        "lookup_ticker"
+    );
+    assert_eq!(
+        messages[1]["tool_calls"][0]["function"]["arguments"],
+        "{\"symbol\":\"AAPL\"}"
+    );
 
     assert_eq!(messages[2]["role"], "tool");
     assert_eq!(messages[2]["tool_call_id"], "call_stock_001");
@@ -319,7 +338,9 @@ fn test_request_malformed_tool_arguments_rejected_without_silent_coercion() {
         ]
     });
     let err = responses_to_openai(&req).expect_err("malformed tool arguments must be rejected");
-    assert!(err.to_string().contains("malformed JSON in function_call arguments"));
+    assert!(err
+        .to_string()
+        .contains("malformed JSON in function_call arguments"));
 }
 
 #[test]
@@ -342,8 +363,11 @@ fn test_request_missing_call_id_or_name_rejected() {
         "model": "devin/glm-5-2",
         "input": [{"type": "function_call_output", "output": "ok"}]
     });
-    let err = responses_to_openai(&missing_out_call_id).expect_err("missing output call_id rejected");
-    assert!(err.to_string().contains("missing function_call_output call_id"));
+    let err =
+        responses_to_openai(&missing_out_call_id).expect_err("missing output call_id rejected");
+    assert!(err
+        .to_string()
+        .contains("missing function_call_output call_id"));
 }
 
 #[test]
@@ -515,7 +539,9 @@ fn test_streaming_lifecycle_tool_call_turn() {
     // Verify response.completed
     assert_eq!(parsed[6].1["type"], "response.completed");
     assert_eq!(parsed[6].1["response"]["status"], "completed");
-    let output = parsed[6].1["response"]["output"].as_array().expect("output");
+    let output = parsed[6].1["response"]["output"]
+        .as_array()
+        .expect("output");
     assert_eq!(output.len(), 1);
     assert_eq!(output[0]["type"], "function_call");
     assert_eq!(output[0]["arguments"], "{\"expr\":\"2+2\"}");
@@ -588,7 +614,11 @@ fn test_streaming_interleaved_tools_maintain_stable_ids_and_indices() {
     let terminal = &parsed.last().unwrap().1["response"];
     let output = terminal["output"].as_array().expect("output array");
 
-    assert_eq!(output.len(), 3, "must have text item and 2 distinct tool items");
+    assert_eq!(
+        output.len(),
+        3,
+        "must have text item and 2 distinct tool items"
+    );
     assert_eq!(output[0]["type"], "message");
     assert_eq!(output[0]["id"], "msg_0");
 
@@ -665,8 +695,7 @@ fn test_streaming_usage_unknown_vs_zero() {
     );
 
     // 2. Exact zero usage (Some with 0 values)
-    let mut renderer_zero =
-        ResponsesStreamRenderer::new("devin/glm-5-2".to_string(), 1700000000);
+    let mut renderer_zero = ResponsesStreamRenderer::new("devin/glm-5-2".to_string(), 1700000000);
     let frames_zero = renderer_zero.render(CodexEvent::Completed {
         usage: Some(Usage {
             prompt_tokens: 0,
@@ -730,7 +759,7 @@ fn test_nonstream_json_equivalent_to_stream_lifecycle() {
                 cached_tokens_known: false,
                 reasoning_tokens: 5,
                 cache_write_tokens: 0,
-            cache_write_tokens_known: false,
+                cache_write_tokens_known: false,
             }),
         },
     ];
@@ -757,14 +786,19 @@ fn test_nonstream_json_equivalent_to_stream_lifecycle() {
 
     // Explicit validation of machine values
     assert_eq!(nonstream["status"], "completed");
+    // Reasoning is its own Responses output item ahead of the message (Task 9
+    // responses QA: `reasoning-preserved`), carrying the summary and signature.
     let output = nonstream["output"].as_array().expect("output");
-    assert_eq!(output.len(), 2);
-    assert_eq!(output[0]["type"], "message");
-    assert_eq!(output[0]["content"][0]["text"], "Here is the tool call:");
-    assert_eq!(output[1]["type"], "function_call");
-    assert_eq!(output[1]["call_id"], "call_check_1");
-    assert_eq!(output[1]["name"], "check_health");
-    assert_eq!(output[1]["arguments"], "{\"service\":\"db\"}");
+    assert_eq!(output.len(), 3);
+    assert_eq!(output[0]["type"], "reasoning");
+    assert_eq!(output[0]["summary"][0]["text"], "pondering");
+    assert_eq!(output[0]["encrypted_content"], "sig-xyz");
+    assert_eq!(output[1]["type"], "message");
+    assert_eq!(output[1]["content"][0]["text"], "Here is the tool call:");
+    assert_eq!(output[2]["type"], "function_call");
+    assert_eq!(output[2]["call_id"], "call_check_1");
+    assert_eq!(output[2]["name"], "check_health");
+    assert_eq!(output[2]["arguments"], "{\"service\":\"db\"}");
 }
 
 #[test]
@@ -778,8 +812,8 @@ fn test_nonstream_incomplete_and_failure_handling() {
         CodexEvent::OutputLimitReached,
         CodexEvent::Completed { usage: None },
     ];
-    let nonstream_limit =
-        responses_response(&limit_events, "devin/glm-5-2", 1700000000).expect("incomplete response");
+    let nonstream_limit = responses_response(&limit_events, "devin/glm-5-2", 1700000000)
+        .expect("incomplete response");
     assert_eq!(nonstream_limit["status"], "incomplete");
     assert_eq!(
         nonstream_limit["incomplete_details"]["reason"],

@@ -1,5 +1,5 @@
 use crate::mock::{create_mock_router, MockConfig, MockState};
-use crate::runner::{parse_headers, run_benchmark, run_single_request, BenchConfig, RequestParams};
+use crate::runner::{parse_headers, run_benchmark, BenchConfig, RequestParams};
 use crate::stats::{nearest_rank_percentile, BenchReport};
 use futures::StreamExt;
 use reqwest::header::HeaderMap;
@@ -172,9 +172,15 @@ async fn test_50req_10conc_zero_error_run() {
     };
     let state = Arc::new(MockState::new(&cfg));
     let app = create_mock_router(state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind ephemeral");
+    // run_benchmark only targets the leased loopback range 18840-18899.
+    let mut bound = None;
+    for candidate in 18840..=18899u16 {
+        if let Ok(listener) = tokio::net::TcpListener::bind(("127.0.0.1", candidate)).await {
+            bound = Some(listener);
+            break;
+        }
+    }
+    let listener = bound.expect("free port in 18840-18899");
     let port = listener.local_addr().expect("local addr").port();
     tokio::spawn(async move {
         axum::serve(listener, app).await.expect("serve mock");
@@ -191,6 +197,7 @@ async fn test_50req_10conc_zero_error_run() {
         headers: vec!["Authorization: Bearer test-token".to_string()],
         body_json: Some(r#"{"model":"test-pinned-body"}"#.to_string()),
         timeout_ms: 5000,
+        phase: "core".into(),
     };
 
     // When: run benchmark
@@ -269,20 +276,20 @@ async fn test_headers_and_body_json_literal_pinning() {
         reqwest::header::HeaderValue::from_static("Bearer pinned"),
     );
 
-    let res = run_single_request(RequestParams {
-        client: &client,
-        url: &url,
-        headers: hdrs,
-        body: body_literal,
-        timeout: Duration::from_millis(5000),
-    })
+    let res = crate::runner::observe_request(
+        RequestParams {
+            client: &client,
+            url: &url,
+            headers: hdrs,
+            body: body_literal,
+            timeout: Duration::from_millis(5000),
+            expected: None,
+        },
+        "pinning:0".into(),
+        "pinning".into(),
+    )
     .await;
-    match res {
-        crate::runner::SampleResult::Success { ttft_ms } => {
-            assert!(ttft_ms > 0.0);
-        }
-        crate::runner::SampleResult::Error { kind } => {
-            panic!("expected success, got error: {kind}");
-        }
-    }
+    assert!(res.error.is_none(), "{:?}", res.error);
+    assert_eq!(res.status, Some(200));
+    assert!(res.content_ms.unwrap() > 0.0);
 }

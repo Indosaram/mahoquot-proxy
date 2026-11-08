@@ -19,8 +19,127 @@
 //!    equivalence between streaming and non-streaming outputs.
 
 use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashSet;
+
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
+use ring::aead::{self, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
+use ring::rand::{SecureRandom, SystemRandom};
+use sha2::{Digest, Sha256};
+
+const COMPACTION_CAPSULE_PREFIX: &str = "cpa-ag-compact-v1:";
+const COMPACTION_SECRET_KEY: &[u8] = b"CLIProxyAPI";
+
+#[derive(Serialize, Deserialize)]
+struct CompactionPayload {
+    summary: String,
+    model: String,
+    created_at: u64,
+}
+
+pub fn is_recognized_compaction_capsule(capsule: &str) -> bool {
+    capsule.starts_with(COMPACTION_CAPSULE_PREFIX)
+}
+
+fn derive_compaction_key() -> LessSafeKey {
+    let mut hasher = Sha256::new();
+    hasher.update(COMPACTION_SECRET_KEY);
+    let key_bytes = hasher.finalize();
+    let unbound = UnboundKey::new(&AES_256_GCM, &key_bytes).expect("AES_256_GCM key");
+    LessSafeKey::new(unbound)
+}
+
+// These public helpers are exercised by t25; this file is also included by a narrower test target.
+#[allow(dead_code)]
+pub fn seal_compaction_capsule(summary: &str, model: &str) -> Result<String, String> {
+    let payload = CompactionPayload {
+        summary: summary.to_string(),
+        model: model.to_string(),
+        created_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    };
+    let json_bytes = serde_json::to_vec(&payload).map_err(|e| e.to_string())?;
+
+    let rng = SystemRandom::new();
+    let mut nonce_bytes = [0u8; 12];
+    rng.fill(&mut nonce_bytes)
+        .map_err(|e| format!("rng error: {e}"))?;
+    let nonce =
+        Nonce::try_assume_unique_for_key(&nonce_bytes).map_err(|_| "invalid nonce".to_string())?;
+
+    let key = derive_compaction_key();
+    let mut in_out = json_bytes;
+    key.seal_in_place_append_tag(nonce, aead::Aad::empty(), &mut in_out)
+        .map_err(|e| format!("seal error: {e}"))?;
+
+    let mut combined = nonce_bytes.to_vec();
+    combined.extend_from_slice(&in_out);
+    let encoded = URL_SAFE_NO_PAD.encode(&combined);
+    Ok(format!("{COMPACTION_CAPSULE_PREFIX}{encoded}"))
+}
+
+// These public helpers are exercised by t25; this file is also included by a narrower test target.
+#[allow(dead_code)]
+pub fn unseal_compaction_capsule(capsule: &str) -> Result<String, String> {
+    if !is_recognized_compaction_capsule(capsule) {
+        return Err("unrecognized capsule prefix".to_string());
+    }
+    let encoded = &capsule[COMPACTION_CAPSULE_PREFIX.len()..];
+    let decoded = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|e| format!("decode error: {e}"))?;
+    if decoded.len() < 12 + 16 {
+        return Err("invalid capsule: payload too short".to_string());
+    }
+    let (nonce_bytes, ct) = decoded.split_at(12);
+    let nonce =
+        Nonce::try_assume_unique_for_key(nonce_bytes).map_err(|_| "invalid nonce".to_string())?;
+    let mut ct_vec = ct.to_vec();
+    let key = derive_compaction_key();
+    let pt = key
+        .open_in_place(nonce, aead::Aad::empty(), &mut ct_vec)
+        .map_err(|e| format!("invalid or tampered capsule: {e}"))?;
+    let payload: CompactionPayload =
+        serde_json::from_slice(pt).map_err(|e| format!("invalid JSON in capsule: {e}"))?;
+    Ok(payload.summary)
+}
+
+pub fn unseal_compaction_capsule_for_model(
+    capsule: &str,
+    expected_model: &str,
+) -> Result<String, String> {
+    if !is_recognized_compaction_capsule(capsule) {
+        return Err("unrecognized capsule prefix".to_string());
+    }
+    let encoded = &capsule[COMPACTION_CAPSULE_PREFIX.len()..];
+    let decoded = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|e| format!("decode error: {e}"))?;
+    if decoded.len() < 12 + 16 {
+        return Err("invalid capsule: payload too short".to_string());
+    }
+    let (nonce_bytes, ct) = decoded.split_at(12);
+    let nonce =
+        Nonce::try_assume_unique_for_key(nonce_bytes).map_err(|_| "invalid nonce".to_string())?;
+    let mut ct_vec = ct.to_vec();
+    let key = derive_compaction_key();
+    let pt = key
+        .open_in_place(nonce, aead::Aad::empty(), &mut ct_vec)
+        .map_err(|e| format!("invalid or tampered capsule: {e}"))?;
+    let payload: CompactionPayload =
+        serde_json::from_slice(pt).map_err(|e| format!("invalid JSON in capsule: {e}"))?;
+    if !expected_model.is_empty() && payload.model != expected_model {
+        return Err(format!(
+            "model mismatch: capsule sealed for '{}' but requested for '{}'",
+            payload.model, expected_model
+        ));
+    }
+    Ok(payload.summary)
+}
 
 use crate::compat::events::{CodexEvent, Usage};
 use crate::compat::split_data_url;
@@ -137,7 +256,9 @@ pub fn responses_to_openai(req: &Value) -> Result<Value, ResponsesError> {
                 .unwrap_or("function");
             if tool_type != "function" {
                 return Err(ResponsesError::unsupported(
-                    format!("unsupported tool type '{tool_type}': only function tools are supported"),
+                    format!(
+                        "unsupported tool type '{tool_type}': only function tools are supported"
+                    ),
                     Some("tools"),
                 ));
             }
@@ -147,11 +268,9 @@ pub fn responses_to_openai(req: &Value) -> Result<Value, ResponsesError> {
                 .and_then(|f| f.get("name"))
                 .or_else(|| tool.get("name"))
                 .and_then(Value::as_str);
-            let name = name
-                .filter(|n| !n.trim().is_empty())
-                .ok_or_else(|| {
-                    ResponsesError::invalid_request("tool function missing name", Some("tools"))
-                })?;
+            let name = name.filter(|n| !n.trim().is_empty()).ok_or_else(|| {
+                ResponsesError::invalid_request("tool function missing name", Some("tools"))
+            })?;
 
             let description = tool
                 .get("function")
@@ -223,6 +342,8 @@ pub fn responses_to_openai(req: &Value) -> Result<Value, ResponsesError> {
     let mut defined_tool_calls: HashSet<String> = HashSet::new();
     let mut answered_tool_calls: HashSet<String> = HashSet::new();
 
+    let target_model = obj.get("model").and_then(Value::as_str).unwrap_or("");
+
     match obj.get("input") {
         Some(Value::String(text)) => {
             messages.push(json!({
@@ -235,6 +356,31 @@ pub fn responses_to_openai(req: &Value) -> Result<Value, ResponsesError> {
                 let item_type = item.get("type").and_then(Value::as_str);
 
                 match item_type {
+                    Some("compaction") => {
+                        let capsule = item
+                            .get("encrypted_content")
+                            .or_else(|| item.get("content"))
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| {
+                                ResponsesError::invalid_request(
+                                    "missing compaction encrypted_content",
+                                    Some("input"),
+                                )
+                            })?;
+
+                        let unsealed = unseal_compaction_capsule_for_model(capsule, target_model)
+                            .map_err(|err| {
+                            ResponsesError::invalid_request(
+                                format!("invalid compaction capsule: {err}"),
+                                Some("input"),
+                            )
+                        })?;
+
+                        messages.push(json!({
+                            "role": "developer",
+                            "content": unsealed,
+                        }));
+                    }
                     Some("function_call") => {
                         let call_id = item
                             .get("call_id")
@@ -346,12 +492,28 @@ pub fn responses_to_openai(req: &Value) -> Result<Value, ResponsesError> {
                         }
                         messages.push(tool_msg);
                     }
+                    Some("configuration_update") => {
+                        // Documented cache-preserving effort switch: the item
+                        // carries no message content, only the new level. It is
+                        // forwarded as an effort marker so the provider adapter
+                        // (codex item or Anthropic effort-only system message)
+                        // can keep every earlier block inside the cached prefix.
+                        if let Some(effort) = item
+                            .pointer("/reasoning/effort")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                        {
+                            messages.push(json!({
+                                "role": "system",
+                                "content": "",
+                                "x_effort_update": effort,
+                            }));
+                        }
+                    }
                     _ => {
                         // Regular message turn
-                        let role = item
-                            .get("role")
-                            .and_then(Value::as_str)
-                            .unwrap_or("user");
+                        let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
 
                         let mut text_parts = Vec::new();
                         let mut image_parts = Vec::new();
@@ -386,7 +548,9 @@ pub fn responses_to_openai(req: &Value) -> Result<Value, ResponsesError> {
                                     let ptype = part.get("type").and_then(Value::as_str);
                                     match ptype {
                                         Some("input_text") | Some("text") | Some("output_text") => {
-                                            if let Some(t) = part.get("text").and_then(Value::as_str) {
+                                            if let Some(t) =
+                                                part.get("text").and_then(Value::as_str)
+                                            {
                                                 text_parts.push(t.to_string());
                                             }
                                         }
@@ -394,10 +558,16 @@ pub fn responses_to_openai(req: &Value) -> Result<Value, ResponsesError> {
                                             let url_opt = part
                                                 .get("image_url")
                                                 .and_then(|u| {
-                                                    u.get("url").and_then(Value::as_str).or_else(|| u.as_str())
+                                                    u.get("url")
+                                                        .and_then(Value::as_str)
+                                                        .or_else(|| u.as_str())
                                                 })
-                                                .or_else(|| part.get("data").and_then(Value::as_str))
-                                                .or_else(|| part.get("url").and_then(Value::as_str));
+                                                .or_else(|| {
+                                                    part.get("data").and_then(Value::as_str)
+                                                })
+                                                .or_else(|| {
+                                                    part.get("url").and_then(Value::as_str)
+                                                });
 
                                             let Some(url) = url_opt else {
                                                 return Err(ResponsesError::invalid_request(
@@ -434,10 +604,14 @@ pub fn responses_to_openai(req: &Value) -> Result<Value, ResponsesError> {
                                             {
                                                 reasoning_text = Some(r.to_string());
                                             }
-                                            if let Some(sig) = part.get("signature").and_then(Value::as_str) {
+                                            if let Some(sig) =
+                                                part.get("signature").and_then(Value::as_str)
+                                            {
                                                 reasoning_signature = Some(sig.to_string());
                                             }
-                                            if part.get("redacted").and_then(Value::as_bool) == Some(true) {
+                                            if part.get("redacted").and_then(Value::as_bool)
+                                                == Some(true)
+                                            {
                                                 reasoning_redacted = true;
                                             }
                                         }
@@ -445,7 +619,9 @@ pub fn responses_to_openai(req: &Value) -> Result<Value, ResponsesError> {
                                             reasoning_redacted = true;
                                         }
                                         _ => {
-                                            if let Some(t) = part.get("text").and_then(Value::as_str) {
+                                            if let Some(t) =
+                                                part.get("text").and_then(Value::as_str)
+                                            {
                                                 text_parts.push(t.to_string());
                                             }
                                         }
@@ -547,17 +723,26 @@ fn sse_frame(event_name: &str, payload: &Value) -> Bytes {
 fn build_usage_json(usage: Option<&Usage>) -> Value {
     match usage {
         None => Value::Null,
-        Some(u) => json!({
+        Some(u) => {
+            let mut value = json!({
             "input_tokens": u.prompt_tokens,
             "output_tokens": u.completion_tokens,
             "total_tokens": u.total_tokens,
-            "input_tokens_details": {
-                "cached_tokens": u.cached_tokens,
-            },
             "output_tokens_details": {
                 "reasoning_tokens": u.reasoning_tokens,
             }
-        }),
+            });
+            if u.cached_tokens_known {
+                value["input_tokens_details"] = json!({"cached_tokens":u.cached_tokens});
+            }
+            if u.cache_write_tokens_known {
+                if value.get("input_tokens_details").is_none() {
+                    value["input_tokens_details"] = json!({});
+                }
+                value["input_tokens_details"]["cache_write_tokens"] = json!(u.cache_write_tokens);
+            }
+            value
+        }
     }
 }
 
@@ -565,7 +750,7 @@ fn build_usage_json(usage: Option<&Usage>) -> Value {
 enum TextItemState {
     Unstarted,
     Open { item_id: String, output_index: u64 },
-    Done { item_id: String, output_index: u64 },
+    Done,
 }
 
 #[derive(Debug, Clone)]
@@ -578,6 +763,22 @@ struct ToolCallItem {
     arguments: String,
     args_done_emitted: bool,
     item_done_emitted: bool,
+}
+
+impl ToolCallItem {
+    fn value(&self, status: &str) -> Value {
+        if self.name == "web_search" && self.call_id.starts_with("srvtoolu_") {
+            let query = serde_json::from_str::<Value>(&self.arguments)
+                .ok()
+                .and_then(|args| args.get("query").cloned())
+                .unwrap_or(Value::Null);
+            json!({"id":self.item_id,"type":"web_search_call","status":status,
+                "action":{"type":"search","query":query}})
+        } else {
+            json!({"id":self.item_id,"type":"function_call","status":status,
+                "arguments":self.arguments,"call_id":self.call_id,"name":self.name})
+        }
+    }
 }
 
 /// Renderer translating upstream [`CodexEvent`] streams into standard OpenAI
@@ -598,6 +799,39 @@ pub struct ResponsesStreamRenderer {
     text_state: TextItemState,
     tools: Vec<ToolCallItem>,
     next_output_index: u64,
+    closed_text: std::collections::BTreeMap<u64, Value>,
+    reasoning_index: Option<u64>,
+    /// Monotonic `sequence_number` for locally rendered events (Task 9).
+    next_sequence: u64,
+}
+
+/// Stamps a monotonic `sequence_number` into each locally rendered SSE frame.
+fn stamp_sequence(frames: Vec<Bytes>, next: &mut u64) -> Vec<Bytes> {
+    frames
+        .into_iter()
+        .map(|frame| {
+            let text = String::from_utf8_lossy(&frame);
+            let Some(start) = text.find("\ndata: ") else {
+                return frame;
+            };
+            let head = &text[..start + "\ndata: ".len()];
+            let data = text[head.len()..].trim_end_matches('\n');
+            let Ok(mut payload) = serde_json::from_str::<Value>(data) else {
+                return frame;
+            };
+            let Some(object) = payload.as_object_mut() else {
+                return frame;
+            };
+            object.insert("sequence_number".into(), json!(*next));
+            *next += 1;
+            let mut buf = head.as_bytes().to_vec();
+            if serde_json::to_writer(&mut buf, &payload).is_err() {
+                return frame;
+            }
+            buf.extend_from_slice(b"\n\n");
+            Bytes::from(buf)
+        })
+        .collect()
 }
 
 impl ResponsesStreamRenderer {
@@ -618,6 +852,9 @@ impl ResponsesStreamRenderer {
             text_state: TextItemState::Unstarted,
             tools: Vec::new(),
             next_output_index: 0,
+            closed_text: std::collections::BTreeMap::new(),
+            reasoning_index: None,
+            next_sequence: 0,
         }
     }
 
@@ -658,12 +895,7 @@ impl ResponsesStreamRenderer {
             } else {
                 "completed"
             };
-            out.push(sse_frame(
-                "response.output_item.done",
-                &json!({
-                    "type": "response.output_item.done",
-                    "output_index": output_index,
-                    "item": {
+            let mut item = json!({
                         "id": item_id,
                         "type": "message",
                         "status": item_status,
@@ -672,13 +904,23 @@ impl ResponsesStreamRenderer {
                             "type": "output_text",
                             "text": self.text_accumulator,
                         }]
-                    }
-                }),
+            });
+            if !self.reasoning_accumulator.is_empty() {
+                item["reasoning_content"] = json!(self.reasoning_accumulator);
+            }
+            if let Some(sig) = &self.reasoning_signature {
+                item["reasoning_signature"] = json!(sig);
+            }
+            if self.reasoning_redacted {
+                item["reasoning_redacted"] = json!(true);
+            }
+            out.push(sse_frame(
+                "response.output_item.done",
+                &json!({"type":"response.output_item.done", "output_index":output_index, "item":item}),
             ));
-            self.text_state = TextItemState::Done {
-                item_id: item_id.clone(),
-                output_index,
-            };
+            self.text_state = TextItemState::Done;
+            self.closed_text.insert(output_index, item);
+            self.text_accumulator.clear();
         }
     }
 
@@ -711,20 +953,58 @@ impl ResponsesStreamRenderer {
                 &json!({
                     "type": "response.output_item.done",
                     "output_index": tool.output_index,
-                    "item": {
-                        "id": tool.item_id,
-                        "type": "function_call",
-                        "status": item_status,
-                        "arguments": tool.arguments,
-                        "call_id": tool.call_id,
-                        "name": tool.name,
-                    }
+                    "item": tool.value(item_status)
                 }),
             ));
         }
     }
 
     pub fn render(&mut self, event: CodexEvent) -> Vec<Bytes> {
+        let frames = self.render_unstamped(event);
+        stamp_sequence(frames, &mut self.next_sequence)
+    }
+
+    fn ensure_reasoning_item(&mut self, out: &mut Vec<Bytes>) -> u64 {
+        self.ensure_created_frame(out);
+        if let Some(index) = self.reasoning_index {
+            return index;
+        }
+        let index = self.next_output_index;
+        self.next_output_index += 1;
+        self.reasoning_index = Some(index);
+        out.push(sse_frame(
+            "response.output_item.added",
+            &json!({
+                "type":"response.output_item.added", "output_index":index,
+                "item":{"id":format!("rs_{index}"),"type":"reasoning","summary":[]}
+            }),
+        ));
+        index
+    }
+
+    fn reasoning_item(&self, index: u64) -> Value {
+        let mut item = json!({"id":format!("rs_{index}"),"type":"reasoning",
+            "summary":if self.reasoning_accumulator.is_empty() { json!([]) }
+                else { json!([{"type":"summary_text","text":self.reasoning_accumulator}]) }});
+        if let Some(sig) = &self.reasoning_signature {
+            item["encrypted_content"] = json!(sig);
+        }
+        item
+    }
+
+    fn close_reasoning_item(&self, out: &mut Vec<Bytes>) {
+        if let Some(index) = self.reasoning_index {
+            out.push(sse_frame(
+                "response.output_item.done",
+                &json!({
+                    "type":"response.output_item.done","output_index":index,
+                    "item":self.reasoning_item(index)
+                }),
+            ));
+        }
+    }
+
+    fn render_unstamped(&mut self, event: CodexEvent) -> Vec<Bytes> {
         if self.terminated {
             return Vec::new();
         }
@@ -743,28 +1023,31 @@ impl ResponsesStreamRenderer {
                 self.ensure_created_frame(&mut out);
             }
             CodexEvent::ReasoningDelta(delta) => {
-                self.ensure_created_frame(&mut out);
+                let index = self.ensure_reasoning_item(&mut out);
                 self.reasoning_accumulator.push_str(&delta);
                 out.push(sse_frame(
                     "response.reasoning_text.delta",
                     &json!({
                         "type": "response.reasoning_text.delta",
                         "delta": delta,
-                        "output_index": 0,
+                        "output_index": index,
+                        "item_id": format!("rs_{index}"),
                     }),
                 ));
             }
             CodexEvent::ReasoningSignature(sig) => {
+                self.ensure_reasoning_item(&mut out);
                 self.reasoning_signature = Some(sig);
             }
             CodexEvent::ReasoningRedacted => {
+                self.ensure_reasoning_item(&mut out);
                 self.reasoning_redacted = true;
             }
             CodexEvent::TextDelta(delta) => {
                 self.ensure_created_frame(&mut out);
 
                 let (item_id, output_index) = match self.text_state {
-                    TextItemState::Unstarted => {
+                    TextItemState::Unstarted | TextItemState::Done => {
                         let out_idx = self.next_output_index;
                         self.next_output_index += 1;
                         let id = format!("msg_{out_idx}");
@@ -805,13 +1088,6 @@ impl ResponsesStreamRenderer {
                         ref item_id,
                         output_index,
                     } => (item_id.clone(), output_index),
-                    TextItemState::Done {
-                        ref item_id,
-                        output_index,
-                    } => {
-                        // Re-open if subsequent text arrives
-                        (item_id.clone(), output_index)
-                    }
                 };
 
                 self.text_accumulator.push_str(&delta);
@@ -837,7 +1113,11 @@ impl ResponsesStreamRenderer {
 
                 let resp_output_idx = self.next_output_index;
                 self.next_output_index += 1;
-                let item_id = format!("fc_{resp_output_idx}");
+                let item_id = if name == "web_search" && call_id.starts_with("srvtoolu_") {
+                    call_id.clone()
+                } else {
+                    format!("fc_{resp_output_idx}")
+                };
 
                 let tool_item = ToolCallItem {
                     item_id: item_id.clone(),
@@ -849,6 +1129,7 @@ impl ResponsesStreamRenderer {
                     args_done_emitted: false,
                     item_done_emitted: false,
                 };
+                let added_item = tool_item.value("in_progress");
                 self.tools.push(tool_item);
 
                 out.push(sse_frame(
@@ -856,14 +1137,7 @@ impl ResponsesStreamRenderer {
                     &json!({
                         "type": "response.output_item.added",
                         "output_index": resp_output_idx,
-                        "item": {
-                            "id": item_id,
-                            "type": "function_call",
-                            "status": "in_progress",
-                            "arguments": "",
-                            "call_id": call_id,
-                            "name": name,
-                        }
+                        "item": added_item
                     }),
                 ));
             }
@@ -895,6 +1169,7 @@ impl ResponsesStreamRenderer {
             }
             CodexEvent::Completed { usage } => {
                 self.ensure_created_frame(&mut out);
+                self.close_reasoning_item(&mut out);
                 self.close_text_item(&mut out);
                 for i in 0..self.tools.len() {
                     self.close_tool_item(i, &mut out);
@@ -923,6 +1198,7 @@ impl ResponsesStreamRenderer {
                 }
             }
             CodexEvent::Failed { message } => {
+                self.close_reasoning_item(&mut out);
                 self.close_text_item(&mut out);
                 for i in 0..self.tools.len() {
                     self.close_tool_item(i, &mut out);
@@ -953,83 +1229,34 @@ impl ResponsesStreamRenderer {
     }
 
     pub fn close_unterminated(&mut self) -> Vec<Bytes> {
-        if self.terminated {
-            return Vec::new();
-        }
-        let mut out = Vec::new();
-        self.ensure_created_frame(&mut out);
-        self.close_text_item(&mut out);
-        for i in 0..self.tools.len() {
-            self.close_tool_item(i, &mut out);
-        }
-        self.terminated = true;
+        let frames = self.close_unstamped();
+        stamp_sequence(frames, &mut self.next_sequence)
+    }
 
-        let resp_val = self.current_response();
-        if self.output_limit_reached {
-            out.push(sse_frame(
-                "response.incomplete",
-                &json!({
-                    "type": "response.incomplete",
-                    "response": resp_val,
-                }),
-            ));
-        } else {
-            out.push(sse_frame(
-                "response.completed",
-                &json!({
-                    "type": "response.completed",
-                    "response": resp_val,
-                }),
-            ));
-        }
-        out
+    fn close_unstamped(&mut self) -> Vec<Bytes> {
+        self.render_unstamped(CodexEvent::Failed {
+            message: "upstream stream ended before completion".into(),
+        })
     }
 
     /// Assembles the complete canonical Responses JSON response object.
     pub fn current_response(&self) -> Value {
-        let mut output_items = Vec::new();
-
-        if !matches!(self.text_state, TextItemState::Unstarted) || !self.text_accumulator.is_empty()
+        let mut output_items = self.closed_text.clone();
+        if let Some(index) = self.reasoning_index {
+            output_items.insert(index, self.reasoning_item(index));
+        }
+        if let TextItemState::Open {
+            ref item_id,
+            output_index,
+        } = self.text_state
         {
-            let (item_id, item_status) = match self.text_state {
-                TextItemState::Open { ref item_id, .. } | TextItemState::Done { ref item_id, .. } => (
-                    item_id.clone(),
-                    if self.output_limit_reached {
-                        "incomplete"
-                    } else {
-                        "completed"
-                    },
-                ),
-                TextItemState::Unstarted => (
-                    "msg_0".to_string(),
-                    if self.output_limit_reached {
-                        "incomplete"
-                    } else {
-                        "completed"
-                    },
-                ),
-            };
-
-            let mut msg_obj = json!({
-                "id": item_id,
-                "type": "message",
-                "status": item_status,
-                "role": "assistant",
-                "content": [{
-                    "type": "output_text",
-                    "text": self.text_accumulator,
-                }]
-            });
-            if !self.reasoning_accumulator.is_empty() {
-                msg_obj["reasoning_content"] = json!(self.reasoning_accumulator);
-            }
-            if let Some(ref sig) = self.reasoning_signature {
-                msg_obj["reasoning_signature"] = json!(sig);
-            }
-            if self.reasoning_redacted {
-                msg_obj["reasoning_redacted"] = json!(true);
-            }
-            output_items.push(msg_obj);
+            output_items.insert(
+                output_index,
+                json!({
+                    "id":item_id,"type":"message","status":"in_progress","role":"assistant",
+                    "content":[{"type":"output_text","text":self.text_accumulator}]
+                }),
+            );
         }
 
         for tool in &self.tools {
@@ -1038,14 +1265,7 @@ impl ResponsesStreamRenderer {
             } else {
                 "completed"
             };
-            output_items.push(json!({
-                "id": tool.item_id,
-                "type": "function_call",
-                "status": status,
-                "call_id": tool.call_id,
-                "name": tool.name,
-                "arguments": tool.arguments,
-            }));
+            output_items.insert(tool.output_index, tool.value(status));
         }
 
         let status = if self.failure.is_some() {
@@ -1064,7 +1284,7 @@ impl ResponsesStreamRenderer {
             "created_at": self.created,
             "status": status,
             "model": self.model,
-            "output": output_items,
+            "output": output_items.into_values().collect::<Vec<_>>(),
             "usage": build_usage_json(self.usage.as_ref()),
         });
 
@@ -1080,6 +1300,34 @@ impl ResponsesStreamRenderer {
 
     pub fn into_response(self) -> Value {
         self.current_response()
+    }
+}
+
+#[cfg(test)]
+mod effort_cache_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn configuration_update_becomes_an_effort_marker() {
+        let req = json!({
+            "model": "claude-opus-5-5",
+            "input": [
+                {"role": "user", "content": "a"},
+                {"role": "assistant", "content": "b"},
+                {"type": "configuration_update", "reasoning": {"effort": "high"}},
+                {"role": "user", "content": "c"}
+            ]
+        });
+        let chat = responses_to_openai(&req).expect("valid conversion");
+        let messages = chat["messages"].as_array().expect("messages array");
+        let marker = messages
+            .iter()
+            .find(|message| message.get("x_effort_update").is_some())
+            .expect("effort marker message");
+        assert_eq!(marker["role"], "system");
+        assert_eq!(marker["x_effort_update"], "high");
+        assert_eq!(messages.len(), 4);
     }
 }
 

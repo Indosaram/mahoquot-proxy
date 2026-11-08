@@ -149,7 +149,7 @@ fn test_state(tag: &str, addr: std::net::SocketAddr) -> (Arc<AppState>, std::pat
     std::fs::write(
         &config_path,
         format!(
-            "auth-dir: {}\napi-keys:\n  - {ADMIN_KEY}\nmodel-catalog:\n  refresh-enabled: true\n  url: http://{addr}/secret-url-token/models-v1.json\n  signature-url: http://{addr}/secret-url-token/models-v1.json.sig\n  refresh-interval-secs: 3600\n",
+            "auth-dir: {}\napi-keys:\n  - {ADMIN_KEY}\nremote-management:\n  secret-key: {ADMIN_KEY}\nmodel-catalog:\n  refresh-enabled: true\n  url: http://{addr}/secret-url-token/models-v1.json\n  signature-url: http://{addr}/secret-url-token/models-v1.json.sig\n  refresh-interval-secs: 3600\n",
             auth_dir.display()
         ),
     )
@@ -173,7 +173,9 @@ async fn request(app: &axum::Router, method: Method, authorized: bool) -> (Statu
     }
     let response = app
         .clone()
-        .oneshot(builder.body(Body::empty()).expect("request"))
+        .oneshot(common::with_loopback_peer(
+            builder.body(Body::empty()).expect("request"),
+        ))
         .await
         .expect("response");
     let status = response.status();
@@ -262,10 +264,8 @@ async fn management_registry_rejects_unauthenticated_and_returns_safe_status() {
 
     let (status, body) = request(&app, Method::GET, false).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-    assert_eq!(
-        body,
-        r#"{"error":{"message":"invalid api key","type":"invalid_request_error"}}"#
-    );
+    // Task 26: management answers with the dedicated gate's error body.
+    assert_eq!(body, r#"{"error":"missing management key"}"#);
 
     let (status, body) = request(&app, Method::GET, true).await;
     assert_eq!(status, StatusCode::OK);

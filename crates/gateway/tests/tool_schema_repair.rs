@@ -177,11 +177,9 @@ fn tools_14_nullable_union_drops_property_from_required() {
         direct_schema(&request)["properties"]["offset"]["default"],
         json!(1)
     );
-    assert!(
-        bridge_schema(&request)["properties"]["offset"]
-            .get("default")
-            .is_none()
-    );
+    assert!(bridge_schema(&request)["properties"]["offset"]
+        .get("default")
+        .is_none());
 }
 
 #[test]
@@ -218,7 +216,10 @@ fn tools_14_all_object_union_merges_and_mixed_union_keeps_first_branch() {
         // Both object variants merge into one schema; only the shared
         // required name survives the intersection.
         let shutdown = &schema["properties"]["shutdown"];
-        assert!(shutdown.get("anyOf").is_none(), "union survived: {shutdown}");
+        assert!(
+            shutdown.get("anyOf").is_none(),
+            "union survived: {shutdown}"
+        );
         assert_eq!(shutdown["type"], "object");
         assert_eq!(shutdown["properties"]["reason"]["type"], "string");
         assert_eq!(shutdown["properties"]["approve"]["type"], "boolean");
@@ -428,7 +429,10 @@ fn tools_14_gemini_and_non_claude_antigravity_keep_existing_conversion() {
         request["model"] = json!(model);
         let native = openai_to_gemini(&request).expect("Gemini");
         let envelope = openai_to_antigravity(&request, "test-project").expect("Antigravity");
-        assert_eq!(envelope["request"], native);
+        // The envelope now carries client identity labels beside the converted
+        // body; everything the conversion produces must still match exactly.
+        assert_eq!(envelope["request"]["contents"], native["contents"]);
+        assert_eq!(envelope["request"]["tools"], native["tools"]);
         assert_eq!(
             native["tools"][0]["functionDeclarations"][14]["parameters"],
             json!({"properties": {"query": {"type": "string"}}})

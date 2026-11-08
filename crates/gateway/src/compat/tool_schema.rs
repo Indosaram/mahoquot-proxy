@@ -60,21 +60,25 @@ const ANNOTATION_KEYS: [&str; 5] = ["title", "description", "default", "examples
 fn overlay_annotations(reduced: &mut Map<String, Value>, union_node: &Map<String, Value>) {
     for key in ANNOTATION_KEYS {
         if let Some(value) = union_node.get(key) {
-            reduced.entry(key.to_string()).or_insert_with(|| value.clone());
+            reduced
+                .entry(key.to_string())
+                .or_insert_with(|| value.clone());
         }
     }
 }
 
 fn is_object_schema(branch: &Value) -> bool {
     branch.as_object().is_some_and(|map| {
-        map.contains_key("properties")
-            || map.get("type").is_some_and(|kind| kind == "object")
+        map.contains_key("properties") || map.get("type").is_some_and(|kind| kind == "object")
     })
 }
 
 /// Reduce an already-recursively-flattened branch list to one schema.
 fn reduce_union(branches: Vec<Value>, union_node: &Map<String, Value>) -> Value {
-    let non_null: Vec<Value> = branches.into_iter().filter(|b| !is_null_branch(b)).collect();
+    let non_null: Vec<Value> = branches
+        .into_iter()
+        .filter(|b| !is_null_branch(b))
+        .collect();
     let mut reduced = match non_null.len() {
         0 => json!({}),
         1 => non_null.into_iter().next().unwrap_or_else(|| json!({})),
@@ -128,10 +132,7 @@ fn reduce_union(branches: Vec<Value>, union_node: &Map<String, Value>) -> Value 
             }
             merged.insert("type".into(), json!("object"));
             merged.insert("properties".into(), Value::Object(properties));
-            merged.insert(
-                "required".into(),
-                json!(required.unwrap_or_default()),
-            );
+            merged.insert("required".into(), json!(required.unwrap_or_default()));
             Value::Object(merged)
         }
         _ => non_null.into_iter().next().unwrap_or_else(|| json!({})),
@@ -171,11 +172,7 @@ fn flatten_unions(schema: &mut Value, depth: usize) -> Result<(), String> {
     visit_schema_children(map, &mut |child| flatten_unions(child, depth + 1))?;
     if !nullable_names.is_empty() {
         if let Some(required) = map.get_mut("required").and_then(Value::as_array_mut) {
-            required.retain(|name| {
-                !nullable_names
-                    .iter()
-                    .any(|nullable| name == nullable)
-            });
+            required.retain(|name| !nullable_names.iter().any(|nullable| name == nullable));
         }
     }
     for key in UNION_KEYS {

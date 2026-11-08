@@ -3,10 +3,13 @@
 //! router fallback, which sits outside the management layers and therefore
 //! lacks the `X-CPA-VERSION` stamp every real handler response carries.
 
+mod common;
+
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::http::{header, Request, StatusCode};
+use axum::http::{Request, StatusCode};
+use common::with_loopback_peer;
 use mahoquot_gateway::config::GatewayConfig;
 use mahoquot_gateway::inbound::ApiKeys;
 use mahoquot_gateway::routes::create_app;
@@ -75,6 +78,16 @@ async fn every_manifest_management_route_answers_from_a_registered_handler() {
         config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
+    mahoquot_gateway::management::settings::Settings {
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: PROBE_KEY.to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(&config.config_path)
+    .expect("persist management settings");
     let app = create_app(Arc::new(AppState::new(&config).expect("state")));
 
     // when every manifest route is probed with its own method
@@ -88,12 +101,12 @@ async fn every_manifest_management_route_answers_from_a_registered_handler() {
         let request = Request::builder()
             .method(method.as_str())
             .uri(concrete(path))
-            .header(header::AUTHORIZATION, format!("Bearer {PROBE_KEY}"))
+            .header("X-Management-Key", PROBE_KEY)
             .body(Body::empty())
             .expect("request");
         let response = app
             .clone()
-            .oneshot(request)
+            .oneshot(with_loopback_peer(request))
             .await
             .expect("infallible service");
         let status = response.status();
@@ -125,16 +138,29 @@ async fn an_unimplemented_management_path_answers_the_bare_fallback() {
         config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
+    mahoquot_gateway::management::settings::Settings {
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: PROBE_KEY.to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(&config.config_path)
+    .expect("persist management settings");
     let app = create_app(Arc::new(AppState::new(&config).expect("state")));
 
     // when an upstream path is probed that was never ported
     let request = Request::builder()
         .method("GET")
         .uri("/v0/management/quotas/vercel")
-        .header(header::AUTHORIZATION, format!("Bearer {PROBE_KEY}"))
+        .header("X-Management-Key", PROBE_KEY)
         .body(Body::empty())
         .expect("request");
-    let response = app.oneshot(request).await.expect("infallible service");
+    let response = app
+        .oneshot(with_loopback_peer(request))
+        .await
+        .expect("infallible service");
 
     // then the fallback answers unstamped so the positive gate stays honest
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
@@ -143,7 +169,7 @@ async fn an_unimplemented_management_path_answers_the_bare_fallback() {
 }
 
 #[tokio::test]
-async fn unimplemented_pluginhost_routes_are_not_advertised_as_handlers() {
+async fn plugin_routes_are_registered_and_unknown_plugin_paths_fall_back() {
     let auth_dir = std::env::temp_dir().join(format!(
         "mahoquot-route-gate-pluginhost-{}",
         std::process::id()
@@ -155,23 +181,44 @@ async fn unimplemented_pluginhost_routes_are_not_advertised_as_handlers() {
         config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
+    mahoquot_gateway::management::settings::Settings {
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: PROBE_KEY.to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(&config.config_path)
+    .expect("persist management settings");
     let app = create_app(Arc::new(AppState::new(&config).expect("state")));
 
-    for (method, path) in [
-        ("GET", "/v0/management/plugins"),
-        ("GET", "/v0/management/plugin-store"),
-        ("POST", "/v0/management/plugin-store/probe/install"),
-    ] {
+    let plugins = app
+        .clone()
+        .oneshot(with_loopback_peer(
+            Request::builder()
+                .uri("/v0/management/plugins")
+                .header("X-Management-Key", PROBE_KEY)
+                .body(Body::empty())
+                .expect("plugins request"),
+        ))
+        .await
+        .expect("plugins response");
+    // Task 30 registers /v0/management/plugins as a real management handler.
+    assert_eq!(plugins.status(), StatusCode::OK);
+    assert!(stamped(&plugins));
+
+    for (method, path) in [("GET", "/v0/management/plugins/not-a-route/extra")] {
         let response = app
             .clone()
-            .oneshot(
+            .oneshot(with_loopback_peer(
                 Request::builder()
                     .method(method)
                     .uri(path)
-                    .header(header::AUTHORIZATION, format!("Bearer {PROBE_KEY}"))
+                    .header("X-Management-Key", PROBE_KEY)
                     .body(Body::empty())
                     .expect("request"),
-            )
+            ))
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {path}");
@@ -196,17 +243,27 @@ async fn trae_import_local_accepts_the_desktop_apps_bodyless_post() {
         config_path: auth_dir.join("config.yaml"),
         ..GatewayConfig::default()
     };
+    mahoquot_gateway::management::settings::Settings {
+        remote_management: mahoquot_gateway::management::settings::RemoteManagement {
+            secret_key: PROBE_KEY.to_string(),
+            ..Default::default()
+        },
+        auth_dir: auth_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+    .persist(&config.config_path)
+    .expect("persist management settings");
     let app = create_app(Arc::new(AppState::new(&config).expect("state")));
 
     let response = app
-        .oneshot(
+        .oneshot(with_loopback_peer(
             Request::builder()
                 .method("POST")
                 .uri("/v0/management/trae/import-local")
-                .header(header::AUTHORIZATION, format!("Bearer {PROBE_KEY}"))
+                .header("X-Management-Key", PROBE_KEY)
                 .body(Body::empty())
                 .expect("request"),
-        )
+        ))
         .await
         .expect("response");
 
