@@ -348,6 +348,11 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&state),
         mahoquot_gateway::registry::catalog_refresh_check_interval(),
     );
+    // Rotates OAuth grants ahead of expiry. This relay mints refresh tokens
+    // whose lifetime equals the access-token lifetime, so reactive refresh
+    // presents a dead grant and the account is lost with invalid_grant.
+    let pre_expiry_refresh =
+        mahoquot_gateway::pre_expiry_refresh::spawn_from_env(Arc::clone(&state));
     mahoquot_gateway::egress_supervisor::spawn_egress_supervisor(
         state.clone(),
         std::time::Duration::from_secs(10),
@@ -373,6 +378,7 @@ async fn main() -> anyhow::Result<()> {
     // server.
     usage_poller.shutdown().await;
     catalog_refresh.shutdown().await;
+    pre_expiry_refresh.shutdown().await;
     flush_worker.shutdown().await;
     claude_budget_refresher.abort();
     claude_affinity_worker.abort();

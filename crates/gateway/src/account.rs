@@ -1930,6 +1930,20 @@ impl AccountMember {
         *guard = health;
     }
 
+    /// Whether the account is benched pending re-authentication.
+    ///
+    /// A rejected refresh grant is terminal, so retrying it on a timer cannot
+    /// succeed and only risks the identity provider locking the client out.
+    pub fn is_auth_failed(&self) -> bool {
+        matches!(
+            *self
+                .health
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            Health::AuthFailed
+        )
+    }
+
     /// The quota group `model` bills against on this account, if its provider
     /// meters model families separately.
     pub fn quota_group_for<'a>(&self, model: &'a str) -> Option<&'a str> {
