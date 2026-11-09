@@ -2158,6 +2158,10 @@ impl AppState {
             in_flight: self.monitor.in_flight(),
             served: self.metrics.served.load(Ordering::Relaxed),
             failed_over: self.metrics.failed_over.load(Ordering::Relaxed),
+            served_model_substitutions: self
+                .metrics
+                .served_model_substitutions
+                .load(Ordering::Relaxed),
             refreshed: self.refreshed.load(Ordering::Relaxed),
             exposed_errors: self.metrics.exposed_errors.load(Ordering::Relaxed),
             exposed_client_errors: self.metrics.exposed_client_errors.load(Ordering::Relaxed),

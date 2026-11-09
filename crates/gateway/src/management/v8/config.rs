@@ -2873,6 +2873,10 @@ fn local_leaf(path: &str) -> bool {
         "credit-codex-account-ids",
         "codex-fast-mode",
         "logs-segment-size-mb",
+        "claude-route-mode",
+        "claude-api-key-budgets",
+        "claude-suspected-accounts",
+        "claude-account-egress",
     ]
     .iter()
     .any(|p| path == *p || path.starts_with(&format!("{p}.")))

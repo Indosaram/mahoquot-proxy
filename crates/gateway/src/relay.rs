@@ -1,7 +1,7 @@
 // allow: SIZE_OK — single-loop failover relay state machine with auth refresh, retry, and in-flight tracking
 
 use std::hash::Hasher;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -3293,6 +3293,57 @@ fn stream_response_observed(
         })
 }
 
+/// Watches the head of a relayed stream for a model substitution.
+///
+/// The passthrough branch relays upstream bytes unchanged, so the log line and
+/// the history row would attribute the turn to the *requested* model even when
+/// the upstream answered with another one. The scan is bounded to the head of
+/// the stream and never delays a chunk: once the model is seen, or the budget
+/// is spent, the tap stops inspecting and only forwards.
+fn observe_served_model(
+    body: Body,
+    requested: String,
+    account: String,
+    provider: String,
+    substitutions: Arc<AtomicU64>,
+) -> Body {
+    const OBSERVE_BUDGET: usize = 16 * 1024;
+    let mut seen = 0usize;
+    let mut decided = false;
+    let mut head: Vec<u8> = Vec::new();
+    let tapped = body.into_data_stream().map(move |chunk| {
+        if !decided {
+            if let Ok(bytes) = &chunk {
+                if seen < OBSERVE_BUDGET {
+                    let take = bytes.len().min(OBSERVE_BUDGET - seen);
+                    head.extend_from_slice(&bytes[..take]);
+                    seen += take;
+                }
+                let served = compat::served_codex_model(&head);
+                if let Some(served) = served {
+                    decided = true;
+                    head.clear();
+                    if served != requested {
+                        substitutions.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(
+                            requested_model = %requested,
+                            served_model = %served,
+                            %account,
+                            %provider,
+                            "upstream served a different model than requested"
+                        );
+                    }
+                } else if seen >= OBSERVE_BUDGET {
+                    decided = true;
+                    head.clear();
+                }
+            }
+        }
+        chunk
+    });
+    Body::from_stream(tapped)
+}
+
 fn body_response(status: StatusCode, content_type: Option<&str>, body: Bytes) -> Response {
     let mut builder = Response::builder().status(status);
     if let Some(ct) = content_type {
@@ -5249,13 +5300,32 @@ async fn finish_success(
         {
             return Err("upstream returned html instead of an api response".to_string());
         }
-        return raw_stream_response(
+        let passthrough = raw_stream_response(
             resp,
             status_code,
             raw_sse_wire(plan),
             get_preflight_deadline(headers),
         )
-        .await;
+        .await?;
+        // The bytes are relayed unchanged, so nothing downstream would notice a
+        // substituted model; tap the head of the stream to record it.
+        let requested = plan
+            .model
+            .clone()
+            .filter(|model| !model.is_empty())
+            .unwrap_or_default();
+        if requested.is_empty() {
+            return Ok(passthrough);
+        }
+        let (parts, body) = passthrough.into_parts();
+        let body = observe_served_model(
+            body,
+            requested,
+            member.id().to_string(),
+            member.provider_name(),
+            Arc::clone(&state.metrics.served_model_substitutions),
+        );
+        return Ok(Response::from_parts(parts, body));
     }
 
     if matches!(
@@ -5434,10 +5504,22 @@ async fn finish_success(
             ANTHROPIC_EMPTY_HOLD
         };
         compat::open_anthropic_stream(resp, hold).await?
+    } else if protocol == compat::Protocol::Codex && plan.client_stream {
+        // Codex-family upstreams can answer 200 with a well-formed stream that
+        // carries a role prelude, reasoning, and a terminal event but no text
+        // and no tool call. Holding the preamble lets that turn fail over
+        // instead of reaching the client as an empty response it must retry.
+        compat::open_codex_stream(resp, get_preflight_deadline(headers)).await?
     } else {
         compat::open_stream(resp, protocol).await?
     };
-    let model = plan.model.clone().unwrap_or_default();
+    // The upstream envelope is authoritative for the model that actually ran.
+    // Codex can answer a request for one id with another (its safety-buffering
+    // path serves a faster surface and announces it in `response.model`);
+    // re-labelling those frames with the requested id would hide that from the
+    // client. Fall back to the requested id when the preamble names none.
+    let model = compat::served_codex_model(&first)
+        .unwrap_or_else(|| plan.model.clone().unwrap_or_default());
 
     if protocol == compat::Protocol::Antigravity && !plan.client_stream {
         let completion = collect_antigravity_once(
@@ -7521,15 +7603,24 @@ pub async fn handle_relay(
                     if is_claude_member(&member) {
                         let denial =
                             crate::claude_denial::classify(mapped_status.as_u16(), description);
-                        if denial != crate::claude_denial::Denial::Other {
+                        let enforcement = denial == crate::claude_denial::Denial::Enforcement;
+                        // A repeat plain denial inside the promotion window also
+                        // benches the account, but the current request still
+                        // fails over to a peer that may serve it.
+                        let escalate = enforcement
+                            || (denial == crate::claude_denial::Denial::Denied
+                                && state.claude_denials.record(member.id(), now_unix_secs()));
+                        if escalate {
                             handle_claude_denial(
                                 &state,
                                 &member,
                                 mapped_status.as_u16(),
                                 description,
-                                denial,
+                                crate::claude_denial::Denial::Enforcement,
                             )
                             .await;
+                        }
+                        if enforcement {
                             return body_response(mapped_status, Some("application/json"), Bytes::from(serde_json::json!({"error":{"message":description,"type":"upstream_error","code":code}}).to_string()));
                         }
                     }
@@ -7666,12 +7757,27 @@ pub async fn handle_relay(
             let message = String::from_utf8_lossy(&failure.body);
             let denial = crate::claude_denial::classify(status_code, &message);
             if denial != crate::claude_denial::Denial::Other {
-                handle_claude_denial(&state, &member, status_code, &message, denial).await;
-                return body_response(
-                    failure.status,
-                    failure.content_type.as_deref(),
-                    failure.body,
-                );
+                // Account- or org-level enforcement never lets another account
+                // see the request.
+                let escalate = denial == crate::claude_denial::Denial::Enforcement
+                    || state.claude_denials.record(member.id(), now_unix_secs());
+                if escalate {
+                    handle_claude_denial(
+                        &state,
+                        &member,
+                        status_code,
+                        &message,
+                        crate::claude_denial::Denial::Enforcement,
+                    )
+                    .await;
+                    if denial == crate::claude_denial::Denial::Enforcement {
+                        return body_response(
+                            failure.status,
+                            failure.content_type.as_deref(),
+                            failure.body,
+                        );
+                    }
+                }
             }
             resp = rebuild_response(failure);
         }
