@@ -2930,6 +2930,20 @@ fn structural(path: &str) -> bool {
             .any(|(_, current)| current.starts_with(&format!("{path}.")))
 }
 fn validate_tree(value: &Value, path: &str) -> Result<(), ConfigError> {
+    if path == "oauth-model-alias" || path == "oauth.model-alias" {
+        // Delegate to the consumer so the accepted shapes cannot drift from what
+        // `Settings::parse_model_aliases` actually reads. The alias map has three
+        // live forms (flat map, provider-nested map, and a list of rule objects)
+        // and the persisted file uses the nested one.
+        let settings = Settings {
+            oauth_model_alias: value.clone(),
+            ..Settings::default()
+        };
+        return settings
+            .parse_model_aliases()
+            .map(|_| ())
+            .map_err(|error| ConfigError::InvalidConfig(error.to_string()));
+    }
     if path == "omo-profile" {
         serde_json::from_value::<Option<crate::management::settings::OmoProfile>>(value.clone())
             .map_err(|error| ConfigError::InvalidConfig(error.to_string()))?;
@@ -3118,6 +3132,28 @@ fn strip_auth_indexes(root: &mut Value) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The persisted file stores aliases as a provider-nested map. Validation
+    /// used to demand a list of rule objects, so every config write that
+    /// round-tripped the file failed with 422 even though the reader accepted it.
+    #[test]
+    fn alias_map_shapes_the_reader_accepts_also_validate() {
+        for value in [
+            // Nested: provider -> {alias: target}
+            json!({"b-ai": {"b-ai/glm-5.3-flash": "glm-5.3-flash"}}),
+            // Flat: alias -> target
+            json!({"glm-5.3-flash": "glm-5.3-flash"}),
+            // List of rule objects
+            json!({"b-ai": [{"alias": "glm-5.3-flash", "name": "glm-5.3-flash"}]}),
+        ] {
+            assert!(
+                validate(&json!({"oauth-model-alias": value.clone()})).is_ok(),
+                "reader-accepted shape was rejected: {value}"
+            );
+        }
+        // A value the reader cannot interpret still fails loudly.
+        assert!(validate(&json!({"oauth-model-alias": {"b-ai": 7}})).is_err());
+    }
 
     #[test]
     fn management_secret_omission_preserves_but_explicit_edits_apply() {
