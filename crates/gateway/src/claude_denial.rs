@@ -130,6 +130,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn quarantine_tracks_and_clears_accounts() {
+        let set = QuarantineSet::default();
+        assert!(set.is_empty());
+        set.insert("claude-a");
+        assert!(set.contains("claude-a"));
+        assert!(!set.contains("claude-b"));
+        assert_eq!(set.len(), 1);
+        set.remove("claude-a");
+        assert!(set.is_empty());
+    }
+
+    #[test]
+    fn quarantine_is_idempotent() {
+        let set = QuarantineSet::default();
+        set.insert("claude-a");
+        set.insert("claude-a");
+        assert_eq!(set.len(), 1);
+    }
+
+
+    #[test]
     fn recorded_bodies_land_in_the_expected_class() {
         let cases: &[(u16, &str, Denial)] = &[
             (

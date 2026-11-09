@@ -288,6 +288,32 @@ mod tests {
     }
 
     #[test]
+    fn touch_refreshes_an_active_binding() {
+        let store = AffinityStore::in_memory();
+        store.put(7, "claude-a", 0);
+        let later = BINDING_TTL_SECS + 100;
+        store.touch(7, "claude-a", later);
+        // Without the refresh this entry would be past its idle TTL.
+        assert_eq!(store.get(7, later).as_deref(), Some("claude-a"));
+    }
+
+    #[test]
+    fn touch_never_steals_a_binding_from_another_account() {
+        let store = AffinityStore::in_memory();
+        store.put(8, "claude-a", 0);
+        store.touch(8, "claude-b", 10);
+        assert_eq!(store.get(8, 10).as_deref(), Some("claude-a"));
+    }
+
+    #[test]
+    fn touch_ignores_an_unknown_binding() {
+        let store = AffinityStore::in_memory();
+        store.touch(9, "claude-a", 5);
+        assert_eq!(store.get(9, 5), None);
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
     fn the_cap_drops_the_oldest_entries() {
         let store = AffinityStore::in_memory();
         for i in 0..(MAX_BINDINGS as u64 + 5) {

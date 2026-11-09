@@ -2803,6 +2803,74 @@ fn content_type_of(resp: &reqwest::Response) -> Option<String> {
         .map(ToString::to_string)
 }
 
+/// Scans the leading bytes of an SSE stream for an upstream enforcement
+/// error without touching what the client receives. Best effort: only
+/// complete frames inside the first 64 KiB are classified.
+#[derive(Debug, Default)]
+struct SseFrameScanner {
+    leading: Vec<u8>,
+    seen: usize,
+    done: bool,
+}
+
+impl SseFrameScanner {
+    const LIMIT: usize = 64 * 1024;
+
+    /// Feed one chunk. Returns the matching frame once, then stops scanning.
+    fn push(&mut self, chunk: &[u8]) -> Option<String> {
+        if self.done || self.seen >= Self::LIMIT {
+            return None;
+        }
+        let take = chunk.len().min(Self::LIMIT - self.seen);
+        self.leading.extend_from_slice(&chunk[..take]);
+        self.seen += take;
+        // Inspect complete SSE frames only; chunk boundaries are not frame
+        // boundaries.
+        while let Some((end, delimiter)) = self
+            .leading
+            .windows(2)
+            .position(|w| w == b"\n\n")
+            .map(|end| (end, 2))
+            .into_iter()
+            .chain(
+                self.leading
+                    .windows(4)
+                    .position(|w| w == b"\r\n\r\n")
+                    .map(|end| (end, 4)),
+            )
+            .min_by_key(|(end, _)| *end)
+        {
+            let frame = String::from_utf8_lossy(&self.leading[..end]).into_owned();
+            let matched = is_enforcement_event(&frame);
+            self.leading.drain(..end + delimiter);
+            if matched {
+                self.done = true;
+                self.leading.clear();
+                return Some(frame);
+            }
+        }
+        if self.seen >= Self::LIMIT {
+            self.done = true;
+            self.leading.clear();
+        }
+        None
+    }
+}
+
+fn is_enforcement_event(frame: &str) -> bool {
+    let error_event = frame.lines().any(|line| {
+        line.strip_prefix("event:")
+            .is_some_and(|event| event.trim() == "error")
+    });
+    if !error_event {
+        return false;
+    }
+    let lowered = frame.to_ascii_lowercase();
+    lowered.contains("permission_error")
+        || lowered.contains("enforcement")
+        || crate::claude_denial::is_enforcement_text(frame)
+}
+
 fn stream_response(resp: reqwest::Response, status_code: u16) -> Response {
     stream_response_observed(resp, status_code, None::<fn(String)>)
 }
@@ -2820,53 +2888,16 @@ fn stream_response_observed(
         }
     }
     let mut observe = observe;
-    let mut leading = Vec::new();
-    let mut seen = 0usize;
+    let mut scanner = SseFrameScanner::default();
     let stream = resp.bytes_stream().inspect(move |chunk| {
-        if observe.is_none() || seen >= 64 * 1024 {
+        if observe.is_none() {
             return;
         }
         let Ok(chunk) = chunk else { return };
-        let take = chunk.len().min(64 * 1024 - seen);
-        leading.extend_from_slice(&chunk[..take]);
-        seen += take;
-        // Inspect complete SSE frames only; chunk boundaries are not frame
-        // boundaries. The original chunks flow through untouched.
-        while let Some((end, delimiter)) = leading
-            .windows(2)
-            .position(|w| w == b"\n\n")
-            .map(|end| (end, 2))
-            .into_iter()
-            .chain(
-                leading
-                    .windows(4)
-                    .position(|w| w == b"\r\n\r\n")
-                    .map(|end| (end, 4)),
-            )
-            .min_by_key(|(end, _)| *end)
-        {
-            let frame = String::from_utf8_lossy(&leading[..end]);
-            let lowered = frame.to_ascii_lowercase();
-            let error_event = frame.lines().any(|line| {
-                line.strip_prefix("event:")
-                    .is_some_and(|event| event.trim() == "error")
-            });
-            if error_event
-                && (lowered.contains("permission_error")
-                    || lowered.contains("enforcement")
-                    || crate::claude_denial::is_enforcement_text(&frame))
-            {
-                if let Some(observe) = observe.take() {
-                    observe(frame.into_owned());
-                }
-                leading.clear();
-                break;
+        if let Some(frame) = scanner.push(chunk) {
+            if let Some(observe) = observe.take() {
+                observe(frame);
             }
-            leading.drain(..end + delimiter);
-        }
-        if seen >= 64 * 1024 {
-            observe = None;
-            leading.clear();
         }
     });
     res_builder
@@ -7376,6 +7407,60 @@ pub async fn handle_relay(
     )
     .await;
     response
+}
+
+#[cfg(test)]
+mod sse_frame_scanner_tests {
+    use super::*;
+
+    #[test]
+    fn a_permission_error_event_is_reported_once() {
+        let mut scanner = SseFrameScanner::default();
+        let chunk = b"event: message_start\ndata: {}\n\nevent: error\ndata: {\"error\":{\"type\":\"permission_error\"}}\n\n";
+        let found = scanner.push(chunk).expect("frame");
+        assert!(found.contains("permission_error"));
+        // Later enforcement frames are not reported twice.
+        assert!(scanner
+            .push(b"event: error\ndata: {\"error\":{\"type\":\"permission_error\"}}\n\n")
+            .is_none());
+    }
+
+    #[test]
+    fn ordinary_frames_are_ignored() {
+        let mut scanner = SseFrameScanner::default();
+        assert!(scanner
+            .push(b"event: content_block_delta\ndata: {\"text\":\"hi\"}\n\n")
+            .is_none());
+    }
+
+    #[test]
+    fn frames_split_across_chunks_are_joined() {
+        let mut scanner = SseFrameScanner::default();
+        assert!(scanner.push(b"event: err").is_none());
+        let found = scanner
+            .push(b"or\ndata: {\"error\":{\"type\":\"permission_error\"}}\n\n")
+            .expect("frame");
+        assert!(found.contains("permission_error"));
+    }
+
+    #[test]
+    fn crlf_frames_are_recognized() {
+        let mut scanner = SseFrameScanner::default();
+        let found = scanner
+            .push(b"event: error\r\ndata: {\"error\":{\"type\":\"permission_error\"}}\r\n\r\n")
+            .expect("frame");
+        assert!(found.contains("permission_error"));
+    }
+
+    #[test]
+    fn scanning_stops_after_the_limit() {
+        let mut scanner = SseFrameScanner::default();
+        let filler = vec![b'a'; SseFrameScanner::LIMIT];
+        assert!(scanner.push(&filler).is_none());
+        assert!(scanner
+            .push(b"event: error\ndata: {\"error\":{\"type\":\"permission_error\"}}\n\n")
+            .is_none());
+    }
 }
 
 #[cfg(test)]
