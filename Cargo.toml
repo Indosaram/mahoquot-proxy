@@ -43,7 +43,7 @@ serde_json = { version = "1", features = ["preserve_order"] }
 serde_yaml = "0.9"
 toml = { version = "0.8", default-features = false, features = ["parse"] }
 arc-swap = "1"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json", "socks", "http2"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json", "socks", "gzip", "deflate", "brotli", "zstd", "http2"] }
 anyhow = "1"
 thiserror = "2"
 tracing = "0.1"

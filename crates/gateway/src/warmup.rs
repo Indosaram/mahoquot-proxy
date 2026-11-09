@@ -14,6 +14,7 @@ use std::{
     time::Duration,
 };
 const LIMIT: usize = 4;
+const PROBE_LOG_WINDOW_SECS: i64 = 24 * 3600;
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct WarmupResult {
     pub id: String,
@@ -39,6 +40,7 @@ type ActiveIds = BTreeSet<String>;
 struct WarmupInner {
     active: Option<ActiveIds>,
     entries: HashMap<String, WarmupHistoryEntry>,
+    probe_log: HashMap<String, std::collections::VecDeque<i64>>,
     flights: HashMap<String, FlightEntry>,
     /// Monotonic tag handed to each new flight so a stale completion can never
     /// remove a flight registered after a prune (or a prune + re-add).
@@ -69,6 +71,7 @@ impl Default for WarmupRunner {
             inner: Mutex::new(WarmupInner {
                 active: None,
                 entries: HashMap::new(),
+                probe_log: HashMap::new(),
                 flights: HashMap::new(),
                 flight_generation: 0,
             }),
@@ -85,6 +88,7 @@ impl WarmupRunner {
         inner.active = Some(active.clone());
         let before_history = inner.entries.len();
         inner.entries.retain(|id, _| active.contains(id));
+        inner.probe_log.retain(|id, _| active.contains(id));
         let before_flights = inner.flights.len();
         inner.flights.retain(|id, _| active.contains(id));
         (before_history - inner.entries.len()) + (before_flights - inner.flights.len())
@@ -98,8 +102,26 @@ impl WarmupRunner {
         if !inner.admits(id) {
             return false;
         }
+        let at_unix = record.1;
+        let log = inner.probe_log.entry(id.to_string()).or_default();
+        log.push_back(at_unix);
+        while log
+            .front()
+            .is_some_and(|t| *t <= at_unix - PROBE_LOG_WINDOW_SECS)
+        {
+            log.pop_front();
+        }
         inner.entries.insert(id.to_string(), record);
         true
+    }
+    /// Probes sent for `id` in the 24 hours before `now_unix`.
+    pub fn probes_last_24h(&self, id: &str, now_unix: i64) -> usize {
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner.probe_log.get(id).map_or(0, |log| {
+            log.iter()
+                .filter(|t| **t > now_unix - PROBE_LOG_WINDOW_SECS)
+                .count()
+        })
     }
     /// Removes the flight registered under `id`, but only while it is still the
     /// exact generation its creator published. A prune (or a prune followed by a
@@ -195,6 +217,15 @@ fn policy(
 fn eligibility(state: &AppState, m: &AccountMember, model: &str) -> Option<&'static str> {
     if m.active_requests.load(std::sync::atomic::Ordering::Relaxed) != 0 {
         return Some("account_active");
+    }
+    if m.provider_name() == "claude"
+        && state
+            .settings
+            .current()
+            .claude_suspected_accounts
+            .contains_key(&m.id)
+    {
+        return Some("suspected");
     }
     if m.is_manually_disabled() {
         return Some("disabled");
@@ -905,6 +936,20 @@ pub fn status(state: &AppState) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn probe_counts_expire_and_follow_membership() {
+        let runner = WarmupRunner::default();
+        let at = tokio::time::Instant::now();
+        assert!(runner.record_probe("live", (at, 100_000, None)));
+        assert!(runner.record_probe("live", (at, 100_001, None)));
+        assert_eq!(runner.probes_last_24h("live", 100_002), 2);
+        assert_eq!(runner.probes_last_24h("live", 186_400), 1);
+        assert_eq!(runner.probes_last_24h("live", 186_401), 0);
+        runner.retain_accounts(&ActiveIds::new());
+        assert_eq!(runner.probes_last_24h("live", 100_002), 0);
+        assert!(!runner.record_probe("live", (at, 100_003, None)));
+    }
+
     #[test]
     fn codex_display_requires_evidence_of_a_started_five_hour_window() {
         let now = 1_800_000_000;

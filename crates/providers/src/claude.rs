@@ -226,3 +226,18 @@ mod plan_tests {
         assert_eq!(legacy.plan, None);
     }
 }
+
+pub const AGENT_SDK_IDENTITY_HEADERS: &[(&str, &str)] = &[
+    (
+        "user-agent",
+        "claude-cli/2.1.296 (external, sdk-ts, agent-sdk/0.3.296)",
+    ),
+    ("x-app", "cli"),
+    ("anthropic-dangerous-direct-browser-access", "true"),
+    ("x-stainless-lang", "js"),
+    ("x-stainless-package-version", "0.128.0"),
+    ("x-stainless-os", "Linux"),
+    ("x-stainless-arch", "x64"),
+    ("x-stainless-runtime", "node"),
+    ("x-stainless-runtime-version", "v26.3.0"),
+];
