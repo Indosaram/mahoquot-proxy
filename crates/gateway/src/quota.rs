@@ -1372,14 +1372,31 @@ pub async fn refresh_all_usage(state: &Arc<AppState>) {
         tasks.push(tokio::spawn(async move {
             // Logged rather than discarded: a silently failing quota poll is
             // indistinguishable from a provider that reports no quota.
-            match refresh_account_usage(&state, &m).await {
-                Ok(()) | Err(QuotaError::Unsupported) => {}
-                Err(e) => tracing::warn!(
-                    account = %m.id,
-                    provider = ?m.kind(),
-                    error = %e,
-                    "quota refresh failed"
-                ),
+            let result = refresh_account_usage(&state, &m).await;
+            // The same account failing the same way every poll is one
+            // condition, not one event per cycle. Only a change of outcome is
+            // logged, so a transient provider gap cannot bury the log and a
+            // recovery is still visible.
+            let fingerprint = match &result {
+                Ok(()) | Err(QuotaError::Unsupported) => String::new(),
+                Err(e) => format!("{}: {e}", m.kind().as_str()),
+            };
+            let previous = state
+                .quota_poll_failures
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(m.id.clone(), fingerprint.clone());
+            if let Err(e) = &result {
+                if previous.as_deref() != Some(fingerprint.as_str()) {
+                    tracing::warn!(
+                        account = %m.id,
+                        provider = ?m.kind(),
+                        error = %e,
+                        "quota refresh failed"
+                    );
+                }
+            } else if previous.is_some_and(|p| !p.is_empty()) {
+                tracing::info!(account = %m.id, provider = ?m.kind(), "quota refresh recovered");
             }
         }));
     }

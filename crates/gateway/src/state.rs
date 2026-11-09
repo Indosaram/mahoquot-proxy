@@ -949,6 +949,10 @@ pub struct AppState {
     pub claude_budgets: crate::claude_budget::BudgetTracker,
     /// W1: recent plain denials per Claude account, for promotion.
     pub claude_denials: crate::claude_denial::DeniedTracker,
+    /// Last logged quota-poll outcome per account, so one persistent failure
+    /// is logged once instead of on every poll cycle.
+    pub quota_poll_failures:
+        std::sync::Mutex<std::collections::HashMap<String, String>>,
     pub claude_quarantine: crate::claude_denial::QuarantineSet,
     /// W2: durable Claude OAuth session -> account bindings.
     pub claude_affinity: Arc<crate::affinity_store::AffinityStore>,
@@ -1271,6 +1275,7 @@ impl AppState {
             claude_reset_order: crate::claude_reset_order::ClaudeResetOrder::default(),
             claude_budgets: crate::claude_budget::BudgetTracker::default(),
             claude_denials: crate::claude_denial::DeniedTracker::default(),
+            quota_poll_failures: std::sync::Mutex::default(),
             claude_quarantine: crate::claude_denial::QuarantineSet::default(),
             claude_affinity: Arc::new(if config.auth_dir.as_os_str().is_empty() {
                 crate::affinity_store::AffinityStore::in_memory()

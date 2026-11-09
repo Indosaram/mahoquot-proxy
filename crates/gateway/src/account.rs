@@ -4198,6 +4198,20 @@ mod identity_tests {
 /// real Codex credentials carry their PLAN there (`plus`, `pro`), so dispatching
 /// on `type` alone would reject live accounts. `type` is consulted only as a
 /// fallback for files whose name carries no known prefix.
+/// Whether a JSON file in the auth directory is meant to be a credential.
+///
+/// The gateway stores its own state (usage samples, scheduler state,
+/// telemetry, signature ledgers) in the same directory, so a `*.json` name is
+/// not enough. A file qualifies when its name carries a provider prefix or
+/// when the parsed document declares a provider `type`.
+fn is_credential_like(file_path: &Path, value: Option<&serde_json::Value>) -> bool {
+    let declared_type = value
+        .and_then(|value| value.get("type"))
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    classify_credential(file_path, declared_type).is_some()
+}
+
 fn classify_credential(file_path: &Path, declared_type: &str) -> Option<ProviderKind> {
     let name = file_path
         .file_name()
@@ -4313,10 +4327,26 @@ pub fn load_account_members(auth_dir: &Path) -> anyhow::Result<Vec<Arc<AccountMe
         let value: serde_json::Value = match serde_json::from_str(&content) {
             Ok(value) => value,
             Err(e) => {
-                tracing::warn!(path = ?file_path, error = %e, "skipping malformed credential");
+                // The auth directory also holds state files written by the
+                // gateway itself. Only a file that looks like a credential is
+                // worth a warning; an empty or truncated one is not a pool
+                // defect.
+                if is_credential_like(&file_path, None) {
+                    tracing::warn!(path = ?file_path, error = %e, "skipping malformed credential");
+                } else {
+                    tracing::debug!(path = ?file_path, error = %e, "ignoring non-credential json");
+                }
                 continue;
             }
         };
+
+        // Provider state written into the same directory (usage samples,
+        // scheduler state, telemetry, signature ledgers) is not a credential.
+        // A real credential is named for its provider or declares a type.
+        if !is_credential_like(&file_path, Some(&value)) {
+            tracing::debug!(path = ?file_path, "ignoring non-credential json");
+            continue;
+        }
 
         let declared_type = value
             .get("type")
