@@ -480,7 +480,9 @@ async fn duplicate_import_rejected() {
         json_body(first).await
     );
 
-    let duplicate = management(
+    // A shared email is not duplicate identity: Codex personal and team
+    // accounts legitimately reuse it while carrying distinct account ids.
+    let distinct = management(
         &ctx.app,
         Method::POST,
         "/auth-files/import",
@@ -489,11 +491,27 @@ async fn duplicate_import_rejected() {
         })),
     )
     .await;
+    assert_eq!(
+        distinct.status(),
+        StatusCode::CREATED,
+        "distinct account id must import: {}",
+        json_body(distinct).await
+    );
+
+    let duplicate = management(
+        &ctx.app,
+        Method::POST,
+        "/auth-files/import",
+        Some(json!({
+            "files": [{"name": "codex-third.json", "content": codex_credential("first", "other@example.test")}]
+        })),
+    )
+    .await;
     let status = duplicate.status();
     let body = json_body(duplicate).await;
     assert_eq!(status, StatusCode::CONFLICT, "duplicate response: {body}");
     assert_eq!(body["error"]["code"], "duplicate_credential");
-    assert!(!ctx.auth_dir.join("codex-second.json").exists());
+    assert!(!ctx.auth_dir.join("codex-third.json").exists());
 }
 
 #[tokio::test]

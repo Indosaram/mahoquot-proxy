@@ -99,10 +99,38 @@ pub struct UserMessage {
     pub content: Option<UserMessageContent>,
     #[prost(string, tag = "2")]
     pub message_id: String,
+    #[prost(message, optional, tag = "3")]
+    pub selected_context: Option<SelectedContext>,
     #[prost(int32, tag = "4")]
     pub mode: i32,
     #[prost(string, tag = "17")]
     pub correlation_id: String,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct SelectedContext {
+    #[prost(message, repeated, tag = "1")]
+    pub selected_images: Vec<SelectedImage>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct SelectedImage {
+    #[prost(string, tag = "2")]
+    pub uuid: String,
+    #[prost(string, tag = "3")]
+    pub path: String,
+    #[prost(string, tag = "7")]
+    pub mime_type: String,
+    #[prost(message, optional, tag = "9")]
+    pub blob_id_with_data: Option<SelectedImageBlobIdWithData>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct SelectedImageBlobIdWithData {
+    #[prost(bytes = "vec", tag = "1")]
+    pub blob_id: Vec<u8>,
+    #[prost(bytes = "vec", tag = "2")]
+    pub data: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]

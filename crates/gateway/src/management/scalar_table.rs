@@ -61,10 +61,13 @@ fn set_usize(target: &mut usize, body: &Value) -> WriteResult {
 
 /// Upstream accepts several spellings per strategy and answers with the
 /// canonical one, rejecting anything else with 400 `invalid strategy`.
+///
+/// Weighted round-robin has no selector behind it: accepting the write would
+/// report a strategy the router does not implement. It stays rejected until a
+/// weighted selector exists.
 pub fn normalize_routing_strategy(raw: &str) -> Option<&'static str> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "" | "round-robin" | "roundrobin" | "rr" => Some("round-robin"),
-        "weighted-round-robin" | "weightedroundrobin" | "wrr" => Some("weighted-round-robin"),
         "fill-first" | "fillfirst" | "ff" => Some("fill-first"),
         _ => None,
     }

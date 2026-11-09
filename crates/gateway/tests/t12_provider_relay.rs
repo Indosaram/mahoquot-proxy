@@ -390,6 +390,58 @@ async fn generic_anthropic_adapter_account_relays_native_messages_wire() {
     std::fs::remove_dir_all(auth_dir).ok();
 }
 
+/// The Generic `anthropic` adapter returns before the shared /v1/messages
+/// serialization point, so the cache-breakpoint cap has to live in the
+/// translator for that path. Anthropic rejects a fifth marker with HTTP 400.
+#[tokio::test]
+async fn generic_anthropic_adapter_caps_client_breakpoints() {
+    let response = r#"{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-5","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":2}}"#;
+    let (upstream, seen, mock_task) = start_mock(response, "application/json").await;
+    let (gateway, auth_dir, gateway_task) = start_adapter_gateway(
+        "anthropic-apikey",
+        "anthropic",
+        "claude-sonnet-5",
+        &upstream,
+    )
+    .await;
+    let marker = || serde_json::json!({"type": "ephemeral"});
+    let reply = reqwest::Client::new()
+        .post(format!("{gateway}/v1/chat/completions"))
+        .bearer_auth("relay-key")
+        .json(&serde_json::json!({
+            "model": "claude-sonnet-5",
+            "stream": false,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "a", "cache_control": marker()},
+                {"type": "text", "text": "b", "cache_control": marker()},
+                {"type": "text", "text": "c", "cache_control": marker()},
+                {"type": "text", "text": "d", "cache_control": marker()},
+                {"type": "text", "text": "e", "cache_control": marker()}
+            ]}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reply.status(), StatusCode::OK);
+
+    let request = seen
+        .lock()
+        .unwrap()
+        .first()
+        .cloned()
+        .expect("upstream call");
+    let serialized = request.body.to_string();
+    let breakpoints = serialized.matches("\"cache_control\"").count();
+    assert!(
+        breakpoints <= 4,
+        "upstream must never receive more than four cache_control markers, saw {breakpoints}: {serialized}"
+    );
+
+    gateway_task.abort();
+    mock_task.abort();
+    std::fs::remove_dir_all(auth_dir).ok();
+}
+
 #[tokio::test]
 async fn azure_openai_account_relays_the_responses_wire_with_an_api_key_header() {
     let response = r#"{"id":"resp_1","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"azure-ok"}]}]}"#;
@@ -1007,6 +1059,56 @@ async fn zcode_relays_native_anthropic_wire_end_to_end() {
     assert_anthropic_native("zcode", "glm-5.2").await;
 }
 
+/// Anthropic answers a fifth cache_control breakpoint with HTTP 400. A client
+/// that manages its own markers can send more than the cap, so the gateway has
+/// to enforce the limit on every Anthropic-shaped destination, not only on the
+/// subscription path that places its own breakpoints.
+#[tokio::test]
+async fn zcode_native_client_breakpoints_are_capped_before_upstream() {
+    let (upstream, seen, mock_task) = start_mock(ANTHROPIC_STREAM, "text/event-stream").await;
+    let (gateway, auth_dir, gateway_task) = start_gateway("zcode", &upstream).await;
+
+    let marker = || serde_json::json!({"type":"ephemeral"});
+    let response = reqwest::Client::new()
+        .post(format!("{gateway}/v1/messages"))
+        .header("x-api-key", "relay-key")
+        .header("anthropic-version", "2023-06-01")
+        .json(&serde_json::json!({
+            "model": "glm-5.2",
+            "max_tokens": 64,
+            "stream": true,
+            "system": [{"type":"text","text":"s","cache_control": marker()}],
+            "messages": [{"role":"user","content":[
+                {"type":"text","text":"a","cache_control": marker()},
+                {"type":"text","text":"b","cache_control": marker()},
+                {"type":"text","text":"c","cache_control": marker()},
+                {"type":"text","text":"d","cache_control": marker()},
+            ]}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let request = seen
+        .lock()
+        .unwrap()
+        .first()
+        .cloned()
+        .expect("upstream call");
+    let serialized = request.body.to_string();
+    let breakpoints = serialized.matches("\"cache_control\"").count();
+    assert!(
+        breakpoints <= 4,
+        "upstream must never receive more than four cache_control markers, saw {breakpoints}: {serialized}"
+    );
+    assert!(breakpoints > 0, "translation must keep caching enabled");
+
+    gateway_task.abort();
+    mock_task.abort();
+    std::fs::remove_dir_all(auth_dir).ok();
+}
+
 #[tokio::test]
 async fn anthropic_stream_forwards_first_delta_before_upstream_finishes() {
     use futures::StreamExt;
@@ -1245,7 +1347,7 @@ async fn kiro_relays_conversation_state_and_decodes_eventstream() {
         .post(format!("{gateway}/v1/chat/completions"))
         .bearer_auth("relay-key")
         .json(&serde_json::json!({
-            "model": "kiro/claude-haiku-4-5-20251001",
+            "model": "kiro/claude-haiku-4.5",
             "stream": true,
             "messages": [
                 {"role":"system","content":"be concise"},
@@ -1499,6 +1601,6 @@ async fn codex_does_not_claim_models_owned_by_loaded_provider_accounts() {
         .find(|member| member.kind() == mahoquot_gateway::account::ProviderKind::Codex)
         .unwrap();
     assert!(!codex.supports_model("claude-sonnet-4-5-20250929"));
-    assert!(!codex.supports_model("kiro/claude-haiku-4-5-20251001"));
+    assert!(!codex.supports_model("kiro/claude-haiku-4.5"));
     std::fs::remove_dir_all(dir).ok();
 }

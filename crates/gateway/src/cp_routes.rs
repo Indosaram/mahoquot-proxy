@@ -31,7 +31,7 @@ use crate::static_pages::{CALLBACK_HTML, MANAGEMENT_HTML, ROOT_JSON};
 use crate::v1beta::{self, GeminiAction};
 use axum::Extension;
 
-const CODEX_RESPONSES_PATH: &str = "/backend-api/codex/responses";
+pub(crate) const CODEX_RESPONSES_PATH: &str = "/backend-api/codex/responses";
 const CODEX_RESPONSES_COMPACT_PATH: &str = "/backend-api/codex/responses/compact";
 
 fn json_status(status: StatusCode, body: Value) -> Response {
@@ -899,11 +899,10 @@ async fn compact_via_summary(
     parsed: Value,
     model: String,
 ) -> Response {
-    let mut request = parsed.clone();
-    if let Some(object) = request.as_object_mut() {
-        object.insert("stream".into(), json!(false));
-        object.remove("store");
-    }
+    let request = match crate::compat::responses::normalize_compaction_request(&parsed) {
+        Ok(request) => request,
+        Err(error) => return json_status(StatusCode::BAD_REQUEST, error.to_json_value()),
+    };
     if let Err(error) = crate::compat::responses::responses_to_openai(&request) {
         return json_status(StatusCode::BAD_REQUEST, error.to_json_value());
     }
@@ -941,6 +940,9 @@ async fn compact_via_summary(
         .filter_map(|part| part["text"].as_str().map(str::to_string))
         .collect::<Vec<_>>()
         .join("");
+    if let Err(body) = crate::compat::responses::validate_compaction_summary(&summary) {
+        return json_status(StatusCode::BAD_GATEWAY, body);
+    }
     let capsule = match crate::compat::responses::seal_compaction_capsule(&summary, &model) {
         Ok(capsule) => capsule,
         Err(error) => {

@@ -230,8 +230,11 @@ mod tests {
     #[test]
     fn model_matcher_accepts_known_models_only() {
         assert!(is_kiro_model("claude-sonnet-4.6"));
+        assert!(is_kiro_model("claude-sonnet-4.5"));
         assert!(is_kiro_model("claude-opus-4.6"));
-        assert!(is_kiro_model("claude-haiku-4-5-20251001"));
+        assert!(is_kiro_model("claude-haiku-4.5"));
         assert!(!is_kiro_model("claude-opus-4-5-20251101"));
+        // Date-suffixed ids are rejected upstream with INVALID_MODEL_ID.
+        assert!(!is_kiro_model("claude-haiku-4-5-20251001"));
     }
 }

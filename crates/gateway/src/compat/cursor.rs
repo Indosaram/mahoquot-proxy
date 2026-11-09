@@ -1,3 +1,4 @@
+use base64::Engine;
 use prost::Message;
 use serde_json::Value;
 
@@ -12,6 +13,8 @@ pub const MAX_CURSOR_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// Capacity of the bounded channel carrying mandatory client replies (KV/exec)
 /// and heartbeats back into the upstream request body.
 pub const CURSOR_REPLY_QUEUE_CAPACITY: usize = 64;
+const MAX_BLOB_BYTES: usize = 32 * 1024 * 1024;
+const MAX_BLOB_KEYS: usize = 256;
 
 /// Reported when a mandatory reply cannot be enqueued because the bounded reply
 /// channel is full. The decoder converts this into an explicit failure event.
@@ -76,7 +79,51 @@ pub fn openai_to_cursor_connect(body: &Value) -> Result<Vec<u8>, String> {
         .and_then(|message| message.get("content"))
         .map(text_content)
         .unwrap_or_default();
-    if user_text.is_empty() {
+    let mut selected_images = Vec::new();
+    let mut image_bytes = 0usize;
+    for block in conversational
+        .last()
+        .and_then(|message| message["content"].as_array())
+        .into_iter()
+        .flatten()
+    {
+        let Some(url) = block.pointer("/image_url/url").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some((mime, encoded)) = url
+            .strip_prefix("data:")
+            .and_then(|data| data.split_once(";base64,"))
+        else {
+            continue;
+        };
+        if !matches!(
+            mime,
+            "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+        ) {
+            return Err("unsupported Cursor image type".to_string());
+        }
+        if encoded.len() > MAX_BLOB_BYTES * 4 / 3 + 4 {
+            return Err("Cursor image exceeds blob limit".to_string());
+        }
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|_| "invalid Cursor image base64".to_string())?;
+        image_bytes += data.len();
+        if image_bytes > MAX_BLOB_BYTES || selected_images.len() >= MAX_BLOB_KEYS {
+            return Err("Cursor images exceed blob limit".to_string());
+        }
+        let uuid = format!("{id}-{}", selected_images.len());
+        selected_images.push(proto::SelectedImage {
+            path: format!("{uuid}.{}", mime.strip_prefix("image/").unwrap()),
+            mime_type: mime.to_string(),
+            blob_id_with_data: Some(proto::SelectedImageBlobIdWithData {
+                blob_id: uuid.as_bytes().to_vec(),
+                data,
+            }),
+            uuid,
+        });
+    }
+    if user_text.is_empty() && selected_images.is_empty() {
         return Err("Cursor requires a user message".to_string());
     }
     let history = conversational
@@ -114,6 +161,7 @@ pub fn openai_to_cursor_connect(body: &Value) -> Result<Vec<u8>, String> {
                             text: Some(proto::UserMessageText { text }),
                         }),
                         message_id: id.clone(),
+                        selected_context: Some(proto::SelectedContext { selected_images }),
                         mode: 1,
                         correlation_id: id.clone(),
                     }),
@@ -245,6 +293,8 @@ pub struct CursorDecoder {
     output_tokens: u64,
     open_tools: std::collections::HashMap<String, (String, u64)>,
     next_tool_index: u64,
+    blobs: std::collections::HashMap<Vec<u8>, Vec<u8>>,
+    blob_bytes: usize,
     reply_tx: Option<tokio::sync::mpsc::Sender<bytes::Bytes>>,
 }
 
@@ -448,14 +498,24 @@ impl CursorDecoder {
 
     fn reply_to_kv(&mut self, message: proto::KvServerMessage, out: &mut Vec<CodexEvent>) {
         let reply = match message.message {
-            Some(proto::kv_server_message::Message::GetBlobArgs(_)) => {
+            Some(proto::kv_server_message::Message::GetBlobArgs(args)) => {
                 proto::kv_client_message::Message::GetBlobResult(proto::GetBlobResult {
-                    blob_data: None,
+                    blob_data: self.blobs.get(&args.blob_id).cloned(),
                 })
             }
-            Some(proto::kv_server_message::Message::SetBlobArgs(_)) => {
+            Some(proto::kv_server_message::Message::SetBlobArgs(args)) => {
+                let previous = self.blobs.get(&args.blob_id).map_or(0, Vec::len);
+                let retained = self.blob_bytes - previous + args.blob_data.len();
+                let rejected = args.blob_id.len() > 1024
+                    || retained > MAX_BLOB_BYTES
+                    || (!self.blobs.contains_key(&args.blob_id)
+                        && self.blobs.len() >= MAX_BLOB_KEYS);
+                if !rejected {
+                    self.blobs.insert(args.blob_id, args.blob_data);
+                    self.blob_bytes = retained;
+                }
                 proto::kv_client_message::Message::SetBlobResult(proto::SetBlobResult {
-                    error: None,
+                    error: rejected.then_some(proto::ProtoError {}),
                 })
             }
             None => return,
@@ -610,6 +670,99 @@ mod tests {
         );
     }
     use super::*;
+
+    #[test]
+    fn cursor_image_only_encodes_selected_image() {
+        for text in ["", "look"] {
+            let frame = openai_to_cursor_connect(&serde_json::json!({"model":"cursor/auto", "messages":[{"role":"user","content":[{"type":"text","text":text},{"type":"image_url","image_url":{"url":"data:image/png;base64,AQID"}}]}]})).unwrap();
+            let envelope = proto::AgentClientMessage::decode(&frame[5..]).unwrap();
+            let Some(proto::agent_client_message::Message::RunRequest(run)) = envelope.message
+            else {
+                panic!("run")
+            };
+            let Some(proto::conversation_action::Action::UserMessageAction(action)) =
+                run.action.unwrap().action
+            else {
+                panic!("action")
+            };
+            let message = action.user_message.unwrap();
+            assert_eq!(message.content.unwrap().text.unwrap().text, text);
+            let image = message.selected_context.unwrap().selected_images.remove(0);
+            assert_eq!(image.mime_type, "image/png");
+            let blob = image.blob_id_with_data.unwrap();
+            assert!(!blob.blob_id.is_empty());
+            assert_eq!(blob.data, vec![1, 2, 3]);
+        }
+    }
+
+    #[test]
+    fn cursor_kv_set_then_get_preserves_bytes() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut decoder = CursorDecoder::with_reply_sender(tx);
+        let mut events = Vec::new();
+        for message in [
+            proto::kv_server_message::Message::SetBlobArgs(proto::SetBlobArgs {
+                blob_id: vec![1],
+                blob_data: vec![2, 3],
+            }),
+            proto::kv_server_message::Message::GetBlobArgs(proto::GetBlobArgs { blob_id: vec![1] }),
+            proto::kv_server_message::Message::SetBlobArgs(proto::SetBlobArgs {
+                blob_id: vec![1],
+                blob_data: vec![0; MAX_BLOB_BYTES + 1],
+            }),
+            proto::kv_server_message::Message::GetBlobArgs(proto::GetBlobArgs { blob_id: vec![1] }),
+        ] {
+            decoder.reply_to_kv(
+                proto::KvServerMessage {
+                    id: 1,
+                    message: Some(message),
+                },
+                &mut events,
+            );
+        }
+        let mut replies = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            let envelope = proto::AgentClientMessage::decode(&frame[5..]).unwrap();
+            let Some(proto::agent_client_message::Message::KvClientMessage(reply)) =
+                envelope.message
+            else {
+                panic!("kv")
+            };
+            replies.push(reply.message.unwrap());
+        }
+        assert!(
+            matches!(&replies[0], proto::kv_client_message::Message::SetBlobResult(result) if result.error.is_none())
+        );
+        assert!(
+            matches!(&replies[1], proto::kv_client_message::Message::GetBlobResult(result) if result.blob_data == Some(vec![2, 3]))
+        );
+        assert!(
+            matches!(&replies[2], proto::kv_client_message::Message::SetBlobResult(result) if result.error.is_some())
+        );
+        assert_eq!(replies[1], replies[3]);
+    }
+
+    #[test]
+    fn exec_write_rejects_dotdot_escape() {
+        let directory = std::env::temp_dir().join(format!("cursor-exec-{}", rand::random::<u64>()));
+        let root = directory.join("root");
+        let outside = directory.join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        assert!(exec_resolve_in_root("../outside/new.txt", &root).is_err());
+        assert!(exec_resolve_in_root("../missing/../outside/new.txt", &root).is_err());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+            assert!(exec_resolve_in_root("link/new.txt", &root).is_err());
+        }
+        assert!(!outside.join("new.txt").exists());
+        assert_eq!(
+            exec_resolve_in_root("new.txt", &root).unwrap(),
+            root.canonicalize().unwrap().join("new.txt")
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn trailing_system_message_does_not_replace_user_prompt() {
@@ -1182,16 +1335,44 @@ pub(crate) fn exec_root() -> std::path::PathBuf {
 }
 
 pub(crate) fn exec_resolve(path: &str) -> Result<std::path::PathBuf, String> {
-    let root = exec_root();
+    exec_resolve_in_root(path, &exec_root())
+}
+
+fn exec_resolve_in_root(path: &str, root: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    let root = root.canonicalize().map_err(|error| error.to_string())?;
     let candidate = std::path::Path::new(path);
     let joined = if candidate.is_absolute() {
         candidate.to_path_buf()
     } else {
         root.join(candidate)
     };
-    let normalized = joined.canonicalize().unwrap_or(joined);
+    let normalized = match joined.canonicalize() {
+        Ok(path) => path,
+        Err(_) => {
+            let mut ancestor = joined.as_path();
+            let mut remainder = Vec::new();
+            let canonical = loop {
+                match ancestor.canonicalize() {
+                    Ok(path) => break path,
+                    Err(_) => {
+                        let name = ancestor
+                            .file_name()
+                            .ok_or_else(|| "invalid exec path".to_string())?;
+                        remainder.push(name.to_os_string());
+                        ancestor = ancestor
+                            .parent()
+                            .ok_or_else(|| "invalid exec parent".to_string())?;
+                    }
+                }
+            };
+            let mut path = canonical;
+            for name in remainder.into_iter().rev() {
+                path.push(name);
+            }
+            path
+        }
+    };
     if root != std::path::Path::new("/") {
-        let root = root.canonicalize().unwrap_or(root);
         if !normalized.starts_with(&root) {
             return Err(format!(
                 "path escapes the configured exec root {}",

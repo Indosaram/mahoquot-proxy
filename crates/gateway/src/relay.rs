@@ -975,6 +975,106 @@ struct ResolvedRoute {
     provider_classes: Vec<ResolvedProviderClass>,
 }
 
+/// Text carried by a Responses content value: either a bare string or an
+/// array of typed text parts. Non-text parts (images, files) are dropped here
+/// because only system text is being hoisted out of `input`.
+fn responses_content_text(content: Option<&serde_json::Value>) -> Option<String> {
+    match content? {
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Array(parts) => {
+            let joined = parts
+                .iter()
+                .filter(|part| {
+                    matches!(
+                        part.get("type").and_then(serde_json::Value::as_str),
+                        Some("input_text" | "output_text" | "text")
+                    )
+                })
+                .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            (!joined.is_empty()).then_some(joined)
+        }
+        _ => None,
+    }
+}
+
+/// Shape a public Responses request for the strict Codex backend.
+///
+/// The public surface accepts envelope fields the Codex endpoint rejects, and
+/// Codex only reads a structured `input` array whose system text belongs in
+/// top-level `instructions`. Function calls, encrypted reasoning and every
+/// other item pass through byte-for-byte: this is a sanitizer, not a rebuild.
+fn normalize_native_codex_responses(body: &Bytes) -> Result<Bytes, String> {
+    let Ok(mut document) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return Ok(body.clone());
+    };
+    let Some(object) = document.as_object_mut() else {
+        return Ok(body.clone());
+    };
+    // Verified rejections: the Codex backend answers `Unsupported parameter`
+    // for these public-Responses envelope fields. Keyed prompt caching,
+    // streaming and no-store are the values it requires.
+    object.remove("metadata");
+    object.remove("truncation");
+    object.remove("max_output_tokens");
+    object.insert("stream".into(), serde_json::Value::Bool(true));
+    object.insert("store".into(), serde_json::Value::Bool(false));
+
+    let Some(input) = object.remove("input") else {
+        return Ok(Bytes::from(document.to_string()));
+    };
+    let items = match input {
+        serde_json::Value::String(text) => vec![serde_json::json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": text}],
+        })],
+        serde_json::Value::Array(items) => items,
+        other => {
+            object.insert("input".into(), other);
+            return Ok(Bytes::from(document.to_string()));
+        }
+    };
+
+    let mut system_text = Vec::new();
+    let mut kept = Vec::with_capacity(items.len());
+    for item in items {
+        let is_message = matches!(
+            item.get("type").and_then(serde_json::Value::as_str),
+            None | Some("message")
+        );
+        if is_message
+            && matches!(
+                item.get("role").and_then(serde_json::Value::as_str),
+                Some("system" | "developer")
+            )
+        {
+            if let Some(text) = responses_content_text(item.get("content")) {
+                if !text.trim().is_empty() {
+                    system_text.push(text);
+                }
+            }
+            continue;
+        }
+        kept.push(item);
+    }
+    if !system_text.is_empty() {
+        let hoisted = system_text.join("\n\n");
+        let merged = match object
+            .get("instructions")
+            .and_then(serde_json::Value::as_str)
+            .filter(|existing| !existing.trim().is_empty())
+        {
+            Some(existing) => format!("{hoisted}\n\n{existing}"),
+            None => hoisted,
+        };
+        object.insert("instructions".into(), serde_json::Value::String(merged));
+    }
+    object.insert("input".into(), serde_json::Value::Array(kept));
+    Ok(Bytes::from(document.to_string()))
+}
+
 fn normalize_developer_role(value: &mut serde_json::Value) {
     if let Some(messages) = value.get_mut("messages").and_then(|m| m.as_array_mut()) {
         for msg in messages {
@@ -1339,8 +1439,14 @@ fn resolve_target(
             let path = format!(
                 "/v1/projects/{project}/locations/{location}/publishers/google/models/{model}:{action}"
             );
+            // Vertex publishes per-location hosts; the global host rejects a
+            // regional resource path.
+            let url = match upstream {
+                Some(base) => crate::url::join_provider_path(base, &path),
+                None => format!("{}{path}", crate::url::vertex_base_url(&location)),
+            };
             return Ok(UpstreamTarget {
-                url: crate::url::build_provider_url(member.kind(), upstream, &path),
+                url,
                 body: Bytes::from({
                     let mut gemini = compat::gemini::openai_to_gemini(&openai)?;
                     apply_vertex_thinking(plan, model, &mut gemini)?;
@@ -1439,6 +1545,28 @@ fn resolve_target(
             }
             let openai_body = openai_body_with_model(plan, upstream_model)
                 .ok_or_else(|| "generic adapter requires OpenAI-compatible input".to_string())?;
+            if adapter == "command-code" {
+                let session_id = session_affinity
+                    .map(str::to_string)
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                return Ok(UpstreamTarget {
+                    url: crate::url::join_provider_path(
+                        upstream.unwrap_or("https://api.commandcode.ai"),
+                        "/alpha/generate",
+                    ),
+                    body: Bytes::from(
+                        compat::command_code::openai_to_command_code(&openai_body)?.to_string(),
+                    ),
+                    protocol: compat::Protocol::CommandCode,
+                    headers: Some(
+                        compat::command_code::command_code_headers(selected_token, &session_id)
+                            .into_iter()
+                            .map(|(name, value)| (name.to_string(), value))
+                            .collect(),
+                    ),
+                    replay: None,
+                });
+            }
             if adapter == "google" {
                 let model = openai_body
                     .get("model")
@@ -1459,6 +1587,8 @@ fn resolve_target(
                 });
             }
             if adapter == "anthropic" {
+                // The translator enforces the cache-breakpoint cap itself, so
+                // this branch needs no extra step.
                 return Ok(UpstreamTarget {
                     url: crate::url::build_provider_url(member.kind(), upstream, "/v1/messages"),
                     body: Bytes::from(
@@ -1506,14 +1636,31 @@ fn resolve_target(
                     replay: None,
                 });
             }
+            // A Responses request is not a chat request: forwarding the
+            // client document verbatim would put `input` on a wire that only
+            // reads `messages`. The translated body is the chat-shaped one.
+            let chat_body = match plan.mode {
+                RelayMode::Responses => plan
+                    .openai_body
+                    .clone()
+                    .map(|mut body| {
+                        normalize_developer_role(&mut body);
+                        body["model"] = serde_json::Value::String(upstream_model.to_string());
+                        Bytes::from(body.to_string())
+                    })
+                    .unwrap_or_else(|| body_with_model(&plan.original_body, upstream_model)),
+                _ => body_with_model(&plan.original_body, upstream_model),
+            };
             return Ok(UpstreamTarget {
                 url: crate::url::build_provider_url(
                     member.kind(),
                     upstream,
                     "/v1/chat/completions",
                 ),
-                body: body_with_model(&plan.original_body, upstream_model),
-                protocol: compat::Protocol::Codex,
+                body: chat_body,
+                // A chat upstream answers with choices[].delta, which the
+                // Responses decoder does not understand.
+                protocol: compat::Protocol::Chat,
                 headers: None,
                 replay: None,
             });
@@ -1620,6 +1767,16 @@ fn resolve_target(
                 );
             }
 
+            // Anthropic answers a fifth cache_control breakpoint with HTTP 400.
+            // Every Anthropic-shaped body built in THIS branch (subscription,
+            // relay, Zcode) leaves here, so the cap runs last: after the
+            // path-specific placement above may have added its own markers. The
+            // Generic anthropic adapter returns earlier and is capped by the
+            // translator itself.
+            compat::claude::enforce_cache_control_limit(
+                &mut anthropic_val,
+                compat::claude::MAX_CACHE_BREAKPOINTS,
+            );
             let body = Bytes::from(serde_json::to_vec(&anthropic_val).map_err(|e| e.to_string())?);
             return Ok(UpstreamTarget {
                 url: crate::url::build_provider_url(member.kind(), upstream, "/v1/messages"),
@@ -1822,7 +1979,9 @@ async fn send_upstream(
             solve_gate: &state.captcha_solve_gate,
         }
     });
-    strip_ingress_headers(&mut member_headers, headers);
+    if protocol != compat::Protocol::CommandCode {
+        strip_ingress_headers(&mut member_headers, headers);
+    }
     let member_sets_content_type = member_headers
         .iter()
         .any(|(name, _)| name.eq_ignore_ascii_case("content-type"));
@@ -2164,6 +2323,36 @@ fn cooldown_deadline_ms(now_ms: i64, retry_after_secs: i64) -> i64 {
     now_ms.saturating_add(bounded.saturating_mul(1000))
 }
 
+/// Parses a Retry-After header value in either RFC 9110 form: an integer
+/// number of seconds, or an HTTP-date. The date form is honoured because an
+/// upstream that sends it expects the account to return at that instant;
+/// falling back to the fixed default would release it early (or bench it past
+/// the stated window). Obsolete RFC 850 / asctime forms are accepted too,
+/// since HTTP-date explicitly allows them.
+fn parse_retry_after(value: &str, now_ms: i64) -> Option<i64> {
+    if let Ok(secs) = value.parse::<i64>() {
+        return Some(secs.max(0));
+    }
+    let deadline_ms = chrono::DateTime::parse_from_rfc2822(value)
+        .map(|at| at.timestamp_millis())
+        .or_else(|_| {
+            // RFC 850 form. chrono's %y maps two-digit years into the
+            // nearest century, which is enough for a cooldown deadline: the
+            // MAX_COOLDOWN_SECS clamp bounds any century misread.
+            chrono::NaiveDateTime::parse_from_str(value, "%A, %d-%b-%y %H:%M:%S GMT")
+                .map(|at| at.and_utc().timestamp_millis())
+        })
+        .or_else(|_| {
+            // asctime carries no zone; HTTP-date defines it as GMT.
+            chrono::NaiveDateTime::parse_from_str(value, "%a %b %e %H:%M:%S %Y")
+                .map(|at| at.and_utc().timestamp_millis())
+        })
+        .ok()?;
+    // Round up so a sub-second remainder does not shorten the stated delay.
+    let delay_ms = deadline_ms.saturating_sub(now_ms);
+    Some(delay_ms.max(0).saturating_add(999) / 1000)
+}
+
 pub fn cooldown_deadline_from_headers(headers: &reqwest::header::HeaderMap, now_ms: i64) -> i64 {
     let now_unix = now_ms / 1000;
     // Prefer an explicit Retry-After, then a reset timestamp the Codex quota
@@ -2173,7 +2362,7 @@ pub fn cooldown_deadline_from_headers(headers: &reqwest::header::HeaderMap, now_
     let retry_after_secs = headers
         .get(reqwest::header::RETRY_AFTER)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.trim().parse::<i64>().ok())
+        .and_then(|v| parse_retry_after(v.trim(), now_ms))
         .or_else(|| {
             headers
                 .iter()
@@ -2615,6 +2804,203 @@ fn content_type_of(resp: &reqwest::Response) -> Option<String> {
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(ToString::to_string)
+}
+
+/// Downstream SSE dialect of a raw passthrough. Only the terminal event is
+/// inspected: the bytes themselves are copied unchanged.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RawSseWire {
+    Chat,
+    Responses,
+    Anthropic,
+    Gemini,
+}
+
+/// Which terminal event a raw passthrough client waits for. A wire with no
+/// known terminal (image, token count) is not inspected at all.
+fn raw_sse_wire(plan: &RelayPlan) -> Option<RawSseWire> {
+    match plan.mode {
+        RelayMode::Native | RelayMode::Responses => Some(RawSseWire::Responses),
+        RelayMode::GeminiNative => Some(RawSseWire::Gemini),
+        RelayMode::Anthropic => Some(RawSseWire::Anthropic),
+        RelayMode::OpenAiCompat | RelayMode::LegacyCompletions => Some(RawSseWire::Chat),
+        RelayMode::Image | RelayMode::GeminiCountTokens => None,
+    }
+}
+
+#[derive(Default)]
+struct SseTerminalScan {
+    /// Only inspection is buffered; the relay forwards the original chunks.
+    carry: Vec<u8>,
+    discarding_frame: bool,
+    saw_terminal: bool,
+}
+
+impl SseTerminalScan {
+    fn observe(&mut self, chunk: &[u8], wire: RawSseWire) {
+        if self.saw_terminal {
+            return;
+        }
+        // Oversized frames cannot prove completion. Discard through their
+        // delimiter rather than mistaking a suffix for a fresh SSE frame.
+        const MAX_FRAME_BYTES: usize = 64 * 1024;
+        for &byte in chunk {
+            self.carry.push(byte);
+            let delimiter = self.carry.ends_with(b"\n\n") || self.carry.ends_with(b"\r\n\r\n");
+            if delimiter {
+                if !self.discarding_frame && Self::frame_is_terminal(&self.carry, wire) {
+                    self.saw_terminal = true;
+                    self.carry.clear();
+                    return;
+                }
+                self.carry.clear();
+                self.discarding_frame = false;
+            } else if self.discarding_frame || self.carry.len() >= MAX_FRAME_BYTES {
+                self.discarding_frame = true;
+                let keep = self.carry.len().saturating_sub(3);
+                self.carry.drain(..keep);
+            }
+        }
+    }
+
+    fn frame_is_terminal(frame: &[u8], wire: RawSseWire) -> bool {
+        use serde_json::Value;
+
+        let Ok(text) = std::str::from_utf8(frame) else {
+            return false;
+        };
+        let mut event = None;
+        let mut data = Vec::new();
+        for line in text.lines() {
+            if let Some(value) = line.strip_prefix("event:") {
+                event = Some(value.strip_prefix(' ').unwrap_or(value));
+            } else if let Some(value) = line.strip_prefix("data:") {
+                data.push(value.strip_prefix(' ').unwrap_or(value));
+            }
+        }
+        let data = data.join("\n");
+        let value = serde_json::from_str::<Value>(&data).ok();
+        let event_type = event.or_else(|| value.as_ref()?.get("type")?.as_str());
+        match wire {
+            // Some Codex-compatible upstreams end the stream with the chat
+            // sentinel instead of a event; that is still an explicit terminator.
+            RawSseWire::Responses => {
+                data == "[DONE]"
+                    || matches!(
+                        event_type,
+                        Some("response.completed" | "response.incomplete")
+                    )
+            }
+            RawSseWire::Anthropic => event_type == Some("message_stop"),
+            RawSseWire::Chat => {
+                data == "[DONE]"
+                    || value.as_ref().is_some_and(|value| {
+                        value.is_object()
+                            && (value.get("finish_reason").is_some_and(Value::is_string)
+                                || value.get("choices").and_then(Value::as_array).is_some_and(
+                                    |choices| {
+                                        choices.iter().any(|choice| {
+                                            choice
+                                                .get("finish_reason")
+                                                .is_some_and(Value::is_string)
+                                        })
+                                    },
+                                ))
+                    })
+            }
+            RawSseWire::Gemini => value.as_ref().is_some_and(|value| {
+                value
+                    .get("candidates")
+                    .and_then(Value::as_array)
+                    .is_some_and(|candidates| {
+                        candidates.iter().any(|candidate| {
+                            candidate.get("finishReason").is_some_and(Value::is_string)
+                        })
+                    })
+            }),
+        }
+    }
+}
+
+/// Copy a raw upstream body after proving it is a real event stream.
+///
+/// Two guarantees a direct copy lacks: an SSE response whose stream is already
+/// empty fails here, before the client sees HTTP 200, so the dispatcher can
+/// still fail over; and an SSE body that ends without its terminal event
+/// becomes a transport error at the client instead of a clean success.
+/// Non-SSE bodies keep their exact bytes.
+async fn raw_stream_response(
+    resp: reqwest::Response,
+    status_code: u16,
+    wire: Option<RawSseWire>,
+    deadline: std::time::Duration,
+) -> Result<Response, String> {
+    let Some(wire) = wire else {
+        return Ok(stream_response(resp, status_code));
+    };
+    if !content_type_of(&resp)
+        .as_deref()
+        .is_some_and(|ct| ct.trim_start().starts_with("text/event-stream"))
+    {
+        return Ok(stream_response(resp, status_code));
+    }
+    let mut upstream: compat::UpstreamStream = Box::pin(resp.bytes_stream());
+    let first = match tokio::time::timeout(deadline, upstream.next()).await {
+        Err(_) => return Err("upstream request timed out during preflight".to_string()),
+        Ok(None) => return Err("upstream SSE ended before delivering any event".to_string()),
+        Ok(Some(Err(error))) => return Err(error.to_string()),
+        Ok(Some(Ok(first))) => first,
+    };
+    // The preflight chunk is replayed through `source` below, so it must be
+    // observed there exactly once: scanning it here as well would duplicate
+    // its prefix and corrupt a terminal frame split across the first chunks.
+    let source = futures::stream::once(async { Ok::<Bytes, std::io::Error>(first) })
+        .chain(upstream.map(|chunk| chunk.map_err(std::io::Error::other)));
+    let observed = terminated_raw_stream(Box::pin(source), wire);
+    Ok(Response::builder()
+        .status(StatusCode::from_u16(status_code).unwrap_or(StatusCode::OK))
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from_stream(observed))
+        .unwrap_or_else(|_| {
+            (StatusCode::INTERNAL_SERVER_ERROR, "failed to build body").into_response()
+        }))
+}
+
+/// Wrap an upstream byte stream so a clean EOF is legitimate only after the
+/// scanner proved a terminal SSE event. Each chunk is observed exactly once.
+fn terminated_raw_stream<S>(
+    source: S,
+    wire: RawSseWire,
+) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>>
+where
+    S: futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+{
+    futures::stream::unfold(
+        (
+            Box::pin(source),
+            SseTerminalScan::default(),
+            /* done */ false,
+        ),
+        move |(mut source, mut scan, mut done)| async move {
+            match source.next().await {
+                Some(Ok(chunk)) => {
+                    scan.observe(&chunk, wire);
+                    done |= scan.saw_terminal;
+                    Some((Ok(chunk), (source, scan, done)))
+                }
+                Some(Err(error)) => Some((Err(error), (source, scan, done))),
+                None if done => None,
+                // A clean EOF is legitimate only after a terminal event.
+                None => Some((
+                    Err(std::io::Error::other(
+                        "upstream SSE ended before a terminal event",
+                    )),
+                    (source, scan, true),
+                )),
+            }
+        },
+    )
 }
 
 fn stream_response(resp: reqwest::Response, status_code: u16) -> Response {
@@ -3225,16 +3611,27 @@ fn build_plan(
     prompt_cache_key: Option<&str>,
 ) -> Result<RelayPlan, String> {
     match mode {
-        RelayMode::Native => Ok(RelayPlan {
-            upstream_path: req_path.to_string(),
-            model: compat::extract_model(&body_bytes),
-            body: body_bytes.clone(),
-            mode,
-            client_stream: true,
-            include_usage: false,
-            openai_body: None,
-            original_body: body_bytes.clone(),
-        }),
+        RelayMode::Native => {
+            // The native Responses passthrough targets the strict Codex
+            // backend, which rejects public-Responses envelope fields that
+            // other providers accept. Compact and alpha/search are different
+            // endpoints and keep the client document verbatim.
+            let body = if req_path == crate::cp_routes::CODEX_RESPONSES_PATH {
+                normalize_native_codex_responses(&body_bytes)?
+            } else {
+                body_bytes.clone()
+            };
+            Ok(RelayPlan {
+                upstream_path: req_path.to_string(),
+                model: compat::extract_model(&body),
+                body,
+                mode,
+                client_stream: true,
+                include_usage: false,
+                openai_body: None,
+                original_body: body_bytes.clone(),
+            })
+        }
         RelayMode::GeminiCountTokens | RelayMode::Image => Ok(RelayPlan {
             upstream_path: req_path.to_string(),
             model: compat::extract_model(&body_bytes),
@@ -4066,6 +4463,35 @@ mod usage_capture_tests {
         assert_eq!(cooldown_deadline_ms(now, 0), now);
     }
 
+    #[test]
+    fn cooldown_retry_after_http_date_precedes_reset() {
+        use super::parse_retry_after;
+        // 2026-01-01T00:00:00Z; +10min in the three obsolete/current forms a
+        // Retry-After date may take.
+        let now_ms = 1_767_225_600_000_i64;
+        assert_eq!(
+            parse_retry_after("Thu, 01 Jan 2026 00:10:00 GMT", now_ms),
+            Some(600)
+        );
+        assert_eq!(
+            parse_retry_after("Thursday, 01-Jan-26 00:10:00 GMT", now_ms),
+            Some(600)
+        );
+        assert_eq!(
+            parse_retry_after("Thu Jan  1 00:10:00 2026", now_ms),
+            Some(600)
+        );
+        // Integer seconds keep their existing meaning, and a past date means
+        // no delay rather than a negative one.
+        assert_eq!(parse_retry_after("120", now_ms), Some(120));
+        assert_eq!(
+            parse_retry_after("Thu, 01 Jan 2026 00:00:00 GMT", now_ms),
+            Some(0)
+        );
+        // Garbage still falls through to the reset/default path.
+        assert_eq!(parse_retry_after("soon", now_ms), None);
+    }
+
     use super::usage_header_prefix;
     use crate::account::ProviderKind;
 
@@ -4092,6 +4518,9 @@ async fn collect_antigravity_once(
         Some(replay) => compat::gemini::GeminiDecoder::with_replay(replay),
         None => compat::gemini::GeminiDecoder::new(),
     };
+    if let Some(names) = session.gemini_tool_names.clone() {
+        decoder = decoder.with_tool_names(names);
+    }
     let mut aggregator = compat::render::Aggregator::new(model.clone(), created);
     if let Some(replay) = session.replay {
         aggregator = aggregator.with_replay(replay);
@@ -4390,8 +4819,11 @@ async fn finish_success(
     if member.kind() == crate::account::ProviderKind::Generic
         && !matches!(
             member.generic_adapter().as_deref(),
-            Some("google") | Some("anthropic")
+            Some("google") | Some("anthropic") | Some("command-code")
         )
+        // A Responses client cannot consume a chat-shaped passthrough; the
+        // translated renderer below owns that shape conversion.
+        && plan.mode != RelayMode::Responses
     {
         if content_type
             .as_deref()
@@ -4399,7 +4831,13 @@ async fn finish_success(
         {
             return Err("upstream returned html instead of an api response".to_string());
         }
-        return Ok(stream_response(resp, status_code));
+        return raw_stream_response(
+            resp,
+            status_code,
+            raw_sse_wire(plan),
+            get_preflight_deadline(headers),
+        )
+        .await;
     }
 
     if matches!(
@@ -4415,7 +4853,13 @@ async fn finish_success(
         {
             return Err("upstream returned html instead of an api response".to_string());
         }
-        return Ok(stream_response(resp, status_code));
+        return raw_stream_response(
+            resp,
+            status_code,
+            raw_sse_wire(plan),
+            get_preflight_deadline(headers),
+        )
+        .await;
     }
 
     if content_type
@@ -4423,6 +4867,32 @@ async fn finish_success(
         .is_some_and(|ct| ct.trim_start().starts_with("text/html"))
     {
         return Err("upstream body is not an event stream: html response".to_string());
+    }
+
+    // A chat upstream answers a buffered Responses call with one chat
+    // completion object, so it needs the same shape conversion the streaming
+    // decoder performs frame by frame.
+    if !plan.client_stream
+        && protocol == compat::Protocol::Chat
+        && content_type
+            .as_deref()
+            .is_some_and(|ct| ct.starts_with("application/json"))
+    {
+        let raw = bounded_response_bytes(resp).await?;
+        let value: serde_json::Value = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
+        let model = plan.model.clone().unwrap_or_default();
+        let output = match plan.mode {
+            RelayMode::Responses => chat_completion_to_responses(&value, &model, created),
+            _ => value,
+        };
+        member.record_ok();
+        state.metrics.served.fetch_add(1, Ordering::Relaxed);
+        state.router.feedback(member.id(), Outcome::Success);
+        return Ok(body_response(
+            StatusCode::OK,
+            Some("application/json"),
+            Bytes::from(output.to_string()),
+        ));
     }
 
     if !plan.client_stream
@@ -4471,11 +4941,20 @@ async fn finish_success(
         let raw = bounded_response_bytes(resp).await?;
         let value: serde_json::Value =
             serde_json::from_slice(&raw).map_err(|error| error.to_string())?;
-        let mut output = compat::gemini::gemini_json_to_openai(
-            &value,
-            &plan.model.clone().unwrap_or_default(),
-            created,
-        );
+        let mut output = match plan.openai_body.as_ref() {
+            Some(body) => compat::gemini::gemini_json_to_openai_with_tool_names(
+                &value,
+                &plan.model.clone().unwrap_or_default(),
+                created,
+                None,
+                &compat::gemini::GeminiToolNames::from_body(body),
+            ),
+            None => compat::gemini::gemini_json_to_openai(
+                &value,
+                &plan.model.clone().unwrap_or_default(),
+                created,
+            ),
+        };
         if plan.mode == RelayMode::Responses {
             output = chat_completion_to_responses(
                 &output,
@@ -5947,7 +6426,10 @@ pub async fn handle_relay(
             match state.refresh_member(&member, None).await {
                 Ok(_) => refreshed_this_account = true,
                 Err(e) => {
-                    if e.is_auth_failure() {
+                    if e.is_grant_rejection() {
+                        // The access token has already expired here, so there is
+                        // no working credential left; bench and stop replaying.
+                        member.mark_grant_rejected();
                         member.set_health(Health::AuthFailed);
                         state.monitor.record_error(
                             member.id(),
@@ -6194,7 +6676,8 @@ pub async fn handle_relay(
                     }
                 }
                 Err(e) => {
-                    if e.is_auth_failure() {
+                    if e.is_grant_rejection() {
+                        member.mark_grant_rejected();
                         member.set_health(Health::AuthFailed);
                         state.monitor.record_error(
                             member.id(),
@@ -6230,6 +6713,10 @@ pub async fn handle_relay(
                     protocol: target.protocol,
                     cursor_reply,
                     replay: target.replay,
+                    gemini_tool_names: plan
+                        .openai_body
+                        .as_ref()
+                        .map(compat::gemini::GeminiToolNames::from_body),
                 },
             )
             .await
@@ -7006,6 +7493,7 @@ mod routing_tests {
                     protocol: compat::Protocol::Antigravity,
                     cursor_reply: None,
                     replay: Some(replay.clone()),
+                    gemini_tool_names: None,
                 },
                 "gemini-test".into(),
                 1,
@@ -7122,6 +7610,7 @@ mod routing_tests {
                     protocol,
                     cursor_reply: None,
                     replay: None,
+                    gemini_tool_names: None,
                 },
             )
             .await;
@@ -7802,7 +8291,7 @@ mod routing_tests {
             "gemini-3.7-flash-high",
             "claude-sonnet-4-5-20250929",
             "glm-5.3",
-            "kiro/claude-haiku-4-5-20251001",
+            "kiro/claude-haiku-4.5",
             "cursor/auto",
         ] {
             let route = resolve_route(&pool, Some(model), None).unwrap().unwrap();
@@ -8272,5 +8761,253 @@ mod codex_fast_mode_tests {
             apply_codex_fast_mode(&mut target);
             assert_eq!(target.body, Bytes::from(original.to_string()));
         }
+    }
+}
+
+#[cfg(test)]
+mod native_responses_tests {
+    use super::*;
+
+    fn normalized(body: &str) -> serde_json::Value {
+        let out = normalize_native_codex_responses(&Bytes::from(body.to_string()))
+            .expect("valid JSON normalizes");
+        serde_json::from_slice(&out).expect("normalizer emits JSON")
+    }
+
+    #[test]
+    fn native_codex_responses_drops_envelope_fields_the_backend_rejects() {
+        let body = normalized(
+            r#"{"model":"gpt-6.1-sol","metadata":{"a":1},"truncation":"auto","max_output_tokens":10,"stream":false,"store":true,"input":[]}"#,
+        );
+        assert!(body.get("metadata").is_none());
+        assert!(body.get("truncation").is_none());
+        assert!(body.get("max_output_tokens").is_none());
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["store"], false);
+        assert_eq!(body["model"], "gpt-6.1-sol");
+    }
+
+    #[test]
+    fn native_codex_responses_hoists_system_text_into_instructions() {
+        let body = normalized(
+            r#"{"model":"m","instructions":"existing rule","input":[
+                {"type":"message","role":"system","content":[{"type":"input_text","text":"sys rule"}]},
+                {"type":"message","role":"developer","content":"dev rule"},
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}
+            ]}"#,
+        );
+        assert_eq!(
+            body["instructions"],
+            "sys rule\n\ndev rule\n\nexisting rule"
+        );
+        let items = body["input"].as_array().expect("input stays an array");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["role"], "user");
+    }
+
+    #[test]
+    fn native_codex_responses_wraps_a_bare_string_input() {
+        let body = normalized(r#"{"model":"m","input":"hello"}"#);
+        let items = body["input"].as_array().expect("string becomes items");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["type"], "message");
+        assert_eq!(items[0]["role"], "user");
+        assert_eq!(items[0]["content"][0]["text"], "hello");
+    }
+
+    #[test]
+    fn native_codex_responses_preserves_calls_and_reasoning_items() {
+        let body = normalized(
+            r#"{"model":"m","input":[
+                {"type":"function_call","call_id":"c1","name":"f","arguments":"{}"},
+                {"type":"reasoning","id":"r1","encrypted_content":"opaque","summary":[]},
+                {"type":"message","role":"user","content":"go"}
+            ]}"#,
+        );
+        let items = body["input"].as_array().expect("items");
+        assert_eq!(items[0]["type"], "function_call");
+        assert_eq!(items[0]["call_id"], "c1");
+        assert_eq!(items[1]["type"], "reasoning");
+        assert_eq!(items[1]["encrypted_content"], "opaque");
+    }
+
+    #[test]
+    fn native_codex_responses_leaves_non_object_bodies_untouched() {
+        for original in ["[1,2,3]", "not json"] {
+            let bytes = Bytes::from(original.to_string());
+            assert_eq!(
+                normalize_native_codex_responses(&bytes).expect("passthrough"),
+                bytes
+            );
+        }
+    }
+
+    #[test]
+    fn raw_sse_wire_matches_the_downstream_dialect() {
+        let mut plan = RelayPlan {
+            upstream_path: compat::CODEX_PATH.to_string(),
+            body: Bytes::new(),
+            model: None,
+            mode: RelayMode::Native,
+            client_stream: true,
+            include_usage: false,
+            openai_body: None,
+            original_body: Bytes::new(),
+        };
+        assert_eq!(
+            raw_sse_wire(&plan).map(|w| w as u8),
+            Some(RawSseWire::Responses as u8)
+        );
+        plan.mode = RelayMode::Anthropic;
+        assert_eq!(
+            raw_sse_wire(&plan).map(|w| w as u8),
+            Some(RawSseWire::Anthropic as u8)
+        );
+        plan.mode = RelayMode::Image;
+        assert!(raw_sse_wire(&plan).is_none());
+    }
+
+    #[test]
+    fn terminal_scan_ignores_null_finish_reason_and_detects_real_ones() {
+        let mut scan = SseTerminalScan::default();
+        scan.observe(
+            b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":null}]}\n\n",
+            RawSseWire::Chat,
+        );
+        assert!(!scan.saw_terminal);
+        scan.observe(
+            b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            RawSseWire::Chat,
+        );
+        assert!(scan.saw_terminal);
+    }
+
+    #[tokio::test]
+    async fn raw_sse_terminal_frames_control_eof_and_preserve_bytes() {
+        for (wire, payload, succeeds) in [
+            (RawSseWire::Responses, "data: {\"type\":\"response.output_text.delta\",\"delta\":\"response.completed\"}\n\n", false),
+            (RawSseWire::Chat, "data: {\"choices\":[{\"finish_reason\": \"stop\"}]}\n\n", true),
+            (RawSseWire::Responses, "event: response.completed\r\ndata: {}\r\n\r\n", true),
+            (RawSseWire::Anthropic, "event: message_stop\ndata: {}\n\n", true),
+            (RawSseWire::Chat, "data: [DONE]\n\n", true),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let app = axum::Router::new().route("/", axum::routing::get(move || async move {
+                ([("content-type", "text/event-stream")], payload)
+            }));
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let upstream = reqwest::get(format!("http://{addr}/")).await.unwrap();
+            let response = raw_stream_response(upstream, 200, Some(wire), std::time::Duration::from_secs(5)).await.unwrap();
+            let result = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+            server.abort();
+            if succeeds {
+                assert_eq!(result.unwrap().as_ref(), payload.as_bytes());
+            } else {
+                assert!(result.unwrap_err().to_string().contains("upstream SSE ended before a terminal event"));
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_scan_requires_complete_bounded_frames() {
+        for wire in [
+            RawSseWire::Responses,
+            RawSseWire::Anthropic,
+            RawSseWire::Chat,
+        ] {
+            let mut scan = SseTerminalScan::default();
+            scan.observe(b"data: {\"delta\":\"response.completed message_stop [DONE] \\\"finish_reason\\\":\\\"stop\\\"\"}\n\n", wire);
+            assert!(!scan.saw_terminal);
+        }
+        let mut scan = SseTerminalScan::default();
+        scan.observe(
+            b"event: response.completed\r\ndata: {}\r\n",
+            RawSseWire::Responses,
+        );
+        assert!(!scan.saw_terminal);
+        scan.observe(b"\r\n", RawSseWire::Responses);
+        assert!(scan.saw_terminal);
+
+        let mut scan = SseTerminalScan::default();
+        scan.observe(&vec![b'x'; 128 * 1024], RawSseWire::Chat);
+        assert!(scan.carry.len() <= 3);
+        scan.observe(b"data: [DONE]\n\n", RawSseWire::Chat);
+        assert!(!scan.saw_terminal);
+        scan.observe(b"data: [DONE]\n\n", RawSseWire::Chat);
+        assert!(scan.saw_terminal);
+    }
+
+    /// The preflight chunk is replayed through the body stream; observing it
+    /// twice duplicated its prefix and lost a terminal frame split across the
+    /// first two chunks.
+    #[tokio::test]
+    async fn raw_stream_observes_the_preflight_chunk_exactly_once() {
+        for (wire, first, rest) in [
+            (
+                RawSseWire::Responses,
+                &b"event: response.comp"[..],
+                &b"leted\ndata: {}\n\n"[..],
+            ),
+            (
+                RawSseWire::Chat,
+                &b"data: {\"choices\":[{\"finish_reason\":"[..],
+                &b" \"stop\"}]}\n\n"[..],
+            ),
+        ] {
+            let chunks: Vec<Result<bytes::Bytes, std::io::Error>> = vec![
+                Ok(bytes::Bytes::from_static(first)),
+                Ok(bytes::Bytes::from_static(rest)),
+            ];
+            let source = futures::stream::iter(chunks);
+            // The SSE content type is what keeps this on the inspecting path:
+            // without it raw_stream_response passes the body straight through
+            // and the test would not cover the scan at all.
+            let response = reqwest::Response::from(
+                http::Response::builder()
+                    .status(200)
+                    .header("content-type", "text/event-stream")
+                    .body(reqwest::Body::wrap_stream(source))
+                    .unwrap(),
+            );
+            let response =
+                raw_stream_response(response, 200, Some(wire), std::time::Duration::from_secs(5))
+                    .await
+                    .unwrap();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("a terminal frame split across the first two chunks must terminate");
+            assert_eq!(body.len(), first.len() + rest.len());
+        }
+    }
+
+    /// Observing one chunk twice corrupts a frame split across chunk
+    /// boundaries: the second observation prepends the first chunk's bytes to
+    /// the carried fragment. The body builder must therefore observe each
+    /// forwarded chunk exactly once.
+    #[test]
+    fn double_observation_corrupts_a_split_terminal_frame() {
+        let mut once = SseTerminalScan::default();
+        once.observe(b"event: response.comp", RawSseWire::Responses);
+        once.observe(b"leted\ndata: {}\n\n", RawSseWire::Responses);
+        assert!(once.saw_terminal, "single observation sees the frame");
+
+        let mut twice = SseTerminalScan::default();
+        twice.observe(b"event: response.comp", RawSseWire::Responses);
+        twice.observe(b"event: response.comp", RawSseWire::Responses);
+        twice.observe(b"leted\ndata: {}\n\n", RawSseWire::Responses);
+        assert!(
+            !twice.saw_terminal,
+            "double observation must be detectable as the bug it is"
+        );
+    }
+
+    #[test]
+    fn terminal_marker_split_across_chunks_is_still_seen() {
+        let mut scan = SseTerminalScan::default();
+        scan.observe(b"event: response.comp", RawSseWire::Responses);
+        assert!(!scan.saw_terminal);
+        scan.observe(b"leted\ndata: {}\n\n", RawSseWire::Responses);
+        assert!(scan.saw_terminal);
     }
 }

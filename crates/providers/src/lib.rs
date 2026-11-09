@@ -13,6 +13,7 @@ pub mod credential_file;
 pub mod cursor;
 pub mod devin;
 pub mod kiro;
+pub mod kiro_idc;
 pub mod mimo;
 pub mod opencode;
 pub use opencode::OpenCodeAccount;

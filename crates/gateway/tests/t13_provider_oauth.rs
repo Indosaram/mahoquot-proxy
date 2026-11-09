@@ -2628,3 +2628,46 @@ async fn test_zcode_oauth_flow_end_to_end() {
     server_task_7.close().await;
     std::fs::remove_dir_all(auth_dir).ok();
 }
+
+#[tokio::test]
+async fn kiro_auth_url_refuses_a_malformed_region_before_any_upstream_call() {
+    // given a gateway with the management secret configured
+    let auth_dir = unique_temp_dir("mahoquot-kiro-idc-reject");
+    let config = GatewayConfig {
+        auth_dir: auth_dir.clone(),
+        api_keys: mahoquot_gateway::inbound::ApiKeys::new(vec![API_KEY.to_string()]),
+        config_path: auth_dir.join("config.yaml"),
+        ..GatewayConfig::default()
+    };
+    persist_management_secret(&config.config_path, &auth_dir);
+    let app = create_app(Arc::new(AppState::new(&config).unwrap()));
+
+    // when the device flow is started with a region that would reshape the
+    // OIDC host
+    let response = app
+        .oneshot(with_loopback_peer(
+            Request::builder()
+                .method("GET")
+                .uri("/v0/management/kiro-auth-url?region=NOT_A_REGION")
+                .header("X-Management-Key", MANAGEMENT_KEY)
+                .body(Body::empty())
+                .unwrap(),
+        ))
+        .await
+        .unwrap();
+
+    // then it is refused locally, with no request leaving the process
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value =
+        serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 1_000_000).await.unwrap())
+            .unwrap();
+    assert_eq!(body["status"], "error");
+    assert_eq!(body["provider"], "kiro");
+    assert!(
+        body["error"].as_str().unwrap().contains("invalid AWS region"),
+        "unexpected error: {}",
+        body["error"]
+    );
+
+    std::fs::remove_dir_all(auth_dir).ok();
+}

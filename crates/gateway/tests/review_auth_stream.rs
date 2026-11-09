@@ -109,10 +109,11 @@ async fn exercise_stream(drop_early: bool) {
         drop(body);
     } else {
         drop(tx);
-        tokio::time::timeout(std::time::Duration::from_secs(5), body.collect())
+        // An upstream that ends without a terminal event is now a stream
+        // error rather than a silent success; the guard must still release.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), body.collect())
             .await
-            .unwrap()
-            .unwrap();
+            .expect("body finishes at upstream EOF");
     }
     assert_eq!(
         state.monitor.in_flight(),

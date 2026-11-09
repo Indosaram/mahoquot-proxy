@@ -510,6 +510,137 @@ fn struct_response(raw: &str) -> Value {
     }
 }
 
+fn gemini_finish_is_failure(reason: &str) -> bool {
+    matches!(
+        reason,
+        "SAFETY"
+            | "RECITATION"
+            | "BLOCKLIST"
+            | "PROHIBITED_CONTENT"
+            | "SPII"
+            | "MALFORMED_FUNCTION_CALL"
+            | "IMAGE_SAFETY"
+            | "OTHER"
+    )
+}
+
+/// Request-scoped codec shared by request translation and response decoding.
+#[derive(Clone, Default)]
+pub struct GeminiToolNames {
+    names: std::collections::BTreeMap<String, String>,
+}
+
+impl GeminiToolNames {
+    pub fn from_body(body: &Value) -> Self {
+        fn collect(value: &Value, names: &mut std::collections::BTreeSet<String>) {
+            match value {
+                Value::Array(items) => items.iter().for_each(|item| collect(item, names)),
+                Value::Object(map) => {
+                    if let Some(name) = map.get("name").and_then(Value::as_str) {
+                        names.insert(name.to_string());
+                    }
+                    for key in ["tools", "function", "messages", "tool_calls", "tool_choice"] {
+                        if let Some(child) = map.get(key) {
+                            collect(child, names);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut originals = std::collections::BTreeSet::new();
+        collect(body, &mut originals);
+        let legal = |name: &str| {
+            !name.is_empty()
+                && name.len() <= 64
+                && name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '-'))
+        };
+        let mut used: std::collections::BTreeSet<String> = originals
+            .iter()
+            .filter(|name| legal(name))
+            .cloned()
+            .collect();
+        let mut names = std::collections::BTreeMap::new();
+        for original in originals {
+            let mut wire = original.clone();
+            if !legal(&original) {
+                let mut base: String = original
+                    .chars()
+                    .map(|c| {
+                        if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '-') {
+                            c
+                        } else {
+                            '_'
+                        }
+                    })
+                    .collect();
+                if !base.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
+                    base.insert(0, '_');
+                }
+                base.truncate(64);
+                wire = base.clone();
+                let mut index = 0;
+                while used.contains(&wire) {
+                    index += 1;
+                    let suffix = format!("_{index}");
+                    wire = format!("{}{}", &base[..base.len().min(64 - suffix.len())], suffix);
+                }
+            }
+            used.insert(wire.clone());
+            names.insert(original, wire);
+        }
+        Self { names }
+    }
+
+    fn original<'a>(&'a self, wire: &'a str) -> &'a str {
+        self.names
+            .iter()
+            .find_map(|(original, mapped)| (mapped == wire).then_some(original.as_str()))
+            .unwrap_or(wire)
+    }
+
+    fn map_request(&self, value: &mut Value) {
+        match value {
+            Value::Array(items) => items.iter_mut().for_each(|item| self.map_request(item)),
+            Value::Object(map) => {
+                if let Some(name) = map.get_mut("name") {
+                    if let Some(mapped) = name.as_str().and_then(|name| self.names.get(name)) {
+                        *name = json!(mapped);
+                    }
+                }
+                if let Some(names) = map
+                    .get_mut("allowedFunctionNames")
+                    .and_then(Value::as_array_mut)
+                {
+                    for name in names {
+                        if let Some(mapped) = name.as_str().and_then(|name| self.names.get(name)) {
+                            *name = json!(mapped);
+                        }
+                    }
+                }
+                for key in [
+                    "contents",
+                    "parts",
+                    "tools",
+                    "functionDeclarations",
+                    "functionCall",
+                    "functionResponse",
+                    "toolConfig",
+                    "functionCallingConfig",
+                ] {
+                    if let Some(child) = map.get_mut(key) {
+                        self.map_request(child);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn build_thinking_config(model: &str, body: &Value) -> Option<Value> {
     let mut config = Map::new();
 
@@ -521,6 +652,20 @@ fn build_thinking_config(model: &str, body: &Value) -> Option<Value> {
 
     if reasoning_effort == Some("none") {
         config.insert("thinkingBudget".to_string(), json!(0));
+        return Some(Value::Object(config));
+    }
+
+    if reasoning_effort == Some("auto") || (reasoning_effort.is_none() && explicit_budget.is_some())
+    {
+        config.insert(
+            "thinkingBudget".to_string(),
+            json!(if reasoning_effort == Some("auto") {
+                -1
+            } else {
+                explicit_budget.unwrap()
+            }),
+        );
+        config.insert("includeThoughts".to_string(), json!(true));
         return Some(Value::Object(config));
     }
 
@@ -873,6 +1018,20 @@ fn openai_to_gemini_inner(
         .and_then(Value::as_array)
         .ok_or_else(|| "missing messages".to_string())?;
 
+    let function_names = GeminiToolNames::from_body(body);
+    for msg in messages {
+        if msg
+            .get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|parts| {
+                parts
+                    .iter()
+                    .any(|part| part.get("type").and_then(Value::as_str) == Some("input_audio"))
+            })
+        {
+            return Err("unsupported Gemini media: input_audio".to_string());
+        }
+    }
     let mut contents: Vec<Value> = Vec::new();
     let mut system_parts: Vec<Value> = Vec::new();
     let empty: Vec<Value> = Vec::new();
@@ -1092,6 +1251,27 @@ fn openai_to_gemini_inner(
             json!(reserve_thinking_budget(model, m)),
         );
     }
+    if let Some(stop) = body.get("stop").or_else(|| body.get("stop_sequences")) {
+        let sequences = match stop {
+            Value::String(value) => Some(vec![json!(value)]),
+            Value::Array(values) => Some(values.clone()),
+            _ => None,
+        };
+        if let Some(sequences) = sequences {
+            generation.insert("stopSequences".to_string(), json!(sequences));
+        }
+    }
+    if let Some(format) = body.get("response_format") {
+        match format.get("type").and_then(Value::as_str) {
+            Some("json_object" | "json_schema") => {
+                generation.insert("responseMimeType".to_string(), json!("application/json"));
+                if let Some(schema) = format.pointer("/json_schema/schema") {
+                    generation.insert("responseSchema".to_string(), schema.clone());
+                }
+            }
+            _ => {}
+        }
+    }
     if let Some(thinking) = build_thinking_config(model, body) {
         generation.insert("thinkingConfig".to_string(), thinking);
     }
@@ -1179,7 +1359,9 @@ fn openai_to_gemini_inner(
         }
     }
 
-    Ok(Value::Object(request))
+    let mut request = Value::Object(request);
+    function_names.map_request(&mut request);
+    Ok(request)
 }
 
 /// JSON-Schema keywords the Gemini function-declaration subset rejects with a
@@ -1204,6 +1386,56 @@ const GEMINI_UNSUPPORTED_SCHEMA_KEYS: &[&str] = &[
 ];
 
 fn sanitize_gemini_schema(value: &mut Value) -> Result<(), String> {
+    let root = value.clone();
+    resolve_gemini_refs(value, &root, &mut Vec::new(), &mut 8192, 0)?;
+    strip_gemini_schema(value)
+}
+
+fn resolve_gemini_refs(
+    value: &mut Value,
+    root: &Value,
+    active: &mut Vec<String>,
+    remaining: &mut usize,
+    depth: usize,
+) -> Result<(), String> {
+    if *remaining == 0 {
+        return Err("Gemini tool schema expansion limit exceeded".to_string());
+    }
+    *remaining -= 1;
+    if depth >= 64 {
+        return Err("Gemini tool schema reference depth exceeded".to_string());
+    }
+    let Some(map) = value.as_object_mut() else {
+        return Ok(());
+    };
+    if let Some(reference) = map
+        .remove("$ref")
+        .and_then(|value| value.as_str().map(str::to_owned))
+    {
+        if let Some(target) = reference
+            .strip_prefix('#')
+            .and_then(|pointer| root.pointer(pointer))
+        {
+            if active.contains(&reference) {
+                return Err("cyclic Gemini tool schema reference".to_string());
+            }
+            let mut resolved = target.clone();
+            active.push(reference);
+            resolve_gemini_refs(&mut resolved, root, active, remaining, depth + 1)?;
+            active.pop();
+            if let Some(resolved) = resolved.as_object() {
+                let siblings = std::mem::take(map);
+                *map = resolved.clone();
+                map.extend(siblings);
+            }
+        }
+    }
+    super::tool_schema::visit_schema_children(map, &mut |child| {
+        resolve_gemini_refs(child, root, active, remaining, depth + 1)
+    })
+}
+
+fn strip_gemini_schema(value: &mut Value) -> Result<(), String> {
     if let Value::Object(map) = value {
         for key in GEMINI_UNSUPPORTED_SCHEMA_KEYS {
             map.remove(*key);
@@ -1211,7 +1443,7 @@ fn sanitize_gemini_schema(value: &mut Value) -> Result<(), String> {
         if let Some(one) = map.remove("oneOf") {
             map.entry("anyOf").or_insert(one);
         }
-        super::tool_schema::visit_schema_children(map, &mut sanitize_gemini_schema)?;
+        super::tool_schema::visit_schema_children(map, &mut strip_gemini_schema)?;
     }
     Ok(())
 }
@@ -1284,7 +1516,7 @@ pub fn openai_request_uses_claude(body: &Value) -> bool {
 }
 
 pub fn gemini_json_to_openai(body: &Value, model: &str, created: i64) -> Value {
-    gemini_json_to_openai_inner(body, model, created, None)
+    gemini_json_to_openai_inner(body, model, created, None, None)
 }
 
 pub fn gemini_json_to_openai_with_replay(
@@ -1293,7 +1525,17 @@ pub fn gemini_json_to_openai_with_replay(
     created: i64,
     replay: &ReplayScope,
 ) -> Value {
-    gemini_json_to_openai_inner(body, model, created, Some(replay))
+    gemini_json_to_openai_inner(body, model, created, Some(replay), None)
+}
+
+pub fn gemini_json_to_openai_with_tool_names(
+    body: &Value,
+    model: &str,
+    created: i64,
+    replay: Option<&ReplayScope>,
+    names: &GeminiToolNames,
+) -> Value {
+    gemini_json_to_openai_inner(body, model, created, replay, Some(names))
 }
 
 fn gemini_json_to_openai_inner(
@@ -1301,6 +1543,7 @@ fn gemini_json_to_openai_inner(
     model: &str,
     created: i64,
     replay: Option<&ReplayScope>,
+    names: Option<&GeminiToolNames>,
 ) -> Value {
     let response = body.get("response").unwrap_or(body);
     let candidate = response
@@ -1321,6 +1564,7 @@ fn gemini_json_to_openai_inner(
         for part in parts {
             if let Some(call) = part.get("functionCall") {
                 let name = call.get("name").and_then(Value::as_str).unwrap_or("");
+                let name = names.map(|names| names.original(name)).unwrap_or(name);
                 let args = call
                     .get("args")
                     .map(|a| a.to_string())
@@ -1367,19 +1611,23 @@ fn gemini_json_to_openai_inner(
         }
     }
 
-    let finish_reason = if !tool_calls.is_empty() {
+    let native_finish = candidate
+        .and_then(|c| c.get("finishReason"))
+        .and_then(Value::as_str);
+    let finish_reason = if native_finish.is_some_and(gemini_finish_is_failure) {
+        "content_filter"
+    } else if native_finish == Some("MAX_TOKENS") {
+        "length"
+    } else if !tool_calls.is_empty() {
         "tool_calls"
     } else {
-        match candidate
-            .and_then(|c| c.get("finishReason"))
-            .and_then(Value::as_str)
-        {
-            Some("MAX_TOKENS") => "length",
-            _ => "stop",
-        }
+        "stop"
     };
 
     let usage = response.get("usageMetadata");
+    let cached_tokens = usage
+        .and_then(|u| u.get("cachedContentTokenCount"))
+        .and_then(Value::as_u64);
     let prompt_tokens = usage
         .and_then(|u| u.get("promptTokenCount"))
         .and_then(Value::as_u64)
@@ -1388,14 +1636,13 @@ fn gemini_json_to_openai_inner(
         .and_then(|u| u.get("candidatesTokenCount"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let total_tokens = usage
-        .and_then(|u| u.get("totalTokenCount"))
-        .and_then(Value::as_u64)
-        .unwrap_or(prompt_tokens + completion_tokens);
     let reasoning_tokens = usage
         .and_then(|u| u.get("thoughtsTokenCount"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
+
+    let completion_tokens = completion_tokens + reasoning_tokens;
+    let total_tokens = prompt_tokens + completion_tokens;
 
     let mut message = if !tool_calls.is_empty() {
         if text.is_empty() {
@@ -1427,7 +1674,7 @@ fn gemini_json_to_openai_inner(
         .map(|s| s.to_string())
         .unwrap_or_else(|| format!("chatcmpl-{created}"));
 
-    json!({
+    let mut result = json!({
         "id": id,
         "object": "chat.completion",
         "created": created,
@@ -1445,7 +1692,11 @@ fn gemini_json_to_openai_inner(
                 "reasoning_tokens": reasoning_tokens,
             }
         }
-    })
+    });
+    if let Some(cached) = cached_tokens {
+        result["usage"]["prompt_tokens_details"] = json!({"cached_tokens": cached});
+    }
+    result
 }
 
 /// Antigravity thinking models bill internal reasoning against maxOutputTokens
@@ -1519,6 +1770,7 @@ pub struct GeminiDecoder {
     saw_finish_reason: bool,
     pending_signature: Option<String>,
     replay: Option<ReplayScope>,
+    names: GeminiToolNames,
 }
 
 impl GeminiDecoder {
@@ -1531,6 +1783,11 @@ impl GeminiDecoder {
             replay: Some(replay),
             ..Self::default()
         }
+    }
+
+    pub fn with_tool_names(mut self, names: GeminiToolNames) -> Self {
+        self.names = names;
+        self
     }
 
     pub fn decode(&mut self, payload: &[u8], out: &mut Vec<CodexEvent>) {
@@ -1577,6 +1834,11 @@ impl GeminiDecoder {
                 .get("candidatesTokenCount")
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
+            let reasoning = usage
+                .get("thoughtsTokenCount")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let completion = completion + reasoning;
             let total = usage
                 .get("totalTokenCount")
                 .and_then(Value::as_u64)
@@ -1591,10 +1853,7 @@ impl GeminiDecoder {
                 total_tokens: total,
                 cached_tokens: cached.unwrap_or(0),
                 cached_tokens_known: cached.is_some(),
-                reasoning_tokens: usage
-                    .get("thoughtsTokenCount")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
+                reasoning_tokens: reasoning,
                 cache_write_tokens: 0,
                 cache_write_tokens_known: false,
             });
@@ -1616,6 +1875,7 @@ impl GeminiDecoder {
             for part in parts {
                 if let Some(call) = part.get("functionCall") {
                     let name = call.get("name").and_then(Value::as_str).unwrap_or("");
+                    let name = self.names.original(name);
                     let args = call
                         .get("args")
                         .map(|a| a.to_string())
@@ -1678,6 +1938,13 @@ impl GeminiDecoder {
         }
 
         if let Some(reason) = candidate.get("finishReason").and_then(Value::as_str) {
+            if gemini_finish_is_failure(reason) {
+                out.push(CodexEvent::Failed {
+                    message: format!("Gemini generation failed: {reason}"),
+                });
+                self.completed = true;
+                return;
+            }
             if reason == "MAX_TOKENS" {
                 out.push(CodexEvent::OutputLimitReached);
             }
@@ -1705,6 +1972,206 @@ impl GeminiDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gemini_finish_reason_safety_is_not_success() {
+        for reason in [
+            "SAFETY",
+            "RECITATION",
+            "BLOCKLIST",
+            "PROHIBITED_CONTENT",
+            "SPII",
+            "MALFORMED_FUNCTION_CALL",
+            "IMAGE_SAFETY",
+            "OTHER",
+            "MAX_TOKENS",
+        ] {
+            let response = json!({"candidates":[{"finishReason":reason}]});
+            let buffered = gemini_json_to_openai(&response, "gemini-2.5-flash", 0);
+            assert_eq!(
+                buffered["choices"][0]["finish_reason"],
+                if reason == "MAX_TOKENS" {
+                    "length"
+                } else {
+                    "content_filter"
+                }
+            );
+            let mut decoder = GeminiDecoder::new();
+            let mut events = Vec::new();
+            decoder.decode(&serde_json::to_vec(&response).unwrap(), &mut events);
+            decoder.finish(&mut events);
+            if reason == "MAX_TOKENS" {
+                assert!(events.contains(&CodexEvent::OutputLimitReached));
+            } else {
+                assert!(events
+                    .iter()
+                    .any(|event| matches!(event, CodexEvent::Failed { .. })));
+                assert!(!events
+                    .iter()
+                    .any(|event| matches!(event, CodexEvent::Completed { .. })));
+            }
+        }
+    }
+
+    #[test]
+    fn gemini_buffered_usage_includes_thoughts_and_cache() {
+        for cache in [None, Some(0), Some(7)] {
+            let mut response = json!({"candidates":[{"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":16,"candidatesTokenCount":5,"thoughtsTokenCount":42,"totalTokenCount":63}});
+            if let Some(cache) = cache {
+                response["usageMetadata"]["cachedContentTokenCount"] = json!(cache);
+            }
+            let result = gemini_json_to_openai(&response, "gemini-2.5-flash", 0);
+            // L2-03: cached content is a subset of promptTokenCount, not extra input.
+            assert_eq!(result["usage"]["prompt_tokens"], 16);
+            assert_eq!(result["usage"]["completion_tokens"], 47);
+            assert_eq!(result["usage"]["total_tokens"], 63);
+            assert_eq!(
+                result["usage"]["completion_tokens_details"]["reasoning_tokens"],
+                42
+            );
+            assert_eq!(
+                result["usage"]["prompt_tokens_details"]["cached_tokens"],
+                cache.map_or(Value::Null, |cache| json!(cache))
+            );
+        }
+    }
+
+    #[test]
+    fn gemini_stop_sequences_are_forwarded() {
+        for (field, value, expected) in [
+            ("stop", json!("END"), json!(["END"])),
+            ("stop", json!(["END", "DONE"]), json!(["END", "DONE"])),
+            ("stop_sequences", json!(["NATIVE"]), json!(["NATIVE"])),
+        ] {
+            let mut body =
+                json!({"model":"gemini-2.5-flash","messages":[{"role":"user","content":"hi"}]});
+            body[field] = value;
+            assert_eq!(
+                openai_to_gemini(&body).unwrap()["generationConfig"]["stopSequences"],
+                expected
+            );
+            assert_eq!(
+                openai_to_antigravity(&body, "p").unwrap()["request"]["generationConfig"]
+                    ["stopSequences"],
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn gemini_local_ref_schema_is_resolved() {
+        let mut schema = json!({"type":"object","$defs":{"A/B":{"type":"string"}},"properties":{"x":{"$ref":"#/$defs/A~1B"},"missing":{"$ref":"#/$defs/absent"}}});
+        sanitize_gemini_schema(&mut schema).unwrap();
+        assert_eq!(schema["properties"]["x"]["type"], "string");
+        assert!(schema.get("$defs").is_none());
+        assert!(schema["properties"]["x"].get("$ref").is_none());
+        assert!(schema["properties"]["missing"].get("$ref").is_none());
+        let mut cyclic = json!({"$defs":{"loop":{"$ref":"#/$defs/loop"}},"$ref":"#/$defs/loop"});
+        assert!(sanitize_gemini_schema(&mut cyclic).is_err());
+    }
+
+    #[test]
+    fn gemini_tool_name_codec_roundtrips() {
+        let body = json!({"model":"gemini-2.5-flash","tools":[{"type":"function","function":{"name":"9tool"}},{"type":"function","function":{"name":"_9tool"}}],"tool_choice":{"type":"function","function":{"name":"9tool"}},"messages":[{"role":"assistant","tool_calls":[{"id":"call1","function":{"name":"9tool","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call1","content":"{}"}]});
+        let names = GeminiToolNames::from_body(&body);
+        let request = openai_to_gemini(&body).unwrap();
+        let wire = request["tools"][0]["functionDeclarations"][0]["name"]
+            .as_str()
+            .unwrap();
+        assert_ne!(wire, "9tool");
+        assert_ne!(wire, "_9tool");
+        assert!(wire.len() <= 64 && wire.starts_with('_'));
+        assert!(wire
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '-')));
+        assert_eq!(
+            request["contents"][0]["parts"][0]["functionCall"]["name"],
+            wire
+        );
+        assert_eq!(
+            request["contents"][1]["parts"][0]["functionResponse"]["name"],
+            wire
+        );
+        assert_eq!(
+            request["toolConfig"]["functionCallingConfig"]["allowedFunctionNames"][0],
+            wire
+        );
+        let response = json!({"candidates":[{"content":{"parts":[{"functionCall":{"name":wire,"args":{}}}]},"finishReason":"STOP"}]});
+        let result =
+            gemini_json_to_openai_with_tool_names(&response, "gemini-2.5-flash", 0, None, &names);
+        assert_eq!(
+            result["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "9tool"
+        );
+        let mut decoder = GeminiDecoder::new().with_tool_names(names);
+        let mut events = Vec::new();
+        decoder.decode(&serde_json::to_vec(&response).unwrap(), &mut events);
+        assert!(events.iter().any(
+            |event| matches!(event, CodexEvent::ToolCallBegin { name, .. } if name == "9tool")
+        ));
+    }
+
+    #[test]
+    fn gemini_explicit_budget_beats_model_default() {
+        for (options, budget) in [
+            (json!({"thinking_budget":2048}), 2048),
+            (json!({"reasoning_effort":"auto"}), -1),
+        ] {
+            let mut body =
+                json!({"model":"gemini-2.5-flash","messages":[{"role":"user","content":"hi"}]});
+            body.as_object_mut()
+                .unwrap()
+                .extend(options.as_object().unwrap().clone());
+            for request in [
+                openai_to_gemini(&body).unwrap(),
+                openai_to_antigravity(&body, "p").unwrap()["request"].clone(),
+            ] {
+                assert_eq!(
+                    request["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+                    budget
+                );
+                assert!(request["generationConfig"]["thinkingConfig"]
+                    .get("thinkingLevel")
+                    .is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn gemini_response_format_on_generic_and_antigravity() {
+        for format in [
+            json!({"type":"json_object"}),
+            json!({"type":"json_schema","json_schema":{"schema":{"type":"object","properties":{"ok":{"type":"boolean"}}}}}),
+        ] {
+            let body = json!({"model":"gemini-2.5-flash","messages":[{"role":"user","content":"hi"}],"response_format":format});
+            for request in [
+                openai_to_gemini(&body).unwrap(),
+                openai_to_antigravity(&body, "p").unwrap()["request"].clone(),
+            ] {
+                assert_eq!(
+                    request["generationConfig"]["responseMimeType"],
+                    "application/json"
+                );
+                assert_eq!(
+                    request["generationConfig"]["responseSchema"],
+                    format["json_schema"]["schema"]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gemini_input_audio_is_rejected() {
+        for content in [
+            json!([{"type":"input_audio","input_audio":{"format":"wav","data":"UklGRg=="}}]),
+            json!([{"type":"text","text":"transcribe"},{"type":"input_audio","input_audio":{"format":"wav","data":"UklGRg=="}}]),
+        ] {
+            let body =
+                json!({"model":"gemini-2.5-flash","messages":[{"role":"user","content":content}]});
+            assert!(openai_to_gemini(&body).is_err());
+            assert!(openai_to_antigravity(&body, "p").is_err());
+        }
+    }
 
     #[test]
     fn tool_parameters_strip_gemini_rejected_keywords_recursively() {
@@ -2743,7 +3210,7 @@ mod signature_tests {
         match completed_events[0] {
             CodexEvent::Completed { usage: Some(ref u) } => {
                 assert_eq!(u.prompt_tokens, 700);
-                assert_eq!(u.completion_tokens, 60);
+                assert_eq!(u.completion_tokens, 76);
                 assert_eq!(u.total_tokens, 760);
                 assert_eq!(u.reasoning_tokens, 16);
                 assert_eq!(u.cached_tokens, 0);

@@ -504,9 +504,9 @@ pub(crate) fn validate_provider_credential(content: &Value) -> Result<(), String
     Ok(())
 }
 
-/// Stable duplicate-detection identity for imports. Provider plus email keeps
-/// separate providers distinct; account/project/identity ids cover credentials
-/// that do not carry an email. Secret token material is never part of the key.
+/// Stable duplicate-detection identity for imports. Opaque account/project ids
+/// take precedence over email and retain their case. Secret token material is
+/// never part of the key.
 pub(crate) fn credential_identity(content: &Value) -> Option<String> {
     let provider = content
         .get("provider")
@@ -517,7 +517,7 @@ pub(crate) fn credential_identity(content: &Value) -> Option<String> {
     if provider.is_empty() {
         return None;
     }
-    let identity = ["email", "account_id", "project_id", "identity_slug"]
+    let (field, identity) = ["account_id", "project_id", "identity_slug", "email"]
         .into_iter()
         .find_map(|field| {
             content
@@ -525,9 +525,14 @@ pub(crate) fn credential_identity(content: &Value) -> Option<String> {
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
-                .map(str::to_ascii_lowercase)
+                .map(|value| (field, value))
         })?;
-    Some(format!("{provider}|{identity}"))
+    let identity = if field == "email" {
+        identity.to_ascii_lowercase()
+    } else {
+        identity.to_string()
+    };
+    Some(format!("{provider}|{field}|{identity}"))
 }
 
 /// Upstream addresses a credential by a stable opaque handle rather than its
@@ -1910,6 +1915,22 @@ pub fn creds_routes() -> Router<Arc<AppState>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_import_keys_on_account_id() {
+        let personal = json!({"type":"codex", "email":"u@example.com", "account_id":"personal"});
+        let team = json!({"type":"codex", "email":"u@example.com", "account_id":"team"});
+        let mut copy = personal.clone();
+        copy["email"] = json!("renamed@example.com");
+        assert_ne!(credential_identity(&personal), credential_identity(&team));
+        assert_eq!(credential_identity(&personal), credential_identity(&copy));
+        copy["account_id"] = json!("Personal");
+        assert_ne!(credential_identity(&personal), credential_identity(&copy));
+        assert_eq!(
+            credential_identity(&json!({"type":"codex", "email":" U@Example.com "})),
+            credential_identity(&json!({"type":"codex", "email":"u@example.com"}))
+        );
+    }
 
     #[test]
     fn explicit_account_order_precedes_unlisted_files() {

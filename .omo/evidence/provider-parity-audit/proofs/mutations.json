@@ -1,0 +1,465 @@
+[
+  {
+    "id": "L1-02",
+    "file": "crates/gateway/src/compat/claude.rs",
+    "old": "        result[\"input_tokens\"] = json!(usage\n            .prompt_tokens\n            .saturating_sub(usage.cached_tokens)\n            .saturating_sub(usage.cache_write_tokens));",
+    "new": "        result[\"input_tokens\"] = json!(usage.prompt_tokens);",
+    "package": "mahoquot-gateway",
+    "test": "compat::claude::tests::anthropic_render_usage_excludes_known_caches",
+    "testFile": "crates/gateway/src/compat/claude.rs"
+  },
+  {
+    "id": "L1-03",
+    "file": "crates/gateway/src/compat/claude.rs",
+    "old": "    if let Some(stop) = body.get(\"stop_sequences\") {\n        out.insert(\"stop\".to_string(), stop.clone());\n    }",
+    "new": "    if body.get(\"stop_sequences\").is_some() { /* pre-fix: unmapped */ }",
+    "package": "mahoquot-gateway",
+    "test": "compat::claude::tests::claude_stop_controls_cross_map",
+    "testFile": "crates/gateway/src/compat/claude.rs"
+  },
+  {
+    "id": "L1-04",
+    "file": "crates/gateway/src/compat/claude.rs",
+    "old": "body.get(\"max_tokens\").or_else(|| body.get(\"max_completion_tokens\")).and_then(Value::as_u64).unwrap_or(32_768)",
+    "new": "body.get(\"max_tokens\").and_then(Value::as_u64).unwrap_or(32_768)",
+    "package": "mahoquot-gateway",
+    "test": "compat::claude::tests::claude_honors_max_completion_tokens",
+    "testFile": "crates/gateway/src/compat/claude.rs"
+  },
+  {
+    "id": "L1-05",
+    "file": "crates/gateway/src/compat/claude.rs",
+    "old": "                            } else if source[\"type\"] == \"url\" {\n                                image_parts.push(json!({\n                                    \"type\": \"image_url\",\n                                    \"image_url\": {\"url\": source[\"url\"]}\n                                }));\n                            }",
+    "new": "                            }",
+    "package": "mahoquot-gateway",
+    "test": "compat::claude::tests::anthropic_url_images_survive_chat_translation",
+    "testFile": "crates/gateway/src/compat/claude.rs"
+  },
+  {
+    "id": "L1-06",
+    "file": "crates/gateway/src/compat/claude.rs",
+    "old": "        out_messages.extend(tool_results);",
+    "new": "        let _ = &tool_results;",
+    "package": "mahoquot-gateway",
+    "test": "compat::claude::tests::anthropic_tool_results_precede_user_followup",
+    "testFile": "crates/gateway/src/compat/claude.rs"
+  },
+  {
+    "id": "L1-07",
+    "file": "crates/gateway/src/compat/claude.rs",
+    "old": "    let thinking_type = body[\"thinking\"][\"type\"].as_str();\n    let effort = if thinking_type == Some(\"disabled\") {\n        Some(\"none\".to_string())\n    } else if let Some(effort) = body[\"output_config\"][\"effort\"].as_str() {\n        Some(effort.to_string())\n    } else if let Some(budget) = body[\"thinking\"][\"budget_tokens\"].as_u64() {\n        Some(\n            super::request::normalize_thinking_level(&budget.to_string())\n                .map_err(|error| error.to_string())?,\n        )\n    } else if matches!(thinking_type, Some(\"adaptive\" | \"enabled\")) {\n        Some(\"auto\".to_string())\n    } else {\n        None\n    };",
+    "new": "    let effort: Option<String> = None;",
+    "package": "mahoquot-gateway",
+    "test": "compat::claude::tests::anthropic_thinking_controls_survive_codex_plan",
+    "testFile": "crates/gateway/src/compat/claude.rs"
+  },
+  {
+    "id": "L1-08",
+    "file": "crates/gateway/src/compat/claude.rs",
+    "old": "        let mut content = content;\n        if role == \"assistant\" {\n            if let Some(signature) = message[\"reasoning_signature\"].as_str().filter(|signature| {\n                if message[\"reasoning_redacted\"] == true {\n                    !signature.is_empty()\n                } else {\n                    plausible_claude_signature(signature)\n                }\n            }) {",
+    "new": "        let mut content = content;\n        if role == \"assistant\" {\n            if let Some(signature) = None::<&str>.filter(|signature: &&str| !signature.is_empty()) {",
+    "package": "mahoquot-gateway",
+    "test": "compat::claude::tests::claude_replays_signed_assistant_reasoning_before_tools",
+    "testFile": "crates/gateway/src/compat/claude.rs"
+  },
+  {
+    "id": "L2-02",
+    "file": "crates/gateway/src/compat/gemini.rs",
+    "old": "        \"SAFETY\"\n            | \"RECITATION\"\n            | \"BLOCKLIST\"\n            | \"PROHIBITED_CONTENT\"\n            | \"SPII\"\n            | \"MALFORMED_FUNCTION_CALL\"\n            | \"IMAGE_SAFETY\"\n            | \"OTHER\"",
+    "new": "        \"__never__\"",
+    "package": "mahoquot-gateway",
+    "test": "compat::gemini::tests::gemini_finish_reason_safety_is_not_success",
+    "testFile": "crates/gateway/src/compat/gemini.rs"
+  },
+  {
+    "id": "L2-03",
+    "file": "crates/gateway/src/compat/gemini.rs",
+    "old": "    let completion_tokens = completion_tokens + reasoning_tokens;",
+    "new": "    let completion_tokens = completion_tokens;",
+    "package": "mahoquot-gateway",
+    "test": "compat::gemini::tests::gemini_buffered_usage_includes_thoughts_and_cache",
+    "testFile": "crates/gateway/src/compat/gemini.rs"
+  },
+  {
+    "id": "L2-04",
+    "file": "crates/gateway/src/compat/gemini.rs",
+    "old": "    if let Some(stop) = body.get(\"stop\").or_else(|| body.get(\"stop_sequences\")) {",
+    "new": "    if let Some(stop) = body.get(\"__unmapped__\") {",
+    "package": "mahoquot-gateway",
+    "test": "compat::gemini::tests::gemini_stop_sequences_are_forwarded",
+    "testFile": "crates/gateway/src/compat/gemini.rs"
+  },
+  {
+    "id": "L2-05",
+    "file": "crates/gateway/src/compat/gemini.rs",
+    "old": "    if let Some(reference) = map\n        .remove(\"$ref\")\n        .and_then(|value| value.as_str().map(str::to_owned))\n    {",
+    "new": "    if let Some(reference) = None::<String>\n    {",
+    "package": "mahoquot-gateway",
+    "test": "compat::gemini::tests::gemini_local_ref_schema_is_resolved",
+    "testFile": "crates/gateway/src/compat/gemini.rs"
+  },
+  {
+    "id": "L2-10",
+    "file": "crates/gateway/src/compat/gemini.rs",
+    "old": "            return Err(\"unsupported Gemini media: input_audio\".to_string());",
+    "new": "            return Ok(Value::Null);",
+    "package": "mahoquot-gateway",
+    "test": "compat::gemini::tests::gemini_input_audio_is_rejected",
+    "testFile": "crates/gateway/src/compat/gemini.rs"
+  },
+  {
+    "id": "L2-08",
+    "file": "crates/gateway/src/compat/gemini.rs",
+    "old": "            Some(\"json_object\" | \"json_schema\") => {\n                generation.insert(\"responseMimeType\".to_string(), json!(\"application/json\"));",
+    "new": "            Some(\"__never__\") => {\n                generation.insert(\"responseMimeType\".to_string(), json!(\"application/json\"));",
+    "package": "mahoquot-gateway",
+    "test": "compat::gemini::tests::gemini_response_format_on_generic_and_antigravity",
+    "testFile": "crates/gateway/src/compat/gemini.rs"
+  },
+  {
+    "id": "L2-07",
+    "file": "crates/gateway/src/compat/gemini.rs",
+    "old": "    if reasoning_effort == Some(\"auto\") || (reasoning_effort.is_none() && explicit_budget.is_some())",
+    "new": "    if reasoning_effort == Some(\"__never__\")",
+    "package": "mahoquot-gateway",
+    "test": "compat::gemini::tests::gemini_explicit_budget_beats_model_default",
+    "testFile": "crates/gateway/src/compat/gemini.rs"
+  },
+  {
+    "id": "L3-02",
+    "file": "crates/gateway/src/compat/events.rs",
+    "old": "                Some(\"response.function_call_arguments.done\") => value.get(\"arguments\"),\n                Some(\"response.output_item.done\")\n                    if value.pointer(\"/item/type\").and_then(Value::as_str)\n                        == Some(\"function_call\") =>\n                {\n                    value.pointer(\"/item/arguments\")\n                }",
+    "new": "                Some(\"__never__\") => value.get(\"arguments\"),",
+    "package": "mahoquot-gateway",
+    "test": "compat::render::tests::codex_done_only_arguments_survive_chat_rendering",
+    "testFile": "crates/gateway/src/compat/render.rs"
+  },
+  {
+    "id": "L3-08",
+    "file": "crates/gateway/src/compat/request.rs",
+    "old": "    if let Some(summary) = obj.get(\"reasoning\").and_then(|r| r.get(\"summary\")) {\n        out.get_mut(\"reasoning\").expect(\"reasoning was inserted\")[\"summary\"] = summary.clone();\n    }",
+    "new": "",
+    "package": "mahoquot-gateway",
+    "test": "compat::request::tests::codex_explicit_reasoning_summary_is_retained",
+    "testFile": "crates/gateway/src/compat/request.rs"
+  },
+  {
+    "id": "L3-05",
+    "file": "crates/gateway/src/compat/responses.rs",
+    "old": "    for key in [\"reasoning\", \"parallel_tool_calls\"] {",
+    "new": "    for key in [\"reasoning\"] {",
+    "package": "mahoquot-gateway",
+    "test": "compat::responses::tests::responses_claude_controls_survive_translation",
+    "testFile": "crates/gateway/src/compat/responses.rs"
+  },
+  {
+    "id": "L1-01",
+    "file": "crates/gateway/src/compat/claude.rs",
+    "old": "    let prompt_tokens = prompt_tokens + cache_read.unwrap_or(0) + cache_write.unwrap_or(0);",
+    "new": "    let prompt_tokens = prompt_tokens;",
+    "package": "mahoquot-gateway",
+    "test": "compat::claude::tests::anthropic_cache_usage_is_inclusive_json_and_stream",
+    "testFile": "crates/gateway/src/compat/claude.rs"
+  },
+  {
+    "id": "L2-01",
+    "file": "crates/gateway/src/url.rs",
+    "old": "    if location.is_empty() || location == \"global\" {\n        \"https://global-aiplatform.googleapis.com\".to_string()\n    } else {\n        format!(\"https://{location}-aiplatform.googleapis.com\")\n    }",
+    "new": "    \"https://global-aiplatform.googleapis.com\".to_string()",
+    "package": "mahoquot-gateway",
+    "test": "url::tests::vertex_location_selects_regional_host",
+    "testFile": "crates/gateway/src/url.rs"
+  },
+  {
+    "id": "L3-04",
+    "file": "crates/gateway/src/compat/request.rs",
+    "old": "        if id.len() <= 64 || shortened.contains_key(id) {",
+    "new": "        if true {",
+    "package": "mahoquot-gateway",
+    "test": "compat::request::tests::codex_long_call_ids_keep_injective_pairing",
+    "testFile": "crates/gateway/src/compat/request.rs"
+  },
+  {
+    "id": "L3-07",
+    "file": "crates/gateway/src/compat/responses.rs",
+    "old": "    for key in [\"tools\", \"tool_choice\", \"parallel_tool_calls\", \"text\"] {\n        obj.remove(key);",
+    "new": "    for key in [\"tools\", \"tool_choice\", \"parallel_tool_calls\"] {\n        obj.remove(key);",
+    "package": "mahoquot-gateway",
+    "test": "compat::responses::tests::compact_requests_summary_and_rejects_tool_only_reply",
+    "testFile": "crates/gateway/src/compat/responses.rs"
+  },
+  {
+    "id": "L4-02",
+    "file": "crates/providers/src/refresh_exec.rs",
+    "old": "    pub fn is_grant_rejection(&self) -> bool {\n        match self {\n            RefreshError::Status { code: 401, .. } => true,",
+    "new": "    pub fn is_grant_rejection(&self) -> bool {\n        match self {\n            RefreshError::Status { code: 401 | 403, .. } => true,",
+    "package": "mahoquot-gateway",
+    "test": "pre_expiry_refresh::tests::only_a_rejected_grant_benches_the_account",
+    "testFile": "crates/gateway/src/pre_expiry_refresh.rs"
+  },
+  {
+    "id": "L4-07",
+    "file": "crates/gateway/src/account.rs",
+    "old": "                        if claim.claim_age()? >= CODEX_CLAIM_ABANDON_AFTER {\n                            claim.take_over()?;\n                            return Ok((claim, None));\n                        }",
+    "new": "",
+    "package": "mahoquot-gateway",
+    "test": "account::codex_refresh_claim_tests::codex_abandoned_claim_reaches_an_actionable_state",
+    "testFile": "crates/gateway/src/account.rs"
+  },
+  {
+    "id": "L4-04",
+    "file": "crates/gateway/src/management/creds.rs",
+    "old": "    let (field, identity) = [\"account_id\", \"project_id\", \"identity_slug\", \"email\"]",
+    "new": "    let (field, identity) = [\"email\", \"account_id\", \"project_id\", \"identity_slug\"]",
+    "package": "mahoquot-gateway",
+    "test": "management::creds::tests::codex_import_keys_on_account_id",
+    "testFile": "crates/gateway/src/management/creds.rs"
+  },
+  {
+    "id": "L4-05",
+    "file": "crates/gateway/src/management/oauth.rs",
+    "old": "        for field in [\n            \"access_token\",\n            \"refresh_token\",\n            \"project_id\",\n            \"email\",\n            \"expires_in\",\n            \"timestamp\",\n            \"expired\",\n        ] {",
+    "new": "        for field in [\n            \"access_token\",\n            \"refresh_token\",\n            \"project_id\",\n            \"email\",\n            \"expires_in\",\n            \"timestamp\",\n            \"expired\",\n            \"disabled\",\n        ] {",
+    "package": "mahoquot-gateway",
+    "test": "management::oauth::tests::reauth_preserves_operator_disabled",
+    "testFile": "crates/gateway/src/management/oauth.rs"
+  },
+  {
+    "id": "L4-08",
+    "file": "crates/gateway/src/management/scalar_table.rs",
+    "old": "        \"\" | \"round-robin\" | \"roundrobin\" | \"rr\" => Some(\"round-robin\"),",
+    "new": "        \"\" | \"round-robin\" | \"roundrobin\" | \"rr\" => Some(\"round-robin\"),\n        \"wrr\" | \"weighted-round-robin\" | \"weightedroundrobin\" => Some(\"round-robin\"),",
+    "package": "mahoquot-gateway",
+    "test": "management::scalars::tests::weighted_round_robin_is_refused_because_no_selector_implements_it",
+    "testFile": "crates/gateway/src/management/scalars.rs"
+  },
+  {
+    "id": "L5-03",
+    "file": "crates/gateway/src/compat/mod.rs",
+    "old": "            Self::Gemini(_) | Self::Responses(_) => Bytes::from_static(b\": keepalive\\n\\n\"),",
+    "new": "            Self::Gemini(_) | Self::Responses(_) => Bytes::from_static(b\"\"),",
+    "package": "mahoquot-gateway",
+    "test": "compat::bounded_stream_tests::responses_and_gemini_idle_tick_is_complete_comment",
+    "testFile": "crates/gateway/src/compat/mod.rs"
+  },
+  {
+    "id": "L5-05",
+    "file": "crates/gateway/src/relay.rs",
+    "old": "    let deadline_ms = chrono::DateTime::parse_from_rfc2822(value)",
+    "new": "    let deadline_ms = chrono::DateTime::parse_from_rfc2822(\"\")",
+    "package": "mahoquot-gateway",
+    "test": "relay::usage_capture_tests::cooldown_retry_after_http_date_precedes_reset",
+    "testFile": "crates/gateway/src/relay.rs"
+  },
+  {
+    "id": "L6-07",
+    "file": "crates/gateway/src/compat/command_code.rs",
+    "old": "        (\"user-agent\", \"cli\".into()),",
+    "new": "        (\"user-agent\", \"generic\".into()),",
+    "package": "mahoquot-gateway",
+    "test": "compat::command_code::tests::command_code_oauth_uses_cli_wire",
+    "testFile": "crates/gateway/src/compat/command_code.rs"
+  },
+  {
+    "id": "L6-01",
+    "file": "crates/gateway/src/compat/cursor.rs",
+    "old": "        let Some(url) = block.pointer(\"/image_url/url\").and_then(Value::as_str) else {\n            continue;\n        };\n        let Some((mime, encoded)) = url",
+    "new": "        let Some(url) = block.pointer(\"/image_url/url\").and_then(Value::as_str).filter(|_| !user_text.is_empty() && false) else {\n            continue;\n        };\n        let Some((mime, encoded)) = url",
+    "package": "mahoquot-gateway",
+    "test": "compat::cursor::tests::cursor_image_only_encodes_selected_image",
+    "testFile": "crates/gateway/src/compat/cursor.rs"
+  },
+  {
+    "id": "L6-02",
+    "file": "crates/gateway/src/compat/cursor.rs",
+    "old": "                if !rejected {\n                    self.blobs.insert(args.blob_id, args.blob_data);\n                    self.blob_bytes = retained;\n                }",
+    "new": "                if !rejected {\n                    self.blob_bytes = retained;\n                }",
+    "package": "mahoquot-gateway",
+    "test": "compat::cursor::tests::cursor_kv_set_then_get_preserves_bytes",
+    "testFile": "crates/gateway/src/compat/cursor.rs"
+  },
+  {
+    "id": "L6-EXEC",
+    "package": "mahoquot-gateway",
+    "file": "crates/gateway/src/compat/cursor.rs",
+    "test": "compat::cursor::tests::exec_write_rejects_dotdot_escape",
+    "old": "    let root = root.canonicalize().map_err(|error| error.to_string())?;",
+    "new": "    let root = root.to_path_buf();",
+    "hardening": true,
+    "testFile": "crates/gateway/src/compat/cursor.rs"
+  },
+  {
+    "id": "L6-05",
+    "file": "crates/gateway/src/compat/kiro.rs",
+    "old": "            if let Some(redacted) = value.get(\"redactedContent\").and_then(Value::as_str) {\n                out.push(CodexEvent::KiroRedactedReasoning(redacted.to_string()));\n            }",
+    "new": "",
+    "package": "mahoquot-gateway",
+    "test": "compat::kiro::tests::kiro_redacted_reasoning_roundtrips",
+    "testFile": "crates/gateway/src/compat/kiro.rs"
+  },
+  {
+    "id": "L6-06",
+    "file": "crates/gateway/src/compat/kiro.rs",
+    "old": "            if let Some(tokens) = value.get(\"tokenUsage\") {",
+    "new": "            if let Some(tokens) = value.get(\"__no_token_usage__\") {",
+    "package": "mahoquot-gateway",
+    "test": "compat::kiro::tests::kiro_metadata_usage_survives_stop_and_eof",
+    "testFile": "crates/gateway/src/compat/kiro.rs"
+  },
+  {
+    "id": "L6-04",
+    "file": "crates/gateway/src/compat/kiro.rs",
+    "old": "            if role == \"tool\" {\n                let id = message",
+    "new": "            if role == \"tool\" && false {\n                let id = message",
+    "package": "mahoquot-gateway",
+    "test": "compat::kiro::tests::kiro_prior_tool_result_survives_new_user",
+    "testFile": "crates/gateway/src/compat/kiro.rs"
+  },
+  {
+    "id": "L6-08",
+    "file": "crates/gateway/src/interactions.rs",
+    "old": "    let saved = store.get(&key, now).ok_or(",
+    "new": "    let saved = store.get(&format!(\"{key}:never\"), now).ok_or(",
+    "package": "mahoquot-gateway",
+    "test": "interactions::tests::devin_function_result_continuation_pairs_pending_call",
+    "testFile": "crates/gateway/src/interactions.rs"
+  },
+  {
+    "id": "L2-06",
+    "file": "crates/gateway/src/compat/gemini.rs",
+    "old": "        let legal = |name: &str| {\n            !name.is_empty()",
+    "new": "        let legal = |name: &str| {\n            let _ = name;\n            true || !name.is_empty()",
+    "package": "mahoquot-gateway",
+    "test": "compat::gemini::tests::gemini_tool_name_codec_roundtrips",
+    "testFile": "crates/gateway/src/compat/gemini.rs"
+  },
+  {
+    "id": "L2-09",
+    "file": "crates/gateway/src/management/oauth.rs",
+    "old": "        if done {\n            return if project.is_empty() {\n                Err(\"onboarding finished without a project\".to_string())\n            } else {\n                Ok(project)\n            };\n        }",
+    "new": "        if done {\n            return Ok(project);\n        }",
+    "package": "mahoquot-gateway",
+    "test": "management::oauth::tests::antigravity_login_waits_for_project_before_persist",
+    "testFile": "crates/gateway/src/management/oauth.rs"
+  },
+  {
+    "id": "L3-01",
+    "file": "crates/gateway/src/relay.rs",
+    "old": "    object.remove(\"metadata\");\n    object.remove(\"truncation\");\n    object.remove(\"max_output_tokens\");",
+    "new": "    let _ = object;",
+    "package": "mahoquot-gateway",
+    "test": "relay::native_responses_tests::native_codex_responses_drops_envelope_fields_the_backend_rejects",
+    "testFile": "crates/gateway/src/relay.rs"
+  },
+  {
+    "id": "L3-03",
+    "file": "crates/gateway/src/compat/events.rs",
+    "old": "            && matches!(\n                value\n                    .pointer(\"/response/incomplete_details/reason\")\n                    .and_then(Value::as_str),\n                Some(\"max_output_tokens\" | \"max_tokens\" | \"content_filter\")\n            )",
+    "new": "            && false",
+    "package": "mahoquot-gateway",
+    "test": "compat::render::tests::codex_incomplete_preserves_chat_reason_and_usage",
+    "testFile": "crates/gateway/src/compat/render.rs"
+  },
+  {
+    "id": "L4-01",
+    "file": "crates/gateway/src/pre_expiry_refresh.rs",
+    "old": "        && !member.is_grant_rejected()",
+    "new": "        && (member.is_grant_rejected() || true)",
+    "package": "mahoquot-gateway",
+    "test": "pre_expiry_refresh::tests::a_rejected_grant_keeps_the_working_access_token_routable",
+    "testFile": "crates/gateway/src/pre_expiry_refresh.rs"
+  },
+  {
+    "id": "L4-03",
+    "file": "crates/providers/src/refresh_exec.rs",
+    "old": "    #[error(\"status {code}\")]\n    Status { code: u16, body: String },",
+    "new": "    #[error(\"status {code}: {body}\")]\n    Status { code: u16, body: String },",
+    "package": "mahoquot-providers",
+    "test": "refresh_exec::tests::a_status_error_never_renders_the_upstream_body",
+    "testFile": "crates/providers/src/refresh_exec.rs"
+  },
+  {
+    "id": "L3-06",
+    "file": "crates/gateway/src/compat/responses.rs",
+    "old": "                                            if let Some(detail) = part.get(\"detail\") {\n                                                image[\"detail\"] = detail.clone();\n                                            }",
+    "new": "                                            let _ = part.get(\"detail\");",
+    "package": "mahoquot-gateway",
+    "test": "compat::responses::tests::responses_tool_output_array_retains_image_order",
+    "testFile": "crates/gateway/src/compat/responses.rs"
+  },
+  {
+    "id": "L4-06",
+    "file": "crates/gateway/src/management/oauth.rs",
+    "old": "        let _mutation = state.settings.composition_lock();\n        write_session_credential_with(session, || {\n            let current = match std::fs::read(path) {",
+    "new": "        write_session_credential_with(session, || {\n            let current = match std::fs::read(path) {",
+    "package": "mahoquot-gateway",
+    "test": "management::oauth::tests::oauth_write_takes_composition_lock",
+    "testFile": "crates/gateway/src/management/oauth.rs"
+  },
+  {
+    "id": "L5-01",
+    "file": "crates/gateway/src/relay.rs",
+    "old": "                    scan.observe(&chunk, wire);\n                    done |= scan.saw_terminal;",
+    "new": "                    let _ = &mut scan;\n                    done = true;",
+    "package": "mahoquot-gateway",
+    "test": "relay::native_responses_tests::raw_sse_terminal_frames_control_eof_and_preserve_bytes",
+    "testFile": "crates/gateway/src/relay.rs"
+  },
+  {
+    "id": "L5-02",
+    "file": "crates/gateway/src/compat/mod.rs",
+    "old": "    if received_chunk {\n        STREAM_UPSTREAM_SILENCE_BUDGET\n    } else {\n        remaining.saturating_sub(upstream_wait)\n    }",
+    "new": "    let _ = (received_chunk, upstream_wait);\n    remaining",
+    "package": "mahoquot-gateway",
+    "test": "compat::bounded_stream_tests::translate_stall_budget_accounts_only_upstream_wait",
+    "testFile": "crates/gateway/src/compat/mod.rs"
+  },
+  {
+    "id": "L5-04",
+    "file": "crates/gateway/src/compat/mod.rs",
+    "old": "            Some(\"message_stop\") => return AnthropicPreamble::Failed(empty_message_reason(&text)),",
+    "new": "            Some(\"message_stop\") => return AnthropicPreamble::Served,",
+    "package": "mahoquot-gateway",
+    "test": "compat::bounded_stream_tests::anthropic_empty_text_preamble_remains_retryable",
+    "testFile": "crates/gateway/src/compat/mod.rs"
+  },
+  {
+    "id": "L3-09",
+    "file": "crates/gateway/src/relay.rs",
+    "old": "                // A chat upstream answers with choices[].delta, which the\n                // Responses decoder does not understand.\n                protocol: compat::Protocol::Chat,",
+    "new": "                protocol: compat::Protocol::Codex,",
+    "package": "mahoquot-gateway",
+    "test": "responses_client_receives_chat_stream_as_responses_events",
+    "integrationTest": "generic_chat_responses",
+    "testFile": "crates/gateway/tests/generic_chat_responses.rs"
+  },
+  {
+    "id": "L1-09",
+    "file": "crates/gateway/src/compat/claude.rs",
+    "old": "    enforce_cache_control_limit(body, MAX_CACHE_BREAKPOINTS);\n",
+    "new": "",
+    "package": "mahoquot-gateway",
+    "test": "compat::claude::openai_to_anthropic_tests::excess_client_breakpoints_are_capped_at_the_provider_limit",
+    "testFile": "crates/gateway/src/compat/claude.rs"
+  },
+  {
+    "id": "L1-10",
+    "file": "crates/gateway/src/relay.rs",
+    "old": "            // Anthropic answers a fifth cache_control breakpoint with HTTP 400.\n            // Every Anthropic-shaped body built in THIS branch (subscription,\n            // relay, Zcode) leaves here, so the cap runs last: after the\n            // path-specific placement above may have added its own markers. The\n            // Generic anthropic adapter returns earlier and is capped by the\n            // translator itself.\n            compat::claude::enforce_cache_control_limit(\n                &mut anthropic_val,\n                compat::claude::MAX_CACHE_BREAKPOINTS,\n            );\n",
+    "new": "",
+    "package": "mahoquot-gateway",
+    "test": "zcode_native_client_breakpoints_are_capped_before_upstream",
+    "integrationTest": "t12_provider_relay",
+    "testFile": "crates/gateway/tests/t12_provider_relay.rs"
+  },
+  {
+    "id": "L1-11",
+    "package": "mahoquot-gateway",
+    "file": "crates/gateway/src/compat/claude.rs",
+    "test": "generic_anthropic_adapter_caps_client_breakpoints",
+    "old": "    // Every OpenAI -> Anthropic translation leaves through here, and the\n    // client's own markers are preserved, so the provider limit is enforced at\n    // the translation boundary. A caller that adds path-specific breakpoints\n    // afterwards must enforce it again (see the relay serialization point).\n    enforce_cache_control_limit(&mut result, MAX_CACHE_BREAKPOINTS);\n",
+    "new": "",
+    "integrationTest": "t12_provider_relay",
+    "testFile": "crates/gateway/tests/t12_provider_relay.rs"
+  }
+]

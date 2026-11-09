@@ -328,6 +328,7 @@ async fn gt6_streaming_body_terminal_is_independent_of_chunk_boundaries() {
                 protocol: Protocol::Codex,
                 cursor_reply: None,
                 replay: None,
+                gemini_tool_names: None,
             },
             upstream_capture: None,
             devin_outcome: None,

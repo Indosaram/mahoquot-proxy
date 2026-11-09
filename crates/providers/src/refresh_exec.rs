@@ -6,17 +6,53 @@ use serde_json::Value;
 use crate::credential_file::write_credential_atomically;
 use crate::refresh::Tokens;
 
+/// OAuth `error` codes that prove the grant itself is dead. Anything else in
+/// a 400 body (malformed request, unsupported grant type, WAF page) says
+/// nothing about the stored credential.
+const GRANT_REJECTION_CODES: &[&str] = &[
+    "invalid_grant",
+    "invalid_token",
+    "expired_token",
+    "refresh_token_expired",
+    "refresh_token_invalidated",
+];
+
+/// Whether an error body is a definite grant rejection.
+///
+/// Only structured OAuth errors count. A body that merely contains the word
+/// `invalid_grant` inside an HTML error page is not evidence of a dead grant.
+pub fn is_grant_rejection_body(body: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return false;
+    };
+    let code = value
+        .get("error")
+        .and_then(|error| {
+            error
+                .as_str()
+                .or_else(|| error.get("code").and_then(Value::as_str))
+        })
+        .or_else(|| value.get("error_code").and_then(Value::as_str));
+    code.is_some_and(|code| {
+        GRANT_REJECTION_CODES
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(code))
+    })
+}
+
 pub fn format_expired_rfc3339(unix: i64) -> String {
     DateTime::<Utc>::from_timestamp(unix, 0)
         .unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
         .to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 pub enum RefreshError {
     #[error("http: {0}")]
     Http(#[from] reqwest::Error),
-    #[error("status {code}: {body}")]
+    /// The upstream body is kept for local classification only and never
+    /// rendered: an IdP or proxy may echo tokens or a credential-bearing URL.
+    #[error("status {code}")]
     Status { code: u16, body: String },
     #[error("parse: {0}")]
     Parse(String),
@@ -24,14 +60,46 @@ pub enum RefreshError {
     Io(#[from] std::io::Error),
 }
 
+impl std::fmt::Debug for RefreshError {
+    /// Derived Debug would print the retained upstream body, which the same
+    /// IdP or proxy can fill with the presented tokens. Keep the enum
+    /// inspectable without ever projecting that body.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RefreshError::Http(error) => f.debug_tuple("Http").field(error).finish(),
+            RefreshError::Status { code, body } => f
+                .debug_struct("Status")
+                .field("code", code)
+                .field("body_bytes", &body.len())
+                .finish(),
+            RefreshError::Parse(message) => f.debug_tuple("Parse").field(message).finish(),
+            RefreshError::Io(error) => f.debug_tuple("Io").field(error).finish(),
+        }
+    }
+}
+
 impl RefreshError {
-    /// Whether this error represents an explicit, permanent authentication rejection by the IdP
-    /// (e.g. HTTP 400 invalid_grant, 401 Unauthorized, 403 Forbidden).
-    /// Network errors, timeouts, 5xx server errors, or I/O errors are transient transport
-    /// problems and MUST NOT cause the account to be marked as AuthFailed.
+    /// Whether this refresh failure proves the stored grant is dead and must
+    /// not be replayed. Stricter than [`RefreshError::is_auth_failure`]: a 403
+    /// may be a WAF or proxy rejection for a valid grant.
+    pub fn is_grant_rejection(&self) -> bool {
+        match self {
+            RefreshError::Status { code: 401, .. } => true,
+            RefreshError::Status { code: 400, body } => is_grant_rejection_body(body),
+            _ => false,
+        }
+    }
+
+    /// Whether this error represents an explicit, permanent authentication rejection by the IdP.
+    ///
+    /// Only positive evidence counts: 401, or a 400 whose OAuth error code is a
+    /// grant rejection. A WAF 403, a payment 402, or a non-grant 400 says
+    /// nothing about the credential, so those stay retryable. Network errors,
+    /// timeouts, 5xx, and I/O errors are likewise transient.
     pub fn is_auth_failure(&self) -> bool {
         match self {
-            RefreshError::Status { code, .. } => (400..=403).contains(code),
+            RefreshError::Status { code: 401, .. } => true,
+            RefreshError::Status { code: 400, body } => is_grant_rejection_body(body),
             _ => false,
         }
     }
@@ -591,5 +659,20 @@ mod tests {
         assert_eq!(val2["last_refresh"], expected_now_rfc.as_str());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_status_error_never_renders_the_upstream_body() {
+        // An IdP or an intercepting proxy can echo the presented tokens in an
+        // error page; the Display projection reaches logs verbatim.
+        let error = RefreshError::Status {
+            code: 400,
+            body: "{\"error\":\"invalid_grant\",\"echo\":\"refresh_token=SECRET-RT\"} SECRET-BODY".to_string(),
+        };
+        let rendered = error.to_string();
+        assert!(rendered.contains("status 400"), "{rendered}");
+        assert!(!rendered.contains("SECRET"), "body leaked: {rendered}");
+        assert!(!rendered.contains("invalid_grant"), "body leaked: {rendered}");
+        assert!(!format!("{error:?}").contains("SECRET"), "debug leaked");
     }
 }

@@ -41,16 +41,17 @@ const LEGACY_CLAUDE_MODELS: [&str; 12] = [
 const LEGACY_ZCODE_MODELS: [&str; 5] =
     ["glm-5.3", "glm-5.3-flash", "glm-5.2", "glm-5.1", "glm-4.6"];
 
-// 4. Kiro models (8) - exposed as kiro/{model}
-const LEGACY_KIRO_MODELS: [&str; 8] = [
+// 4. Kiro models (7) - exposed as kiro/{model}, dot-notation runtime ids.
+// Date-suffixed ids (claude-sonnet-4-5-20250929, claude-haiku-4-5-20251001) are
+// rejected by runtime.{region}.kiro.dev with INVALID_MODEL_ID; the runtime
+// accepts the normalized dot form instead.
+const LEGACY_KIRO_MODELS: [&str; 6] = [
     "auto",
     "claude-sonnet-4.6",
+    "claude-sonnet-4.5",
     "claude-opus-4.6",
+    "claude-opus-4.5",
     "claude-haiku-4.5",
-    "claude-sonnet-4-5-20250929",
-    "claude-sonnet-4-5-20250929-thinking",
-    "claude-haiku-4-5-20251001",
-    "claude-haiku-4-5-20251001-thinking",
 ];
 
 // 5. Cursor models (4 in /v1/models + 2 cursor-*)
@@ -178,7 +179,7 @@ fn embedded_catalog_covers_legacy_sources() {
         }
     }
 
-    // 4. Verify all 8 Kiro models (as kiro/{model})
+    // 4. Verify all Kiro runtime models (as kiro/{model})
     let kiro_provider = ProviderId::kiro();
     for raw in LEGACY_KIRO_MODELS {
         let prefixed = format!("kiro/{raw}");
