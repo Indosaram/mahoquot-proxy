@@ -9,6 +9,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::prelude::*;
+#[cfg(test)]
 use mahoquot_providers::credential_file::write_credential_atomically;
 use mahoquot_providers::{antigravity_client_id, antigravity_client_secret};
 use serde_json::{json, Value};
@@ -159,6 +160,74 @@ fn antigravity_daily_url<'a>(session: &OAuthSession, meta: &'a Value) -> Result<
     Ok(ANTIGRAVITY_DEFAULT_DAILY_URL)
 }
 
+/// Onboarding is an asynchronous operation: the first answer may report
+/// `done: false` with no project yet, and persisting that as a completed login
+/// leaves an unusable credential. Poll within a fixed bound instead, and fail
+/// the login rather than store an account whose project is still unknown.
+const ANTIGRAVITY_ONBOARD_ATTEMPTS: u32 = 6;
+
+async fn onboard_antigravity_project(
+    client: &reqwest::Client,
+    daily_url: &str,
+    access_token: &str,
+) -> Result<String, String> {
+    let mut last = String::from("no response");
+    for attempt in 0..ANTIGRAVITY_ONBOARD_ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_millis(500 * u64::from(attempt))).await;
+        }
+        let response = client
+            .post(daily_url)
+            .header("authorization", format!("Bearer {access_token}"))
+            .header("accept", "*/*")
+            .header("content-type", "application/json")
+            .header("user-agent", mahoquot_providers::ANTIGRAVITY_USER_AGENT)
+            .json(&json!({
+                "tier_id": "free-tier",
+                "metadata": {
+                    "ide_type": "ANTIGRAVITY",
+                    "ide_name": "antigravity",
+                    "ide_version": "2.5.5"
+                }
+            }))
+            .send()
+            .await
+            .map_err(|error| format!("onboarding request failed: {error}"))?;
+        let status = response.status();
+        let data: Value = response.json().await.unwrap_or(Value::Null);
+        if !status.is_success() {
+            // 429 and 5xx may clear; a rejected request will not.
+            if status.is_client_error() && status != StatusCode::TOO_MANY_REQUESTS {
+                return Err(format!("onboarding rejected with status {status}"));
+            }
+            last = format!("status {status}");
+            continue;
+        }
+        let mut project = extract_antigravity_project_id(&data);
+        if project.is_empty() {
+            if let Some(inner) = data.get("response") {
+                project = extract_antigravity_project_id(inner);
+            }
+        }
+        let done = data
+            .get("done")
+            .and_then(Value::as_bool)
+            .or_else(|| data.get("response")?.get("done")?.as_bool())
+            .unwrap_or(true);
+        if done {
+            return if project.is_empty() {
+                Err("onboarding finished without a project".to_string())
+            } else {
+                Ok(project)
+            };
+        }
+        last = "operation still pending".to_string();
+    }
+    Err(format!(
+        "gave up after {ANTIGRAVITY_ONBOARD_ATTEMPTS} attempts: {last}"
+    ))
+}
+
 fn extract_antigravity_project_id(data: &Value) -> String {
     for key in ["cloudaicompanionProject", "projectId", "project"] {
         if let Some(val) = data.get(key) {
@@ -185,6 +254,19 @@ async fn exchange_antigravity_code(
     code: &str,
 ) -> Result<(), String> {
     let extra_meta: Value = serde_json::from_str(&session.poll_url).unwrap_or(json!({}));
+    let auth_dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
+    let requested_name = extra_meta.get("credential_name").and_then(Value::as_str);
+    let expected_target = if let Some(name) = requested_name {
+        if name.is_empty() || name.contains(['/', '\\']) || !name.ends_with(".json") {
+            return Err("Invalid reauthentication credential name".to_string());
+        }
+        let raw = tokio::fs::read(auth_dir.join(name))
+            .await
+            .map_err(|e| format!("Cannot read reauthentication target: {e}"))?;
+        Some(serde_json::from_slice::<Value>(&raw).map_err(|e| e.to_string())?)
+    } else {
+        None
+    };
     let client_id = extra_meta
         .get("client_id")
         .and_then(Value::as_str)
@@ -325,36 +407,14 @@ async fn exchange_antigravity_code(
     }
 
     if project_id.is_empty() {
-        let onboard_resp = state
-            .http_client()
-            .post(daily_url)
-            .header("authorization", format!("Bearer {access_token}"))
-            .header("accept", "*/*")
-            .header("content-type", "application/json")
-            .header("user-agent", mahoquot_providers::ANTIGRAVITY_USER_AGENT)
-            .json(&json!({
-                "tier_id": "free-tier",
-                "metadata": {
-                    "ide_type": "ANTIGRAVITY",
-                    "ide_name": "antigravity",
-                    "ide_version": "2.5.5"
-                }
-            }))
-            .send()
-            .await;
-
-        if let Ok(resp) = onboard_resp {
-            if resp.status().is_success() {
-                if let Ok(data) = resp.json::<Value>().await {
-                    project_id = extract_antigravity_project_id(&data);
-                    if project_id.is_empty() {
-                        if let Some(resp_obj) = data.get("response") {
-                            project_id = extract_antigravity_project_id(resp_obj);
-                        }
-                    }
-                }
-            }
-        }
+        project_id = onboard_antigravity_project(&state.http_client(), daily_url, access_token)
+            .await
+            .map_err(|error| format!("Antigravity onboarding failed for {email}: {error}"))?;
+    }
+    if project_id.is_empty() {
+        return Err(format!(
+            "Antigravity onboarding for {email} returned no project; reauthenticate once the account is provisioned"
+        ));
     }
 
     let now_secs = current_timestamp_secs();
@@ -364,7 +424,7 @@ async fn exchange_antigravity_code(
         .unwrap_or(0);
     let expired_rfc3339 = format_rfc3339(now_secs.saturating_add(expires_in.max(0) as u64));
 
-    let mut credential = json!({
+    let credential = json!({
         "type": "antigravity",
         "access_token": access_token,
         "refresh_token": refresh_token,
@@ -377,19 +437,10 @@ async fn exchange_antigravity_code(
     });
 
     let filename = format!("antigravity-{}.json", sanitize_filename(&email));
-    let auth_dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
     let mut target = auth_dir.join(filename);
-    let requested_name = extra_meta.get("credential_name").and_then(Value::as_str);
-    let mut existing = None;
+    let mut existing = expected_target;
     if let Some(name) = requested_name {
-        if name.is_empty() || name.contains(['/', '\\']) || !name.ends_with(".json") {
-            return Err("Invalid reauthentication credential name".to_string());
-        }
         target = auth_dir.join(name);
-        let raw = tokio::fs::read(&target)
-            .await
-            .map_err(|e| format!("Cannot read reauthentication target: {e}"))?;
-        existing = Some(serde_json::from_slice::<Value>(&raw).map_err(|e| e.to_string())?);
     } else {
         let mut entries = tokio::fs::read_dir(&auth_dir)
             .await
@@ -416,24 +467,7 @@ async fn exchange_antigravity_code(
             }
         }
     }
-    if let Some(mut old) = existing {
-        if old["type"] != "antigravity"
-            || !old["email"]
-                .as_str()
-                .is_some_and(|value| value.eq_ignore_ascii_case(&email))
-        {
-            return Err("Reauthentication used a different Google account; sign in with the original account".to_string());
-        }
-        if refresh_token.is_empty() {
-            credential["refresh_token"] = old["refresh_token"].clone();
-        }
-        if let (Some(old), Some(new)) = (old.as_object_mut(), credential.as_object()) {
-            old.extend(new.clone());
-        }
-        credential = old;
-    }
-    let rendered = serde_json::to_string_pretty(&credential).map_err(|error| error.to_string())?;
-    persist_session_credential(state, session, &target, rendered.as_bytes())?;
+    persist_antigravity_credential(state, session, &target, &credential, existing.as_ref())?;
 
     session.saved_account_email = Some(email);
     session.status = SessionStatus::Completed;
@@ -1176,6 +1210,7 @@ fn session_is_active(state: &str) -> bool {
     })
 }
 
+#[cfg(test)]
 fn write_session_credential(
     session: &OAuthSession,
     path: &std::path::Path,
@@ -1186,19 +1221,105 @@ fn write_session_credential(
     })
 }
 
+/// Runs a synchronous credential mutation under the shared composition lock.
+///
+/// `block_in_place` is only legal on the multi-threaded runtime; management
+/// handlers run there, while unit tests use the current-thread runtime and must
+/// not panic on the same code path.
+fn with_composition_lock<T>(_state: &AppState, body: impl FnOnce() -> T) -> T {
+    let multi_thread = tokio::runtime::Handle::try_current()
+        .map(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+        .unwrap_or(false);
+    if multi_thread {
+        tokio::task::block_in_place(body)
+    } else {
+        body()
+    }
+}
+
 fn persist_session_credential(
     state: &AppState,
     session: &OAuthSession,
     path: &std::path::Path,
     contents: &[u8],
 ) -> Result<(), String> {
-    if state.settings.storage_manager().is_none() {
-        return write_session_credential(session, path, contents);
-    }
-    tokio::task::block_in_place(|| {
+    with_composition_lock(state, || {
         let _mutation = state.settings.composition_lock();
         write_session_credential_with(session, || {
             super::creds::persist_credential(state, path, contents)
+                .map_err(|error| error.to_string())
+        })
+    })
+}
+
+fn merge_antigravity_credential(
+    issued: &Value,
+    expected: Option<&Value>,
+    current: Option<Value>,
+) -> Result<Value, String> {
+    if let Some(expected) = expected {
+        let mut current = current.ok_or("Reauthentication target was removed")?;
+        if current["type"] != "antigravity"
+            || !current["email"].as_str().is_some_and(|email| {
+                issued["email"]
+                    .as_str()
+                    .is_some_and(|new| email.eq_ignore_ascii_case(new))
+            })
+            || current["type"] != expected["type"]
+            || current["refresh_token"] != expected["refresh_token"]
+            || current["access_token"] != expected["access_token"]
+        {
+            return Err(
+                "Reauthentication target changed or belongs to a different Google account"
+                    .to_string(),
+            );
+        }
+        for field in [
+            "access_token",
+            "refresh_token",
+            "project_id",
+            "email",
+            "expires_in",
+            "timestamp",
+            "expired",
+        ] {
+            if field != "refresh_token"
+                || issued[field]
+                    .as_str()
+                    .is_some_and(|token| !token.is_empty())
+            {
+                current[field] = issued[field].clone();
+            }
+        }
+        Ok(current)
+    } else if current.is_some() {
+        Err("OAuth credential target already exists".to_string())
+    } else {
+        Ok(issued.clone())
+    }
+}
+
+fn persist_antigravity_credential(
+    state: &AppState,
+    session: &OAuthSession,
+    path: &std::path::Path,
+    issued: &Value,
+    expected: Option<&Value>,
+) -> Result<(), String> {
+    with_composition_lock(state, || {
+        let _mutation = state.settings.composition_lock();
+        write_session_credential_with(session, || {
+            let current = match std::fs::read(path) {
+                Ok(raw) => {
+                    Some(serde_json::from_slice::<Value>(&raw).map_err(|error| error.to_string())?)
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.to_string()),
+            };
+            let credential = merge_antigravity_credential(issued, expected, current)?;
+            let contents =
+                serde_json::to_vec_pretty(&credential).map_err(|error| error.to_string())?;
+            super::creds::persist_credential(state, path, &contents)
                 .map_err(|error| error.to_string())
         })
     })
@@ -1925,6 +2046,50 @@ pub(crate) async fn auth_status(
                     }
                 }
             }
+            if session.provider == "kiro" && session.status == SessionStatus::Pending {
+                let auth_dir = std::path::PathBuf::from(state.settings.current().auth_dir.clone());
+                let poll_result =
+                    poll_kiro_session(&state, &state.http_client(), &auth_dir, &mut session).await;
+                if !session_is_active(session_state) {
+                    return json_status(
+                        StatusCode::NOT_FOUND,
+                        json!({ "status": "error", "error": "OAuth session expired or cancelled" }),
+                    );
+                }
+                match poll_result {
+                    Ok(Some(_label)) => {
+                        if !session_is_active(session_state) {
+                            return json_status(
+                                StatusCode::NOT_FOUND,
+                                json!({ "status": "error", "error": "OAuth session expired or cancelled" }),
+                            );
+                        }
+                        if let Err(error) = state.rescan_pool() {
+                            eprintln!("pool rescan failed after kiro idc onboarding: {error}");
+                        }
+                        update_session_in(&mut SESSIONS.write().unwrap(), session.clone());
+                        return json_status(
+                            StatusCode::OK,
+                            json!({ "status": "ok", "provider": "kiro" }),
+                        );
+                    }
+                    Ok(None) => return json_status(StatusCode::OK, json!({ "status": "pending" })),
+                    Err(err) => {
+                        if !session_is_active(session_state) {
+                            return json_status(
+                                StatusCode::NOT_FOUND,
+                                json!({ "status": "error", "error": "OAuth session expired or cancelled" }),
+                            );
+                        }
+                        session.status = SessionStatus::Failed(err.clone());
+                        update_session_in(&mut SESSIONS.write().unwrap(), session);
+                        return json_status(
+                            StatusCode::BAD_REQUEST,
+                            json!({ "status": "error", "error": err }),
+                        );
+                    }
+                }
+            }
             if device_provider(&session.provider).is_some()
                 && session.status == SessionStatus::Pending
             {
@@ -2106,11 +2271,12 @@ async fn exchange_command_code_callback(
 
     let final_label = validated_user_name.trim();
 
-    let base_url = if session.challenge.is_empty() {
-        COMMAND_CODE_DEFAULT_BASE_URL
-    } else {
-        &session.challenge
-    };
+    let base_url =
+        if session.challenge.is_empty() || session.challenge == COMMAND_CODE_DEFAULT_BASE_URL {
+            "https://api.commandcode.ai"
+        } else {
+            &session.challenge
+        };
 
     let models =
         fetch_credential_models(&state.http_client(), base_url, api_key, "command-code").await?;
@@ -2120,7 +2286,7 @@ async fn exchange_command_code_callback(
         "provider": "command-code",
         "account_id": validated_user_id,
         "label": final_label,
-        "adapter": "openai-chat",
+        "adapter": "command-code",
         "base_url": base_url,
         "api_key": api_key,
         "auth_mode": "oauth",
@@ -2381,7 +2547,12 @@ async fn anthropic_auth_url_handler(
 ) -> Response {
     let (url, state, session) = create_anthropic_auth_url(&params);
     let listener = if !params.contains_key("redirect_uri") {
-        let listener = match bind_callback_listener("anthropic", app_state.oauth_callback_port_offset).await {
+        let listener = match bind_callback_listener(
+            "anthropic",
+            app_state.oauth_callback_port_offset,
+        )
+        .await
+        {
             Ok(listener) => listener,
             Err(error) => {
                 return json_status(
@@ -2569,7 +2740,12 @@ async fn antigravity_auth_url_handler(
 ) -> Response {
     let (url, state, session) = create_antigravity_auth_url(&params);
     let listener = if !params.contains_key("redirect_uri") {
-        let listener = match bind_callback_listener("antigravity", app_state.oauth_callback_port_offset).await {
+        let listener = match bind_callback_listener(
+            "antigravity",
+            app_state.oauth_callback_port_offset,
+        )
+        .await
+        {
             Ok(listener) => listener,
             Err(error) => {
                 return json_status(
@@ -2645,7 +2821,9 @@ async fn codex_auth_url_handler(
 ) -> Response {
     let (url, state, session) = create_codex_auth_url(&params);
     let listener = if !params.contains_key("redirect_uri") {
-        let listener = match bind_callback_listener("codex", app_state.oauth_callback_port_offset).await {
+        let listener = match bind_callback_listener("codex", app_state.oauth_callback_port_offset)
+            .await
+        {
             Ok(listener) => listener,
             Err(error) => {
                 return json_status(
@@ -2702,7 +2880,12 @@ async fn command_code_auth_url_handler(
 ) -> Response {
     let (url, state, session) = create_command_code_auth_url(&params);
     let listener = if !params.contains_key("redirect_uri") && !params.contains_key("callback") {
-        let listener = match bind_callback_listener("command-code", app_state.oauth_callback_port_offset).await {
+        let listener = match bind_callback_listener(
+            "command-code",
+            app_state.oauth_callback_port_offset,
+        )
+        .await
+        {
             Ok(listener) => listener,
             Err(error) => {
                 return json_status(
@@ -2918,6 +3101,166 @@ async fn zcode_auth_url_handler(
     }
 }
 
+/// An SSO OIDC login has no PKCE, no redirect and no callback listener: the
+/// operator approves a user code on the portal and this side polls the token
+/// endpoint. `OAuthSession` is shared with the redirect-based providers, so the
+/// device-flow state rides in its existing slots:
+///
+/// | slot          | holds           |
+/// |---------------|-----------------|
+/// | `challenge`   | OIDC client id  |
+/// | `verifier`    | OIDC client secret |
+/// | `redirect_uri`| Identity Center start URL |
+/// | `uuid`        | device code     |
+/// | `poll_url`    | Identity Center region |
+/// | `token_url`   | profile ARN, once resolved |
+async fn start_kiro_session(
+    state: &AppState,
+    params: &HashMap<String, String>,
+) -> Result<(String, String, OAuthSession), String> {
+    let region = params
+        .get("region")
+        .map(String::as_str)
+        .unwrap_or(mahoquot_providers::kiro_idc::KIRO_IDC_DEFAULT_REGION)
+        .to_string();
+    let start_url = params
+        .get("start_url")
+        .map(String::as_str)
+        .unwrap_or(mahoquot_providers::kiro_idc::KIRO_IDC_DEFAULT_START_URL)
+        .to_string();
+
+    let client = state.http_client();
+    let registration = mahoquot_providers::kiro_idc::register_client(&client, &region).await?;
+    let authorization = mahoquot_providers::kiro_idc::start_device_authorization(
+        &client,
+        &region,
+        &registration,
+        &start_url,
+    )
+    .await?;
+
+    let url = if authorization.verification_uri_complete.is_empty() {
+        authorization.verification_uri.clone()
+    } else {
+        authorization.verification_uri_complete.clone()
+    };
+
+    let session = OAuthSession {
+        state: new_state(),
+        provider: "kiro".to_string(),
+        verifier: registration.client_secret,
+        challenge: registration.client_id,
+        redirect_uri: start_url,
+        token_url: String::new(),
+        poll_url: region,
+        uuid: authorization.device_code,
+        status: SessionStatus::Pending,
+        created_at: Instant::now(),
+        saved_account_email: None,
+    };
+
+    Ok((url, authorization.user_code, session))
+}
+
+/// Polls the device token once. `Ok(None)` means the operator has not approved
+/// the code yet; `Ok(Some(label))` means a credential file was written.
+pub(crate) async fn poll_kiro_session(
+    state: &AppState,
+    client: &reqwest::Client,
+    auth_dir: &Path,
+    session: &mut OAuthSession,
+) -> Result<Option<String>, String> {
+    let region = session.poll_url.clone();
+    let registration = mahoquot_providers::kiro_idc::IdcClient {
+        client_id: session.challenge.clone(),
+        client_secret: session.verifier.clone(),
+    };
+    let outcome = mahoquot_providers::kiro_idc::poll_device_token(
+        client,
+        &region,
+        &registration,
+        &session.uuid,
+    )
+    .await?;
+    let (access_token, refresh_token, expires_in) = match outcome {
+        mahoquot_providers::kiro_idc::IdcPollOutcome::Pending
+        | mahoquot_providers::kiro_idc::IdcPollOutcome::SlowDown => return Ok(None),
+        mahoquot_providers::kiro_idc::IdcPollOutcome::Approved {
+            access_token,
+            refresh_token,
+            expires_in,
+        } => (access_token, refresh_token, expires_in),
+    };
+
+    let profile_arn = mahoquot_providers::kiro_idc::resolve_profile_arn(client, &access_token).await?;
+    session.token_url = profile_arn.clone();
+
+    // The token names no account and the account list is keyed by this label, so
+    // the usage endpoint is asked once. It is optional by construction: a
+    // failure only costs a generated label.
+    let email = mahoquot_providers::kiro_idc::fetch_account_email(client, &access_token, &profile_arn)
+        .await;
+    let label = email
+        .clone()
+        .unwrap_or_else(|| format!("kiro-{}", &session.state[..12]));
+
+    // The ARN carries the region the profile lives in, and that is the region
+    // the runtime host and the OIDC token host both answer on.
+    let credential_region = mahoquot_providers::kiro_idc::region_from_profile_arn(&profile_arn)
+        .unwrap_or(&region)
+        .to_string();
+
+    let now_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_default();
+    let expired = mahoquot_providers::format_expired_rfc3339(now_unix + expires_in.max(0));
+
+    let credential = mahoquot_providers::kiro_idc::credential_document(
+        &label,
+        &credential_region,
+        &registration,
+        &access_token,
+        &refresh_token,
+        &expired,
+        &profile_arn,
+    );
+    let rendered = serde_json::to_string_pretty(&credential).map_err(|error| error.to_string())?;
+    let filename = format!("kiro-{}.json", sanitize_filename(&label));
+    persist_session_credential(state, session, &auth_dir.join(filename), rendered.as_bytes())?;
+
+    session.saved_account_email = Some(label.clone());
+    session.status = SessionStatus::Completed;
+    Ok(Some(label))
+}
+
+async fn kiro_auth_url_handler(
+    State(app_state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    match start_kiro_session(&app_state, &params).await {
+        Ok((url, user_code, session)) => {
+            let state = session.state.clone();
+            publish_session(session, None);
+            json_status(
+                StatusCode::OK,
+                json!({
+                    "url": url,
+                    "state": state,
+                    "provider": "kiro",
+                    "status": "ok",
+                    "flow": "device",
+                    "user_code": user_code,
+                }),
+            )
+        }
+        Err(error) => json_status(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": error, "status": "error", "provider": "kiro" }),
+        ),
+    }
+}
+
 async fn xai_auth_url_handler(Query(params): Query<HashMap<String, String>>) -> Response {
     let (url, state, session) = create_xai_auth_url(&params);
     publish_session(session, None);
@@ -2951,6 +3294,7 @@ pub fn oauth_routes() -> Router<Arc<AppState>> {
         .route("/xai-auth-url", get(xai_auth_url_handler))
         .route("/command-code-auth-url", get(command_code_auth_url_handler))
         .route("/zcode-auth-url", get(zcode_auth_url_handler))
+        .route("/kiro-auth-url", get(kiro_auth_url_handler))
         .route("/devin-auth-url", get(devin_auth_url_handler))
         .route(
             "/kimi-auth-url",
@@ -3000,6 +3344,7 @@ pub async fn start_oauth_by_provider(
         "xai" => xai_auth_url_handler(Query(params)).await,
         "command-code" => command_code_auth_url_handler(State(state), Query(params)).await,
         "zcode" => zcode_auth_url_handler(State(state), Query(params)).await,
+        "kiro" => kiro_auth_url_handler(State(state), Query(params)).await,
         "kimi" => device_auth_url(State(state), Query(params), "kimi").await,
         "qwen" => device_auth_url(State(state), Query(params), "qwen").await,
         "nous" => device_auth_url(State(state), Query(params), "nous").await,
@@ -3014,6 +3359,52 @@ pub async fn start_oauth_by_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reauth_preserves_operator_disabled() {
+        let old = json!({"type":"antigravity", "email":"u@example.com", "refresh_token":"old", "access_token":"a", "disabled":true, "label":"operator"});
+        let issued = json!({"type":"antigravity", "email":"u@example.com", "refresh_token":"new", "access_token":"b", "disabled":false});
+        let merged = merge_antigravity_credential(&issued, Some(&old), Some(old.clone())).unwrap();
+        assert_eq!(merged["disabled"], true);
+        assert_eq!(merged["label"], "operator");
+        assert_eq!(merged["refresh_token"], "new");
+        assert_eq!(merged["access_token"], "b");
+        let mut changed = old.clone();
+        changed["refresh_token"] = json!("concurrent-rotation");
+        assert!(merge_antigravity_credential(&issued, Some(&old), Some(changed)).is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn oauth_write_takes_composition_lock() {
+        let mut fixture = ReviewFixture::new();
+        let session = test_session(&new_state(), Instant::now());
+        fixture.insert(session.clone());
+        let path = fixture.root.join("antigravity.json");
+        let old = json!({"type":"antigravity", "email":"u@example.com", "access_token":"a", "refresh_token":"r", "label":"old", "disabled":false});
+        std::fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+        let issued = json!({"type":"antigravity", "email":"u@example.com", "access_token":"b", "refresh_token":"s", "disabled":false});
+        let state = Arc::clone(&fixture.state);
+        let worker_path = path.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let mutation = fixture.state.settings.composition_lock();
+        let worker = tokio::task::spawn_blocking(move || {
+            started_tx.send(()).unwrap();
+            persist_antigravity_credential(&state, &session, &worker_path, &issued, Some(&old))
+        });
+        // Make an acknowledged metadata edit while the writer coordinator is
+        // held. The OAuth commit must re-read it after acquiring that lock.
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut current: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        current["label"] = json!("latest");
+        current["disabled"] = json!(true);
+        write_credential_atomically(&path, &serde_json::to_vec(&current).unwrap()).unwrap();
+        drop(mutation);
+        review_bounded(worker).await.unwrap().unwrap();
+        let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["label"], "latest");
+        assert_eq!(saved["disabled"], true);
+        assert_eq!(saved["refresh_token"], "s");
+    }
 
     #[test]
     fn xai_defaults_use_the_published_oauth2_endpoints() {
@@ -3046,6 +3437,7 @@ mod tests {
             "nous",
             "github-copilot",
             "command-code",
+            "kiro",
         ];
         for path in &advertised {
             let provider = path.trim_start_matches('/').trim_end_matches("-auth-url");
@@ -3832,5 +4224,58 @@ mod tests {
         assert!(!SESSIONS.read().unwrap().contains_key(&state_key));
         assert!(!LISTENERS.lock().unwrap().contains_key(&state_key));
         assert_port_released(port).await;
+    }
+
+    #[tokio::test]
+    async fn antigravity_login_waits_for_project_before_persist() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mock = Router::new().route(
+            "/daily",
+            post({
+                let hits = hits.clone();
+                move || {
+                    let hits = hits.clone();
+                    async move {
+                        let attempt = hits.fetch_add(1, Ordering::SeqCst);
+                        if attempt == 0 {
+                            // The live endpoint answers before provisioning settles.
+                            Json(json!({"done": false}))
+                        } else {
+                            Json(json!({"done": true, "response": {"projectId": "late-project"}}))
+                        }
+                    }
+                }
+            }),
+        );
+        let (listener, port) = allocate_test_listener().await;
+        let task = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+        let url = format!("http://127.0.0.1:{port}/daily");
+        let project = onboard_antigravity_project(&client, &url, "fixture-token")
+            .await
+            .expect("pending onboarding must be retried, not persisted empty");
+        assert_eq!(project, "late-project");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        task.abort();
+        let _ = task.await;
+
+        let empty = Router::new().route("/daily", post(|| async { Json(json!({"done": true})) }));
+        let (listener, port) = allocate_test_listener().await;
+        let task = tokio::spawn(async move { axum::serve(listener, empty).await.unwrap() });
+        let url = format!("http://127.0.0.1:{port}/daily");
+        let error = onboard_antigravity_project(&client, &url, "fixture-token")
+            .await
+            .expect_err("a finished onboarding without a project must fail the login");
+        assert!(
+            error.contains("without a project"),
+            "unexpected error: {error}"
+        );
+        task.abort();
+        let _ = task.await;
     }
 }

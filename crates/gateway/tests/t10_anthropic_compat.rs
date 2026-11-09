@@ -285,9 +285,11 @@ fn test_t10_anthropic_usage_with_cache_creation_input_tokens_parses_into_cache_w
         }
     });
     let openai = anthropic_json_to_openai(&response, "claude-3-5-sonnet", 1234);
-    assert_eq!(openai["usage"]["prompt_tokens"], 50);
+    // OpenAI prompt tokens are the full billed input: raw input plus both
+    // cache reads and cache writes (L1-01).
+    assert_eq!(openai["usage"]["prompt_tokens"], 100);
     assert_eq!(openai["usage"]["completion_tokens"], 15);
-    assert_eq!(openai["usage"]["total_tokens"], 65);
+    assert_eq!(openai["usage"]["total_tokens"], 115);
     assert_eq!(openai["usage"]["cache_read_input_tokens"], 30);
     assert_eq!(openai["usage"]["cache_creation_input_tokens"], 20);
     assert_eq!(

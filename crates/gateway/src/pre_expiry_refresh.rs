@@ -5,11 +5,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use futures::StreamExt;
 use tracing::{debug, info, warn};
 
+#[cfg(test)]
 use mahoquot_types::Health;
 
 use crate::account::{AccountMember, ProviderKind};
 use crate::state::AppState;
 
+#[cfg(test)]
 use mahoquot_providers::refresh_exec::RefreshError;
 
 pub const DEFAULT_LEAD: Duration = Duration::from_secs(2 * 60 * 60);
@@ -38,6 +40,10 @@ fn is_refreshable(member: &AccountMember) -> bool {
     // scan interval can never succeed and only risks the identity provider
     // throttling the client, so it waits for an operator to re-authenticate.
     !member.is_auth_failed()
+        // The grant is turned over; replaying it can revoke the family. The
+        // account still serves inference on its unexpired access token, so
+        // this suppresses the refresh only, not routing.
+        && !member.is_grant_rejected()
         // An operator-disabled account is out of service on purpose; rotating
         // its credential spends a request the rotation cannot pay back.
         && !member.is_manually_disabled()
@@ -62,22 +68,13 @@ fn rotation_is_due(last_rotation: Option<Instant>, now: Instant, min_interval: D
 
 /// Whether a failed refresh proves the grant itself is dead.
 ///
-/// `RefreshError::is_auth_failure` spans 400..=403 because the serving path
-/// benches on it. Proactive refresh must be stricter: a 403 there can be a WAF
-/// or proxy rejection for a perfectly valid grant, and benching a healthy
-/// account from a background scan removes capacity until the next restart. The
-/// observed terminal rejection for a rotated-away refresh token is 400
-/// `invalid_grant`; 401 covers a credential the issuer no longer honours.
-fn is_grant_rejection(error: &RefreshError) -> bool {
-    matches!(
-        error,
-        RefreshError::Status {
-            code: 400 | 401,
-            ..
-        }
-    )
-}
-
+/// The classification is shared with the serving path
+/// (`RefreshError::is_grant_rejection`) so both agree on what evidence counts.
+/// A 403 can be a WAF or proxy rejection for a perfectly valid grant, and
+/// benching a healthy account from a background scan removes capacity until the
+/// next restart. The observed terminal rejection for a rotated-away refresh
+/// token is 400 `invalid_grant`; 401 covers a credential the issuer no longer
+/// honours.
 pub async fn refresh_expiring(
     state: &Arc<AppState>,
     lead: Duration,
@@ -121,11 +118,12 @@ pub async fn refresh_expiring(
                 }
                 Ok(false) => None,
                 Err(error) => {
-                    if is_grant_rejection(&error) {
-                        // Terminal: the grant is dead, only re-authentication
-                        // can fix it. Bench it the same way every other refresh
-                        // caller does so the scan stops retrying.
-                        member.set_health(Health::AuthFailed);
+                    if error.is_grant_rejection() {
+                        // Terminal for this grant, not for the request path:
+                        // the access token is still valid until it expires, so
+                        // only the replay stops. Benching here removed working
+                        // capacity up to two hours early.
+                        member.mark_grant_rejected();
                         warn!(
                             account = %member.id,
                             provider = ?member.kind(),
@@ -256,15 +254,15 @@ mod tests {
     fn only_a_rejected_grant_benches_the_account() {
         let invalid_grant = RefreshError::Status {
             code: 400,
-            body: "invalid_grant".to_string(),
+            body: r#"{"error":"invalid_grant"}"#.to_string(),
         };
-        assert!(is_grant_rejection(&invalid_grant));
+        assert!(invalid_grant.is_grant_rejection());
 
         let revoked = RefreshError::Status {
             code: 401,
             body: String::new(),
         };
-        assert!(is_grant_rejection(&revoked));
+        assert!(revoked.is_grant_rejection());
 
         // A WAF or egress proxy can answer 403 for a grant that is still valid;
         // a background scan must not bench the account over it.
@@ -272,16 +270,54 @@ mod tests {
             code: 403,
             body: "blocked".to_string(),
         };
-        assert!(!is_grant_rejection(&waf));
+        assert!(!waf.is_grant_rejection());
+        assert!(!waf.is_auth_failure());
+
+        // A payment failure (402) or a non-grant 400 says nothing about the
+        // stored credential.
+        let payment = RefreshError::Status {
+            code: 402,
+            body: String::new(),
+        };
+        assert!(!payment.is_grant_rejection());
+        assert!(!payment.is_auth_failure());
+        let malformed = RefreshError::Status {
+            code: 400,
+            body: "<html>bad request</html>".to_string(),
+        };
+        assert!(!malformed.is_auth_failure());
 
         let throttled = RefreshError::Status {
             code: 429,
             body: String::new(),
         };
-        assert!(!is_grant_rejection(&throttled));
+        assert!(!throttled.is_grant_rejection());
+        assert!(!throttled.is_auth_failure());
 
         let transport = RefreshError::Io(std::io::Error::other("reset"));
-        assert!(!is_grant_rejection(&transport));
+        assert!(!transport.is_grant_rejection());
+        assert!(!transport.is_auth_failure());
+    }
+
+    #[test]
+    fn a_rejected_grant_keeps_the_working_access_token_routable() {
+        let member = AccountMember::for_test(ProviderAccount::Codex(CodexAccount {
+            email: "test@example.com".to_string(),
+            ..Default::default()
+        }));
+        assert!(is_refreshable(&member));
+
+        // The issuer rejected the grant, but the access token has not expired.
+        member.mark_grant_rejected();
+        assert!(member.is_grant_rejected());
+        assert!(!is_refreshable(&member), "the dead grant is not replayed");
+        assert!(
+            !member.is_auth_failed(),
+            "the account still serves inference"
+        );
+
+        member.clear_grant_rejection();
+        assert!(is_refreshable(&member));
     }
 
     #[test]
@@ -303,8 +339,8 @@ mod tests {
         }));
         assert!(is_refreshable(&member), "a healthy credential is scanned");
 
-        // A rejected grant cannot start working on a timer, so the scan must
-        // stop presenting it to the identity provider.
+        // A re-authenticated account is published with fresh health, and a
+        // terminal failure is still skipped by the scan.
         member.set_health(Health::AuthFailed);
         assert!(!is_refreshable(&member));
     }

@@ -1,4 +1,4 @@
-//! Gemini Interactions: native Google pass-through and Antigravity translation.
+//! Gemini Interactions: native Google pass-through and provider translation.
 //! The router owns the continuation cache through an Extension, never a global.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -30,7 +30,7 @@ struct Continuation {
     owner: String,
     namespace: String,
     environment: Option<Value>,
-    /// Full Gemini history, including opaque signed model parts.
+    /// Full provider history, including opaque signed model parts.
     contents: Value,
     calls: Vec<Value>,
     expires: Instant,
@@ -286,7 +286,12 @@ pub async fn handle(
         .filter(|member| {
             let native = member.kind() == ProviderKind::Generic
                 && member.generic_adapter().as_deref() == Some("google");
-            (native || (!agent && member.kind() == ProviderKind::Antigravity))
+            (native
+                || (!agent
+                    && matches!(
+                        member.kind(),
+                        ProviderKind::Antigravity | ProviderKind::Devin
+                    )))
                 && eligible_ids
                     .as_ref()
                     .is_none_or(|ids| ids.contains(&member.id))
@@ -324,6 +329,7 @@ pub async fn handle(
         );
     };
     let native = member.kind() == ProviderKind::Generic;
+    let devin = member.kind() == ProviderKind::Devin;
     let model = if agent {
         target.clone()
     } else {
@@ -409,6 +415,21 @@ pub async fn handle(
             format!("{base}/v1beta/interactions")
         };
         (url, body, Value::Null)
+    } else if devin {
+        let request = match interactions_to_devin(&body, saved.as_ref()) {
+            Ok(request) => request,
+            Err(message) => return error(StatusCode::BAD_REQUEST, message),
+        };
+        let history = request["messages"].clone();
+        (
+            crate::url::build_provider_url(
+                member.kind(),
+                member.upstream_override.as_deref(),
+                "/exa.api_server_pb.ApiServerService/GetChatMessage",
+            ),
+            request,
+            history,
+        )
     } else {
         let mut request = match crate::compat::gemini::interactions_to_gemini(&body) {
             Ok(request) => request,
@@ -431,7 +452,13 @@ pub async fn handle(
         &crate::management::settings::PayloadContext {
             model: &model,
             requested_model: &target,
-            protocol: if native { "interactions" } else { "gemini" },
+            protocol: if native {
+                "interactions"
+            } else if devin {
+                "openai"
+            } else {
+                "gemini"
+            },
             from_protocol: "interactions",
             headers: &headers,
             original: &original,
@@ -439,7 +466,7 @@ pub async fn handle(
     ) {
         return error(StatusCode::BAD_REQUEST, message);
     }
-    let wire = if native {
+    let wire = if native || devin {
         business
     } else {
         let Some(project) = member.project_id() else {
@@ -453,7 +480,49 @@ pub async fn handle(
     };
     let activity = member.begin_activity();
     let started = Instant::now();
-    let response = match crate::relay::send_interactions(&state, &member, &url, &wire).await {
+    let sent = if devin {
+        let uid = model.strip_prefix("devin/").unwrap_or(&model);
+        let params = crate::compat::devin::DevinRequestParams {
+            token: member.access_token(),
+            chat_model_uid: uid.to_string(),
+            supports_vision: pool.devin_model_supports_vision(&member.id, uid),
+            trajectory_id: uuid::Uuid::new_v4().to_string(),
+            cascade_id: uuid::Uuid::new_v4().to_string(),
+            execution_id: uuid::Uuid::new_v4().to_string(),
+            fingerprint: "0123456789abcdef0123456789abcdef".into(),
+        };
+        let wire = match crate::compat::devin::build_chat_request(&wire, &params, &mut || {
+            uuid::Uuid::new_v4().to_string()
+        }) {
+            Ok(wire) => wire,
+            Err(message) => return error(StatusCode::BAD_REQUEST, message),
+        };
+        let client = match state.try_devin_client_for_member(&member) {
+            Ok(client) => client,
+            Err(message) => return error(StatusCode::BAD_GATEWAY, message.to_string()),
+        };
+        client
+            .post(&url)
+            .header(
+                header::AUTHORIZATION,
+                crate::compat::devin::authorization_header(&params.token),
+            )
+            .header(
+                header::CONTENT_TYPE,
+                crate::compat::devin::STREAM_CONTENT_TYPE,
+            )
+            .header(
+                "connect-protocol-version",
+                crate::compat::devin::CONNECT_PROTOCOL_VERSION,
+            )
+            .body(crate::compat::devin::frame_data(&wire))
+            .send()
+            .await
+            .map_err(|error| error.to_string())
+    } else {
+        crate::relay::send_interactions(&state, &member, &url, &wire).await
+    };
+    let response = match sent {
         Ok(response) => response,
         Err(message) => return error(StatusCode::BAD_GATEWAY, message.to_string()),
     };
@@ -480,8 +549,24 @@ pub async fn handle(
             response,
         );
     }
+    if devin
+        && response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_none_or(|value| {
+                value.split(';').next().unwrap_or("").trim()
+                    != crate::compat::devin::STREAM_CONTENT_TYPE
+            })
+    {
+        return error(
+            StatusCode::BAD_GATEWAY,
+            "invalid Devin Connect content type",
+        );
+    }
     let mut observer = Observer::new(native, model, namespace, history, store);
     observer.owner = owner;
+    observer.devin = devin;
     observer.function_names = crate::compat::gemini::interactions_function_names(&original)
         .into_iter()
         .map(|(original, mapped)| (mapped, original))
@@ -515,7 +600,11 @@ pub async fn handle(
             response,
         );
     }
-    let body = stream_body(response, observer);
+    let body = if devin {
+        devin_stream_body(response, observer)
+    } else {
+        stream_body(response, observer)
+    };
     if stream {
         let response = (
             status,
@@ -585,8 +674,308 @@ pub async fn handle(
     )
 }
 
+fn interactions_to_devin(body: &Value, saved: Option<&Continuation>) -> Result<Value, String> {
+    let mut messages = saved
+        .and_then(|saved| saved.contents.as_array().cloned())
+        .unwrap_or_default();
+    if saved.is_none() {
+        if let Some(system) = body.get("system_instruction") {
+            messages.push(json!({"role":"system","content":system}));
+        }
+    }
+    let input = body.get("input").ok_or("missing input")?;
+    let steps = if let Some(text) = input.as_str() {
+        vec![json!({"type":"user_input","content":text})]
+    } else {
+        input
+            .as_array()
+            .cloned()
+            .ok_or("input must be a string or array")?
+    };
+    for step in steps {
+        match step.get("type").and_then(Value::as_str) {
+            Some("user_input" | "model_output") => {
+                let content = step
+                    .get("content")
+                    .cloned()
+                    .ok_or("input step requires content")?;
+                let mut reasoning = String::new();
+                let mut signature = None;
+                let content = if let Some(parts) = content.as_array() {
+                    let mut mapped = Vec::new();
+                    for part in parts {
+                        match part.get("type").and_then(Value::as_str) {
+                            Some("text") => mapped.push(json!({"type":"text","text":part["text"]})),
+                            Some("image") => {
+                                let url =
+                                    if let Some(data) = part.get("data").and_then(Value::as_str) {
+                                        format!(
+                                            "data:{};base64,{data}",
+                                            part.get("mime_type")
+                                                .and_then(Value::as_str)
+                                                .unwrap_or("image/png")
+                                        )
+                                    } else {
+                                        part.get("uri")
+                                            .and_then(Value::as_str)
+                                            .ok_or("image requires data or uri")?
+                                            .to_string()
+                                    };
+                                mapped.push(json!({"type":"image_url","image_url":{"url":url}}));
+                            }
+                            Some("thought") => {
+                                reasoning.push_str(
+                                    part.get("text").and_then(Value::as_str).unwrap_or(""),
+                                );
+                                if let Some(value) = part
+                                    .get("thought_signature")
+                                    .or_else(|| part.get("thoughtSignature"))
+                                {
+                                    signature = Some(value.clone());
+                                }
+                            }
+                            _ => return Err("unsupported Devin content part".into()),
+                        }
+                    }
+                    json!(mapped)
+                } else {
+                    content
+                };
+                let mut message = json!({"role":if step["type"] == "user_input" {"user"} else {"assistant"},"content":content});
+                if !reasoning.is_empty() {
+                    message["reasoning_content"] = json!(reasoning);
+                }
+                if let Some(signature) = signature {
+                    message["reasoning_signature"] = signature;
+                }
+                messages.push(message);
+            }
+            Some("thought") => {
+                let content = step.get("text").or_else(|| step.get("content"));
+                let text = match content {
+                    Some(Value::String(text)) => text.clone(),
+                    Some(Value::Array(parts)) => parts
+                        .iter()
+                        .filter_map(|part| part.get("text").and_then(Value::as_str))
+                        .collect::<String>(),
+                    None => String::new(),
+                    _ => return Err("thought content must be a string or array".into()),
+                };
+                messages.push(json!({"role":"assistant","content":"","reasoning_content":text,"reasoning_signature":step.get("thought_signature").or_else(|| step.get("signature")).or_else(|| step.get("thoughtSignature")),"reasoning_redacted":step.get("redacted")}));
+            }
+            Some("function_call") => {
+                let id = step
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .ok_or("function_call requires id")?;
+                let name = step
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.is_empty())
+                    .ok_or("function_call requires name")?;
+                let arguments = step.get("arguments").cloned().unwrap_or(json!({}));
+                let arguments = if arguments.is_string() {
+                    arguments
+                } else {
+                    json!(arguments.to_string())
+                };
+                messages.push(json!({"role":"assistant","content":null,"tool_calls":[{"type":"function","id":id,"function":{"name":name,"arguments":arguments}}]}));
+            }
+            Some("function_result") => {
+                let result = step
+                    .get("result")
+                    .or_else(|| step.get("output"))
+                    .cloned()
+                    .ok_or("function_result requires result")?;
+                messages.push(json!({"role":"tool","tool_call_id":step["call_id"],"content":if result.is_string() {result} else {json!(result.to_string())},"is_error":step.get("is_error")}));
+            }
+            _ => return Err("unsupported Devin interaction step".into()),
+        }
+    }
+    let mut request = json!({"model":body.get("model"),"messages":messages});
+    if let Some(tools) = body.get("tools").and_then(Value::as_array) {
+        request["tools"] = json!(tools
+            .iter()
+            .map(|tool| json!({"type":"function","function":tool}))
+            .collect::<Vec<_>>());
+    }
+    if let Some(config) = body.get("generation_config").and_then(Value::as_object) {
+        for (source, target) in [
+            ("temperature", "temperature"),
+            ("top_p", "top_p"),
+            ("max_output_tokens", "max_tokens"),
+        ] {
+            if let Some(value) = config.get(source) {
+                request[target] = value.clone();
+            }
+        }
+    }
+    Ok(request)
+}
+
+fn devin_events(
+    observer: &mut Observer,
+    calls: &mut BTreeMap<u64, usize>,
+    events: Vec<crate::compat::events::CodexEvent>,
+) -> Result<Vec<u8>, String> {
+    use crate::compat::events::CodexEvent;
+    let mut out = Vec::new();
+    for value in events {
+        if !observer.started {
+            out.extend(event("interaction.created", json!({"interaction":{"id":observer.id,"object":"interaction","model":observer.model,"status":"in_progress"}})));
+            observer.started = true;
+        }
+        let step = match value {
+            CodexEvent::Created { response_id } => {
+                observer.id = response_id;
+                None
+            }
+            CodexEvent::TextDelta(text) => {
+                Some(json!({"type":"model_output","content":[{"type":"text","text":text}]}))
+            }
+            CodexEvent::ReasoningDelta(text) => Some(json!({"type":"thought","text":text})),
+            CodexEvent::ReasoningSignature(signature) => {
+                if let Some(step) = observer
+                    .steps
+                    .iter_mut()
+                    .rev()
+                    .find(|step| step["type"] == "thought")
+                {
+                    step["thought_signature"] = json!(signature);
+                }
+                None
+            }
+            CodexEvent::ReasoningRedacted => Some(json!({"type":"thought","redacted":true})),
+            CodexEvent::ToolCallBegin {
+                output_index,
+                call_id,
+                name,
+            } => {
+                calls.insert(output_index, observer.steps.len());
+                Some(json!({"type":"function_call","id":call_id,"name":name,"arguments":""}))
+            }
+            CodexEvent::ToolArgsDelta {
+                output_index,
+                delta,
+            } => {
+                let index = *calls
+                    .get(&output_index)
+                    .ok_or("Devin arguments without function call")?;
+                let arguments = observer.steps[index]["arguments"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string()
+                    + &delta;
+                observer.steps[index]["arguments"] = json!(arguments);
+                out.extend(event(
+                    "step.delta",
+                    json!({"index":index,"delta":{"type":"arguments_delta","arguments":delta}}),
+                ));
+                None
+            }
+            CodexEvent::Completed { usage } => {
+                observer.finished = true;
+                if let Some(usage) = usage {
+                    observer.usage = Some(
+                        json!({"promptTokenCount":usage.prompt_tokens,"candidatesTokenCount":usage.completion_tokens,"totalTokenCount":usage.total_tokens,"thoughtsTokenCount":usage.reasoning_tokens}),
+                    );
+                    if usage.cached_tokens_known {
+                        observer.usage.as_mut().unwrap()["cachedContentTokenCount"] =
+                            json!(usage.cached_tokens);
+                    }
+                }
+                None
+            }
+            CodexEvent::Failed { message } => return Err(message),
+            CodexEvent::OutputLimitReached | CodexEvent::ContentFilterReached => None,
+            CodexEvent::KiroRedactedReasoning(_) => {
+                return Err("unexpected Devin reasoning event".into())
+            }
+        };
+        if let Some(mut step) = step {
+            let index = observer.steps.len();
+            if step.get("id").is_none() {
+                step["id"] = json!(format!("step_{index}"));
+            }
+            out.extend(event("step.start", json!({"index":index,"step":step})));
+            if let Some(content) = step.pointer("/content/0") {
+                out.extend(event("step.delta", json!({"index":index,"delta":content})));
+            } else if step["type"] == "thought" {
+                out.extend(event("step.delta", json!({"index":index,"delta":step})));
+            }
+            observer.steps.push(step);
+        }
+    }
+    Ok(out)
+}
+
+fn devin_stream_body(response: reqwest::Response, observer: Observer) -> Body {
+    Body::from_stream(futures::stream::unfold(
+        (
+            response.bytes_stream(),
+            crate::compat::devin::DevinDecoder::new(),
+            observer,
+            BTreeMap::new(),
+            false,
+        ),
+        |(mut source, mut decoder, mut observer, mut calls, ended)| async move {
+            if ended {
+                return None;
+            }
+            let mut events = Vec::new();
+            let next = source.next().await;
+            let eof = next.is_none();
+            let result = match next {
+                Some(Ok(bytes)) => {
+                    observer.observed_bytes = observer.observed_bytes.saturating_add(bytes.len());
+                    if observer.observed_bytes > MAX_JSON {
+                        Err("interaction continuation exceeds size limit".to_string())
+                    } else {
+                        decoder.decode(&bytes, &mut events);
+                        Ok(())
+                    }
+                }
+                Some(Err(error)) => Err(error.to_string()),
+                None => {
+                    decoder.finish(&mut events);
+                    Ok(())
+                }
+            };
+            let result = result
+                .and_then(|()| devin_events(&mut observer, &mut calls, events))
+                .and_then(|mut out| {
+                    if eof {
+                        for &index in calls.values() {
+                            let arguments =
+                                observer.steps[index]["arguments"].as_str().unwrap_or("");
+                            observer.steps[index]["arguments"] = serde_json::from_str(arguments)
+                                .map_err(|error| error.to_string())?;
+                        }
+                        for (index, step) in observer.steps.iter().enumerate() {
+                            out.extend(event(
+                                "step.stop",
+                                json!({"index":index,"step_id":step["id"]}),
+                            ));
+                        }
+                        out.extend(observer.finish()?);
+                    }
+                    Ok(out)
+                });
+            let failed = result.is_err();
+            let out = result
+                .unwrap_or_else(|message| event("error", json!({"error":{"message":message}})));
+            Some((
+                Ok::<_, std::io::Error>(Bytes::from(out)),
+                (source, decoder, observer, calls, eof || failed),
+            ))
+        },
+    ))
+}
+
 struct Observer {
     native: bool,
+    devin: bool,
     model: String,
     namespace: String,
     owner: String,
@@ -614,6 +1003,7 @@ impl Observer {
     ) -> Self {
         Self {
             native,
+            devin: false,
             model,
             owner: namespace.clone(),
             namespace,
@@ -661,7 +1051,11 @@ impl Observer {
             .filter(|id| !id.is_empty())
             .ok_or("completed interaction requires id")?;
         let mut contents = self.history.as_array().cloned().unwrap_or_default();
-        if !self.parts.is_empty() {
+        if self.devin {
+            let response = json!({"input": self.steps});
+            let messages = interactions_to_devin(&response, None)?;
+            contents.extend(messages["messages"].as_array().cloned().unwrap_or_default());
+        } else if !self.parts.is_empty() {
             contents.push(json!({"role":"model","parts":self.parts}));
         }
         let now = Instant::now();
@@ -933,6 +1327,244 @@ fn stream_body(response: reqwest::Response, observer: Observer) -> Body {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prost::Message;
+
+    struct DevinFixture {
+        state: Arc<AppState>,
+        store: SharedInteractionsStore,
+        requests:
+            tokio::sync::mpsc::UnboundedReceiver<crate::compat::devin_proto::GetChatMessageRequest>,
+        server: tokio::task::JoinHandle<()>,
+        directory: std::path::PathBuf,
+    }
+
+    impl Drop for DevinFixture {
+        fn drop(&mut self) {
+            self.server.abort();
+            // The continuation store may still be flushing this directory from
+            // a spawned writer; a non-empty temp dir is not a test failure.
+            if let Err(error) = std::fs::remove_dir_all(&self.directory) {
+                eprintln!(
+                    "devin fixture cleanup skipped for {}: {error}",
+                    self.directory.display()
+                );
+            }
+        }
+    }
+
+    impl DevinFixture {
+        async fn new(tool: bool) -> Self {
+            use crate::compat::{devin, devin_proto};
+            use mahoquot_registry::{
+                AuthorityMask, CatalogSource, CatalogVersion, DiscoveredModel, ModelCapability,
+                ModelId, ProviderContribution, ProviderId, ProviderPolicy, RegistryBuilder,
+            };
+
+            let (sender, requests) = tokio::sync::mpsc::unbounded_channel();
+            let app = axum::Router::new().route(
+                "/exa.api_server_pb.ApiServerService/GetChatMessage",
+                axum::routing::post(move |headers: HeaderMap, bytes: Bytes| {
+                    let sender = sender.clone();
+                    async move {
+                        assert_eq!(
+                            headers[header::AUTHORIZATION],
+                            "Basic fixture-token-fixture-token"
+                        );
+                        assert_eq!(headers[header::CONTENT_TYPE], devin::STREAM_CONTENT_TYPE);
+                        assert_eq!(bytes[0], 0);
+                        assert_eq!(
+                            u32::from_be_bytes(bytes[1..5].try_into().unwrap()) as usize,
+                            bytes.len() - 5
+                        );
+                        sender
+                            .send(devin_proto::GetChatMessageRequest::decode(&bytes[5..]).unwrap())
+                            .unwrap();
+                        let message = devin_proto::ChatMessageResponse {
+                            delta_text: (!tool).then(|| "fixture answer".into()),
+                            delta_tool_calls: if tool {
+                                vec![devin_proto::ChatToolCall {
+                                    id: Some("call-fixture".into()),
+                                    name: Some("lookup".into()),
+                                    arguments_json: Some("{\"q\":1}".into()),
+                                }]
+                            } else {
+                                Vec::new()
+                            },
+                            ..Default::default()
+                        };
+                        let mut wire = devin::frame_data(&message.encode_to_vec());
+                        wire.extend(devin::frame_end_stream("{}"));
+                        ([(header::CONTENT_TYPE, devin::STREAM_CONTENT_TYPE)], wire)
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let directory =
+                std::env::temp_dir().join(format!("interactions-devin-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(
+                directory.join("devin.json"),
+                json!({
+                    "type":"devin", "identity_slug":"fixture", "access_token":"fixture-token",
+                    "api_server_url":url, "upstream_override":url, "disabled":false
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let config = crate::config::GatewayConfig {
+                auth_dir: directory.clone(),
+                config_path: directory.join("config.yaml"),
+                auth_refresh_enabled: false,
+                ..Default::default()
+            };
+            let state = Arc::new(AppState::new(&config).unwrap());
+            let mut registry =
+                RegistryBuilder::new(CatalogVersion::new(1), CatalogSource::Discovered);
+            registry.register_provider(ProviderId::devin(), ProviderPolicy::Discovered);
+            registry
+                .apply_contribution(
+                    ProviderContribution::from_discovered_models(
+                        ProviderId::devin(),
+                        vec![
+                            DiscoveredModel::new(ModelId::new("devin/fixture-model").unwrap())
+                                .with_capabilities([ModelCapability::Chat, ModelCapability::Tools])
+                                .with_authority(AuthorityMask::MODELS_ONLY),
+                        ],
+                    )
+                    .with_policy(ProviderPolicy::Discovered),
+                )
+                .unwrap();
+            let current = state.pool.load_full();
+            assert_eq!(current.members.len(), 1);
+            let member = &current.members[0];
+            assert_eq!(member.kind(), ProviderKind::Devin);
+            let key = crate::devin_catalog::DevinCacheKey::new(
+                &member.id,
+                &member.access_token(),
+                member.effective_base_url(),
+            );
+            let model = crate::devin_catalog::DiscoveredDevinModel {
+                model_uid: "fixture-model".into(),
+                public_id: "devin/fixture-model".into(),
+                label: "Fixture".into(),
+                supports_images: true,
+                is_premium: false,
+                is_beta: false,
+                is_recommended: false,
+                is_new: false,
+                is_capacity_limited: false,
+                promo_active: false,
+                max_tokens: Some(4096),
+                credit_multiplier: Some(1.0),
+                description: None,
+            };
+            member.set_devin_catalog_state(Arc::new(
+                crate::devin_catalog::DevinAccountCatalogState::new_success(key, vec![model], 100),
+            ));
+            state
+                .pool
+                .store(Arc::new(crate::runtime_state::PoolSnapshot::new(
+                    current.generation + 1,
+                    current.members.clone(),
+                    current.models.clone(),
+                    Arc::new(registry.build().unwrap()),
+                )));
+            Self {
+                state,
+                store: Arc::new(Mutex::new(InteractionsStore::default())),
+                requests,
+                server,
+                directory,
+            }
+        }
+
+        async fn request(&self, body: Value) -> (StatusCode, Value) {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-session-id", "fixture-session".parse().unwrap());
+            let response = handle(
+                State(self.state.clone()),
+                Extension(ResolvedAuth {
+                    identity: crate::inbound::AuthIdentity::Unrestricted,
+                    key_identifier: None,
+                }),
+                Extension(self.store.clone()),
+                headers,
+                Bytes::from(body.to_string()),
+            )
+            .await;
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), MAX_JSON)
+                .await
+                .unwrap();
+            (status, serde_json::from_slice(&bytes).unwrap())
+        }
+
+        async fn received(&mut self) -> crate::compat::devin_proto::GetChatMessageRequest {
+            tokio::time::timeout(Duration::from_secs(5), self.requests.recv())
+                .await
+                .unwrap()
+                .unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn devin_only_text_user_input_reaches_wire_and_completes() {
+        let mut fixture = DevinFixture::new(false).await;
+        let (status, response) = fixture.request(json!({"model":"devin/fixture-model","input":[{"type":"user_input","content":"hello Devin"}]})).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response["status"], "completed");
+        assert_eq!(response["steps"][0]["content"][0]["text"], "fixture answer");
+        let wire = fixture.received().await;
+        assert_eq!(wire.chat_model_uid.as_deref(), Some("fixture-model"));
+        assert_eq!(
+            wire.chat_message_prompts[0].prompt.as_deref(),
+            Some("hello Devin")
+        );
+        let (status, _) = fixture
+            .request(json!({"agent":"fixture-agent","input":"hi"}))
+            .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn devin_image_user_input_preserves_base64_bytes() {
+        let mut fixture = DevinFixture::new(false).await;
+        let data = "AAECA//+/w==";
+        let (status, response) = fixture.request(json!({"model":"devin/fixture-model","input":[{"type":"user_input","content":[{"type":"text","text":"image"},{"type":"image","mime_type":"image/png","data":data}]}]})).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        let wire = fixture.received().await;
+        let image = &wire.chat_message_prompts[0].images[0];
+        assert_eq!(
+            image.base64_data.as_deref().unwrap().as_bytes(),
+            data.as_bytes()
+        );
+        assert_eq!(image.mime_type.as_deref(), Some("image/png"));
+    }
+
+    #[tokio::test]
+    async fn devin_function_result_continuation_pairs_pending_call() {
+        let mut fixture = DevinFixture::new(true).await;
+        let (status, first) = fixture
+            .request(json!({"model":"devin/fixture-model","input":"lookup"}))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        assert_eq!(first["status"], "requires_action");
+        fixture.received().await;
+        let (status, response) = fixture.request(json!({"model":"devin/fixture-model","previous_interaction_id":first["id"],"input":[{"type":"function_result","call_id":"call-fixture","result":{"answer":42}}]})).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        let wire = fixture.received().await;
+        let call = &wire.chat_message_prompts[1].tool_calls[0];
+        assert_eq!(call.id.as_deref(), Some("call-fixture"));
+        assert_eq!(call.name.as_deref(), Some("lookup"));
+        assert_eq!(call.arguments_json.as_deref(), Some("{\"q\":1}"));
+        let result = &wire.chat_message_prompts[2];
+        assert_eq!(result.tool_call_id, call.id);
+        assert_eq!(result.prompt.as_deref(), Some("{\"answer\":42}"));
+        let (status, _) = fixture.request(json!({"model":"devin/fixture-model","previous_interaction_id":first["id"],"input":[{"type":"function_result","call_id":"unknown","result":42}]})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
 
     fn observer(native: bool, scope: &str, store: SharedInteractionsStore) -> Observer {
         Observer::new(

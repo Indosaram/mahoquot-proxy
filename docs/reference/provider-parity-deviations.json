@@ -1,5 +1,5 @@
 {
-  "$comment": "Test fixture consumed by crates/gateway/tests/t20_reference_parity.rs. Authoritative copy lives in quotio-rs docs/reference/provider-parity-deviations.json - re-sync from that source after changes.",
+  "$comment": "Test fixture consumed by crates/gateway/tests/t20_reference_parity.rs. Authoritative copy lives in quotio-rs docs/reference/provider-parity-deviations.json - re-sync from that source after changes. The `behavioralDeviations` array is audit-owned (2026-11-08 provider-parity audit) and is not consumed by t20_reference_parity.rs; it records deliberate relay/streaming differences that are not registry fields. A provider path with no counterpart in either reference is never claimed as parity: Meta Muse (L6-D4) is recorded here, and Zcode/OpenCode provider contracts are marked NOT-CERTIFIED in .omo/evidence/provider-parity-audit/defects.md.",
   "note": "Deliberate differences between the OpenCodex provider registry snapshot and Quotio's provider catalog. An omission is a reference provider Quotio deliberately does not expose. Every entry is enforced: an undeclared difference fails provider-catalog.test.ts, and a declared difference that no longer exists fails it too. An omitted provider must be absent from the catalog and from the parity manifest.",
   "deviations": [
     {
@@ -17,5 +17,111 @@
       "reason": "The reference label distinguishes two onboarding modes in its own picker. Quotio exposes a single Command Code entry whose OAuth callback lifecycle is implemented, so the mode suffix would be misleading in this UI."
     }
   ],
-  "omissions": []
+  "omissions": [],
+  "behavioralDeviations": [
+    {
+      "id": "L1-D1",
+      "area": "claude/count_tokens",
+      "site": "crates/gateway/src/compat/claude.rs:1495-1519",
+      "reference": "CLIProxyAPI internal/runtime/executor/claude_executor_tokens.go:144-157; opencodex src/claude/inbound.ts:134-143",
+      "behavior": "count_tokens is a documented local bytes/4 approximation; tools and images contribute no tokens.",
+      "reason": "Upstream token counting is not exposed to the proxy; the approximation is documented at the call site and never presented as an exact count."
+    },
+    {
+      "id": "L1-D2",
+      "area": "claude/structured output",
+      "site": "crates/gateway/src/compat/claude.rs:722-731",
+      "reference": "opencodex src/adapters/anthropic.ts:964-975",
+      "behavior": "JSON response formats are rejected unless the catalog advertises a native capability.",
+      "reason": "The reference synthesises output_config.format, which is outside our declared capability contract; we refuse instead of silently substituting."
+    },
+    {
+      "id": "L1-D3",
+      "area": "claude/system turns",
+      "site": "crates/gateway/src/compat/claude.rs:700-870",
+      "reference": "opencodex src/adapters/anthropic.ts:674-677; CLIProxyAPI claude_openai_request.go:175-179",
+      "behavior": "Later system/developer turns stay in history as user messages.",
+      "reason": "Hoisting them to the system block rewrites the cached prefix; we keep prefix stability and document the tradeoff."
+    },
+    {
+      "id": "L2-S2",
+      "area": "aistudio/provider identity",
+      "site": "crates/gateway/src/account.rs:1122-1123",
+      "reference": "opencodex src/adapters/google.ts:965-969",
+      "behavior": "The aistudio provider represents connected WebSocket workers; direct Google API-key traffic lives in the generic adapter=google path.",
+      "reason": "Different transport, different credential shape; conflating them would invent a provider identity."
+    },
+    {
+      "id": "L3-S2",
+      "area": "codex/max tokens",
+      "site": "crates/gateway/src/compat/request.rs:150-161",
+      "reference": "opencodex src/adapters/openai-responses.ts:1335-1341; CLIProxyAPI codex_openai_request.go:52-56",
+      "behavior": "max_tokens/max_completion_tokens are dropped for Codex destinations.",
+      "reason": "Live Codex rejects the budget field; opencodex strips it too. The references disagree with each other, so this is a destination-specific policy."
+    },
+    {
+      "id": "L4-S1",
+      "area": "router/selection cursor",
+      "site": "crates/router/src/lib.rs:1-13,154-194",
+      "reference": "CLIProxyAPI sdk/cliproxy/auth/selector.go:29-36",
+      "behavior": "StrictRoundRobin keys on a member-id service sequence, not a previous-picked-identity cursor.",
+      "reason": "Both resist positional cursor churn; ours is documented as a contract in docs/CONTRACTS.md."
+    },
+    {
+      "id": "L4-S2",
+      "area": "claude/reset ordering",
+      "site": "crates/gateway/src/claude_reset_order.rs:9,41-128",
+      "reference": "opencodex src/oauth/account-quota-rank.ts:75-110",
+      "behavior": "Claude subscription slots rank by earliest weekly reset, with nearly-spent new-session accounts last.",
+      "reason": "A ranks generic failover by measured headroom; ours is a documented cache-preserving policy, not a payload difference."
+    },
+    {
+      "id": "L5-07",
+      "area": "chat/keepalive frame",
+      "site": "crates/gateway/src/compat/mod.rs:661-667",
+      "reference": "opencodex src/bridge.ts:458-460",
+      "behavior": "Chat keepalive emits a full chat chunk with a role prelude and empty delta.",
+      "reason": "Client-specific liveness; both are complete SSE frames, never mid-line insertions."
+    },
+    {
+      "id": "L6-S1",
+      "area": "devin/status",
+      "site": "crates/gateway/src/compat/devin.rs",
+      "reference": "CLIProxyAPI internal/runtime/executor/devin_executor.go:100-105",
+      "behavior": "Devin is exposed as an experimental local integration.",
+      "reason": "Declared experimental; absence from the reference registry is not a defect."
+    },
+    {
+      "id": "L6-03",
+      "area": "cursor/exec policy",
+      "site": "crates/gateway/src/compat/exec_bridge.rs:52-74",
+      "reference": "opencodex src/adapters/cursor/exec-policy.ts:9-44",
+      "behavior": "Local exec is the default: with MAHOQUOT_EXEC_BRIDGE unset the gateway executes cursor exec requests on its own host (a one-time warning on stderr), and MAHOQUOT_EXEC_ROOT defaults to / (compat/cursor.rs:1329-1334). Paths are still contained by .. rejection (exec_write_rejects_dotdot_escape).",
+      "reason": "The reference runs exec on the operator's own machine. A standalone gateway has no such machine, so the documented behaviour is explicit local execution rather than an implicit fallback; operators who need isolation set MAHOQUOT_EXEC_BRIDGE or MAHOQUOT_EXEC_ROOT."
+    },
+    {
+      "id": "L6-D2",
+      "area": "zcode/plan identity",
+      "site": "crates/gateway/src/compat/zcode.rs:151-200",
+      "reference": "CLIProxyAPI zcode plugin (plan vs api host selected per model family)",
+      "behavior": "The plan identity is applied per model family so a plan-scoped model is never sent to the api host and vice versa.",
+      "reason": "The reference exposes separate hosts per family without a shared identity model; applying identity per family preserves routed model semantics without rewriting the client's model name."
+    },
+    {
+      "id": "L6-D3",
+      "area": "opencode/catalog binding",
+      "site": "crates/providers/src/opencode.rs:62-67",
+      "reference": "opencodex registry snapshot",
+      "behavior": "An OpenCode model is allowed only when the pinned opencodex registry snapshot lists it.",
+      "reason": "The catalog is the contract for which OpenCode models exist; admitting models the snapshot does not list invents capability the provider may not serve."
+    },
+    {
+      "id": "L6-D4",
+      "area": "meta/muse",
+      "site": "crates/providers/src/meta.rs:13-16; crates/gateway/src/compat/meta.rs:267-410",
+      "reference": "none: neither opencodex nor CLIProxyAPI implements the first-party Meta Muse device-authorization or muse-code wire",
+      "behavior": "Muse onboarding uses OIDC device authorization, a DCA-to-API-key mint, and pinned muse-code / muse-build user agents; inference is Responses SSE on /responses.",
+      "reason": "Muse is a first-party provider added here by product requirement. There is no reference implementation to compare against, so this path is declared as an uncompared deviation instead of being claimed as parity."
+    }
+  ]
 }

@@ -93,7 +93,7 @@ async fn every_manifest_management_route_answers_from_a_registered_handler() {
     // when every manifest route is probed with its own method
     let mut failures = Vec::new();
     let manifest = manifest_routes();
-    assert_eq!(manifest.len(), 129, "manifest snapshot size drifted");
+    assert_eq!(manifest.len(), 130, "manifest snapshot size drifted");
     for (method, path) in &manifest {
         if explicitly_excluded(path) {
             continue;

@@ -39,6 +39,54 @@ struct CompactionPayload {
     created_at: u64,
 }
 
+/// Removes inference-only controls and asks for a continuation summary.
+/// The compact route must call this before dispatching to a non-Codex provider.
+pub fn normalize_compaction_request(req: &Value) -> Result<Value, ResponsesError> {
+    let mut normalized = req.clone();
+    let obj = normalized
+        .as_object_mut()
+        .ok_or_else(|| ResponsesError::invalid_request("request body must be an object", None))?;
+    for key in ["tools", "tool_choice", "parallel_tool_calls", "text"] {
+        obj.remove(key);
+    }
+    let input = obj.remove("input").unwrap_or_else(|| json!([]));
+    let mut items = match input {
+        Value::String(text) => vec![json!({"role": "user", "content": text})],
+        Value::Array(items) => items,
+        _ => {
+            return Err(ResponsesError::invalid_request(
+                "input must be a string or array",
+                Some("input"),
+            ))
+        }
+    };
+    items.retain(|item| {
+        !matches!(
+            item.get("type").and_then(Value::as_str),
+            Some("compaction_trigger" | "additional_tools")
+        )
+    });
+    items.push(json!({
+        "role": "user",
+        "content": "Summarize the conversation state for continuation by another assistant. Preserve goals, constraints, decisions, important facts, tool results, and unfinished work. Do not answer the pending task or execute tools; return only the continuation summary.",
+    }));
+    obj.insert("input".into(), Value::Array(items));
+    obj.insert("stream".into(), json!(false));
+    obj.insert("store".into(), json!(false));
+    Ok(normalized)
+}
+
+/// Validate before sealing; the compact route must return HTTP 502 with this
+/// error body when no assistant summary text was produced.
+pub fn validate_compaction_summary(summary: &str) -> Result<(), Value> {
+    if summary.trim().is_empty() {
+        return Err(
+            json!({"error": {"message": "empty compaction summary", "type": "server_error"}}),
+        );
+    }
+    Ok(())
+}
+
 pub fn is_recognized_compaction_capsule(capsule: &str) -> bool {
     capsule.starts_with(COMPACTION_CAPSULE_PREFIX)
 }
@@ -54,6 +102,7 @@ fn derive_compaction_key() -> LessSafeKey {
 // These public helpers are exercised by t25; this file is also included by a narrower test target.
 #[allow(dead_code)]
 pub fn seal_compaction_capsule(summary: &str, model: &str) -> Result<String, String> {
+    validate_compaction_summary(summary).map_err(|error| error.to_string())?;
     let payload = CompactionPayload {
         summary: summary.to_string(),
         model: model.to_string(),
@@ -381,6 +430,17 @@ pub fn responses_to_openai(req: &Value) -> Result<Value, ResponsesError> {
                             "content": unsealed,
                         }));
                     }
+                    Some("reasoning") => {
+                        if let Some(blob) =
+                            item.get("kiroRedactedReasoning").and_then(Value::as_str)
+                        {
+                            messages.push(json!({
+                                "role": "assistant",
+                                "content": "",
+                                "kiroRedactedReasoning": blob,
+                            }));
+                        }
+                    }
                     Some("function_call") => {
                         let call_id = item
                             .get("call_id")
@@ -435,18 +495,23 @@ pub fn responses_to_openai(req: &Value) -> Result<Value, ResponsesError> {
                             None => "{}".to_string(),
                         };
 
-                        messages.push(json!({
-                            "role": "assistant",
-                            "content": Value::Null,
-                            "tool_calls": [{
-                                "id": call_id,
-                                "type": "function",
-                                "function": {
-                                    "name": name,
-                                    "arguments": arguments,
-                                }
-                            }]
-                        }));
+                        // Keep opaque reasoning and its tool use on the same
+                        // assistant turn when replaying Responses output items.
+                        let mut message = if messages.last().is_some_and(|message| {
+                            message.get("kiroRedactedReasoning").is_some()
+                                && message["content"] == ""
+                                && message.get("tool_calls").is_none()
+                        }) {
+                            messages.pop().unwrap()
+                        } else {
+                            json!({"role": "assistant", "content": Value::Null})
+                        };
+                        message["tool_calls"] = json!([{
+                            "id": call_id,
+                            "type": "function",
+                            "function": {"name": name, "arguments": arguments}
+                        }]);
+                        messages.push(message);
                     }
                     Some("function_call_output") => {
                         let call_id = item
@@ -475,9 +540,57 @@ pub fn responses_to_openai(req: &Value) -> Result<Value, ResponsesError> {
                         }
 
                         let output = match item.get("output") {
-                            Some(Value::String(s)) => s.clone(),
-                            Some(val) => val.to_string(),
-                            None => String::new(),
+                            Some(Value::String(s)) => Value::String(s.clone()),
+                            Some(Value::Array(parts)) => {
+                                let mut mapped = Vec::with_capacity(parts.len());
+                                for part in parts {
+                                    match part.get("type").and_then(Value::as_str) {
+                                        Some("input_text" | "output_text" | "text") => {
+                                            if let Some(text) =
+                                                part.get("text").and_then(Value::as_str)
+                                            {
+                                                mapped.push(json!({"type": "text", "text": text}));
+                                            }
+                                        }
+                                        Some("input_image") => {
+                                            let url = part
+                                                .get("image_url")
+                                                .and_then(Value::as_str)
+                                                .ok_or_else(|| {
+                                                    ResponsesError::invalid_request(
+                                                        "missing image_url",
+                                                        Some("input"),
+                                                    )
+                                                })?;
+                                            if !url.starts_with("data:") {
+                                                return Err(ResponsesError::unsupported(
+                                                    "remote image url is unsupported",
+                                                    Some("input"),
+                                                ));
+                                            }
+                                            if split_data_url(url).is_none() {
+                                                return Err(ResponsesError::invalid_request(
+                                                    "invalid base64 data url for image",
+                                                    Some("input"),
+                                                ));
+                                            }
+                                            let mut image = json!({"url": url});
+                                            if let Some(detail) = part.get("detail") {
+                                                image["detail"] = detail.clone();
+                                            }
+                                            mapped.push(
+                                                json!({"type": "image_url", "image_url": image}),
+                                            );
+                                        }
+                                        _ => mapped.push(
+                                            json!({"type": "text", "text": part.to_string()}),
+                                        ),
+                                    }
+                                }
+                                Value::Array(mapped)
+                            }
+                            Some(val) => Value::String(val.to_string()),
+                            None => Value::String(String::new()),
                         };
 
                         let mut tool_msg = json!({
@@ -523,6 +636,10 @@ pub fn responses_to_openai(req: &Value) -> Result<Value, ResponsesError> {
                             .get("reasoning_redacted")
                             .and_then(Value::as_bool)
                             .unwrap_or(false);
+                        let kiro_redacted_reasoning = item
+                            .get("kiroRedactedReasoning")
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
 
                         if let Some(r) = item
                             .get("reasoning_content")
@@ -655,6 +772,9 @@ pub fn responses_to_openai(req: &Value) -> Result<Value, ResponsesError> {
                             if reasoning_redacted {
                                 msg["reasoning_redacted"] = json!(true);
                             }
+                            if let Some(blob) = kiro_redacted_reasoning {
+                                msg["kiroRedactedReasoning"] = json!(blob);
+                            }
                         }
 
                         messages.push(msg);
@@ -703,6 +823,11 @@ pub fn responses_to_openai(req: &Value) -> Result<Value, ResponsesError> {
         chat["max_tokens"] = max_out.clone();
     }
 
+    for key in ["reasoning", "parallel_tool_calls"] {
+        if let Some(value) = obj.get(key) {
+            chat[key] = value.clone();
+        }
+    }
     Ok(chat)
 }
 
@@ -790,12 +915,15 @@ pub struct ResponsesStreamRenderer {
     created_sent: bool,
     terminated: bool,
     output_limit_reached: bool,
+    content_filter_reached: bool,
     failure: Option<String>,
     usage: Option<Usage>,
     text_accumulator: String,
     reasoning_accumulator: String,
     reasoning_signature: Option<String>,
     reasoning_redacted: bool,
+    /// Kiro's opaque redacted blob; carried to the replay surface verbatim.
+    kiro_redacted_reasoning: Option<String>,
     text_state: TextItemState,
     tools: Vec<ToolCallItem>,
     next_output_index: u64,
@@ -843,12 +971,14 @@ impl ResponsesStreamRenderer {
             created_sent: false,
             terminated: false,
             output_limit_reached: false,
+            content_filter_reached: false,
             failure: None,
             usage: None,
             text_accumulator: String::new(),
             reasoning_accumulator: String::new(),
             reasoning_signature: None,
             reasoning_redacted: false,
+            kiro_redacted_reasoning: None,
             text_state: TextItemState::Unstarted,
             tools: Vec::new(),
             next_output_index: 0,
@@ -890,7 +1020,7 @@ impl ResponsesStreamRenderer {
             output_index,
         } = self.text_state
         {
-            let item_status = if self.output_limit_reached {
+            let item_status = if self.output_limit_reached || self.content_filter_reached {
                 "incomplete"
             } else {
                 "completed"
@@ -913,6 +1043,9 @@ impl ResponsesStreamRenderer {
             }
             if self.reasoning_redacted {
                 item["reasoning_redacted"] = json!(true);
+            }
+            if let Some(blob) = &self.kiro_redacted_reasoning {
+                item["kiroRedactedReasoning"] = json!(blob);
             }
             out.push(sse_frame(
                 "response.output_item.done",
@@ -943,7 +1076,7 @@ impl ResponsesStreamRenderer {
         }
         if !tool.item_done_emitted {
             tool.item_done_emitted = true;
-            let item_status = if self.output_limit_reached {
+            let item_status = if self.output_limit_reached || self.content_filter_reached {
                 "incomplete"
             } else {
                 "completed"
@@ -988,6 +1121,9 @@ impl ResponsesStreamRenderer {
                 else { json!([{"type":"summary_text","text":self.reasoning_accumulator}]) }});
         if let Some(sig) = &self.reasoning_signature {
             item["encrypted_content"] = json!(sig);
+        }
+        if let Some(blob) = &self.kiro_redacted_reasoning {
+            item["kiroRedactedReasoning"] = json!(blob);
         }
         item
     }
@@ -1042,6 +1178,10 @@ impl ResponsesStreamRenderer {
             CodexEvent::ReasoningRedacted => {
                 self.ensure_reasoning_item(&mut out);
                 self.reasoning_redacted = true;
+            }
+            CodexEvent::KiroRedactedReasoning(blob) => {
+                self.ensure_reasoning_item(&mut out);
+                self.kiro_redacted_reasoning = Some(blob);
             }
             CodexEvent::TextDelta(delta) => {
                 self.ensure_created_frame(&mut out);
@@ -1164,6 +1304,9 @@ impl ResponsesStreamRenderer {
                     ));
                 }
             }
+            CodexEvent::ContentFilterReached => {
+                self.content_filter_reached = true;
+            }
             CodexEvent::OutputLimitReached => {
                 self.output_limit_reached = true;
             }
@@ -1179,7 +1322,7 @@ impl ResponsesStreamRenderer {
                 self.terminated = true;
 
                 let resp_val = self.current_response();
-                if self.output_limit_reached {
+                if self.output_limit_reached || self.content_filter_reached {
                     out.push(sse_frame(
                         "response.incomplete",
                         &json!({
@@ -1260,7 +1403,7 @@ impl ResponsesStreamRenderer {
         }
 
         for tool in &self.tools {
-            let status = if self.output_limit_reached {
+            let status = if self.output_limit_reached || self.content_filter_reached {
                 "incomplete"
             } else {
                 "completed"
@@ -1270,7 +1413,7 @@ impl ResponsesStreamRenderer {
 
         let status = if self.failure.is_some() {
             "failed"
-        } else if self.output_limit_reached {
+        } else if self.output_limit_reached || self.content_filter_reached {
             "incomplete"
         } else if self.terminated {
             "completed"
@@ -1288,8 +1431,8 @@ impl ResponsesStreamRenderer {
             "usage": build_usage_json(self.usage.as_ref()),
         });
 
-        if self.output_limit_reached {
-            payload["incomplete_details"] = json!({"reason": "max_output_tokens"});
+        if self.output_limit_reached || self.content_filter_reached {
+            payload["incomplete_details"] = json!({"reason": if self.content_filter_reached { "content_filter" } else { "max_output_tokens" }});
         }
         if let Some(ref err) = self.failure {
             payload["error"] = json!({"message": err, "type": "server_error"});
@@ -1355,4 +1498,109 @@ pub fn responses_response(
         return Err(err.to_string());
     }
     Ok(renderer.current_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn responses_claude_controls_survive_translation() {
+        let request = json!({"model":"claude-opus-4-6","input":"hi","reasoning":{"effort":"high"},"parallel_tool_calls":false,
+            "tools":[{"type":"function","name":"f","parameters":{"type":"object","properties":{}}}]});
+        let chat = responses_to_openai(&request).unwrap();
+        assert_eq!(chat["reasoning"]["effort"], "high");
+        assert_eq!(chat["parallel_tool_calls"], false);
+        let claude = crate::compat::claude::openai_to_anthropic(&chat).unwrap();
+        assert_eq!(claude["tool_choice"]["disable_parallel_tool_use"], true);
+        assert_eq!(claude["output_config"]["effort"], "high");
+    }
+
+    #[test]
+    fn responses_tool_output_array_retains_image_order() {
+        let mut request = json!({"model":"gpt-5","input":[
+            {"type":"function_call","call_id":"c","name":"f","arguments":"{}"},
+            {"type":"function_call_output","call_id":"c","output":[
+                {"type":"input_text","text":"before"},
+                {"type":"input_image","image_url":"data:image/png;base64,aGVsbG8=","detail":"high"},
+                {"type":"output_text","text":"after"}
+            ]}
+        ]});
+        let chat = responses_to_openai(&request).unwrap();
+        assert_eq!(
+            chat["messages"][1]["content"][0],
+            json!({"type":"text","text":"before"})
+        );
+        assert_eq!(
+            chat["messages"][1]["content"][1]["image_url"]["detail"],
+            "high"
+        );
+        assert_eq!(
+            chat["messages"][1]["content"][2],
+            json!({"type":"text","text":"after"})
+        );
+        let translated =
+            crate::compat::request::openai_to_codex(&serde_json::to_vec(&chat).unwrap()).unwrap();
+        let codex: Value = serde_json::from_slice(&translated.body).unwrap();
+        assert_eq!(
+            codex["input"][1]["output"],
+            json!([
+                {"type":"input_text","text":"before"},
+                {"type":"input_image","image_url":"data:image/png;base64,aGVsbG8=","detail":"high"},
+                {"type":"input_text","text":"after"}
+            ])
+        );
+        for malformed in [
+            json!({"type":"input_image"}),
+            json!({"type":"input_image","image_url":"data:bad"}),
+        ] {
+            request["input"][1]["output"][1] = malformed;
+            assert!(matches!(
+                responses_to_openai(&request),
+                Err(ResponsesError::InvalidRequest { .. })
+            ));
+        }
+        request["input"][1]["output"] = json!({"ok":true});
+        assert_eq!(
+            responses_to_openai(&request).unwrap()["messages"][1]["content"],
+            r#"{"ok":true}"#
+        );
+    }
+
+    #[test]
+    fn compact_requests_summary_and_rejects_tool_only_reply() {
+        let request = json!({"model":"gpt-5","input":[
+            {"role":"user","content":"What is 2+2?"},
+            {"type":"compaction_trigger"},{"type":"additional_tools"}
+        ],"tools":[],"tool_choice":"required","parallel_tool_calls":true,"text":{"format":{"type":"json_object"}}});
+        let normalized = normalize_compaction_request(&request).unwrap();
+        for key in ["tools", "tool_choice", "parallel_tool_calls", "text"] {
+            assert!(normalized.get(key).is_none());
+        }
+        assert_eq!(normalized["input"].as_array().unwrap().len(), 2);
+        assert_eq!(normalized["input"][1]["role"], "user");
+        assert!(!normalized["input"][1]["content"]
+            .as_str()
+            .unwrap()
+            .is_empty());
+        assert!(responses_to_openai(&normalized).is_ok());
+        let string_input = normalize_compaction_request(&json!({"input":"history"})).unwrap();
+        assert_eq!(string_input["input"][0]["content"], "history");
+        let tool_only = json!({"choices":[{"message":{"content":null,"tool_calls":[{"id":"c"}]}}]});
+        let summary = tool_only
+            .pointer("/choices/0/message/content")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        assert_eq!(
+            validate_compaction_summary(summary).unwrap_err(),
+            json!({"error":{"message":"empty compaction summary","type":"server_error"}})
+        );
+        assert!(seal_compaction_capsule(summary, "gpt-5").is_err());
+        assert!(validate_compaction_summary("  ").is_err());
+        let capsule = seal_compaction_capsule("Goals and unfinished work", "gpt-5").unwrap();
+        assert_eq!(
+            unseal_compaction_capsule_for_model(&capsule, "gpt-5").unwrap(),
+            "Goals and unfinished work"
+        );
+    }
 }

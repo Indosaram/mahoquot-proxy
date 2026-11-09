@@ -1,10 +1,12 @@
+pub mod chat;
 pub mod claude;
+pub mod command_code;
 pub mod cursor;
 pub mod cursor_proto;
-pub mod exec_bridge;
-pub mod exec_ops;
 pub mod devin;
 pub mod devin_proto;
+pub mod exec_bridge;
+pub mod exec_ops;
 pub mod meta;
 pub mod xai;
 pub mod zcode;
@@ -91,6 +93,7 @@ use std::sync::Arc;
 use axum::body::Body;
 
 const STREAM_IDLE_TICK: std::time::Duration = std::time::Duration::from_secs(15);
+const STREAM_UPSTREAM_SILENCE_BUDGET: std::time::Duration = std::time::Duration::from_secs(300);
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use serde_json::{json, Value};
@@ -149,7 +152,7 @@ pub async fn open_stream(
         Some(Ok(first))
             if matches!(
                 protocol,
-                Protocol::Kiro | Protocol::Cursor | Protocol::Devin
+                Protocol::Kiro | Protocol::CommandCode | Protocol::Cursor | Protocol::Devin
             ) || looks_like_sse(&first) =>
         {
             Ok((first, stream))
@@ -207,7 +210,11 @@ fn classify_anthropic_preamble(buf: &[u8]) -> AnthropicPreamble {
                 if matches!(
                     value["content_block"]["type"].as_str(),
                     Some("thinking") | Some("redacted_thinking")
-                ) =>
+                ) || (value["content_block"]["type"] == "text"
+                    && value["content_block"]["text"]
+                        .as_str()
+                        .unwrap_or("")
+                        .is_empty()) =>
             {
                 continue
             }
@@ -215,7 +222,8 @@ fn classify_anthropic_preamble(buf: &[u8]) -> AnthropicPreamble {
                 if matches!(
                     value["delta"]["type"].as_str(),
                     Some("thinking_delta") | Some("signature_delta")
-                ) =>
+                ) || (value["delta"]["type"] == "text_delta"
+                    && value["delta"]["text"].as_str().unwrap_or("").is_empty()) =>
             {
                 continue
             }
@@ -354,8 +362,12 @@ pub enum Protocol {
     Antigravity,
     Anthropic,
     Kiro,
+    CommandCode,
     Cursor,
     Devin,
+    /// A generic OpenAI chat-completions upstream. Only the reply shape
+    /// differs from Codex: the request is already chat-shaped.
+    Chat,
 }
 
 impl Protocol {
@@ -365,8 +377,10 @@ impl Protocol {
             Self::Antigravity => "antigravity",
             Self::Anthropic => "anthropic",
             Self::Kiro => "kiro",
+            Self::CommandCode => "command-code",
             Self::Cursor => "cursor",
             Self::Devin => "devin",
+            Self::Chat => "chat",
         }
     }
 }
@@ -375,6 +389,10 @@ pub struct ProtocolSession {
     pub protocol: Protocol,
     pub cursor_reply: Option<tokio::sync::mpsc::Sender<Bytes>>,
     pub replay: Option<signature_ledger::ReplayScope>,
+    /// Request-scoped Gemini tool-name codec. Names outside Gemini's identifier
+    /// set are rewritten on the way out, so the same mapping must decode the
+    /// reply or the client sees names it never sent.
+    pub gemini_tool_names: Option<gemini::GeminiToolNames>,
 }
 
 struct ProtocolParser {
@@ -382,8 +400,10 @@ struct ProtocolParser {
     gemini: Option<gemini::GeminiDecoder>,
     anthropic: Option<claude::AnthropicDecoder>,
     kiro: Option<kiro::KiroDecoder>,
+    command_code: Option<command_code::CommandCodeDecoder>,
     cursor: Option<cursor::CursorDecoder>,
     devin: Option<devin::DevinDecoder>,
+    chat: Option<chat::ChatDecoder>,
 }
 
 impl ProtocolParser {
@@ -396,10 +416,11 @@ impl ProtocolParser {
     /// turn, so the decoder writes it into the same scope the request was
     /// translated with.
     fn with_session(session: &ProtocolSession) -> Self {
-        Self::with_parts(
+        Self::with_session_parts(
             session.protocol,
             session.cursor_reply.clone(),
             session.replay.clone(),
+            session.gemini_tool_names.clone(),
         )
     }
 
@@ -415,31 +436,55 @@ impl ProtocolParser {
         cursor_reply: Option<tokio::sync::mpsc::Sender<Bytes>>,
         replay: Option<signature_ledger::ReplayScope>,
     ) -> Self {
+        Self::with_session_parts(protocol, cursor_reply, replay, None)
+    }
+
+    fn with_session_parts(
+        protocol: Protocol,
+        cursor_reply: Option<tokio::sync::mpsc::Sender<Bytes>>,
+        replay: Option<signature_ledger::ReplayScope>,
+        gemini_tool_names: Option<gemini::GeminiToolNames>,
+    ) -> Self {
         Self {
             sse: SseParser::default(),
             gemini: match protocol {
                 Protocol::Codex => None,
-                Protocol::Antigravity => Some(match replay {
-                    Some(replay) => gemini::GeminiDecoder::with_replay(replay),
-                    None => gemini::GeminiDecoder::new(),
+                Protocol::Antigravity => Some({
+                    let decoder = match replay {
+                        Some(replay) => gemini::GeminiDecoder::with_replay(replay),
+                        None => gemini::GeminiDecoder::new(),
+                    };
+                    match gemini_tool_names {
+                        Some(names) => decoder.with_tool_names(names),
+                        None => decoder,
+                    }
                 }),
                 Protocol::Anthropic => None,
                 Protocol::Kiro => None,
+                Protocol::CommandCode => None,
                 Protocol::Cursor => None,
                 Protocol::Devin => None,
+                Protocol::Chat => None,
             },
             anthropic: (protocol == Protocol::Anthropic).then(claude::AnthropicDecoder::new),
             kiro: (protocol == Protocol::Kiro).then(kiro::KiroDecoder::new),
+            command_code: (protocol == Protocol::CommandCode)
+                .then(command_code::CommandCodeDecoder::new),
             cursor: (protocol == Protocol::Cursor).then(|| match cursor_reply {
                 Some(sender) => cursor::CursorDecoder::with_reply_sender(sender),
                 None => cursor::CursorDecoder::new(),
             }),
             devin: (protocol == Protocol::Devin).then(devin::DevinDecoder::new),
+            chat: (protocol == Protocol::Chat).then(chat::ChatDecoder::new),
         }
     }
 
     fn push(&mut self, chunk: &[u8], events: &mut Vec<CodexEvent>) {
         if let Some(decoder) = self.cursor.as_mut() {
+            decoder.decode(chunk, events);
+            return;
+        }
+        if let Some(decoder) = self.command_code.as_mut() {
             decoder.decode(chunk, events);
             return;
         }
@@ -449,6 +494,15 @@ impl ProtocolParser {
         }
         if let Some(decoder) = self.devin.as_mut() {
             decoder.decode(chunk, events);
+            return;
+        }
+        if let Some(decoder) = self.chat.as_mut() {
+            let mut frames = Vec::new();
+            let result = self.sse.push_raw_data(chunk, &mut frames);
+            for frame in frames {
+                decoder.decode_frame(&frame, events);
+            }
+            push_limit_failure(result, events);
             return;
         }
         if let Some(decoder) = self.anthropic.as_mut() {
@@ -478,11 +532,25 @@ impl ProtocolParser {
             decoder.finish(events);
             return;
         }
+        if let Some(decoder) = self.command_code.as_mut() {
+            decoder.finish(events);
+            return;
+        }
         if let Some(decoder) = self.kiro.as_mut() {
             decoder.finish(events);
             return;
         }
         if let Some(decoder) = self.devin.as_mut() {
+            decoder.finish(events);
+            return;
+        }
+        if let Some(decoder) = self.chat.as_mut() {
+            let mut frames = Vec::new();
+            let result = self.sse.finish_raw_data(&mut frames);
+            for frame in frames {
+                decoder.decode_frame(&frame, events);
+            }
+            push_limit_failure(result, events);
             decoder.finish(events);
             return;
         }
@@ -522,6 +590,20 @@ fn push_limit_failure(result: Result<(), events::SseLimitError>, events: &mut Ve
     }
 }
 
+// Only the elapsed upstream poll is charged; downstream pulls and generated
+// ticks do not consume or reset the silence budget.
+fn remaining_upstream_budget(
+    remaining: std::time::Duration,
+    upstream_wait: std::time::Duration,
+    received_chunk: bool,
+) -> std::time::Duration {
+    if received_chunk {
+        STREAM_UPSTREAM_SILENCE_BUDGET
+    } else {
+        remaining.saturating_sub(upstream_wait)
+    }
+}
+
 struct TranslateState {
     upstream: UpstreamStream,
     parser: ProtocolParser,
@@ -529,6 +611,7 @@ struct TranslateState {
     pending: VecDeque<Bytes>,
     drained: bool,
     last_emit: std::time::Instant,
+    upstream_budget: std::time::Duration,
 }
 
 /// Streaming surfaces differ per client protocol: OpenAI chunk objects versus
@@ -579,7 +662,7 @@ impl StreamRenderer {
         match self {
             Self::OpenAi(renderer) => renderer.tick(),
             Self::Anthropic(renderer) => renderer.tick(),
-            _ => Bytes::new(),
+            Self::Gemini(_) | Self::Responses(_) => Bytes::from_static(b": keepalive\n\n"),
         }
     }
 }
@@ -629,6 +712,7 @@ pub fn streaming_body(params: StreamingBodyParams) -> Body {
         pending: VecDeque::new(),
         drained: false,
         last_emit: std::time::Instant::now(),
+        upstream_budget: STREAM_UPSTREAM_SILENCE_BUDGET,
     };
     let mut events = Vec::new();
     state.parser.push(&first, &mut events);
@@ -664,9 +748,26 @@ pub fn streaming_body(params: StreamingBodyParams) -> Body {
                     }
                     continue;
                 }
-                let next = match tokio::time::timeout(STREAM_IDLE_TICK, state.upstream.next()).await {
+                let poll_budget = STREAM_IDLE_TICK.min(state.upstream_budget);
+                let poll_started = std::time::Instant::now();
+                let next = tokio::time::timeout(poll_budget, state.upstream.next()).await;
+                state.upstream_budget = remaining_upstream_budget(
+                    state.upstream_budget,
+                    poll_started.elapsed(),
+                    matches!(&next, Ok(Some(Ok(_)))),
+                );
+                let next = match next {
                     Ok(item) => item,
                     Err(_) => {
+                        if state.upstream_budget.is_zero() {
+                            state.drained = true;
+                            state.upstream = Box::pin(futures::stream::empty());
+                            state.pending.extend(error_frames(
+                                &mut state.renderer,
+                                "upstream stall timeout",
+                            ));
+                            continue;
+                        }
                         let frame = state.renderer.tick();
                         state.last_emit = std::time::Instant::now();
                         if !frame.is_empty() {
@@ -1054,6 +1155,7 @@ mod bounded_stream_tests {
                 protocol,
                 cursor_reply: None,
                 replay: None,
+                gemini_tool_names: None,
             },
             upstream_capture: None,
             devin_outcome: None,
@@ -1244,7 +1346,7 @@ mod bounded_stream_tests {
     #[tokio::test]
     async fn thinking_followed_by_text_is_released_whole() {
         let thinking = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n";
-        let text = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n";
+        let text = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"answer\"}}\n\n";
         let tail = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         let (first, mut rest) = hold_anthropic_preamble(
             Bytes::from_static(MESSAGE_START.as_bytes()),
@@ -1264,6 +1366,109 @@ mod bounded_stream_tests {
     }
 
     #[test]
+    fn responses_and_gemini_idle_tick_is_complete_comment() {
+        for mut renderer in [
+            StreamRenderer::Responses(Box::new(responses::ResponsesStreamRenderer::new(
+                "fixture".into(),
+                0,
+            ))),
+            StreamRenderer::Gemini(Box::new(GeminiChunkRenderer::new("fixture".into(), 0))),
+        ] {
+            assert!(!renderer.terminated());
+            assert_eq!(renderer.tick(), Bytes::from_static(b": keepalive\n\n"));
+            assert!(!renderer.terminated());
+            assert_eq!(renderer.tick(), Bytes::from_static(b": keepalive\n\n"));
+        }
+    }
+
+    #[tokio::test]
+    async fn anthropic_empty_text_preamble_remains_retryable() {
+        for content in [
+            json!({"type":"content_block_start","content_block":{"type":"text"}}),
+            json!({"type":"content_block_start","content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","delta":{"type":"text_delta"}}),
+            json!({"type":"content_block_delta","delta":{"type":"text_delta","text":""}}),
+        ] {
+            let first = Bytes::from(format!("{MESSAGE_START}data: {content}\n\n"));
+            assert!(matches!(
+                classify_anthropic_preamble(&first),
+                AnthropicPreamble::Pending
+            ));
+            for (terminal, expected_code) in [
+                (json!({"type":"message_stop"}), "unavailable:"),
+                (
+                    json!({"type":"error","error":{"type":"rate_limit_error","message":"limited"}}),
+                    "resource_exhausted:",
+                ),
+            ] {
+                let (send, receive) = tokio::sync::oneshot::channel();
+                let source: UpstreamStream = Box::pin(futures::stream::once(async move {
+                    Ok(receive.await.expect("terminal gate"))
+                }));
+                let preamble = hold_anthropic_preamble(
+                    first.clone(),
+                    source,
+                    std::time::Duration::from_secs(5),
+                );
+                tokio::pin!(preamble);
+                assert!(futures::poll!(&mut preamble).is_pending());
+                send.send(Bytes::from(format!("data: {terminal}\n\n")))
+                    .expect("preamble must still be waiting");
+                let reason = preamble.await.err().expect("empty text must be retryable");
+                assert!(reason.starts_with(expected_code), "{reason}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn anthropic_nonempty_text_releases_preamble() {
+        for content in [
+            json!({"type":"content_block_start","content_block":{"type":"text","text":"answer"}}),
+            json!({"type":"content_block_delta","delta":{"type":"text_delta","text":"answer"}}),
+        ] {
+            let first = Bytes::from(format!("{MESSAGE_START}data: {content}\n\n"));
+            let source: UpstreamStream = Box::pin(futures::stream::pending());
+            let preamble =
+                hold_anthropic_preamble(first.clone(), source, std::time::Duration::from_secs(5));
+            tokio::pin!(preamble);
+            match futures::poll!(&mut preamble) {
+                Poll::Ready(Ok((buffered, _))) => assert_eq!(buffered, first),
+                _ => panic!("nonempty text must release without another upstream poll"),
+            }
+        }
+    }
+
+    #[test]
+    fn translate_stall_budget_accounts_only_upstream_wait() {
+        use std::time::Duration;
+
+        let remaining =
+            remaining_upstream_budget(STREAM_UPSTREAM_SILENCE_BUDGET, STREAM_IDLE_TICK, false);
+        assert_eq!(remaining, Duration::from_secs(285));
+        // Downstream backpressure and tick generation supply no upstream wait.
+        assert_eq!(
+            remaining_upstream_budget(remaining, Duration::ZERO, false),
+            remaining
+        );
+        assert_eq!(
+            remaining_upstream_budget(remaining, Duration::from_secs(1), true),
+            STREAM_UPSTREAM_SILENCE_BUDGET
+        );
+        assert_eq!(
+            remaining_upstream_budget(remaining, Duration::from_secs(285), false),
+            Duration::ZERO
+        );
+        assert_eq!(
+            remaining_upstream_budget(remaining, Duration::from_secs(600), false),
+            Duration::ZERO
+        );
+        assert_eq!(
+            STREAM_IDLE_TICK.min(Duration::from_secs(3)),
+            Duration::from_secs(3)
+        );
+    }
+
+    #[test]
     fn bounded_nonstream_append_allows_exactly_the_cap() {
         let mut raw = vec![0u8; MAX_NONSTREAM_RESPONSE_BYTES - 3];
         assert!(extend_nonstream_bounded(&mut raw, &[1, 2, 3]).is_ok());
@@ -1276,5 +1481,32 @@ mod bounded_stream_tests {
         let error = extend_nonstream_bounded(&mut raw, &[1]).unwrap_err();
         assert!(error.contains("limit"), "{error}");
         assert_eq!(raw.len(), MAX_NONSTREAM_RESPONSE_BYTES);
+    }
+}
+
+#[cfg(test)]
+mod chat_parser_tests {
+    use super::*;
+
+    #[test]
+    fn a_chat_session_parser_decodes_chat_frames() {
+        let session = ProtocolSession {
+            protocol: Protocol::Chat,
+            cursor_reply: None,
+            replay: None,
+            gemini_tool_names: None,
+        };
+        let mut parser = ProtocolParser::with_session(&session);
+        let mut events = Vec::new();
+        parser.push(
+            b"data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            &mut events,
+        );
+        parser.push(b"data: [DONE]\n\n", &mut events);
+        parser.finish(&mut events);
+        assert!(
+            events.iter().any(|event| matches!(event, CodexEvent::TextDelta(text) if text == "hi")),
+            "{events:?}"
+        );
     }
 }

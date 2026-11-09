@@ -2,6 +2,14 @@ use mahoquot_providers::{
     antigravity_count_tokens_url, antigravity_stream_url, ANTIGRAVITY_UPSTREAM_BASE, UPSTREAM_BASE,
 };
 
+pub fn vertex_base_url(location: &str) -> String {
+    if location.is_empty() || location == "global" {
+        "https://global-aiplatform.googleapis.com".to_string()
+    } else {
+        format!("https://{location}-aiplatform.googleapis.com")
+    }
+}
+
 pub fn build_antigravity_url(upstream_override: Option<&str>) -> String {
     antigravity_stream_url(upstream_override.unwrap_or(ANTIGRAVITY_UPSTREAM_BASE))
 }
@@ -110,6 +118,24 @@ pub fn build_target_url(upstream_override: Option<&str>, req_path: &str) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vertex_location_selects_regional_host() {
+        assert_eq!(
+            vertex_base_url("europe-west4"),
+            "https://europe-west4-aiplatform.googleapis.com"
+        );
+        assert_eq!(
+            vertex_base_url("us-central1"),
+            "https://us-central1-aiplatform.googleapis.com"
+        );
+        for location in ["global", ""] {
+            assert_eq!(
+                vertex_base_url(location),
+                "https://global-aiplatform.googleapis.com"
+            );
+        }
+    }
 
     #[test]
     fn generic_account_uses_base_url_when_the_override_is_absent() {

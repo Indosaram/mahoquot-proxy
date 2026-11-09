@@ -90,7 +90,8 @@ impl GeminiChunkRenderer {
         if let Some(u) = usage {
             payload["usageMetadata"] = json!({
                 "promptTokenCount": u.prompt_tokens,
-                "candidatesTokenCount": u.completion_tokens,
+                // L2-03: canonical completion includes thoughts; Gemini reports them separately.
+                "candidatesTokenCount": u.completion_tokens.saturating_sub(u.reasoning_tokens),
                 "totalTokenCount": u.total_tokens,
                 "thoughtsTokenCount": u.reasoning_tokens,
             });
@@ -168,7 +169,7 @@ impl GeminiChunkRenderer {
                 vec![self.frame_for(json!([{"thoughtSignature": sig}]), None, None)]
             }
             // Gemini has no redacted-thinking wire shape; the marker is state.
-            CodexEvent::ReasoningRedacted => Vec::new(),
+            CodexEvent::ReasoningRedacted | CodexEvent::KiroRedactedReasoning(_) => Vec::new(),
             CodexEvent::ToolCallBegin {
                 output_index,
                 call_id,
@@ -204,6 +205,7 @@ impl GeminiChunkRenderer {
                 }
                 Vec::new()
             }
+            CodexEvent::ContentFilterReached => Vec::new(),
             CodexEvent::OutputLimitReached => {
                 self.output_limit_reached = true;
                 Vec::new()
@@ -264,6 +266,7 @@ pub struct ChunkRenderer {
     role_sent: bool,
     saw_tool_call: bool,
     output_limit_reached: bool,
+    content_filter_reached: bool,
     terminated: bool,
     tool_slots: Vec<u64>,
 }
@@ -278,6 +281,7 @@ impl ChunkRenderer {
             role_sent: false,
             saw_tool_call: false,
             output_limit_reached: false,
+            content_filter_reached: false,
             terminated: false,
             tool_slots: Vec::new(),
         }
@@ -366,7 +370,7 @@ impl ChunkRenderer {
             }
             CodexEvent::ReasoningSignature(_) => {}
             // Redaction is a state marker with no chat.completion delta shape.
-            CodexEvent::ReasoningRedacted => {}
+            CodexEvent::ReasoningRedacted | CodexEvent::KiroRedactedReasoning(_) => {}
             CodexEvent::ToolCallBegin {
                 output_index,
                 call_id,
@@ -400,9 +404,12 @@ impl ChunkRenderer {
                 ));
             }
             CodexEvent::OutputLimitReached => self.output_limit_reached = true,
+            CodexEvent::ContentFilterReached => self.content_filter_reached = true,
             CodexEvent::Completed { usage } => {
                 self.role_prelude(&mut out);
-                let reason = if self.output_limit_reached {
+                let reason = if self.content_filter_reached {
+                    "content_filter"
+                } else if self.output_limit_reached {
                     "length"
                 } else if self.saw_tool_call {
                     "tool_calls"
@@ -465,6 +472,7 @@ pub struct Aggregator {
     usage: Option<Usage>,
     failure: Option<String>,
     output_limit_reached: bool,
+    content_filter_reached: bool,
     /// Set when the caller has a signature source, so the Gemini-shaped reply
     /// can put `thoughtSignature` back on the calls that arrived with one.
     replay: Option<super::signature_ledger::ReplayScope>,
@@ -484,6 +492,7 @@ impl Aggregator {
             usage: None,
             failure: None,
             output_limit_reached: false,
+            content_filter_reached: false,
             replay: None,
         }
     }
@@ -528,9 +537,10 @@ impl Aggregator {
             CodexEvent::ReasoningSignature(sig) => self.reasoning_signature = Some(sig),
             // Kept in native_events for surfaces that can express redaction;
             // the aggregate itself has no redacted-thinking shape.
-            CodexEvent::ReasoningRedacted => {}
+            CodexEvent::ReasoningRedacted | CodexEvent::KiroRedactedReasoning(_) => {}
             CodexEvent::Completed { usage } => self.usage = usage,
             CodexEvent::OutputLimitReached => self.output_limit_reached = true,
+            CodexEvent::ContentFilterReached => self.content_filter_reached = true,
             CodexEvent::Failed { message } => self.failure = Some(message),
         }
     }
@@ -547,7 +557,7 @@ impl Aggregator {
             "object": "text_completion",
             "created": self.created,
             "model": self.model,
-            "choices": [{"index": 0, "text": self.text, "finish_reason": if self.output_limit_reached { "length" } else { "stop" }}],
+            "choices": [{"index": 0, "text": self.text, "finish_reason": if self.content_filter_reached { "content_filter" } else if self.output_limit_reached { "length" } else { "stop" }}],
         });
         if let Some(usage) = self.usage.as_ref() {
             payload["usage"] = usage_value(usage);
@@ -609,7 +619,8 @@ impl Aggregator {
         if let Some(usage) = self.usage.as_ref() {
             payload["usageMetadata"] = json!({
                 "promptTokenCount": usage.prompt_tokens,
-                "candidatesTokenCount": usage.completion_tokens,
+                // L2-03: canonical completion includes thoughts; Gemini reports them separately.
+                "candidatesTokenCount": usage.completion_tokens.saturating_sub(usage.reasoning_tokens),
                 "totalTokenCount": usage.total_tokens,
                 "thoughtsTokenCount": usage.reasoning_tokens,
             });
@@ -648,7 +659,9 @@ impl Aggregator {
                     .collect(),
             );
         }
-        let finish_reason = if self.output_limit_reached {
+        let finish_reason = if self.content_filter_reached {
+            "content_filter"
+        } else if self.output_limit_reached {
             "length"
         } else if self.tools.is_empty() {
             "stop"
@@ -982,5 +995,124 @@ mod open_frame_tests {
             renderer.tick().is_empty(),
             "a terminated stream must not emit keepalives"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compat::events::SseParser;
+
+    fn decode(values: Vec<Value>) -> Vec<CodexEvent> {
+        let wire = values
+            .into_iter()
+            .map(|v| format!("data: {v}\n\n"))
+            .collect::<String>();
+        let mut parser = SseParser::default();
+        let mut events = Vec::new();
+        // Split frames across pushes to exercise persistent per-call state.
+        for chunk in wire.as_bytes().chunks(7) {
+            parser.push(chunk, &mut events);
+        }
+        parser.finish(&mut events);
+        events
+    }
+
+    #[test]
+    fn codex_done_only_arguments_survive_chat_rendering() {
+        for use_delta in [false, true] {
+            let mut values = vec![
+                json!({"type":"response.output_item.added","output_index":4,"item":{"type":"function_call","call_id":"a","name":"f"}}),
+                json!({"type":"response.output_item.added","output_index":8,"item":{"type":"function_call","call_id":"b","name":"g"}}),
+            ];
+            if use_delta {
+                values.push(json!({"type":"response.function_call_arguments.delta","output_index":4,"delta":"{\"x\":1}"}));
+            }
+            values.extend([
+                json!({"type":"response.output_item.done","output_index":8,"item":{"type":"function_call","arguments":"{\"y\":2}"}}),
+                json!({"type":"response.function_call_arguments.done","output_index":4,"arguments":"{\"x\":1}"}),
+                json!({"type":"response.output_item.done","output_index":4,"item":{"type":"function_call","arguments":"{\"x\":1}"}}),
+                json!({"type":"response.completed","response":{}}),
+            ]);
+            let mut aggregate = Aggregator::new("model".into(), 0);
+            let mut renderer = ChunkRenderer::new("model".into(), 0, true);
+            let mut arguments = [String::new(), String::new()];
+            for event in decode(values) {
+                aggregate.push(event.clone());
+                for frame in renderer.render(event) {
+                    if frame.as_ref() == DONE_FRAME {
+                        continue;
+                    }
+                    let value: Value = serde_json::from_slice(&frame[6..]).unwrap();
+                    if let Some(call) = value.pointer("/choices/0/delta/tool_calls/0") {
+                        if let Some(delta) =
+                            call.pointer("/function/arguments").and_then(Value::as_str)
+                        {
+                            arguments[call["index"].as_u64().unwrap() as usize].push_str(delta);
+                        }
+                    }
+                }
+            }
+            let completion = aggregate.into_completion();
+            for (index, expected) in [r#"{"x":1}"#, r#"{"y":2}"#].iter().enumerate() {
+                assert_eq!(arguments[index], *expected);
+                assert_eq!(
+                    completion["choices"][0]["message"]["tool_calls"][index]["function"]
+                        ["arguments"],
+                    *expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn codex_incomplete_preserves_chat_reason_and_usage() {
+        for (reason, finish) in [
+            ("max_tokens", "length"),
+            ("max_output_tokens", "length"),
+            ("content_filter", "content_filter"),
+        ] {
+            let events = decode(vec![
+                json!({"type":"response.output_text.delta","delta":"partial"}),
+                json!({"type":"response.incomplete","response":{"error":null,"incomplete_details":{"reason":reason},"usage":{"input_tokens":3,"output_tokens":1}}}),
+            ]);
+            let mut aggregate = Aggregator::new("model".into(), 0);
+            let mut renderer = ChunkRenderer::new("model".into(), 0, true);
+            let mut frames = Vec::new();
+            for event in events {
+                aggregate.push(event.clone());
+                frames.extend(renderer.render(event));
+            }
+            assert!(aggregate.failure().is_none());
+            let completion = aggregate.into_completion();
+            assert_eq!(completion["choices"][0]["message"]["content"], "partial");
+            assert_eq!(completion["choices"][0]["finish_reason"], finish);
+            assert_eq!(completion["usage"]["prompt_tokens"], 3);
+            assert_eq!(completion["usage"]["completion_tokens"], 1);
+            assert_eq!(
+                frames.iter().filter(|f| f.as_ref() == DONE_FRAME).count(),
+                1
+            );
+            let values: Vec<Value> = frames
+                .iter()
+                .filter(|f| f.as_ref() != DONE_FRAME)
+                .map(|f| serde_json::from_slice(&f[6..]).unwrap())
+                .collect();
+            assert_eq!(
+                values
+                    .iter()
+                    .filter(|v| v
+                        .pointer("/choices/0/finish_reason")
+                        .and_then(Value::as_str)
+                        == Some(finish))
+                    .count(),
+                1
+            );
+            assert!(values
+                .iter()
+                .any(|v| v.pointer("/usage/prompt_tokens") == Some(&json!(3))
+                    && v.pointer("/usage/completion_tokens") == Some(&json!(1))));
+            assert!(!values.iter().any(|v| v.get("error").is_some()));
+        }
     }
 }

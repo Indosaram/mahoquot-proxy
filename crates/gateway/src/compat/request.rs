@@ -1,4 +1,6 @@
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, thiserror::Error)]
 pub enum TranslateError {
@@ -138,6 +140,9 @@ pub fn openai_to_codex_with_cache_key(
         "reasoning".into(),
         json!({ "effort": resolved_effort.as_deref().unwrap_or("medium") }),
     );
+    if let Some(summary) = obj.get("reasoning").and_then(|r| r.get("summary")) {
+        out.get_mut("reasoning").expect("reasoning was inserted")["summary"] = summary.clone();
+    }
     if let Some(tools) = obj.get("tools").and_then(Value::as_array) {
         let mapped = map_tools(tools);
         if !mapped.is_empty() {
@@ -236,6 +241,47 @@ pub fn openai_to_codex_with_cache_key(
 fn split_messages(messages: &[Value]) -> (String, Vec<Value>) {
     let mut instructions = String::new();
     let mut input: Vec<Value> = Vec::with_capacity(messages.len());
+    let ids: Vec<&str> = messages
+        .iter()
+        .flat_map(|msg| {
+            msg.get("tool_call_id")
+                .and_then(Value::as_str)
+                .into_iter()
+                .chain(
+                    msg.get("tool_calls")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|call| call.get("id").and_then(Value::as_str)),
+                )
+        })
+        .collect();
+    let mut reserved: HashSet<String> = ids
+        .iter()
+        .filter(|id| id.len() <= 64)
+        .map(|id| (*id).to_string())
+        .collect();
+    let mut shortened: HashMap<&str, String> = HashMap::new();
+    for id in ids {
+        if id.len() <= 64 || shortened.contains_key(id) {
+            continue;
+        }
+        let mut retry = 0u64;
+        loop {
+            let mut hash = Sha256::new();
+            hash.update(id.as_bytes());
+            if retry > 0 {
+                hash.update(retry.to_be_bytes());
+            }
+            let candidate = format!("{:x}", hash.finalize());
+            if reserved.insert(candidate.clone()) {
+                shortened.insert(id, candidate);
+                break;
+            }
+            retry += 1;
+        }
+    }
+    let call_id = |id: &str| shortened.get(id).cloned().unwrap_or_else(|| id.to_string());
 
     for msg in messages {
         match msg.get("role").and_then(Value::as_str).unwrap_or("user") {
@@ -272,7 +318,7 @@ fn split_messages(messages: &[Value]) -> (String, Vec<Value>) {
                     .unwrap_or(false);
                 input.push(json!({
                     "type": "function_call_output",
-                    "call_id": msg.get("tool_call_id").and_then(Value::as_str).unwrap_or_default(),
+                    "call_id": call_id(msg.get("tool_call_id").and_then(Value::as_str).unwrap_or_default()),
                     "output": if from_anthropic {
                         Value::String(flatten_text(msg.get("content")))
                     } else {
@@ -314,7 +360,7 @@ fn split_messages(messages: &[Value]) -> (String, Vec<Value>) {
                     let function = call.get("function");
                     input.push(json!({
                         "type": "function_call",
-                        "call_id": call.get("id").and_then(Value::as_str).unwrap_or_default(),
+                        "call_id": call_id(call.get("id").and_then(Value::as_str).unwrap_or_default()),
                         "name": function.and_then(|f| f.get("name")).and_then(Value::as_str).unwrap_or_default(),
                         "arguments": function.and_then(|f| f.get("arguments")).and_then(Value::as_str).unwrap_or("{}"),
                     }));
@@ -1075,5 +1121,47 @@ mod prompt_cache_key_tests {
         assert_eq!(val["text"]["format"]["type"], "custom_format");
         assert_eq!(val["text"]["format"]["name"], "custom");
         assert_eq!(val["text"]["verbosity"], "high");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_long_call_ids_keep_injective_pairing() {
+        let first = "a".repeat(65);
+        let second = "b".repeat(65);
+        let reserved = format!("{:x}", Sha256::digest(first.as_bytes()));
+        let ids = [first, second, reserved.clone()];
+        let mut messages = Vec::new();
+        for id in &ids {
+            messages.push(json!({"role":"assistant","tool_calls":[{"id":id,"function":{"name":"f","arguments":"{}"}}]}));
+            messages.push(json!({"role":"tool","tool_call_id":id,"content":"ok"}));
+        }
+        let (_, input) = split_messages(&messages);
+        let mut wire_ids = HashSet::new();
+        for pair in input.chunks_exact(2) {
+            let id = pair[0]["call_id"].as_str().unwrap();
+            assert!(id.len() <= 64 && id.is_ascii());
+            assert!(wire_ids.insert(id.to_string()));
+            assert_eq!(pair[0]["call_id"], pair[1]["call_id"]);
+        }
+        assert_eq!(input[4]["call_id"], reserved);
+        assert_ne!(input[0]["call_id"], reserved);
+    }
+
+    #[test]
+    fn codex_explicit_reasoning_summary_is_retained() {
+        for (model, effort) in [("gpt-5", "high"), ("gpt-5(low)", "low")] {
+            let request =
+                json!({"model":model,"messages":[],"reasoning":{"effort":"high","summary":"auto"}});
+            let translated = openai_to_codex(&serde_json::to_vec(&request).unwrap()).unwrap();
+            let body: Value = serde_json::from_slice(&translated.body).unwrap();
+            assert_eq!(body["reasoning"], json!({"effort":effort,"summary":"auto"}));
+        }
+        let translated = openai_to_codex(br#"{"model":"gpt-5","messages":[]}"#).unwrap();
+        let body: Value = serde_json::from_slice(&translated.body).unwrap();
+        assert!(body["reasoning"].get("summary").is_none());
     }
 }
