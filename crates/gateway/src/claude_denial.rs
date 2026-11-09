@@ -4,7 +4,7 @@
 //! policy signal across the whole pool. Classification decides, per answer,
 //! whether another account may see the request at all.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Mutex;
 
 /// Phrases Anthropic uses when an account or organization is restricted.
@@ -62,6 +62,43 @@ pub fn enforcement_reason(status: u16, message: &str) -> String {
         .copied()
         .unwrap_or("repeated permission denial");
     format!("{status}: {signature}")
+}
+
+/// Fail-closed quarantine, including accounts whose settings write failed.
+#[derive(Debug, Default)]
+pub struct QuarantineSet {
+    inner: Mutex<BTreeSet<String>>,
+}
+
+impl QuarantineSet {
+    pub fn insert(&self, account: &str) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(account.to_string());
+    }
+
+    pub fn contains(&self, account: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(account)
+    }
+
+    pub fn remove(&self, account: &str) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(account);
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 /// Per-account timestamps of the last plain `Denied`, used to promote a

@@ -713,11 +713,13 @@ async fn main() -> anyhow::Result<()> {
     // store keeps Claude sessions pinned across restarts.
     let claude_budget_refresher =
         mahoquot_gateway::claude_budget::BudgetTracker::spawn_refresher(Arc::clone(&state));
-    let claude_affinity_worker = mahoquot_gateway::affinity_store::AffinityStore::spawn_persistence(
-        Arc::clone(&state.claude_affinity),
-        std::time::Duration::from_secs(5),
-        Arc::new(tokio::sync::Notify::new()),
-    );
+    let claude_affinity_shutdown = Arc::new(tokio::sync::Notify::new());
+    let mut claude_affinity_worker =
+        mahoquot_gateway::affinity_store::AffinityStore::spawn_persistence(
+            Arc::clone(&state.claude_affinity),
+            std::time::Duration::from_secs(5),
+            Arc::clone(&claude_affinity_shutdown),
+        );
     // Rotates OAuth credentials ahead of expiry. Every other refresh trigger is
     // reactive, so an identity provider that expires its refresh token with the
     // access token turns the first post-expiry attempt into a terminal failure.
@@ -745,7 +747,17 @@ async fn main() -> anyhow::Result<()> {
     cline_catalog.shutdown().await;
     pre_expiry_refresh.shutdown().await;
     claude_budget_refresher.abort();
-    claude_affinity_worker.abort();
+    claude_affinity_shutdown.notify_one();
+    if tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        &mut claude_affinity_worker,
+    )
+    .await
+    .is_err()
+    {
+        warn!("claude affinity persistence is still running; waiting before final flush");
+        let _ = claude_affinity_worker.await;
+    }
     let now_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)

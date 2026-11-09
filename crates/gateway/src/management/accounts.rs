@@ -1228,6 +1228,7 @@ pub async fn clear_suspected_account(
         .current()
         .claude_suspected_accounts
         .contains_key(&account_id)
+        && !state.claude_quarantine.contains(&account_id)
     {
         return typed_error(
             StatusCode::NOT_FOUND,
@@ -1244,10 +1245,13 @@ pub async fn clear_suspected_account(
     })
     .await;
     match result {
-        Ok(Ok(_)) => json_status(
-            StatusCode::OK,
-            json!({ "status": "ok", "account_id": account_id }),
-        ),
+        Ok(Ok(_)) => {
+            state.claude_quarantine.remove(&account_id);
+            json_status(
+                StatusCode::OK,
+                json!({ "status": "ok", "account_id": account_id }),
+            )
+        }
         Ok(Err(err)) => typed_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "persist_failed",

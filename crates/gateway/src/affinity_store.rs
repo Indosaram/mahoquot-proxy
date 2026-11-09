@@ -99,6 +99,20 @@ impl AffinityStore {
         self.dirty.store(true, Ordering::Release);
     }
 
+    /// Refresh the idle timer only while the binding still names this
+    /// account. A one-off failover must not steal the durable binding.
+    pub fn touch(&self, key: u64, account_id: &str, now_unix: i64) {
+        let mut map = self.map.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(binding) = map.get_mut(&key) else {
+            return;
+        };
+        if binding.account_id != account_id {
+            return;
+        }
+        binding.last_used_unix = now_unix;
+        self.dirty.store(true, Ordering::Release);
+    }
+
     /// Number of live bindings per account, for the console.
     pub fn counts(&self, now_unix: i64) -> HashMap<String, usize> {
         let map = self.map.lock().unwrap_or_else(|p| p.into_inner());

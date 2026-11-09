@@ -1169,6 +1169,7 @@ async fn handle_claude_denial(
         &format!("suspected enforcement: {reason}"),
     );
     tracing::warn!(account = %member.id(), %reason, "claude account benched as suspected");
+    state.claude_quarantine.insert(member.id());
     let account = member.id().to_string();
     let settings = Arc::clone(&state.settings);
     let result = tokio::task::spawn_blocking(move || {
@@ -2803,6 +2804,14 @@ fn content_type_of(resp: &reqwest::Response) -> Option<String> {
 }
 
 fn stream_response(resp: reqwest::Response, status_code: u16) -> Response {
+    stream_response_observed(resp, status_code, None::<fn(String)>)
+}
+
+fn stream_response_observed(
+    resp: reqwest::Response,
+    status_code: u16,
+    observe: Option<impl FnOnce(String) + Send + 'static>,
+) -> Response {
     let status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::OK);
     let mut res_builder = Response::builder().status(status);
     if let Some(ct) = resp.headers().get(reqwest::header::CONTENT_TYPE) {
@@ -2810,8 +2819,58 @@ fn stream_response(resp: reqwest::Response, status_code: u16) -> Response {
             res_builder = res_builder.header(header::CONTENT_TYPE, v);
         }
     }
+    let mut observe = observe;
+    let mut leading = Vec::new();
+    let mut seen = 0usize;
+    let stream = resp.bytes_stream().inspect(move |chunk| {
+        if observe.is_none() || seen >= 64 * 1024 {
+            return;
+        }
+        let Ok(chunk) = chunk else { return };
+        let take = chunk.len().min(64 * 1024 - seen);
+        leading.extend_from_slice(&chunk[..take]);
+        seen += take;
+        // Inspect complete SSE frames only; chunk boundaries are not frame
+        // boundaries. The original chunks flow through untouched.
+        while let Some((end, delimiter)) = leading
+            .windows(2)
+            .position(|w| w == b"\n\n")
+            .map(|end| (end, 2))
+            .into_iter()
+            .chain(
+                leading
+                    .windows(4)
+                    .position(|w| w == b"\r\n\r\n")
+                    .map(|end| (end, 4)),
+            )
+            .min_by_key(|(end, _)| *end)
+        {
+            let frame = String::from_utf8_lossy(&leading[..end]);
+            let lowered = frame.to_ascii_lowercase();
+            let error_event = frame.lines().any(|line| {
+                line.strip_prefix("event:")
+                    .is_some_and(|event| event.trim() == "error")
+            });
+            if error_event
+                && (lowered.contains("permission_error")
+                    || lowered.contains("enforcement")
+                    || crate::claude_denial::is_enforcement_text(&frame))
+            {
+                if let Some(observe) = observe.take() {
+                    observe(frame.into_owned());
+                }
+                leading.clear();
+                break;
+            }
+            leading.drain(..end + delimiter);
+        }
+        if seen >= 64 * 1024 {
+            observe = None;
+            leading.clear();
+        }
+    });
     res_builder
-        .body(Body::from_stream(resp.bytes_stream()))
+        .body(Body::from_stream(stream))
         .unwrap_or_else(|_| {
             (StatusCode::INTERNAL_SERVER_ERROR, "failed to build body").into_response()
         })
@@ -3764,6 +3823,7 @@ fn claude_account_permitted(member: &AccountMember, state: &AppState) -> bool {
     }
     let settings = state.settings.current();
     if settings.claude_suspected_accounts.contains_key(member.id())
+        || state.claude_quarantine.contains(member.id())
         || state.claude_egress_invalid(member)
     {
         return false;
@@ -4681,8 +4741,8 @@ async fn acquire_devin_first_frame(
 
 #[allow(clippy::too_many_arguments)]
 async fn finish_success(
-    state: &AppState,
-    member: &AccountMember,
+    state: &Arc<AppState>,
+    member: &Arc<AccountMember>,
     plan: &RelayPlan,
     headers: &HeaderMap,
     resp: reqwest::Response,
@@ -4759,7 +4819,24 @@ async fn finish_success(
         && protocol == compat::Protocol::Anthropic
         && is_direct_claude_oauth(member, state)
     {
-        return Ok(stream_response(resp, status_code));
+        let state = Arc::clone(state);
+        let member = Arc::clone(member);
+        let runtime = tokio::runtime::Handle::current();
+        return Ok(stream_response_observed(
+            resp,
+            status_code,
+            Some(move |message: String| {
+                let denial = crate::claude_denial::classify(403, &message);
+                let denial = if message.to_ascii_lowercase().contains("enforcement") {
+                    crate::claude_denial::Denial::Enforcement
+                } else {
+                    denial
+                };
+                runtime.spawn(async move {
+                    handle_claude_denial(&state, &member, 403, &message, denial).await;
+                });
+            }),
+        ));
     }
 
     if !plan.client_stream
@@ -6457,6 +6534,9 @@ pub async fn handle_relay(
             Err(message) => return json_error(StatusCode::BAD_REQUEST, &message),
         };
 
+        let is_claude_direct_wire = target.protocol == compat::Protocol::Anthropic
+            && target.headers.is_some()
+            && is_direct_claude_oauth(&member, &state);
         let mut target_body = target.body;
         if let Some(h) = hierarchy.as_ref() {
             if let Some(body) =
@@ -6466,7 +6546,7 @@ pub async fn handle_relay(
             }
         }
         let mut target_url = target.url;
-        let target_headers = target.headers;
+        let mut target_headers = target.headers;
 
         let payload_settings = &state.settings.current().payload.extra;
         if !payload_settings.is_empty() {
@@ -6579,6 +6659,13 @@ pub async fn handle_relay(
             }
         }
 
+        if is_claude_direct_wire {
+            let mut signed = target_body.to_vec();
+            if crate::claude_wire::sign_cch(&mut signed).is_ok() {
+                target_body = Bytes::from(signed);
+            }
+        }
+
         // The MiMo anti-abuse gate inspects Accept the way it inspects the
         // User-Agent, so mirror what its own CLI client sends.
         let accept = (member.kind() == crate::account::ProviderKind::Generic
@@ -6646,6 +6733,16 @@ pub async fn handle_relay(
         if status_code == 401 && state.auth_refresh_enabled && !refreshed_this_account {
             match state.refresh_member(&member, Some(&member_at)).await {
                 Ok(_) => {
+                    if is_claude_direct_wire {
+                        if let Some(ref mut headers) = target_headers {
+                            if let Some(auth) = headers
+                                .iter_mut()
+                                .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+                            {
+                                auth.1 = format!("Bearer {}", member.access_token());
+                            }
+                        }
+                    }
                     match send_upstream(
                         &state,
                         &target_url,
@@ -6713,9 +6810,16 @@ pub async fn handle_relay(
             .await
             {
                 Ok(mut response) => {
-                    if is_claude_oauth(&member) && durable_bound.is_none() {
+                    if is_claude_oauth(&member) {
                         if let Some(key) = durable_key {
-                            state.claude_affinity.put(key, member.id(), now_unix_secs());
+                            // A bound session that keeps working must not expire
+                            // on its creation timestamp alone.
+                            state
+                                .claude_affinity
+                                .touch(key, member.id(), now_unix_secs());
+                            if durable_bound.is_none() {
+                                state.claude_affinity.put(key, member.id(), now_unix_secs());
+                            }
                         }
                     }
                     if let Some(h) = hierarchy.as_mut() {
@@ -7624,6 +7728,7 @@ mod routing_tests {
                 None,
             )
             .unwrap();
+            let state = Arc::new(state);
             let result = finish_success(
                 &state,
                 &member,
