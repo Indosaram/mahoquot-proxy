@@ -2,7 +2,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::extract::{DefaultBodyLimit, State};
+use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::{from_fn, from_fn_with_state, Next};
 use axum::response::{IntoResponse, Json, Response};
@@ -449,12 +449,30 @@ async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoRespons
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body)
 }
 
-async fn admin_stats_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(state.get_stats())
+async fn admin_stats_handler(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<AdminStatsQuery>,
+) -> impl IntoResponse {
+    Json(state.get_stats_with_history(params.history_minutes))
 }
 
-async fn admin_usage_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(state.get_stats())
+/// `history_minutes` bounds the `history` array in `/admin/stats`.
+///
+/// The array is one bucket per minute per provider per account over a month of
+/// retention, so the unfiltered response is tens of megabytes on a busy
+/// gateway. Omitted keeps that full response for older clients; `0` omits the
+/// array for pollers that only need live counters, and `n` returns the last `n`
+/// minutes for a chart that knows its own range.
+#[derive(Debug, serde::Deserialize)]
+struct AdminStatsQuery {
+    history_minutes: Option<i64>,
+}
+
+async fn admin_usage_handler(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<AdminStatsQuery>,
+) -> impl IntoResponse {
+    Json(state.get_stats_with_history(params.history_minutes))
 }
 
 async fn admin_warmup_handler(

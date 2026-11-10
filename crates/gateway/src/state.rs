@@ -951,8 +951,7 @@ pub struct AppState {
     pub claude_denials: crate::claude_denial::DeniedTracker,
     /// Last logged quota-poll outcome per account, so one persistent failure
     /// is logged once instead of on every poll cycle.
-    pub quota_poll_failures:
-        std::sync::Mutex<std::collections::HashMap<String, String>>,
+    pub quota_poll_failures: std::sync::Mutex<std::collections::HashMap<String, String>>,
     pub claude_quarantine: crate::claude_denial::QuarantineSet,
     /// W2: durable Claude OAuth session -> account bindings.
     pub claude_affinity: Arc<crate::affinity_store::AffinityStore>,
@@ -1995,6 +1994,15 @@ impl AppState {
     }
 
     pub fn get_stats(&self) -> AdminStatsResponse {
+        // Callers that do not name a window keep the previous behaviour: the
+        // whole retained range. New callers pass an explicit window so the
+        // response stays small.
+        self.get_stats_with_history(None)
+    }
+
+    /// `history_minutes`: `None` keeps the full retained history, `Some(0)`
+    /// omits it entirely, `Some(n)` returns the last `n` minutes.
+    pub fn get_stats_with_history(&self, history_minutes: Option<i64>) -> AdminStatsResponse {
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
@@ -2172,7 +2180,10 @@ impl AppState {
             exposed_client_errors: self.metrics.exposed_client_errors.load(Ordering::Relaxed),
             ttft: self.monitor.ttft_percentiles(),
             accounts,
-            history: self.telemetry.snapshot(),
+            history: match history_minutes {
+                None => self.telemetry.snapshot(),
+                Some(minutes) => self.telemetry.snapshot_window(minutes),
+            },
             signature_ledger: self.signature_ledger.stats(),
         }
     }
@@ -2239,6 +2250,26 @@ mod stats_tests {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0)
+    }
+
+    /// The console polls `/admin/stats` repeatedly and only needs the bucket
+    /// history for its chart backfill, so the route has to be able to leave it
+    /// out. Omitting the parameter must keep the old full response alive.
+    #[test]
+    fn stats_history_is_omitted_by_a_zero_window_and_kept_when_unset() {
+        let (state, _member) = state_with_cline_account();
+        // `record_with_account` takes unix seconds, not minutes.
+        let now_secs = now_ms() / 1000;
+        state
+            .telemetry
+            .record_with_account(now_secs - 60 * 60, "codex", None, true);
+        state
+            .telemetry
+            .record_with_account(now_secs, "codex", None, true);
+
+        assert!(state.get_stats_with_history(Some(0)).history.is_empty());
+        assert_eq!(state.get_stats_with_history(Some(30)).history.len(), 1);
+        assert_eq!(state.get_stats().history.len(), 2);
     }
 
     #[test]
