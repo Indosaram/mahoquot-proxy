@@ -76,6 +76,15 @@ pub fn account_upstream_base<'a>(
         .find(|url| !url.is_empty())
 }
 
+/// True for a trailing API version segment such as `v1`, `v4`, or `v1beta`.
+fn is_api_version(segment: &str) -> bool {
+    let Some(rest) = segment.strip_prefix('v') else {
+        return false;
+    };
+    rest.chars().next().is_some_and(|c| c.is_ascii_digit())
+        && rest.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
 pub fn join_provider_path(base: &str, req_path: &str) -> String {
     let base = base.trim_end_matches('/');
     if base.ends_with("/chat/completions")
@@ -85,8 +94,20 @@ pub fn join_provider_path(base: &str, req_path: &str) -> String {
     {
         return base.to_string();
     }
-    if base.ends_with("/v1") && req_path.starts_with("/v1/") {
-        return format!("{base}{}", &req_path[3..]);
+    // A base that already carries its own API version (for example Zhipu's
+    // `https://open.bigmodel.cn/api/coding/paas/v4`) must not gain a second one:
+    // appending `/v1/chat/completions` verbatim produced `/v4/v1/chat/completions`
+    // and the upstream answered 404.
+    if let Some(version) = base.rsplit('/').next() {
+        if is_api_version(version) {
+            let prefix = format!("/{version}/");
+            if let Some(rest) = req_path.strip_prefix(&prefix) {
+                return format!("{base}/{rest}");
+            }
+            if req_path.starts_with("/v1/") {
+                return format!("{base}{}", &req_path[3..]);
+            }
+        }
     }
     format!("{base}{req_path}")
 }
@@ -167,6 +188,24 @@ mod tests {
         assert_eq!(
             join_provider_path("https://example.test/openai/chat", "/v1/chat/completions"),
             "https://example.test/openai/chat"
+        );
+        // Zhipu's coding base already ends in /v4; the request path must not
+        // add a second version segment.
+        assert_eq!(
+            join_provider_path(
+                "https://open.bigmodel.cn/api/coding/paas/v4",
+                "/v1/chat/completions"
+            ),
+            "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions"
+        );
+        assert_eq!(
+            join_provider_path("https://example.test/v1beta", "/v1beta/models"),
+            "https://example.test/v1beta/models"
+        );
+        // A non-version last segment still joins verbatim.
+        assert_eq!(
+            join_provider_path("https://example.test/api", "/v1/chat/completions"),
+            "https://example.test/api/v1/chat/completions"
         );
     }
     use crate::account::ProviderKind;
