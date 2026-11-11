@@ -152,6 +152,13 @@ const INNER_FIELD_ORDER: &[&str] = &[
     "generationConfig",
 ];
 
+/// Gemini's `labels` is `map<string, string>`, so every value must be a JSON
+/// string. Booleans and integers sent raw are rejected by the upstream proto
+/// parser with `Invalid value at 'request.labels[N].value' (TYPE_STRING)`.
+fn proto_string<T: ToString>(value: T) -> String {
+    value.to_string()
+}
+
 fn ordered_labels(
     cascade: &uuid::Uuid,
     trajectory: &uuid::Uuid,
@@ -165,22 +172,22 @@ fn ordered_labels(
     if let Some(model_enum) = labels.model_enum.as_deref().filter(|v| !v.is_empty()) {
         out.insert("model_enum".into(), json!(model_enum));
     }
-    out.insert("used_claude".into(), json!(labels.used_claude));
+    out.insert("used_claude".into(), json!(proto_string(labels.used_claude)));
     out.insert(
         "used_non_gemini_model".into(),
-        json!(labels.used_non_gemini_model),
+        json!(proto_string(labels.used_non_gemini_model)),
     );
     // The client reports twice the turn index here, not the content count.
     out.insert(
         "last_step_index".into(),
-        json!(labels.step.saturating_mul(2)),
+        json!(proto_string(labels.step.saturating_mul(2))),
     );
     if let Some(execution) = labels.last_execution_id.as_deref() {
         out.insert("last_execution_id".into(), json!(execution));
     }
     out.insert(
         "used_claude_conservative".into(),
-        json!(labels.used_claude_conservative),
+        json!(proto_string(labels.used_claude_conservative)),
     );
     out.insert("trajectory_id".into(), json!(trajectory.to_string()));
     out.insert(
@@ -466,8 +473,8 @@ mod tests {
         // The client body passes through untouched; the labels the client adds
         // are now present beside it.
         assert_eq!(wrapped["request"]["contents"], body["contents"]);
-        assert_eq!(wrapped["request"]["labels"]["last_step_index"], 0);
-        assert_eq!(wrapped["request"]["labels"]["used_claude"], false);
+        assert_eq!(wrapped["request"]["labels"]["last_step_index"], "0");
+        assert_eq!(wrapped["request"]["labels"]["used_claude"], "false");
         assert_eq!(
             wrapped["request"]["labels"]["request_id"],
             format!(
@@ -567,8 +574,38 @@ mod tests {
             assert!(at > last, "{key} out of order in {request}");
             last = at;
         }
-        assert!(request.contains("\"last_step_index\":2"), "{request}");
+        assert!(request.contains("\"last_step_index\":\"2\""), "{request}");
         assert!(request.contains("\"request_id\":\""), "{request}");
+    }
+
+    #[test]
+    fn every_label_value_is_a_json_string() {
+        // Gemini declares `labels` as map<string, string>. Emitting a boolean or
+        // an integer makes the upstream proto parser reject the whole request
+        // with `Invalid value at 'request.labels[N].value' (TYPE_STRING)`,
+        // which fails every call rather than one field.
+        let body = json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}]});
+        let labels = AntigravityLabels {
+            step: 3,
+            used_claude: true,
+            used_non_gemini_model: false,
+            used_claude_conservative: false,
+            model_enum: Some("MODEL_PLACEHOLDER_M36".into()),
+            last_execution_id: Some("exec-1".into()),
+        };
+        let wrapped = wrap_for_antigravity_with_labels("gemini-3-flash", "proj-1", &body, &labels);
+        let map = wrapped["request"]["labels"]
+            .as_object()
+            .expect("labels must be an object");
+        for (key, value) in map {
+            assert!(
+                value.is_string(),
+                "label {key} must be a JSON string for map<string,string>, got {value:?}"
+            );
+        }
+        assert_eq!(map["used_claude"], "true");
+        assert_eq!(map["used_claude_conservative"], "false");
+        assert_eq!(map["last_step_index"], "6");
     }
 
     #[test]
