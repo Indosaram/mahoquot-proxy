@@ -15,7 +15,6 @@ pub fn openai_to_kiro_with_profile(
         .and_then(Value::as_str)
         .ok_or_else(|| "missing model".to_string())?;
     let model = model.strip_prefix("kiro/").unwrap_or(model);
-    let model = if model == "auto-kiro" { "auto" } else { model };
     let messages = body
         .get("messages")
         .and_then(Value::as_array)
@@ -543,7 +542,7 @@ mod tests {
 
     #[test]
     fn kiro_prior_tool_result_survives_new_user() {
-        let body = json!({"model":"kiro/auto", "messages":[
+        let body = json!({"model":"kiro/claude-opus-5.5", "messages":[
             {"role":"user","content":"look"},
             {"role":"assistant","content":"", "tool_calls":[{"id":"a|b","function":{"name":"read","arguments":"{}"}}]},
             {"role":"tool","tool_call_id":"a|b","is_error":true,"content":[{"type":"text","text":"done"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AQID"}}]},
@@ -593,8 +592,10 @@ mod tests {
             assert!(events.iter().any(|event| matches!(
                 event, CodexEvent::KiroRedactedReasoning(blob) if blob == "opaque-1"
             )));
-            let mut renderer =
-                super::super::responses::ResponsesStreamRenderer::new("kiro/auto".into(), 0);
+            let mut renderer = super::super::responses::ResponsesStreamRenderer::new(
+                "kiro/claude-opus-5.5".into(),
+                0,
+            );
             let frames: Vec<_> = events
                 .into_iter()
                 .flat_map(|event| renderer.render(event))
@@ -626,7 +627,7 @@ mod tests {
                 input.push(json!({"role":"user","content":"next"}));
             }
             let chat = super::super::responses::responses_to_openai(
-                &json!({"model":"kiro/auto","input":input}),
+                &json!({"model":"kiro/claude-opus-5.5","input":input}),
             )
             .unwrap();
             let replay = openai_to_kiro(&chat).unwrap();
@@ -944,7 +945,7 @@ mod tests {
     #[test]
     fn replays_tool_results_images_and_reasoning_on_kiro_wire() {
         let payload = openai_to_kiro(&json!({
-            "model": "kiro/claude-haiku-4.5",
+            "model": "kiro/claude-opus-5.5",
             "messages": [
                 {"role":"user","content":"look"},
                 {"role":"assistant","content":"", "kiroRedactedReasoning":"blob", "tool_calls":[{
@@ -984,7 +985,7 @@ mod tests {
     fn profile_reasoning_and_object_tool_input_follow_reference_wire() {
         let payload = openai_to_kiro_with_profile(
             &json!({
-                "model":"kiro/claude-sonnet-4.6",
+                "model":"kiro/claude-opus-5.5",
                 "messages":[{"role":"user","content":"hi"}]
             }),
             Some("arn:aws:codewhisperer:us-east-1:123:profile/abc"),

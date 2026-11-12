@@ -41,18 +41,10 @@ const LEGACY_CLAUDE_MODELS: [&str; 12] = [
 const LEGACY_ZCODE_MODELS: [&str; 5] =
     ["glm-5.3", "glm-5.3-flash", "glm-5.2", "glm-5.1", "glm-4.6"];
 
-// 4. Kiro models (7) - exposed as kiro/{model}, dot-notation runtime ids.
-// Date-suffixed ids (claude-sonnet-4-5-20250929, claude-haiku-4-5-20251001) are
-// rejected by runtime.{region}.kiro.dev with INVALID_MODEL_ID; the runtime
-// accepts the normalized dot form instead.
-const LEGACY_KIRO_MODELS: [&str; 6] = [
-    "auto",
-    "claude-sonnet-4.6",
-    "claude-sonnet-4.5",
-    "claude-opus-4.6",
-    "claude-opus-4.5",
-    "claude-haiku-4.5",
-];
+// 4. Kiro models (1) - exposed as kiro/{model}, dot-notation runtime ids.
+// Only the model the operator actually routes is declared; kiro is a closed
+// provider, so anything absent here is refused before it reaches the wire.
+const LEGACY_KIRO_MODELS: [&str; 1] = ["claude-opus-5.5"];
 
 // 5. Cursor models (4 in /v1/models + 2 cursor-*)
 const LEGACY_CURSOR_MODELS: [&str; 6] = [
@@ -204,19 +196,17 @@ fn embedded_catalog_covers_legacy_sources() {
         }
     }
 
-    // Verify auto-kiro alias
-    match snapshot.resolve("auto-kiro") {
-        Ok(resolved_kiro) => {
-            if resolved_kiro.canonical_id.as_str() != "kiro/auto" {
-                missing_errors.push(format!(
-                    "auto-kiro alias expected to resolve to 'kiro/auto', got '{}'",
-                    resolved_kiro.canonical_id
-                ));
-            }
-        }
-        Err(e) => {
-            missing_errors.push(format!("auto-kiro alias failed to resolve: {e:?}"));
-        }
+    // Kiro declares no aliases: the retired auto-kiro shim must not rewrite ids.
+    // (resolve() itself still succeeds for unknown ids through open-provider
+    // passthrough, so the alias table is what must stay clean.)
+    let auto_kiro = ModelId::new("auto-kiro").unwrap();
+    match snapshot.resolve_alias(&auto_kiro) {
+        Ok(target) if target == auto_kiro => {}
+        Ok(target) => missing_errors.push(format!(
+            "auto-kiro must not be aliased, but resolves to '{}'",
+            target.as_str()
+        )),
+        Err(e) => missing_errors.push(format!("auto-kiro alias lookup failed: {e:?}")),
     }
 
     // 5. Verify Cursor models
@@ -454,16 +444,16 @@ fn test_embedded_catalog_resolves_closed_and_open_models() {
         "claude"
     );
 
-    // Kiro alias model
-    let resolved_kiro = snapshot.resolve("auto-kiro").unwrap();
-    assert_eq!(resolved_kiro.canonical_id.as_str(), "kiro/auto");
+    // Kiro model
+    let resolved_kiro = snapshot.resolve("kiro/claude-opus-5.5").unwrap();
+    assert_eq!(resolved_kiro.canonical_id.as_str(), "kiro/claude-opus-5.5");
     assert_eq!(
         resolved_kiro.eligible_bindings[0].provider_id.as_str(),
         "kiro"
     );
     assert_eq!(
         resolved_kiro.eligible_bindings[0].effective_upstream_id(&resolved_kiro.canonical_id),
-        "auto"
+        "claude-opus-5.5"
     );
 
     // Open Codex model

@@ -63,14 +63,7 @@ const LEGACY_CURSOR_MODELS: [&str; 6] = [
     "cursor/auto-intelligence",
 ];
 
-const LEGACY_KIRO_MODELS: [&str; 6] = [
-    "kiro/auto",
-    "kiro/claude-haiku-4.5",
-    "kiro/claude-opus-4.6",
-    "kiro/claude-opus-4.5",
-    "kiro/claude-sonnet-4.6",
-    "kiro/claude-sonnet-4.5",
-];
+const LEGACY_KIRO_MODELS: [&str; 1] = ["kiro/claude-opus-5.5"];
 
 const LEGACY_VERTEX_MODELS: [&str; 21] = [
     "gemini-1.5-flash",
@@ -253,21 +246,21 @@ fn test_kiro_typed_contribution_and_capabilities() {
             "Kiro contribution must support prefixed model {id}"
         );
     }
-    assert_eq!(contrib.models.len(), 6);
+    assert_eq!(contrib.models.len(), 1);
 
     // Kiro unprefixed upstream IDs must also be supported
-    assert!(mahoquot_providers::kiro::is_kiro_model("claude-sonnet-4.6"));
-    assert!(mahoquot_providers::kiro::is_kiro_model("claude-opus-4.6"));
-    assert!(mahoquot_providers::kiro::is_kiro_model("auto"));
-    assert!(contrib.supports_model("claude-sonnet-4.6"));
+    assert!(mahoquot_providers::kiro::is_kiro_model("claude-opus-5.5"));
+    assert!(contrib.supports_model("claude-opus-5.5"));
 
-    // Aliases
-    assert!(contrib.supports_model("auto-kiro"));
+    // Retired models and the auto alias must no longer be claimed.
+    assert!(!mahoquot_providers::kiro::is_kiro_model("auto"));
+    assert!(!contrib.supports_model("claude-sonnet-4.6"));
+    assert!(!contrib.supports_model("auto-kiro"));
 
     // Capabilities (runtime exposes no dedicated "-thinking" model id;
     // thinking depth is an effort suffix on the base model).
     let thinking_caps = contrib
-        .capability_profile("kiro/claude-sonnet-4.6")
+        .capability_profile("kiro/claude-opus-5.5")
         .expect("kiro chat capabilities");
     assert!(thinking_caps.contains(&ModelCapability::Chat));
     assert!(thinking_caps.contains(&ModelCapability::Tools));

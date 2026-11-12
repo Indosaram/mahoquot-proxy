@@ -1347,7 +1347,7 @@ async fn kiro_relays_conversation_state_and_decodes_eventstream() {
         .post(format!("{gateway}/v1/chat/completions"))
         .bearer_auth("relay-key")
         .json(&serde_json::json!({
-            "model": "kiro/claude-haiku-4.5",
+            "model": "kiro/claude-opus-5.5",
             "stream": true,
             "messages": [
                 {"role":"system","content":"be concise"},
@@ -1601,6 +1601,6 @@ async fn codex_does_not_claim_models_owned_by_loaded_provider_accounts() {
         .find(|member| member.kind() == mahoquot_gateway::account::ProviderKind::Codex)
         .unwrap();
     assert!(!codex.supports_model("claude-sonnet-4-5-20250929"));
-    assert!(!codex.supports_model("kiro/claude-haiku-4.5"));
+    assert!(!codex.supports_model("kiro/claude-opus-5.5"));
     std::fs::remove_dir_all(dir).ok();
 }

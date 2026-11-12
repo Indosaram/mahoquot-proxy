@@ -251,12 +251,9 @@ impl ProviderKind {
                 model.starts_with("cursor/")
                     || mahoquot_providers::cursor::is_cursor_model_in_snapshot(snapshot, model)
             }
-            ProviderKind::Kiro => {
-                model == "auto-kiro"
-                    || model.strip_prefix("kiro/").is_some_and(|stripped| {
-                        mahoquot_providers::kiro::is_kiro_model_in_snapshot(snapshot, stripped)
-                    })
-            }
+            ProviderKind::Kiro => model.strip_prefix("kiro/").is_some_and(|stripped| {
+                mahoquot_providers::kiro::is_kiro_model_in_snapshot(snapshot, stripped)
+            }),
             ProviderKind::Zcode => {
                 mahoquot_providers::zcode::is_zcode_model_in_snapshot(snapshot, model)
             }
@@ -450,11 +447,11 @@ mod provider_kind_contract_tests {
         let kiro = ProviderKind::Kiro;
         let cursor = ProviderKind::Cursor;
 
-        // Kiro serves prefixed models and auto-kiro
-        assert!(kiro.serves_model("auto-kiro"));
-        assert!(kiro.serves_model("kiro/auto"));
-        assert!(kiro.serves_model("kiro/claude-sonnet-4.6"));
-        assert!(kiro.serves_model("kiro/claude-haiku-4.5"));
+        // Kiro serves only the single catalog-declared prefixed model
+        assert!(kiro.serves_model("kiro/claude-opus-5.5"));
+        assert!(!kiro.serves_model("kiro/claude-sonnet-4.6"));
+        assert!(!kiro.serves_model("kiro/claude-haiku-4.5"));
+        assert!(!kiro.serves_model("auto-kiro"));
 
         // Kiro rejects bare un-prefixed models
         assert!(!kiro.serves_model("auto"));
@@ -814,8 +811,8 @@ mod provider_kind_contract_tests {
     fn cursor_and_kiro_own_their_reference_models() {
         assert!(ProviderKind::Cursor.serves_model("cursor-small"));
         assert!(!ProviderKind::Codex.serves_model("cursor-small"));
-        assert!(ProviderKind::Kiro.serves_model("kiro/claude-sonnet-4.6"));
-        assert!(!ProviderKind::Codex.serves_model("kiro/claude-sonnet-4.6"));
+        assert!(ProviderKind::Kiro.serves_model("kiro/claude-opus-5.5"));
+        assert!(!ProviderKind::Codex.serves_model("kiro/claude-opus-5.5"));
     }
 }
 

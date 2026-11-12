@@ -8908,15 +8908,15 @@ mod routing_tests {
         let (state, auth_dir) = six_provider_state();
         let pool = state.pool.load_full();
 
-        let kiro = resolve_route(&pool, Some("auto-kiro"), None)
+        let kiro = resolve_route(&pool, Some("kiro/claude-opus-5.5"), None)
             .unwrap()
             .unwrap();
-        assert_eq!(kiro.canonical_model, "kiro/auto");
+        assert_eq!(kiro.canonical_model, "kiro/claude-opus-5.5");
         assert_eq!(
             kiro.provider_classes[0].binding.provider_id.as_str(),
             "kiro"
         );
-        assert_eq!(kiro.provider_classes[0].upstream_model, "auto");
+        assert_eq!(kiro.provider_classes[0].upstream_model, "claude-opus-5.5");
 
         let cursor = resolve_route(&pool, Some("cursor/auto-cost"), None)
             .unwrap()
@@ -9101,7 +9101,7 @@ mod routing_tests {
             "gemini-3.7-flash-high",
             "claude-sonnet-4-5-20250929",
             "glm-5.3",
-            "kiro/claude-haiku-4.5",
+            "kiro/claude-opus-5.5",
             "cursor/auto",
         ] {
             let route = resolve_route(&pool, Some(model), None).unwrap().unwrap();
