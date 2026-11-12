@@ -548,3 +548,45 @@ fn unauthenticated_metrics_never_publish_credential_identifiers() {
         "per-account series was dropped instead of anonymised:\n{rendered}"
     );
 }
+
+/// The desktop's quota Refresh used to answer with the gateway's entire bucket
+/// history: 21MB over a month of retention, which starved every other channel
+/// on a remote tunnel and made the button look dead. A refresh carries no
+/// chart range, so it must answer with live counters only.
+#[tokio::test]
+async fn usage_refresh_answers_with_live_counters_and_no_bucket_history() {
+    let auth_dir =
+        std::env::temp_dir().join(format!("mahoquot-refresh-bound-{}", std::process::id()));
+    std::fs::create_dir_all(&auth_dir).expect("auth dir");
+    let config = GatewayConfig {
+        auth_dir: auth_dir.clone(),
+        api_keys: ApiKeys::new(vec!["refresh-key".to_string()]),
+        config_path: auth_dir.join("config.yaml"),
+        ..GatewayConfig::default()
+    };
+    let state = Arc::new(AppState::new(&common::managed_ref(&config)).expect("state"));
+    state
+        .telemetry
+        .record_with_account(1_800, "codex", Some("codex"), true);
+    state.telemetry.flush().expect("flush history");
+    let app = create_app(state);
+    let response = app
+        .oneshot(common::with_loopback_peer(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/usage/refresh")
+                .header(header::AUTHORIZATION, "Bearer refresh-key")
+                .body(Body::empty())
+                .unwrap(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+    assert!(
+        json["history"].as_array().is_some_and(|rows| rows.is_empty()),
+        "a refresh must not ship bucket history, got {} bytes",
+        body.len()
+    );
+}

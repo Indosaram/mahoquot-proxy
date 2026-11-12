@@ -505,7 +505,10 @@ async fn admin_warmup_one_handler(
 
 async fn admin_usage_refresh_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     crate::quota::refresh_all_usage(&state).await;
-    Json(state.get_stats())
+    // Callers of this endpoint only need the post-refresh live counters; the
+    // bucket history is the chart's job and costs a month of per-minute rows
+    // (~21MB) on every refresh, which stalls the whole remote tunnel.
+    Json(state.get_stats_with_history(Some(0)))
 }
 
 async fn admin_reset_handler(
