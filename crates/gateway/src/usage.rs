@@ -64,6 +64,12 @@ pub struct ResetCredit {
     pub granted_at_unix: Option<i64>,
     pub expires_at_unix: Option<i64>,
     pub status: Option<String>,
+    /// Human-readable name of the grant when the provider supplies one.
+    /// Anthropic hands out several different offers at once (a full reset and
+    /// a single-model launch reset), so a bare count would hide which one a
+    /// spend actually uses. Codex reports no label and leaves this empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 /// Upstream model availability metadata (e.g. from `model_usage` in Codex wham).
@@ -842,6 +848,13 @@ pub fn parse_claude_usage_summary(body: &serde_json::Value, now_unix: i64) -> Ac
     } else {
         Some(now_unix)
     };
+    // Anthropic ships the reset offer in the same payload, but only when the
+    // caller asks for it as the CLI; an absent block leaves the account with
+    // no reset affordance rather than a zero count.
+    let (reset_credits_available, reset_credits) = parse_cedar_ember_status(body)
+        .map_or((None, Vec::new()), |status| {
+            status.into_reset_credits(now_unix)
+        });
 
     AccountUsage {
         plan_type: None,
@@ -859,11 +872,24 @@ pub fn parse_claude_usage_summary(body: &serde_json::Value, now_unix: i64) -> Ac
         credits_balance: None,
         credits_unlimited: None,
         has_credits: None,
-        reset_credits_available: None,
+        reset_credits_available,
+        reset_credits,
         groups: Vec::new(),
         observed_at_unix: observed,
         ..Default::default()
     }
+}
+
+/// Read the reset offer out of a usage payload.
+///
+/// Absent, null, or malformed all mean "no offer": the caller must not be able
+/// to spend a reset the upstream never granted.
+pub fn parse_cedar_ember_status(body: &serde_json::Value) -> Option<CedarEmberStatus> {
+    let node = body.get("cedar_ember")?;
+    if !node.is_object() {
+        return None;
+    }
+    serde_json::from_value(node.clone()).ok()
 }
 
 fn usage_bucket(
@@ -1528,6 +1554,84 @@ pub struct WhamResetCreditEntry {
     pub status: Option<String>,
 }
 
+/// Anthropic's own reset offer ("cedar_ember") from the OAuth usage payload.
+///
+/// The offer is surface-gated: the same endpoint answers an empty block unless
+/// the caller presents the Claude Code CLI user agent, and ineligible orgs
+/// (Enterprise, or a team org outside the promotion) report
+/// `ineligible_reason: "org_not_eligible"` with no grants at all. Only an
+/// explicit `eligible: true` is treated as "this account has resets", so an
+/// absent or refused block never fabricates a reset button.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CedarEmberStatus {
+    #[serde(default)]
+    pub eligible: Option<bool>,
+    #[serde(default)]
+    pub ineligible_reason: Option<String>,
+    #[serde(default)]
+    pub next_grant_id: Option<String>,
+    #[serde(default)]
+    pub grants: Vec<CedarEmberGrant>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CedarEmberGrant {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub resets_total: Option<i64>,
+    #[serde(default)]
+    pub resets_left: Option<i64>,
+    #[serde(default)]
+    pub starts_at: Option<String>,
+    #[serde(default)]
+    pub ends_at: Option<String>,
+    #[serde(default)]
+    pub paused: Option<bool>,
+    #[serde(default)]
+    pub usable_now: Option<bool>,
+}
+
+impl CedarEmberStatus {
+    /// Count and per-grant expiry in the shared reset-credit shape.
+    ///
+    /// A grant that has lapsed or is paused cannot be spent, so it is dropped
+    /// from the count rather than offered; a grant with no expiry is kept,
+    /// because unknown is not the same as gone.
+    pub fn into_reset_credits(self, now_unix: i64) -> (Option<i64>, Vec<ResetCredit>) {
+        if self.eligible != Some(true) {
+            return (None, Vec::new());
+        }
+        let mut credits: Vec<ResetCredit> = self
+            .grants
+            .into_iter()
+            .filter(|grant| grant.paused != Some(true))
+            .filter(|grant| grant.resets_left.unwrap_or(0) > 0)
+            .map(|grant| ResetCredit {
+                granted_at_unix: grant
+                    .starts_at
+                    .as_deref()
+                    .and_then(parse_offset_datetime_unix),
+                expires_at_unix: grant
+                    .ends_at
+                    .as_deref()
+                    .and_then(parse_offset_datetime_unix),
+                status: None,
+                label: grant.label,
+            })
+            .filter(|credit| credit.expires_at_unix.is_none_or(|at| at > now_unix))
+            .collect();
+        credits.sort_by_key(|credit| credit.expires_at_unix.unwrap_or(i64::MAX));
+        let available = credits
+            .iter()
+            .filter(|credit| credit.expires_at_unix.is_none_or(|at| at > now_unix))
+            .count() as i64;
+        (Some(available), credits)
+    }
+}
+
 /// Statuses that mean the credit is gone. Anything else - including a status
 /// this build has never seen - is kept, because dropping an unknown state
 /// would hide a credit the account can still spend.
@@ -1554,6 +1658,7 @@ impl WhamResetCreditList {
                 granted_at_unix: c.granted_at.as_deref().and_then(parse_offset_datetime_unix),
                 expires_at_unix: c.expires_at.as_deref().and_then(parse_offset_datetime_unix),
                 status: c.status,
+                label: None,
             })
             .filter(|c| c.expires_at_unix.is_none_or(|at| at > now_unix))
             .collect();
@@ -3880,6 +3985,7 @@ mod tests {
                 granted_at_unix: Some(1_790_000_000),
                 expires_at_unix: Some(1_792_000_000),
                 status: Some("active".to_string()),
+                label: None,
             }],
             observed_at_unix: Some(1_800_000_000),
             refreshed_at_unix: Some(1_800_000_000),
@@ -4412,5 +4518,163 @@ mod coding_plan_quota_tests {
         let usage = parse_coding_plan_quota(&body, 1);
         assert!(usage.observed_at_unix.is_none());
         assert!(usage.groups.is_empty());
+    }
+
+    // Captured verbatim from /api/oauth/usage?cedar_ember=1 for a Team seat on
+    // 2026-11-12, so the fixture keeps the exact wire shape being parsed.
+    const LIVE_CEDAR_EMBER: &str = r#"{
+      "cedar_ember": {
+        "eligible": true,
+        "ineligible_reason": null,
+        "grants": [
+          {"id": "full-reset-2611", "label": "One full limit reset (November 2026)",
+           "resets_total": 1, "resets_left": 1,
+           "starts_at": "2026-11-10T21:30:00+00:00",
+           "ends_at": "2026-12-10T22:00:00+00:00",
+           "clears": ["five_hour", "seven_day", "seven_day_overage_included"],
+           "paused": false, "usable_now": true, "gives_back_weekly": false},
+          {"id": "launch-2610-fable", "label": "New model launch: one Fable reset",
+           "resets_total": 1, "resets_left": 1,
+           "starts_at": "2026-11-09T18:00:00+00:00",
+           "ends_at": "2027-03-09T07:59:00+00:00",
+           "clears": ["five_hour", "seven_day_overage_included"],
+           "paused": false, "usable_now": true, "gives_back_weekly": true}
+        ],
+        "next_grant_id": "full-reset-2611",
+        "cooldown_until": null
+      }
+    }"#;
+
+    #[test]
+    fn claude_reset_offer_becomes_banked_credits_with_labels() {
+        let body: serde_json::Value = serde_json::from_str(LIVE_CEDAR_EMBER).expect("parse");
+        let usage = parse_claude_usage_summary(&body, 1_794_441_600);
+        assert_eq!(usage.reset_credits_available, Some(2));
+        let credits = &usage.reset_credits;
+        assert_eq!(credits.len(), 2);
+        assert_eq!(
+            credits[0].expires_at_unix,
+            parse_offset_datetime_unix("2026-12-10T22:00:00+00:00")
+        );
+        assert_eq!(
+            credits[0].label.as_deref(),
+            Some("One full limit reset (November 2026)")
+        );
+        assert_eq!(
+            credits[1].label.as_deref(),
+            Some("New model launch: one Fable reset")
+        );
+    }
+
+    #[test]
+    fn claude_reset_offer_absent_never_becomes_zero() {
+        let body = serde_json::json!({"five_hour": {"utilization": 0.0}});
+        let usage = parse_claude_usage_summary(&body, 1_794_441_600);
+        assert_eq!(usage.reset_credits_available, None);
+        assert!(usage.reset_credits.is_empty());
+    }
+
+    #[test]
+    fn claude_reset_offer_ineligible_is_unknown_not_zero() {
+        let body = serde_json::json!({
+            "cedar_ember": {"eligible": false, "ineligible_reason": "org_not_eligible", "grants": []}
+        });
+        let usage = parse_claude_usage_summary(&body, 1_763_000_000);
+        // Ineligibility means the seat is outside the program, so "0 resets"
+        // would assert a count nobody granted; the count stays unknown.
+        assert_eq!(usage.reset_credits_available, None);
+        assert!(usage.reset_credits.is_empty());
+    }
+
+    #[test]
+    fn claude_reset_credits_drop_spent_paused_and_lapsed_grants() {
+        let body = serde_json::json!({"cedar_ember": {
+            "eligible": true,
+            "grants": [
+                {"id": "spent", "label": "already used", "resets_left": 0},
+                {"id": "paused", "label": "held", "resets_left": 1, "paused": true},
+                {"id": "lapsed", "label": "gone", "resets_left": 1,
+                 "ends_at": "2026-01-01T00:00:00+00:00"},
+                {"id": "live", "label": "still here", "resets_left": 1,
+                 "ends_at": "2027-01-01T00:00:00+00:00"}
+            ]
+        }});
+        // 2026-11-12T00:00:00Z, the day this shape was observed live.
+        let usage = parse_claude_usage_summary(&body, 1_794_441_600);
+        assert_eq!(usage.reset_credits_available, Some(1));
+        assert_eq!(usage.reset_credits.len(), 1);
+        assert_eq!(usage.reset_credits[0].label.as_deref(), Some("still here"));
+    }
+
+    #[test]
+    fn claude_reset_grant_selection_prefers_the_named_next_grant() {
+        let body: serde_json::Value = serde_json::from_str(LIVE_CEDAR_EMBER).expect("parse");
+        let mut status = parse_cedar_ember_status(&body).expect("offer");
+        assert_eq!(
+            crate::quota::select_claude_grant(&status).as_deref(),
+            Some("full-reset-2611")
+        );
+        status.next_grant_id = Some("does-not-exist".to_string());
+        assert_eq!(
+            crate::quota::select_claude_grant(&status).as_deref(),
+            Some("full-reset-2611")
+        );
+    }
+
+    #[test]
+    fn claude_reset_grant_selection_refuses_an_ineligible_offer() {
+        let status = CedarEmberStatus {
+            eligible: Some(false),
+            grants: vec![CedarEmberGrant {
+                id: Some("full-reset-2611".to_string()),
+                resets_left: Some(1),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(crate::quota::select_claude_grant(&status).is_none());
+    }
+
+    // The claim verb answers 200 with a verdict in the body, so the status code
+    // alone cannot distinguish a spent reset from a refused one.
+    #[test]
+    fn claude_claim_verdicts_are_read_from_the_body_not_the_status_code() {
+        use crate::quota::ResetAttemptPolicy;
+        assert_eq!(
+            crate::quota::claude_claim_outcome(
+                reqwest::StatusCode::OK,
+                r#"{"result":"reset","cleared":["five_hour"]}"#
+            ),
+            ResetAttemptPolicy::Success
+        );
+        assert_eq!(
+            crate::quota::claude_claim_outcome(
+                reqwest::StatusCode::OK,
+                r#"{"result":"already_used","resets_left":0}"#
+            ),
+            ResetAttemptPolicy::NoCredit
+        );
+        assert_eq!(
+            crate::quota::claude_claim_outcome(
+                reqwest::StatusCode::OK,
+                r#"{"result":"not_limited","reason":"not_next_grant"}"#
+            ),
+            ResetAttemptPolicy::Upstream
+        );
+        assert_eq!(
+            crate::quota::claude_claim_outcome(reqwest::StatusCode::UNAUTHORIZED, ""),
+            ResetAttemptPolicy::Unauthorized
+        );
+    }
+
+    #[test]
+    fn claude_grant_ids_are_validated_before_the_claim_is_sent() {
+        use crate::quota::claude_grant_id_is_well_formed;
+        assert!(claude_grant_id_is_well_formed("full-reset-2611"));
+        assert!(claude_grant_id_is_well_formed("launch_2610_fable"));
+        assert!(!claude_grant_id_is_well_formed(""));
+        assert!(!claude_grant_id_is_well_formed("Full-Reset"));
+        assert!(!claude_grant_id_is_well_formed("has space"));
+        assert!(!claude_grant_id_is_well_formed(&"a".repeat(41)));
     }
 }

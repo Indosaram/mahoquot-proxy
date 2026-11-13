@@ -5,9 +5,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::account::{AccountMember, ProviderKind};
 use crate::state::AppState;
 use crate::usage::{
-    parse_clinepass_usage_summary, parse_cursor_usage_summary, parse_inferx_balance,
-    parse_kiro_usage_summary, parse_xai_billing_credits, ResetCredit, WhamResetCreditList,
-    WhamUsage,
+    parse_cedar_ember_status, parse_clinepass_usage_summary, parse_cursor_usage_summary,
+    parse_inferx_balance, parse_kiro_usage_summary, parse_xai_billing_credits, CedarEmberGrant,
+    CedarEmberStatus, ResetCredit, WhamResetCreditList, WhamUsage,
 };
 
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
@@ -19,7 +19,29 @@ const CODEX_RESET_URL: &str =
 /// official CLI, so requests mirror the Codex CLI user agent.
 const CODEX_USER_AGENT: &str = "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal";
 const CLAUDE_API_BASE: &str = "https://api.anthropic.com";
+/// Base for the Claude account's own OAuth verbs (profile, usage, reset claim).
+///
+/// Honors the same per-account overrides the usage poller uses, so these verbs
+/// can be exercised against a local mock instead of the live upstream.
+fn claude_api_base(member: &AccountMember) -> &str {
+    member
+        .usage_override
+        .as_deref()
+        .or(member.upstream_override.as_deref())
+        .unwrap_or(CLAUDE_API_BASE)
+        .trim_end_matches('/')
+}
 const CLAUDE_USAGE_PATH: &str = "/api/oauth/usage";
+const CLAUDE_PROFILE_PATH: &str = "/api/oauth/profile";
+/// Reset claims are posted per organization, so the account's own org uuid has
+/// to be read from the profile rather than assumed.
+const CLAUDE_RESET_PATH: &str = "/api/organizations";
+/// The reset offer is surface-gated: the usage endpoint answers an empty
+/// `cedar_ember` block unless the caller looks like Claude Code, and the claim
+/// verb rejects anything else outright. Both therefore carry the CLI profile.
+const CLAUDE_CLI_USER_AGENT: &str = crate::claude_wire::USER_AGENT_CLI;
+/// Program id the CLI sends when spending a reset grant.
+const CLAUDE_RESET_PROGRAM: &str = "cedar_ember";
 const CURSOR_USAGE_URL: &str = "https://api2.cursor.sh/auth/usage-summary";
 const KIRO_USAGE_URL: &str = "https://q.us-east-1.amazonaws.com/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST";
 /// ClinePass subscription quota. The account's own API key is the bearer
@@ -196,6 +218,10 @@ pub enum ResetAttemptPolicy {
     RefreshAndRetry,
     Unauthorized,
     NoCredit,
+    /// The upstream throttled the verb. Distinct from `NoCredit`: the grant may
+    /// still be there, so reporting it as an empty bank would tell the caller to
+    /// stop retrying over a condition that clears by itself.
+    RateLimited,
     Upstream,
 }
 
@@ -245,6 +271,10 @@ pub enum QuotaError {
     /// The usage endpoint answered 429: a stale read, not a quota fact. The
     /// caller backs off instead of surfacing it as a poll failure.
     RateLimited,
+    /// The upstream understood the spend request and refused it on its own
+    /// terms (not limited yet, offer ineligible). Distinct from `Upstream`,
+    /// which means the call itself was broken.
+    Rejected(String),
     Upstream(String),
 }
 
@@ -256,6 +286,7 @@ impl std::fmt::Display for QuotaError {
             QuotaError::NoCredit => write!(f, "no reset credits available"),
             QuotaError::Network(m) => write!(f, "reset network error: {m}"),
             QuotaError::RateLimited => write!(f, "usage endpoint rate limited"),
+            QuotaError::Rejected(m) => write!(f, "{m}"),
             QuotaError::Upstream(m) => write!(f, "{m}"),
         }
     }
@@ -815,10 +846,12 @@ async fn try_claude_usage(state: &AppState, member: &Arc<AccountMember>) -> Resu
         QuotaError::Upstream(format!("proxy client construction failed: {error}"))
     })?;
     let resp = client
-        .get(format!("{base}{CLAUDE_USAGE_PATH}"))
+        .get(format!("{base}{CLAUDE_USAGE_PATH}?cedar_ember=1"))
         .header("Authorization", format!("Bearer {token}"))
         .header("anthropic-beta", CLAUDE_OAUTH_BETA)
         .header("Accept", "application/json")
+        .header("user-agent", CLAUDE_CLI_USER_AGENT)
+        .header("x-app", "cli")
         .timeout(Duration::from_secs(20))
         .send()
         .await
@@ -1273,9 +1306,17 @@ pub async fn consume_reset_credit(
     state: &AppState,
     member: &Arc<AccountMember>,
 ) -> Result<(), QuotaError> {
-    if member.kind() != ProviderKind::Codex {
-        return Err(QuotaError::Unsupported);
+    match member.kind() {
+        ProviderKind::Codex => consume_codex_reset_credit(state, member).await,
+        ProviderKind::Claude => consume_claude_reset_credit(state, member).await,
+        _ => Err(QuotaError::Unsupported),
     }
+}
+
+async fn consume_codex_reset_credit(
+    state: &AppState,
+    member: &Arc<AccountMember>,
+) -> Result<(), QuotaError> {
     if member.usage_snapshot().reset_credits_available == Some(0) {
         return Err(QuotaError::NoCredit);
     }
@@ -1308,6 +1349,7 @@ pub async fn consume_reset_credit(
                     return Err(QuotaError::Unauthorized)
                 }
                 ResetAttemptPolicy::NoCredit => return Err(QuotaError::NoCredit),
+                ResetAttemptPolicy::RateLimited => return Err(QuotaError::RateLimited),
                 ResetAttemptPolicy::Upstream => {
                     return Err(reset_upstream_error(retry_status, &retry_body))
                 }
@@ -1317,17 +1359,285 @@ pub async fn consume_reset_credit(
             return Err(QuotaError::Unauthorized)
         }
         ResetAttemptPolicy::NoCredit => return Err(QuotaError::NoCredit),
+        ResetAttemptPolicy::RateLimited => return Err(QuotaError::RateLimited),
         ResetAttemptPolicy::Upstream => return Err(reset_upstream_error(status, &body)),
     }
     let _ = refresh_account_usage(state, member).await;
     Ok(())
 }
 
+/// Spend one of Anthropic's own reset grants ("cedar_ember") on a Claude
+/// OAuth account.
+///
+/// The offer is read fresh instead of from the cached usage snapshot: a grant
+/// id that was already spent must never be presented again, and the snapshot
+/// carries only expiries. Both the organization uuid and the grant id come
+/// from Anthropic, so nothing is inferred from the local auth file.
+async fn consume_claude_reset_credit(
+    state: &AppState,
+    member: &Arc<AccountMember>,
+) -> Result<(), QuotaError> {
+    // Resets are an Anthropic OAuth grant. A relay account carries a static
+    // key and no token pair, so there is nothing to spend and nothing to ask.
+    if member.relay_api_key().is_some() || member.access_token().is_empty() {
+        return Err(QuotaError::Unsupported);
+    }
+    if member.usage_snapshot().reset_credits_available == Some(0) {
+        return Err(QuotaError::NoCredit);
+    }
+    if state.auth_refresh_enabled && member.is_expired(now_unix()) {
+        state
+            .refresh_member(member, None)
+            .await
+            .map_err(|e| QuotaError::Upstream(format!("reset token refresh failed: {e}")))?;
+    }
+    let used_token = member.access_token();
+    match claim_claude_reset_grant(state, member).await {
+        Err(QuotaError::Unauthorized) if state.auth_refresh_enabled => {
+            state
+                .refresh_member(member, Some(&used_token))
+                .await
+                .map_err(|e| QuotaError::Upstream(format!("reset token refresh failed: {e}")))?;
+            claim_claude_reset_grant(state, member).await?;
+        }
+        other => other?,
+    }
+    let _ = refresh_account_usage(state, member).await;
+    Ok(())
+}
+
+/// One claim attempt: resolve the org, pick a spendable grant, post it.
+///
+/// A retry after a token refresh repeats this whole read, so the grant chosen
+/// is always the one Anthropic currently reports as next.
+async fn claim_claude_reset_grant(
+    state: &AppState,
+    member: &Arc<AccountMember>,
+) -> Result<(), QuotaError> {
+    let organization = claude_organization_uuid(state, member).await?;
+    let offer = claude_reset_offer(state, member).await?;
+    let grant_id = select_claude_grant(&offer).ok_or(QuotaError::NoCredit)?;
+    let request_id = uuid_v4();
+    let (code, body) =
+        try_claim_claude_reset(state, member, &organization, &grant_id, &request_id).await?;
+    match claude_claim_outcome(code, &body) {
+        ResetAttemptPolicy::Success => Ok(()),
+        ResetAttemptPolicy::RefreshAndRetry | ResetAttemptPolicy::Unauthorized => {
+            Err(QuotaError::Unauthorized)
+        }
+        ResetAttemptPolicy::NoCredit => Err(QuotaError::NoCredit),
+        ResetAttemptPolicy::RateLimited => Err(QuotaError::RateLimited),
+        ResetAttemptPolicy::Upstream => Err(claude_claim_rejection(code, &body)),
+    }
+}
+
+/// \`GET /api/oauth/profile\` -> \`organization.uuid\`.
+///
+/// The claim is posted per organization and the auth file stores only the
+/// account id, so this is the sole authoritative source.
+async fn claude_organization_uuid(
+    state: &AppState,
+    member: &Arc<AccountMember>,
+) -> Result<String, QuotaError> {
+    let token = member.access_token();
+    let base = claude_api_base(member);
+    let client = state.try_client_for_member(member).map_err(|error| {
+        QuotaError::Upstream(format!("proxy client construction failed: {error}"))
+    })?;
+    let resp = client
+        .get(format!("{base}{CLAUDE_PROFILE_PATH}"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("anthropic-beta", CLAUDE_OAUTH_BETA)
+        .header("user-agent", CLAUDE_CLI_USER_AGENT)
+        .header("x-app", "cli")
+        .header("Accept", "application/json")
+        .timeout(Duration::from_secs(20))
+        .send()
+        .await
+        .map_err(|e| QuotaError::Network(e.to_string()))?;
+    match resp.status() {
+        status if status.is_success() => {}
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
+            return Err(QuotaError::Unauthorized)
+        }
+        status => {
+            return Err(QuotaError::Upstream(format!(
+                "claude profile http {status}"
+            )))
+        }
+    }
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| QuotaError::Upstream(format!("claude profile unreadable: {e}")))?;
+    body.get("organization")
+        .and_then(|org| org.get("uuid"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|uuid| !uuid.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| QuotaError::Upstream("claude profile carried no organization uuid".into()))
+}
+
+/// The account's current reset offer, read with the CLI profile so the block
+/// is actually populated.
+async fn claude_reset_offer(
+    state: &AppState,
+    member: &Arc<AccountMember>,
+) -> Result<CedarEmberStatus, QuotaError> {
+    let token = member.access_token();
+    let base = claude_api_base(member);
+    let client = state.try_client_for_member(member).map_err(|error| {
+        QuotaError::Upstream(format!("proxy client construction failed: {error}"))
+    })?;
+    let resp = client
+        .get(format!("{base}{CLAUDE_USAGE_PATH}?cedar_ember=1"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("anthropic-beta", CLAUDE_OAUTH_BETA)
+        .header("user-agent", CLAUDE_CLI_USER_AGENT)
+        .header("x-app", "cli")
+        .header("Accept", "application/json")
+        .timeout(Duration::from_secs(20))
+        .send()
+        .await
+        .map_err(|e| QuotaError::Network(e.to_string()))?;
+    match resp.status() {
+        status if status.is_success() => {}
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
+            return Err(QuotaError::Unauthorized)
+        }
+        status => return Err(QuotaError::Upstream(format!("claude usage http {status}"))),
+    }
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| QuotaError::Upstream(format!("claude usage unreadable: {e}")))?;
+    parse_cedar_ember_status(&body)
+        .ok_or_else(|| QuotaError::Upstream("claude reset offer missing".into()))
+}
+
+/// The grant to spend: the one Anthropic names as next, else any that still
+/// has uses left. Paused grants are never claimed.
+pub fn select_claude_grant(status: &CedarEmberStatus) -> Option<String> {
+    if status.eligible != Some(true) {
+        return None;
+    }
+    let spendable =
+        |grant: &&CedarEmberGrant| grant.paused != Some(true) && grant.resets_left.unwrap_or(0) > 0;
+    if let Some(id) = status.next_grant_id.as_deref() {
+        if status
+            .grants
+            .iter()
+            .filter(spendable)
+            .any(|grant| grant.id.as_deref() == Some(id))
+        {
+            return Some(id.to_string());
+        }
+    }
+    status
+        .grants
+        .iter()
+        .filter(spendable)
+        .filter_map(|grant| grant.id.clone())
+        .next()
+}
+
+/// Anthropic rejects a malformed id outright, so the claim is validated here
+/// instead of spending a request the upstream will refuse.
+pub fn claude_grant_id_is_well_formed(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 40
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+}
+
+async fn try_claim_claude_reset(
+    state: &AppState,
+    member: &Arc<AccountMember>,
+    organization: &str,
+    grant_id: &str,
+    request_id: &str,
+) -> Result<(reqwest::StatusCode, String), QuotaError> {
+    if !claude_grant_id_is_well_formed(grant_id) {
+        return Err(QuotaError::NoCredit);
+    }
+    let token = member.access_token();
+    let base = claude_api_base(member);
+    let client = state.try_client_for_member(member).map_err(|error| {
+        QuotaError::Upstream(format!("proxy client construction failed: {error}"))
+    })?;
+    let resp = client
+        .post(format!(
+            "{base}{CLAUDE_RESET_PATH}/{organization}/reset_rate_limits"
+        ))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("anthropic-beta", CLAUDE_OAUTH_BETA)
+        .header("Content-Type", "application/json")
+        .header("user-agent", CLAUDE_CLI_USER_AGENT)
+        .header("x-app", "cli")
+        .header("Accept", "application/json")
+        .timeout(Duration::from_secs(25))
+        .json(&serde_json::json!({
+            "program": CLAUDE_RESET_PROGRAM,
+            "grant_id": grant_id,
+            "request_id": request_id,
+        }))
+        .send()
+        .await
+        .map_err(|e| QuotaError::Network(e.to_string()))?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    Ok((status, body))
+}
+
+/// Classify a claim response.
+///
+/// The verb answers 200 with a \`result\` verdict even when nothing was spent, so
+/// a plain success check would report a reset that never happened.
+pub fn claude_claim_outcome(status: reqwest::StatusCode, body: &str) -> ResetAttemptPolicy {
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return ResetAttemptPolicy::Unauthorized;
+    }
+    // A throttle says nothing about how many grants are left, so it must not be
+    // folded into `NoCredit` (which becomes a 409 "no resets" answer).
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return ResetAttemptPolicy::RateLimited;
+    }
+    let parsed: Option<serde_json::Value> = serde_json::from_str(body).ok();
+    match parsed
+        .as_ref()
+        .and_then(|v| v.get("result"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+    {
+        "reset" => ResetAttemptPolicy::Success,
+        "already_used" | "cooldown" => ResetAttemptPolicy::NoCredit,
+        _ => ResetAttemptPolicy::Upstream,
+    }
+}
+
+fn claude_claim_rejection(status: reqwest::StatusCode, body: &str) -> QuotaError {
+    let parsed: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+    let result = parsed
+        .get("result")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("error");
+    let reason = parsed
+        .get("reason")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    QuotaError::Rejected(if reason.is_empty() {
+        format!("claude reset refused: {result} (http {status})")
+    } else {
+        format!("claude reset refused: {result}: {reason} (http {status})")
+    })
+}
+
 pub fn reset_error_status(error: &QuotaError) -> reqwest::StatusCode {
     match error {
         QuotaError::Unsupported => reqwest::StatusCode::UNPROCESSABLE_ENTITY,
         QuotaError::Unauthorized => reqwest::StatusCode::UNAUTHORIZED,
-        QuotaError::NoCredit => reqwest::StatusCode::CONFLICT,
+        QuotaError::NoCredit | QuotaError::Rejected(_) => reqwest::StatusCode::CONFLICT,
         QuotaError::RateLimited => reqwest::StatusCode::TOO_MANY_REQUESTS,
         QuotaError::Network(_) | QuotaError::Upstream(_) => reqwest::StatusCode::BAD_GATEWAY,
     }

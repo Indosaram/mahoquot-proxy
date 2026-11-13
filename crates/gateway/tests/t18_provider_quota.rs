@@ -7,9 +7,11 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::Router;
 use common::unique_temp_dir;
+use mahoquot_gateway::account::ProviderKind;
 use mahoquot_gateway::config::GatewayConfig;
 use mahoquot_gateway::quota::{
-    consume_reset_credit, reset_attempt_policy, retain_redeem_request_id, ResetAttemptPolicy,
+    consume_reset_credit, reset_attempt_policy, retain_redeem_request_id, QuotaError,
+    ResetAttemptPolicy,
 };
 use mahoquot_gateway::state::AppState;
 use mahoquot_gateway::usage::{
@@ -312,6 +314,7 @@ async fn reset_credit_errors_are_truthful_and_distinct() {
         auth_dir.join("claude-plain.json"),
         serde_json::to_vec(&serde_json::json!({
             "type": "claude",
+            "api_key": "sk-relay-static-key",
             "access_token": "token",
             "refresh_token": "refresh",
             "email": "claude@example.test",
@@ -344,6 +347,7 @@ async fn reset_credit_errors_are_truthful_and_distinct() {
         .unwrap()
         .clone();
 
+    // A relay-keyed Claude account holds no Anthropic OAuth grant to spend.
     assert!(matches!(
         consume_reset_credit(&state, &claude_member).await,
         Err(mahoquot_gateway::quota::QuotaError::Unsupported)
@@ -420,6 +424,7 @@ fn partial_header_updates_preserve_reset_credits_and_poll_freshness() {
             granted_at_unix: Some(1_790_000_000),
             expires_at_unix: Some(1_792_000_000),
             status: Some("active".to_string()),
+            label: None,
         }],
         refreshed_at_unix: Some(1_800_000_000),
         observed_at_unix: Some(1_800_000_000),
@@ -699,3 +704,186 @@ fn cursor_quota_separates_auto_and_named_pools() {
     assert_eq!(by_name("Auto"), Some(0.08));
     assert_eq!(by_name("Plan"), Some(25.64));
 }
+
+
+/// Serves the three Anthropic verbs a Claude reset needs, so the whole claim
+/// path runs against a local mock instead of the live upstream.
+#[derive(Clone, Default)]
+struct ClaudeResetMock {
+    claims: Arc<Mutex<Vec<(String, String, String)>>>,
+    claim_status: StatusCode,
+    claim_body: &'static str,
+}
+
+async fn claude_reset_mock(
+    claim_status: StatusCode,
+    claim_body: &'static str,
+) -> (String, ClaudeResetMock, tokio::task::JoinHandle<()>) {
+    let mock_state = ClaudeResetMock {
+        claim_status,
+        claim_body,
+        ..Default::default()
+    };
+    let claims = Arc::clone(&mock_state.claims);
+    let mock = Router::new()
+        .route(
+            "/api/oauth/profile",
+            get(|| async {
+                axum::Json(serde_json::json!({"organization": {"uuid": "org-uuid-live"}}))
+            }),
+        )
+        .route(
+            "/api/oauth/usage",
+            get(|| async {
+                axum::Json(serde_json::json!({"cedar_ember": {
+                    "eligible": true,
+                    "grants": [{
+                        "id": "full-reset-2611",
+                        "label": "One full limit reset (November 2026)",
+                        "resets_left": 1,
+                        "ends_at": "2027-12-10T22:00:00+00:00",
+                        "paused": false
+                    }],
+                    "next_grant_id": "full-reset-2611"
+                }}))
+            }),
+        )
+        .route(
+            "/api/organizations/{org}/reset_rate_limits",
+            post(
+                |State(state): State<ClaudeResetMock>, axum::extract::Path(org): axum::extract::Path<String>, body: String| async move {
+                    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+                    state.claims.lock().unwrap().push((
+                        org,
+                        parsed["grant_id"].as_str().unwrap_or_default().to_string(),
+                        parsed["request_id"].as_str().unwrap_or_default().to_string(),
+                    ));
+                    (state.claim_status, state.claim_body)
+                },
+            ),
+        )
+        .with_state(mock_state);
+
+    let mut listener = None;
+    for port in 18840..=18899 {
+        if let Ok(bound) = tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+            listener = Some(bound);
+            break;
+        }
+    }
+    let listener = listener.expect("reserved test port range 18840-18899 is exhausted");
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let handle = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    (base, ClaudeResetMock { claims, ..Default::default() }, handle)
+}
+
+/// Build an OAuth Claude account pointed at `base`, optionally pre-banked.
+async fn claude_member_at(base: &str, credits: Option<i64>) -> (Arc<AppState>, std::path::PathBuf) {
+    let auth_dir = unique_temp_dir("claude-reset");
+    std::fs::write(
+        auth_dir.join("claude-oauth.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "type": "claude",
+            "access_token": "oauth-token",
+            "refresh_token": "refresh",
+            "email": "claude@example.test",
+            "expired": "2099-01-01T00:00:00Z",
+            "upstream_override": base
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let state = Arc::new(
+        AppState::new(&GatewayConfig {
+            auth_dir: auth_dir.clone(),
+            config_path: auth_dir.join("config.yaml"),
+            auth_refresh_enabled: false,
+            ..GatewayConfig::default()
+        })
+        .unwrap(),
+    );
+    if let Some(count) = credits {
+        let member = claude_oauth_member(&state);
+        member.set_usage(mahoquot_gateway::usage::AccountUsage {
+            reset_credits_available: Some(count),
+            ..Default::default()
+        });
+    }
+    (state, auth_dir)
+}
+
+fn claude_oauth_member(state: &Arc<AppState>) -> std::sync::Arc<mahoquot_gateway::account::AccountMember> {
+    state
+        .pool
+        .load()
+        .members
+        .iter()
+        .find(|m| m.kind() == ProviderKind::Claude)
+        .expect("claude oauth member")
+        .clone()
+}
+
+#[tokio::test]
+async fn claude_reset_success_posts_the_offer_grant_to_the_profile_org() {
+    let (base, mock, handle) = claude_reset_mock(
+        StatusCode::OK,
+        r#"{"result":"reset","cleared":["five_hour","seven_day"]}"#,
+    )
+    .await;
+    let (state, auth_dir) = claude_member_at(&base, Some(1)).await;
+    let member = claude_oauth_member(&state);
+
+    consume_reset_credit(&state, &member).await.unwrap();
+
+    let claims = mock.claims.lock().unwrap();
+    assert_eq!(claims.len(), 1, "one grant is claimed once");
+    // The org comes from the profile, the grant from the offer: neither is
+    // guessed from the local auth file.
+    assert_eq!(claims[0].0, "org-uuid-live");
+    assert_eq!(claims[0].1, "full-reset-2611");
+    assert!(!claims[0].2.is_empty(), "a request id is always sent");
+    drop(claims);
+    handle.abort();
+    std::fs::remove_dir_all(auth_dir).ok();
+}
+
+#[tokio::test]
+async fn claude_reset_throttle_is_rate_limited_not_an_empty_bank() {
+    let (base, _mock, handle) = claude_reset_mock(StatusCode::TOO_MANY_REQUESTS, "").await;
+    let (state, auth_dir) = claude_member_at(&base, Some(1)).await;
+    let member = claude_oauth_member(&state);
+
+    // A 429 says the verb was throttled, not that the grant is gone: reporting
+    // NoCredit would answer 409 "no resets" and tell the user to stop retrying.
+    let error = consume_reset_credit(&state, &member).await.unwrap_err();
+    assert!(
+        matches!(error, QuotaError::RateLimited),
+        "expected RateLimited, got {error:?}"
+    );
+    handle.abort();
+    std::fs::remove_dir_all(auth_dir).ok();
+}
+
+#[tokio::test]
+async fn claude_reset_refusal_is_reported_with_its_own_reason() {
+    let (base, _mock, handle) = claude_reset_mock(
+        StatusCode::OK,
+        r#"{"result":"not_limited","reason":"not_next_grant"}"#,
+    )
+    .await;
+    let (state, auth_dir) = claude_member_at(&base, Some(1)).await;
+    let member = claude_oauth_member(&state);
+
+    // A 200 carrying a refusal verdict must never be read as a spent reset.
+    let error = consume_reset_credit(&state, &member).await.unwrap_err();
+    match &error {
+        QuotaError::Rejected(message) => {
+            assert!(message.contains("not_limited"), "{message}");
+            assert!(message.contains("not_next_grant"), "{message}");
+        }
+        other => panic!("expected Rejected, got {other:?}"),
+    }
+    handle.abort();
+    std::fs::remove_dir_all(auth_dir).ok();
+}
+
