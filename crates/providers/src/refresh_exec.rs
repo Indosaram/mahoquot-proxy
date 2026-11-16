@@ -155,8 +155,8 @@ pub async fn execute_cline_refresh_to(
     }
     let mut value: serde_json::Value =
         serde_json::from_str(&body).map_err(|e| RefreshError::Parse(e.to_string()))?;
-    if let Some(data) = value.get("data").cloned() {
-        value = data;
+    if let Some(data) = value.get_mut("data") {
+        value = data.take();
     }
     let expires_in = value
         .get("expiresAt")
@@ -164,40 +164,29 @@ pub async fn execute_cline_refresh_to(
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
         .map(|dt| dt.timestamp() - chrono::Utc::now().timestamp())
         .filter(|secs| *secs > 0);
-    let mut json_str =
-        serde_json::to_string(&value).map_err(|e| RefreshError::Parse(e.to_string()))?;
     // Re-attach the `workos:` scheme the server strips: the CLI stores
     // `workos:eyJ...` and sends it back verbatim, and the bare JWT alone
     // is rejected with 401 re-authenticate. Verified live 2026-09-10.
     // NOTE: `parse_refresh_response` maps camelCase (`accessToken`) but
     // the prefix check must run on the camelCase key — snake_case
     // `access_token` does not exist yet at this point.
-    if let Ok(mut obj) = serde_json::from_str::<serde_json::Value>(&json_str) {
-        if let Some(map) = obj.as_object_mut() {
-            if let Some(tok) = map.get("accessToken").and_then(|v| v.as_str()) {
-                if !tok.starts_with("workos:") {
-                    map.insert(
-                        "accessToken".to_string(),
-                        serde_json::Value::String(format!("workos:{tok}")),
-                    );
-                    json_str = serde_json::to_string(&obj)
-                        .map_err(|e| RefreshError::Parse(e.to_string()))?;
-                }
+    if let Some(map) = value.as_object_mut() {
+        if let Some(tok) = map.get("accessToken").and_then(|v| v.as_str()) {
+            if !tok.starts_with("workos:") {
+                map.insert(
+                    "accessToken".to_string(),
+                    serde_json::Value::String(format!("workos:{tok}")),
+                );
             }
         }
-    }
-    if let Some(secs) = expires_in {
-        let mut obj: serde_json::Value =
-            serde_json::from_str(&json_str).map_err(|e| RefreshError::Parse(e.to_string()))?;
-        if let Some(map) = obj.as_object_mut() {
+        if let Some(secs) = expires_in {
             map.insert(
                 "expires_in".to_string(),
                 serde_json::Value::Number(secs.into()),
             );
         }
-        json_str = serde_json::to_string(&obj).map_err(|e| RefreshError::Parse(e.to_string()))?;
     }
-    crate::refresh::parse_refresh_response(&json_str).map_err(RefreshError::Parse)
+    crate::refresh::parse_refresh_value(value).map_err(RefreshError::Parse)
 }
 
 pub async fn execute_refresh_spec(
@@ -667,12 +656,16 @@ mod tests {
         // error page; the Display projection reaches logs verbatim.
         let error = RefreshError::Status {
             code: 400,
-            body: "{\"error\":\"invalid_grant\",\"echo\":\"refresh_token=SECRET-RT\"} SECRET-BODY".to_string(),
+            body: "{\"error\":\"invalid_grant\",\"echo\":\"refresh_token=SECRET-RT\"} SECRET-BODY"
+                .to_string(),
         };
         let rendered = error.to_string();
         assert!(rendered.contains("status 400"), "{rendered}");
         assert!(!rendered.contains("SECRET"), "body leaked: {rendered}");
-        assert!(!rendered.contains("invalid_grant"), "body leaked: {rendered}");
+        assert!(
+            !rendered.contains("invalid_grant"),
+            "body leaked: {rendered}"
+        );
         assert!(!format!("{error:?}").contains("SECRET"), "debug leaked");
     }
 }

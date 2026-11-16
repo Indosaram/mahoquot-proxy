@@ -3010,9 +3010,7 @@ impl CodexRefreshClaim {
         // opens it without `create`, so the takeover path must recreate it. A
         // successful issuer response after takeover would otherwise fail before
         // publishing its receipt and the rotated grant would be lost.
-        let pending = self
-            .directory
-            .join(format!("{}.receipt.pending", self.key));
+        let pending = self.directory.join(format!("{}.receipt.pending", self.key));
         let _ = std::fs::remove_file(&pending);
         options.open(&pending)?.sync_all()?;
         std::fs::File::open(&self.directory)?.sync_all()?;
@@ -4282,13 +4280,17 @@ fn list_all_auth_files(auth_dir: &Path) -> Result<Vec<PathBuf>, LoadError> {
     // Explicit order manifest determines pool position; unlisted credentials
     // append to the end sorted alphabetically.
     let order = ordered_manifest_names(auth_dir);
+    let mut ranks = std::collections::HashMap::with_capacity(order.len());
+    for (index, name) in order.iter().enumerate() {
+        ranks.entry(name.as_str()).or_insert(index);
+    }
     files.sort_by(|a, b| {
         let a_name = a.file_name().and_then(|s| s.to_str()).unwrap_or("");
         let b_name = b.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        let a_index = order.iter().position(|name| name == a_name);
-        let b_index = order.iter().position(|name| name == b_name);
+        let a_index = ranks.get(a_name);
+        let b_index = ranks.get(b_name);
         match (a_index, b_index) {
-            (Some(ai), Some(bi)) => ai.cmp(&bi),
+            (Some(ai), Some(bi)) => ai.cmp(bi),
             (Some(_), None) => std::cmp::Ordering::Less,
             (None, Some(_)) => std::cmp::Ordering::Greater,
             (None, None) => a.cmp(b),
@@ -4725,8 +4727,8 @@ pub fn save_claude_device_identities(
     if !parent.as_os_str().is_empty() {
         std::fs::create_dir_all(parent)?;
     }
-    let json = serde_json::to_string_pretty(store)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    let json =
+        serde_json::to_string_pretty(store).map_err(|e| std::io::Error::other(e.to_string()))?;
     write_credential_atomically(path, json.as_bytes())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+        .map_err(|e| std::io::Error::other(e.to_string()))
 }

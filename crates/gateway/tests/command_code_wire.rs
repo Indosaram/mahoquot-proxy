@@ -93,7 +93,8 @@ async fn exercise_command_code_wire(stream: bool, use_override: bool) {
         api_keys: mahoquot_gateway::inbound::ApiKeys::from_env_value("fixture-key"),
         ..GatewayConfig::default()
     };
-    let app = create_app(Arc::new(AppState::new(&config).unwrap()));
+    let state = Arc::new(AppState::new(&config).unwrap());
+    let app = create_app(Arc::clone(&state));
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         let response = app
             .oneshot(
@@ -136,9 +137,18 @@ async fn exercise_command_code_wire(stream: bool, use_override: bool) {
             assert_eq!(choice["finish_reason"], "tool_calls");
         }
     }).await.expect("Command Code relay completes");
+    // The relay records the outcome on a detached task that appends to
+    // `auth_dir/logs/gateway.log`; wait for it before tearing the directory
+    // down, or `remove_dir_all` intermittently hits DirectoryNotEmpty.
+    assert!(
+        state
+            .wait_for_outcome_recordings(std::time::Duration::from_secs(5))
+            .await,
+        "outcome recording did not finish"
+    );
     server.abort();
     let _ = server.await;
-    std::fs::remove_dir_all(auth).unwrap();
+    std::fs::remove_dir_all(&auth).unwrap();
     let seen = seen.lock().unwrap();
     assert_eq!(seen.requests.len(), 1);
     let (method, uri, headers, body) = &seen.requests[0];

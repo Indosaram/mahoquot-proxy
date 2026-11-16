@@ -1041,7 +1041,6 @@ mod tests {
 }
 
 #[cfg(test)]
-#[cfg(test)]
 mod exec_write_tests {
     use super::*;
 
@@ -1372,13 +1371,11 @@ fn exec_resolve_in_root(path: &str, root: &std::path::Path) -> Result<std::path:
             path
         }
     };
-    if root != std::path::Path::new("/") {
-        if !normalized.starts_with(&root) {
-            return Err(format!(
-                "path escapes the configured exec root {}",
-                root.display()
-            ));
-        }
+    if root != std::path::Path::new("/") && !normalized.starts_with(&root) {
+        return Err(format!(
+            "path escapes the configured exec root {}",
+            root.display()
+        ));
     }
     Ok(normalized)
 }

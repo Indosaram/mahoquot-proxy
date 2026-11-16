@@ -60,7 +60,9 @@ impl AffinityStore {
             .and_then(|raw| serde_json::from_slice::<HashMap<String, Binding>>(&raw).ok())
             .map(|raw| {
                 raw.into_iter()
-                    .filter_map(|(key, binding)| Some((u64::from_str_radix(&key, 16).ok()?, binding)))
+                    .filter_map(|(key, binding)| {
+                        Some((u64::from_str_radix(&key, 16).ok()?, binding))
+                    })
                     .collect::<HashMap<_, _>>()
             })
             .unwrap_or_default();
@@ -191,8 +193,12 @@ impl AffinityStore {
                     let result =
                         tokio::task::spawn_blocking(move || write_private(&path, &bytes)).await;
                     match result {
-                        Ok(Err(error)) => tracing::warn!(%error, "failed to persist claude affinity"),
-                        Err(error) => tracing::warn!(%error, "claude affinity persistence task failed"),
+                        Ok(Err(error)) => {
+                            tracing::warn!(%error, "failed to persist claude affinity")
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "claude affinity persistence task failed")
+                        }
                         Ok(Ok(())) => {}
                     }
                 }
@@ -321,7 +327,9 @@ mod tests {
         }
         assert_eq!(store.len(), MAX_BINDINGS);
         assert_eq!(store.get(0, MAX_BINDINGS as i64), None);
-        assert!(store.get(MAX_BINDINGS as u64 + 4, MAX_BINDINGS as i64).is_some());
+        assert!(store
+            .get(MAX_BINDINGS as u64 + 4, MAX_BINDINGS as i64)
+            .is_some());
     }
 
     #[test]

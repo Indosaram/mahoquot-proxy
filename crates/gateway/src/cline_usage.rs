@@ -220,13 +220,17 @@ impl ClineTrackers {
     /// Cline provider gate; pure routing reads use [`Self::existing`] instead
     /// so they never mint state.
     pub fn for_model(&self, model: &str) -> Arc<ClineDailyTracker> {
-        let slug = cline_quota_slug(model).to_owned();
-        let budget = budget_for_slug(&slug);
-        self.trackers
+        let slug = cline_quota_slug(model);
+        let mut trackers = self
+            .trackers
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .entry(slug)
-            .or_insert_with(|| ClineDailyTracker::with_config(budget))
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(tracker) = trackers.get(slug) {
+            return Arc::clone(tracker);
+        }
+        trackers
+            .entry(slug.to_owned())
+            .or_insert_with(|| ClineDailyTracker::with_config(budget_for_slug(slug)))
             .clone()
     }
 

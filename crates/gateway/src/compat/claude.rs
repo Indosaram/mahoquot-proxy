@@ -3312,9 +3312,15 @@ mod openai_to_anthropic_tests {
         // Seven markers against a limit of four: the three message markers
         // absorb the whole excess, so system and tools survive untouched.
         assert_eq!(super::breakpoint_count(&body), super::MAX_CACHE_BREAKPOINTS);
-        assert!(body["messages"][0]["content"][0].get("cache_control").is_none());
-        assert!(body["messages"][0]["content"][1].get("cache_control").is_none());
-        assert!(body["messages"][1]["content"][0].get("cache_control").is_none());
+        assert!(body["messages"][0]["content"][0]
+            .get("cache_control")
+            .is_none());
+        assert!(body["messages"][0]["content"][1]
+            .get("cache_control")
+            .is_none());
+        assert!(body["messages"][1]["content"][0]
+            .get("cache_control")
+            .is_none());
         assert!(body["system"][0].get("cache_control").is_some());
         assert!(body["system"][1].get("cache_control").is_some());
         assert!(body["tools"][0].get("cache_control").is_some());
@@ -3329,7 +3335,9 @@ mod openai_to_anthropic_tests {
         });
         super::apply_prompt_cache_breakpoints(&mut body);
         assert_eq!(super::breakpoint_count(&body), super::MAX_CACHE_BREAKPOINTS);
-        assert!(body["messages"][0]["content"][0].get("cache_control").is_none());
+        assert!(body["messages"][0]["content"][0]
+            .get("cache_control")
+            .is_none());
         assert!(body["system"][0].get("cache_control").is_none());
         assert!(body["system"][1].get("cache_control").is_some());
         assert!(body["system"][2].get("cache_control").is_some());

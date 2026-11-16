@@ -1262,14 +1262,11 @@ fn openai_to_gemini_inner(
         }
     }
     if let Some(format) = body.get("response_format") {
-        match format.get("type").and_then(Value::as_str) {
-            Some("json_object" | "json_schema") => {
-                generation.insert("responseMimeType".to_string(), json!("application/json"));
-                if let Some(schema) = format.pointer("/json_schema/schema") {
-                    generation.insert("responseSchema".to_string(), schema.clone());
-                }
+        if let Some("json_object" | "json_schema") = format.get("type").and_then(Value::as_str) {
+            generation.insert("responseMimeType".to_string(), json!("application/json"));
+            if let Some(schema) = format.pointer("/json_schema/schema") {
+                generation.insert("responseSchema".to_string(), schema.clone());
             }
-            _ => {}
         }
     }
     if let Some(thinking) = build_thinking_config(model, body) {

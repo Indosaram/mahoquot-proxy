@@ -1881,10 +1881,16 @@ impl HeadTailCapture {
             let take = head_room.min(chunk.len());
             self.head.extend_from_slice(&chunk[..take]);
         }
-        self.tail.extend_from_slice(chunk);
-        let overflow = self.tail.len().saturating_sub(self.cap);
-        if overflow > 0 {
-            self.tail.drain(..overflow);
+        if chunk.len() >= self.cap {
+            self.tail.clear();
+            self.tail
+                .extend_from_slice(&chunk[chunk.len() - self.cap..]);
+        } else {
+            let overflow = (self.tail.len() + chunk.len()).saturating_sub(self.cap);
+            if overflow > 0 {
+                self.tail.drain(..overflow);
+            }
+            self.tail.extend_from_slice(chunk);
         }
     }
 
@@ -1959,7 +1965,9 @@ mod cache_presence_tests {
 }
 
 pub fn extract_response_token_usage(head: &[u8], tail: &[u8]) -> Option<ResponseTokenUsage> {
-    if let Some(usage) = last_balanced_object(tail, b"\"usage\"") {
+    if let Some(usage) = last_balanced_object(tail, b"\"usage\"")
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+    {
         let prompt = object_number(&usage, &["prompt_tokens"]);
         let completion = object_number(&usage, &["completion_tokens"]);
         if prompt.is_some() || completion.is_some() {
@@ -2103,17 +2111,18 @@ pub fn extract_response_token_usage(head: &[u8], tail: &[u8]) -> Option<Response
             });
         }
     }
-    if let Some(usage) = last_balanced_object(tail, b"\"usageMetadata\"") {
+    if let Some(usage) = last_balanced_object(tail, b"\"usageMetadata\"")
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+    {
         let prompt = object_number(&usage, &["promptTokenCount"]);
         let completion = object_number(&usage, &["candidatesTokenCount"]);
         if prompt.is_some() || completion.is_some() {
+            let cached = object_number(&usage, &["cachedContentTokenCount"]);
             return Some(ResponseTokenUsage {
                 input_tokens: prompt.unwrap_or(0),
                 output_tokens: completion.unwrap_or(0),
-                cached_input_tokens: object_number(&usage, &["cachedContentTokenCount"])
-                    .unwrap_or(0),
-                cached_input_tokens_known: object_number(&usage, &["cachedContentTokenCount"])
-                    .is_some(),
+                cached_input_tokens: cached.unwrap_or(0),
+                cached_input_tokens_known: cached.is_some(),
                 cache_write_tokens: 0,
                 cache_write_tokens_known: false,
                 reasoning_tokens: object_number(&usage, &["thoughtsTokenCount"]).unwrap_or(0),
@@ -2211,17 +2220,12 @@ fn balanced_end(bytes: &[u8]) -> Option<usize> {
     None
 }
 
-fn object_number(json: &str, keys: &[&str]) -> Option<u64> {
-    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+fn object_number(value: &serde_json::Value, keys: &[&str]) -> Option<u64> {
     keys.iter().find_map(|key| value.get(key)?.as_u64())
 }
 
-fn nested_object_number(json: &str, object: &str, key: &str) -> Option<u64> {
-    serde_json::from_str::<serde_json::Value>(json)
-        .ok()?
-        .get(object)?
-        .get(key)?
-        .as_u64()
+fn nested_object_number(value: &serde_json::Value, object: &str, key: &str) -> Option<u64> {
+    value.get(object)?.get(key)?.as_u64()
 }
 
 fn last_number_after(haystack: &[u8], key: &[u8]) -> Option<u64> {
@@ -2443,9 +2447,14 @@ impl UsageStateStore {
     }
 
     pub fn save(&self, accounts: &std::collections::BTreeMap<String, AccountUsage>, now_unix: i64) {
-        let document = UsageStateDocument {
+        #[derive(serde::Serialize)]
+        struct Document<'a> {
+            saved_at_unix: i64,
+            accounts: &'a std::collections::BTreeMap<String, AccountUsage>,
+        }
+        let document = Document {
             saved_at_unix: now_unix,
-            accounts: accounts.clone(),
+            accounts,
         };
         let Ok(rendered) = serde_json::to_string_pretty(&document) else {
             return;
@@ -3156,6 +3165,23 @@ mod tests {
         assert_eq!(head[0], b'x');
         assert_eq!(tail.len(), 8192);
         assert_eq!(tail[tail.len() - 1], b'x');
+    }
+
+    #[test]
+    fn capture_bounds_allocation_and_preserves_windows_for_mixed_chunks() {
+        // Given chunks both smaller and larger than the capture window.
+        let chunks = [vec![b'a'; 17], vec![b'b'; 100_000], vec![b'c'; 23]];
+        let expected: Vec<u8> = chunks.iter().flatten().copied().collect();
+        let mut capture = HeadTailCapture::new();
+        // When each chunk is captured.
+        for chunk in &chunks {
+            capture.push(chunk);
+        }
+        // Then the windows match the original bytes without retaining the large chunk.
+        let (head, tail) = capture.parts();
+        assert_eq!(head, &expected[..CAPTURE_WINDOW]);
+        assert_eq!(tail, &expected[expected.len() - CAPTURE_WINDOW..]);
+        assert!(capture.tail.capacity() <= CAPTURE_WINDOW);
     }
 
     #[test]

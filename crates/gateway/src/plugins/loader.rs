@@ -280,7 +280,7 @@ impl Drop for CallGuard {
 pub struct HostContextData {
     pub callback_id: usize,
     pub plugin_id: String,
-    pub host: Arc<PluginHostInner>,
+    pub host: HostCallbackHandler,
 }
 
 unsafe extern "C" fn host_call_trampoline(
@@ -311,9 +311,7 @@ unsafe extern "C" fn host_call_trampoline(
         &[]
     };
 
-    let result = ctx
-        .host
-        .handle_host_callback(&ctx.plugin_id, method_str, req_bytes);
+    let result = (ctx.host)(&ctx.plugin_id, method_str, req_bytes);
     let out_bytes = match result {
         Ok(b) => b,
         Err(e) => {
@@ -546,7 +544,7 @@ impl PluginHost {
         let ctx_data = Box::into_raw(Box::new(HostContextData {
             callback_id: 1,
             plugin_id: id.to_string(),
-            host: self.inner.clone(),
+            host: self.inner.host_callback_handler.clone(),
         }));
 
         let host_api = Box::into_raw(Box::new(CliproxyHostApi {
@@ -812,6 +810,80 @@ mod review_plugins_tests {
             received,
             release,
         )
+    }
+
+    unsafe extern "C" fn ulw_gw5_shutdown_callback() {}
+
+    #[test]
+    fn ulw_gw5_host_context_does_not_retain_its_plugin_owner() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let recorded = calls.clone();
+        let host = PluginHost::new(Arc::new(move |id, method, request| {
+            if id != "fixture" || method != "callback" || request != b"request" {
+                return Err(plugin_busy());
+            }
+            recorded.fetch_add(1, Ordering::SeqCst);
+            Ok(b"response".to_vec())
+        }));
+        let owner = Arc::downgrade(&host.inner);
+        let callback = Arc::downgrade(&host.inner.host_callback_handler);
+        let context = Box::into_raw(Box::new(HostContextData {
+            callback_id: 1,
+            plugin_id: "fixture".into(),
+            host: host.inner.host_callback_handler.clone(),
+        }));
+        let active_calls = Arc::new(AtomicUsize::new(0));
+        let client = Arc::new(DynamicLibraryClient {
+            handle: std::ptr::null_mut(),
+            api: CliproxyPluginApi {
+                shutdown: Some(ulw_gw5_shutdown_callback),
+                ..Default::default()
+            },
+            host_api: std::ptr::null_mut(),
+            host_ctx: context.cast(),
+            closed: AtomicBool::new(false),
+            active_calls: active_calls.clone(),
+        });
+        let client_weak = Arc::downgrade(&client);
+        host.inner.loaded.write().unwrap().insert(
+            "fixture".into(),
+            Arc::new(LoadedPlugin {
+                id: "fixture".into(),
+                path: PathBuf::from("fixture"),
+                version: "1".into(),
+                name: "fixture".into(),
+                schema_version: SCHEMA_VERSION,
+                metadata: serde_json::json!({}),
+                capabilities: serde_json::json!({}),
+                client: client.clone(),
+                active_calls,
+            }),
+        );
+        drop(host);
+        assert!(owner.upgrade().is_none());
+        let mut response = CliproxyBuffer::default();
+        let method = CString::new("callback").unwrap();
+        assert_eq!(
+            unsafe {
+                host_call_trampoline(
+                    context.cast(),
+                    method.as_ptr(),
+                    b"request".as_ptr(),
+                    7,
+                    &mut response,
+                )
+            },
+            0
+        );
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(response.ptr.cast::<u8>(), response.len) },
+            b"response"
+        );
+        unsafe { host_free_trampoline(response.ptr, response.len) };
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        drop(client);
+        assert!(client_weak.upgrade().is_none());
+        assert!(callback.upgrade().is_none());
     }
 
     #[test]

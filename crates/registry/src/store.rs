@@ -771,16 +771,23 @@ impl StorageBackend for PostgresStore {
         {
             let pool = self.pool()?;
             let rt = Self::runtime()?;
+            // PostgreSQL text IDs cannot contain NUL. A NULL predicate keeps
+            // that prefix an empty match without sending invalid text.
+            let query_prefix = (!prefix.contains('\0')).then_some(prefix.as_str());
             let q_config = format!(
-                "SELECT id FROM {}",
+                "SELECT id FROM {} WHERE left(id, char_length($1)) COLLATE \"C\" = $1",
                 self.full_table_name(&self.config_table)
             );
-            let q_auth = format!("SELECT id FROM {}", self.full_table_name(&self.auth_table));
+            let q_auth = format!(
+                "SELECT id FROM {} WHERE left(id, char_length($1)) COLLATE \"C\" = $1",
+                self.full_table_name(&self.auth_table)
+            );
             let keys = tokio::task::block_in_place(|| {
                 rt.block_on(async {
                     let mut list = Vec::new();
                     for query in [&q_config, &q_auth] {
                         let rows = sqlx::query(query)
+                            .bind(query_prefix)
                             .fetch_all(pool)
                             .await
                             .map_err(|e| StoreError::Database(e.to_string()))?;

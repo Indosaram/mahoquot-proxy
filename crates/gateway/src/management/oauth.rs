@@ -3192,14 +3192,16 @@ pub(crate) async fn poll_kiro_session(
         } => (access_token, refresh_token, expires_in),
     };
 
-    let profile_arn = mahoquot_providers::kiro_idc::resolve_profile_arn(client, &access_token).await?;
+    let profile_arn =
+        mahoquot_providers::kiro_idc::resolve_profile_arn(client, &access_token).await?;
     session.token_url = profile_arn.clone();
 
     // The token names no account and the account list is keyed by this label, so
     // the usage endpoint is asked once. It is optional by construction: a
     // failure only costs a generated label.
-    let email = mahoquot_providers::kiro_idc::fetch_account_email(client, &access_token, &profile_arn)
-        .await;
+    let email =
+        mahoquot_providers::kiro_idc::fetch_account_email(client, &access_token, &profile_arn)
+            .await;
     let label = email
         .clone()
         .unwrap_or_else(|| format!("kiro-{}", &session.state[..12]));
@@ -3227,7 +3229,12 @@ pub(crate) async fn poll_kiro_session(
     );
     let rendered = serde_json::to_string_pretty(&credential).map_err(|error| error.to_string())?;
     let filename = format!("kiro-{}.json", sanitize_filename(&label));
-    persist_session_credential(state, session, &auth_dir.join(filename), rendered.as_bytes())?;
+    persist_session_credential(
+        state,
+        session,
+        &auth_dir.join(filename),
+        rendered.as_bytes(),
+    )?;
 
     session.saved_account_email = Some(label.clone());
     session.status = SessionStatus::Completed;
@@ -3654,7 +3661,6 @@ mod tests {
     /// project's reserved test range 18840-18899 and returns an already-bound
     /// listener, so no test ever touches a production callback port.
     static TEST_PORT_CURSOR: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
-
     async fn allocate_test_listener() -> (tokio::net::TcpListener, u16) {
         for _ in 0..60 {
             let offset = TEST_PORT_CURSOR.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 60;
@@ -3666,13 +3672,12 @@ mod tests {
         panic!("no free test port available in 18840-18899");
     }
 
-    /// Proves a listener task actually released its callback port instead of
-    /// leaving the socket owned by a detached task.
-    async fn assert_port_released(port: u16) {
-        tokio::net::TcpListener::bind(("127.0.0.1", port))
-            .await
-            .expect("listener task must release its callback port");
-    }
+    // A listener's port ownership is asserted by awaiting its `JoinHandle`, not by
+    // rebinding the port afterwards. `spawn_callback_listener` moves the listener
+    // into the task that serves it, so a resolved join means that task - and the
+    // socket it owned - was dropped. A rebind cannot express the same fact: these
+    // ports are shared with every other test in this binary, so a failed rebind
+    // may just mean a concurrent test legitimately took the port after it closed.
 
     #[tokio::test]
     async fn sweep_expired_returns_the_listeners_of_expired_sessions() {
@@ -3763,7 +3768,6 @@ mod tests {
             .expect("listener must self-terminate on its TTL deadline")
             .expect("listener task must not panic");
 
-        assert_port_released(port).await;
         drop(hung);
     }
 
@@ -3949,7 +3953,6 @@ mod tests {
             assert_eq!(response.status(), StatusCode::OK);
             response.bytes().await.unwrap();
             review_bounded(handle.join).await.unwrap();
-            assert_port_released(port).await;
             assert_eq!(
                 SESSIONS.read().unwrap()[&key].status,
                 SessionStatus::Completed
@@ -4204,12 +4207,16 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_session_aborts_and_awaits_the_listener() {
-        let (listener, port) = allocate_test_listener().await;
+        let (listener, _port) = allocate_test_listener().await;
         let app = Router::new().route("/callback", get(|| async { "ok" }));
         let finished = Arc::new(Notify::new());
         let state_key = format!("cancel-{}", new_state());
         let deadline = tokio::time::Instant::now() + OAUTH_SESSION_TTL;
         let handle = spawn_callback_listener(listener, app, finished, deadline);
+        // `cancel_session` consumes the handle, so keep its abort handle to
+        // observe the task itself: the status and map assertions below would
+        // also pass if cancellation aborted without awaiting the listener.
+        let abort = handle.abort.clone();
         {
             let mut sessions = SESSIONS.write().unwrap();
             sessions.insert(state_key.clone(), test_session(&state_key, Instant::now()));
@@ -4220,10 +4227,15 @@ mod tests {
         params.insert("state".to_string(), state_key.clone());
         let response = cancel_session(Query(params)).await;
 
+        // No await separates the return above from this check, so a listener
+        // that only got aborted would still be running here.
+        assert!(
+            abort.is_finished(),
+            "cancel_session must await the listener task before responding"
+        );
         assert_eq!(response.status(), StatusCode::OK);
         assert!(!SESSIONS.read().unwrap().contains_key(&state_key));
         assert!(!LISTENERS.lock().unwrap().contains_key(&state_key));
-        assert_port_released(port).await;
     }
 
     #[tokio::test]

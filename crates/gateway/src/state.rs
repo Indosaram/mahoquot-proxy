@@ -986,6 +986,13 @@ pub struct AppState {
     pub finalizer_notifiers: Arc<
         std::sync::Mutex<std::collections::HashMap<String, Vec<tokio::sync::mpsc::Sender<()>>>>,
     >,
+    /// Outcome recordings still running on detached tasks. The relay increments
+    /// this before spawning and decrements after the record (including its file
+    /// append) finishes, so a caller that owns the auth directory can wait for
+    /// quiescence instead of racing the writer. A `watch` channel keeps the
+    /// latest count, so a completion that lands before a waiter subscribes is
+    /// still observed.
+    outcome_recordings_in_flight: Arc<tokio::sync::watch::Sender<usize>>,
     pub aistudio: Arc<crate::aistudio::Relay>,
     pub plugins: Option<Arc<crate::plugins::loader::PluginHost>>,
     pub home: Option<Arc<crate::home::HomeClient>>,
@@ -1086,6 +1093,26 @@ pub(crate) fn adopt_runtime_state(target: &AccountMember, previous: &Arc<Account
         target
             .devin_catalog
             .store(previous.devin_catalog.load_full());
+    }
+}
+
+/// Keeps the detached outcome-recording counter balanced.
+///
+/// `begin_outcome_recording` increments the counter before the relay spawns the
+/// recording task and hands back this guard. The guard lives inside that task's
+/// future, so the decrement runs exactly once: on the normal path, when the
+/// future is dropped before its first poll, and while unwinding from a panic.
+/// It is liveness bookkeeping for `wait_for_outcome_recordings`, not a claim
+/// that the record was persisted.
+#[must_use = "the in-flight counter stays unbalanced unless the guard lives as long as the recording"]
+pub struct OutcomeRecordingGuard {
+    in_flight: Arc<tokio::sync::watch::Sender<usize>>,
+}
+
+impl Drop for OutcomeRecordingGuard {
+    fn drop(&mut self) {
+        self.in_flight
+            .send_modify(|in_flight| *in_flight = in_flight.saturating_sub(1));
     }
 }
 
@@ -1335,6 +1362,7 @@ impl AppState {
             model_restrictions: AtomicBool::new(false),
             devin_cache: Arc::new(crate::devin_catalog::DevinDiscoveryCache::new()),
             finalizer_notifiers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            outcome_recordings_in_flight: Arc::new(tokio::sync::watch::channel(0).0),
             aistudio: Arc::new(crate::aistudio::Relay::new()),
             plugins: None,
             home: None,
@@ -1598,10 +1626,11 @@ impl AppState {
             if reqwest::Proxy::all(proxy_url.trim()).is_err() {
                 return true;
             }
-        } else if !runtime.scoped_routing_active() && !runtime.global_proxy_url.is_empty() {
-            if reqwest::Proxy::all(runtime.global_proxy_url.trim()).is_err() {
-                return true;
-            }
+        } else if !runtime.scoped_routing_active()
+            && !runtime.global_proxy_url.is_empty()
+            && reqwest::Proxy::all(runtime.global_proxy_url.trim()).is_err()
+        {
+            return true;
         }
         false
     }
@@ -1852,6 +1881,38 @@ impl AppState {
             .or_default()
             .push(tx);
         rx
+    }
+
+    /// Mark one detached outcome recording as started and return the guard that
+    /// marks it finished when dropped.
+    ///
+    /// Call this before spawning the recording task and move the guard into the
+    /// task, so neither a panic nor a future dropped before its first poll can
+    /// strand the increment.
+    pub fn begin_outcome_recording(&self) -> OutcomeRecordingGuard {
+        self.outcome_recordings_in_flight
+            .send_modify(|in_flight| *in_flight += 1);
+        OutcomeRecordingGuard {
+            in_flight: Arc::clone(&self.outcome_recordings_in_flight),
+        }
+    }
+
+    /// Resolve once no detached outcome recording is in flight, including the
+    /// file append that logging performs. Returns `false` if the wait elapsed.
+    pub async fn wait_for_outcome_recordings(&self, timeout: std::time::Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut in_flight = self.outcome_recordings_in_flight.subscribe();
+        loop {
+            if *in_flight.borrow_and_update() == 0 {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, in_flight.changed())
+                .await
+                .is_err()
+            {
+                return false;
+            }
+        }
     }
 
     pub fn notify_finalizer(&self, account: Option<&str>, event_id: &str) {

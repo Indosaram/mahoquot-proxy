@@ -83,7 +83,9 @@ fn forward_to(
 ) -> Result<(), String> {
     let address = address(raw).ok_or_else(|| format!("invalid exec bridge {raw:?}"))?;
     let payload = message.encode_to_vec();
-    let connect = address.as_str().to_socket_addrs()
+    let connect = address
+        .as_str()
+        .to_socket_addrs()
         .map_err(|error| format!("exec sidecar {address} is unresolvable: {error}"))?
         .next()
         .ok_or_else(|| format!("exec sidecar {address} resolved to no address"))?;
@@ -126,7 +128,9 @@ fn forward_to(
             break;
         }
         if head.is_empty() && !line.contains(" 200") {
-            return Err(format!("exec sidecar {address} returned a non-200 response"));
+            return Err(format!(
+                "exec sidecar {address} returned a non-200 response"
+            ));
         }
         if line.to_ascii_lowercase().starts_with("transfer-encoding:")
             && line.to_ascii_lowercase().contains("chunked")
@@ -152,8 +156,9 @@ fn forward_to(
         let mut payload = vec![0u8; u32::from_be_bytes(length) as usize];
         body.read_exact(&mut payload)
             .map_err(|error| format!("exec sidecar {address} sent a truncated frame: {error}"))?;
-        let frame = proto::AgentClientMessage::decode(payload.as_slice())
-            .map_err(|error| format!("exec sidecar {address} sent an undecodable frame: {error}"))?;
+        let frame = proto::AgentClientMessage::decode(payload.as_slice()).map_err(|error| {
+            format!("exec sidecar {address} sent an undecodable frame: {error}")
+        })?;
         emit(frame);
         emitted += 1;
     }
@@ -260,7 +265,7 @@ async fn handle(
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> axum::http::Response<axum::body::Body> {
-    use axum::http::{StatusCode, header};
+    use axum::http::{header, StatusCode};
 
     let plain = |status: StatusCode| {
         axum::http::Response::builder()
@@ -295,7 +300,9 @@ async fn handle(
     });
 
     let stream = futures::stream::unfold(rx, |mut rx| async move {
-        rx.recv().await.map(|chunk| (Ok::<_, std::io::Error>(chunk), rx))
+        rx.recv()
+            .await
+            .map(|chunk| (Ok::<_, std::io::Error>(chunk), rx))
     });
     axum::http::Response::builder()
         .status(StatusCode::OK)
@@ -320,13 +327,15 @@ mod tests {
     #[test]
     fn frames_round_trip_through_the_wire_format() {
         let frame = proto::AgentClientMessage {
-            message: Some(proto::agent_client_message::Message::ExecClientControlMessage(
-                proto::ExecClientControlMessage {
-                    message: Some(proto::exec_client_control_message::Message::StreamClose(
-                        proto::ExecClientStreamClose { id: 9 },
-                    )),
-                },
-            )),
+            message: Some(
+                proto::agent_client_message::Message::ExecClientControlMessage(
+                    proto::ExecClientControlMessage {
+                        message: Some(proto::exec_client_control_message::Message::StreamClose(
+                            proto::ExecClientStreamClose { id: 9 },
+                        )),
+                    },
+                ),
+            ),
         };
         let bytes = frame.encode_to_vec();
         let mut body = Vec::new();
@@ -375,7 +384,8 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
 
-        let dir = std::env::temp_dir().join(format!("mahoquot-sidecar-grep-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("mahoquot-sidecar-grep-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
         std::fs::write(dir.join("notes.txt"), "alpha\nBETA_MARKER\ngamma\n").expect("write");
         let request = proto::ExecServerMessage {
@@ -398,8 +408,7 @@ mod tests {
             let address = address.clone();
             move || {
                 let mut frames = Vec::new();
-                forward_to(&address, &request, &mut |frame| frames.push(frame))
-                    .map(|()| frames)
+                forward_to(&address, &request, &mut |frame| frames.push(frame)).map(|()| frames)
             }
         })
         .await
@@ -414,7 +423,8 @@ mod tests {
         else {
             panic!("expected an exec reply");
         };
-        let Some(proto::exec_client_message::Message::GrepResult(result)) = message.message.as_ref()
+        let Some(proto::exec_client_message::Message::GrepResult(result)) =
+            message.message.as_ref()
         else {
             panic!("expected a grep reply");
         };
@@ -466,8 +476,7 @@ mod tests {
             let address = address.clone();
             move || {
                 let mut frames = Vec::new();
-                forward_to(&address, &request, &mut |frame| frames.push(frame))
-                    .map(|()| frames)
+                forward_to(&address, &request, &mut |frame| frames.push(frame)).map(|()| frames)
             }
         })
         .await

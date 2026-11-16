@@ -3,8 +3,7 @@ mod common;
 use std::collections::BTreeMap;
 
 use mahoquot_gateway::account::{
-    is_valid_claude_device_id, load_account_members,
-    CLAUDE_DEVICE_IDENTITY_STORE,
+    is_valid_claude_device_id, load_account_members, CLAUDE_DEVICE_IDENTITY_STORE,
 };
 use mahoquot_gateway::config::GatewayConfig;
 use mahoquot_gateway::management::settings::ProviderProxyPolicy;
@@ -133,7 +132,9 @@ fn claude_egress_direct_absent_proxy_preserves_injection() {
     assert_eq!(state.claude_device_id(&member), member.claude_device_id());
     assert!(is_valid_claude_device_id(state.claude_device_id(&member)));
     assert_eq!(
-        state.claude_device_id_for_account("claude-direct-user").as_deref(),
+        state
+            .claude_device_id_for_account("claude-direct-user")
+            .as_deref(),
         Some(member.claude_device_id())
     );
     drop(selected);
@@ -155,7 +156,10 @@ async fn claude_egress_respects_provider_proxy_and_compression() {
             assert!(read > 0);
             request.extend_from_slice(&buf[..read]);
         }
-        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").await.unwrap();
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .await
+            .unwrap();
         String::from_utf8(request).unwrap()
     });
     let auth_dir = common::unique_temp_dir("claude-egress-provider");
@@ -180,9 +184,15 @@ async fn claude_egress_respects_provider_proxy_and_compression() {
             url: format!("http://{proxy_addr}"),
         },
     );
-    let mut settings = mahoquot_gateway::management::settings::Settings::default();
-    settings.proxy_providers = providers;
-    std::fs::write(auth_dir.join("config.yaml"), serde_yaml::to_string(&settings).unwrap()).unwrap();
+    let settings = mahoquot_gateway::management::settings::Settings {
+        proxy_providers: providers,
+        ..Default::default()
+    };
+    std::fs::write(
+        auth_dir.join("config.yaml"),
+        serde_yaml::to_string(&settings).unwrap(),
+    )
+    .unwrap();
 
     let config = GatewayConfig {
         auth_dir: auth_dir.clone(),
@@ -196,9 +206,18 @@ async fn claude_egress_respects_provider_proxy_and_compression() {
 
     let client = state.client_for_member(&member);
     assert_eq!(state.proxy_client_count(), 1);
-    let response = tokio::time::timeout(std::time::Duration::from_secs(5), client.get("http://claude-egress.invalid/probe").send()).await.unwrap().unwrap();
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.get("http://claude-egress.invalid/probe").send(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(response.text().await.unwrap(), "ok");
-    let request = tokio::time::timeout(std::time::Duration::from_secs(5), proxy).await.unwrap().unwrap();
+    let request = tokio::time::timeout(std::time::Duration::from_secs(5), proxy)
+        .await
+        .unwrap()
+        .unwrap();
     assert!(request.starts_with("GET http://claude-egress.invalid/probe HTTP/1.1"));
     let lower = request.to_ascii_lowercase();
     assert!(lower.contains("accept-encoding:"));
@@ -223,9 +242,15 @@ fn claude_egress_respects_global_proxy() {
     });
     std::fs::write(auth_dir.join("claude-g.json"), cred.to_string()).unwrap();
 
-    let mut settings = mahoquot_gateway::management::settings::Settings::default();
-    settings.proxy_url = "http://127.0.0.1:3128".to_string();
-    std::fs::write(auth_dir.join("config.yaml"), serde_yaml::to_string(&settings).unwrap()).unwrap();
+    let settings = mahoquot_gateway::management::settings::Settings {
+        proxy_url: "http://127.0.0.1:3128".to_string(),
+        ..Default::default()
+    };
+    std::fs::write(
+        auth_dir.join("config.yaml"),
+        serde_yaml::to_string(&settings).unwrap(),
+    )
+    .unwrap();
 
     let config = GatewayConfig {
         auth_dir: auth_dir.clone(),
@@ -263,7 +288,11 @@ fn claude_egress_invalid_refuses_silent_unproxied_fallback() {
         "claude-bad-user".to_string(),
         "not-a-valid-proxy-url@@:".to_string(),
     );
-    std::fs::write(auth_dir.join("config.yaml"), serde_yaml::to_string(&settings).unwrap()).unwrap();
+    std::fs::write(
+        auth_dir.join("config.yaml"),
+        serde_yaml::to_string(&settings).unwrap(),
+    )
+    .unwrap();
 
     let config = GatewayConfig {
         auth_dir: auth_dir.clone(),

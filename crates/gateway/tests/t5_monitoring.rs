@@ -585,7 +585,9 @@ async fn usage_refresh_answers_with_live_counters_and_no_bucket_history() {
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
     assert!(
-        json["history"].as_array().is_some_and(|rows| rows.is_empty()),
+        json["history"]
+            .as_array()
+            .is_some_and(|rows| rows.is_empty()),
         "a refresh must not ship bucket history, got {} bytes",
         body.len()
     );

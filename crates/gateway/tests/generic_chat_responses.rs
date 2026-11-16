@@ -33,7 +33,10 @@ async fn chat_reply(
 ) -> ([(&'static str, &'static str); 1], String) {
     let request: Value = serde_json::from_slice(&body).unwrap();
     let stream = request["stream"].as_bool().unwrap_or(false);
-    seen.lock().unwrap().requests.push((method, uri, headers, request));
+    seen.lock()
+        .unwrap()
+        .requests
+        .push((method, uri, headers, request));
     if stream {
         let frames = [
             json!({"id":"chatcmpl-fixture","choices":[{"delta":{"role":"assistant"}}]}),
@@ -70,7 +73,9 @@ async fn exercise(stream: bool) -> (Value, Value, String) {
     let seen = Arc::new(Mutex::new(Captured::default()));
     let mut listener = None;
     for port in 18840..=18899 {
-        if let Ok(bound) = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await {
+        if let Ok(bound) =
+            tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await
+        {
             listener = Some(bound);
             break;
         }
@@ -106,7 +111,8 @@ async fn exercise(stream: bool) -> (Value, Value, String) {
         api_keys: mahoquot_gateway::inbound::ApiKeys::from_env_value("fixture-key"),
         ..GatewayConfig::default()
     };
-    let app = create_app(Arc::new(AppState::new(&config).unwrap()));
+    let state = Arc::new(AppState::new(&config).unwrap());
+    let app = create_app(Arc::clone(&state));
     let response = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         app.oneshot(
             Request::post("/v1/responses")
@@ -129,8 +135,18 @@ async fn exercise(stream: bool) -> (Value, Value, String) {
     .await
     .expect("generic chat relay completes");
     assert_eq!(response.status(), 200);
-    let raw = axum::body::to_bytes(response.into_body(), 2_000_000).await.unwrap();
+    let raw = axum::body::to_bytes(response.into_body(), 2_000_000)
+        .await
+        .unwrap();
     let text = String::from_utf8_lossy(&raw).into_owned();
+    // The relay records the outcome on a detached task that appends to
+    // `auth_dir/logs/gateway.log`; wait for it before deleting the directory.
+    assert!(
+        state
+            .wait_for_outcome_recordings(std::time::Duration::from_secs(5))
+            .await,
+        "outcome recording did not finish"
+    );
     server.abort();
     let _ = server.await;
     let request = seen.lock().unwrap().requests.clone();
@@ -145,7 +161,10 @@ async fn responses_client_receives_chat_stream_as_responses_events() {
     // The translated body must stay a stream: a buffered chat reply cannot be
     // replayed as Responses events.
     assert_eq!(upstream_request["stream"], true, "{upstream_request}");
-    assert!(upstream_request["messages"].is_array(), "{upstream_request}");
+    assert!(
+        upstream_request["messages"].is_array(),
+        "{upstream_request}"
+    );
     assert!(text.contains("response.output_text.delta"), "{text}");
     assert!(text.contains("Hello "), "{text}");
     assert!(text.contains("from chat"), "{text}");

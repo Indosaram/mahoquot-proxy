@@ -862,7 +862,10 @@ mod tests {
             .contribution_for_provider(&mahoquot_registry::ProviderId::antigravity())
             .model_ids()
             .len();
-        assert!(antigravity_ids > 0, "the catalog must list Antigravity models");
+        assert!(
+            antigravity_ids > 0,
+            "the catalog must list Antigravity models"
+        );
 
         let codex_only = model_entries(&[ProviderKind::Codex], None);
         assert_eq!(codex_only.len(), DEFAULT_MODELS.len());

@@ -195,11 +195,18 @@ fn provider_ids(dir: &std::path::Path) -> BTreeSet<String> {
 
 async fn list_providers(State(state): State<Arc<AppState>>) -> Response {
     let dir = auth_dir(&state);
-    let providers: Vec<Value> = provider_ids(&dir)
-        .into_iter()
-        .map(|id| provider_view(&id, &provider_files(&dir, &id)))
-        .collect();
-    json_status(StatusCode::OK, json!({ "providers": providers }))
+    match tokio::task::spawn_blocking(move || {
+        let providers: Vec<Value> = provider_ids(&dir)
+            .into_iter()
+            .map(|id| provider_view(&id, &provider_files(&dir, &id)))
+            .collect();
+        json_status(StatusCode::OK, json!({ "providers": providers }))
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => typed_error(StatusCode::INTERNAL_SERVER_ERROR, "task_join_failed", error),
+    }
 }
 
 fn required_body_string<'a>(body: &'a Value, field: &str) -> ResponseResult<&'a str> {
@@ -662,8 +669,8 @@ async fn import_auth_files(
                     "invalid credential name",
                 );
             }
-            let content = file.get("content").cloned().unwrap_or(Value::Null);
-            if let Err(error) = validate_provider_credential(&content) {
+            let content = file.get("content").unwrap_or(&Value::Null);
+            if let Err(error) = validate_provider_credential(content) {
                 return typed_error(StatusCode::BAD_REQUEST, "invalid_credential", error);
             }
             if dir.join(name).symlink_metadata().is_ok() || !pending_names.insert(name.to_string())
@@ -674,7 +681,7 @@ async fn import_auth_files(
                     "credential name already exists",
                 );
             }
-            if let Some(identity) = credential_identity(&content) {
+            if let Some(identity) = credential_identity(content) {
                 if existing.contains_key(&identity) {
                     return typed_error(
                         StatusCode::CONFLICT,
@@ -755,29 +762,36 @@ async fn export_auth_files(
                 .collect()
         });
     let dir = auth_dir(&state);
-    let mut files = Vec::new();
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return json_status(StatusCode::OK, json!({ "files": files }));
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if !name.to_ascii_lowercase().ends_with(".json")
-            || names
-                .as_ref()
-                .is_some_and(|selected| !selected.contains(&name))
-        {
-            continue;
+    match tokio::task::spawn_blocking(move || {
+        let mut files = Vec::new();
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return json_status(StatusCode::OK, json!({ "files": files }));
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.to_ascii_lowercase().ends_with(".json")
+                || names
+                    .as_ref()
+                    .is_some_and(|selected| !selected.contains(&name))
+            {
+                continue;
+            }
+            let Ok(raw) = std::fs::read_to_string(entry.path()) else {
+                continue;
+            };
+            let Ok(content) = serde_json::from_str::<Value>(&raw) else {
+                continue;
+            };
+            files.push(json!({ "name": name, "content": content }));
         }
-        let Ok(raw) = std::fs::read_to_string(entry.path()) else {
-            continue;
-        };
-        let Ok(content) = serde_json::from_str::<Value>(&raw) else {
-            continue;
-        };
-        files.push(json!({ "name": name, "content": content }));
+        files.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
+        json_status(StatusCode::OK, json!({ "files": files }))
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => typed_error(StatusCode::INTERNAL_SERVER_ERROR, "task_join_failed", error),
     }
-    files.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
-    json_status(StatusCode::OK, json!({ "files": files }))
 }
 
 async fn bulk_auth_files(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {

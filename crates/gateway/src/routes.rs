@@ -681,7 +681,7 @@ async fn completions_handler(
         })
         .unwrap_or_default();
 
-    let mut chat = parsed.clone();
+    let mut chat = parsed;
     if let Some(obj) = chat.as_object_mut() {
         obj.remove("prompt");
         obj.insert(

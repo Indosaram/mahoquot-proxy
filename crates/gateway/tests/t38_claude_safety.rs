@@ -23,10 +23,13 @@ use tower::ServiceExt;
 const MODEL: &str = "claude-sonnet-4-5-20250929";
 const OK_MESSAGE: &str = r#"{"id":"msg_ok","type":"message","role":"assistant","model":"claude-sonnet-4-5-20250929","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#;
 const DISABLED_403: &str = r#"{"type":"error","error":{"type":"permission_error","message":"This organization has been disabled."}}"#;
-const PLAIN_403: &str = r#"{"type":"error","error":{"type":"permission_error","message":"Request not allowed"}}"#;
+const PLAIN_403: &str =
+    r#"{"type":"error","error":{"type":"permission_error","message":"Request not allowed"}}"#;
 const CLAUDE_CODE_ONLY_401: &str = r#"{"type":"error","error":{"type":"authentication_error","message":"This credential is only authorized for use with Claude Code and cannot be used for other API requests."}}"#;
-const OVERLOADED_529: &str = r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#;
-const UNAVAILABLE_503: &str = r#"{"type":"error","error":{"type":"api_error","message":"unavailable"}}"#;
+const OVERLOADED_529: &str =
+    r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#;
+const UNAVAILABLE_503: &str =
+    r#"{"type":"error","error":{"type":"api_error","message":"unavailable"}}"#;
 const SSE_DISABLED: &str = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"permission_error\",\"message\":\"This organization has been disabled.\"}}\n\n";
 
 type Scripted = (u16, &'static str, &'static str);
@@ -51,7 +54,12 @@ impl Upstream {
     }
 
     fn last(&self) -> (HeaderMap, serde_json::Value) {
-        self.seen.lock().unwrap().last().cloned().expect("an upstream call")
+        self.seen
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("an upstream call")
     }
 }
 
@@ -159,7 +167,11 @@ fn write_claude(dir: &Path, id: &str, upstream: &str, api_key: Option<&str>) {
     if let Some(key) = api_key {
         credential["api_key"] = serde_json::Value::String(key.to_string());
     }
-    std::fs::write(dir.join(format!("claude-{id}.json")), credential.to_string()).unwrap();
+    std::fs::write(
+        dir.join(format!("claude-{id}.json")),
+        credential.to_string(),
+    )
+    .unwrap();
 }
 
 async fn send(
@@ -231,7 +243,10 @@ async fn an_enforcement_403_benches_the_account_without_trying_another() {
     let reason = state.settings.current().claude_suspected_accounts[&benched]
         .reason
         .clone();
-    assert!(!reason.contains("This organization"), "reason names the signature only: {reason}");
+    assert!(
+        !reason.contains("This organization"),
+        "reason names the signature only: {reason}"
+    );
 
     // A restart reads the list back from settings: the benched account stays out.
     drop(state);
@@ -249,9 +264,7 @@ async fn an_enforcement_403_benches_the_account_without_trying_another() {
         .iter()
         .skip(1)
         .filter(|(headers, _)| {
-            headers
-                .get("authorization")
-                .and_then(|v| v.to_str().ok())
+            headers.get("authorization").and_then(|v| v.to_str().ok())
                 == Some(&format!("Bearer token-{benched}"))
         })
         .count();
@@ -295,7 +308,10 @@ async fn an_enforcement_401_skips_refresh_and_failover() {
     let (status, _, body) = send(&state, &[], false).await;
 
     assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
-    assert!(body.contains("only authorized for use with Claude Code"), "{body}");
+    assert!(
+        body.contains("only authorized for use with Claude Code"),
+        "{body}"
+    );
     assert_eq!(upstream.hits(), 1);
     assert_eq!(state.refreshed.load(Ordering::Relaxed), 0);
     assert_eq!(suspected(&state).len(), 1);
@@ -334,7 +350,10 @@ async fn a_plain_403_is_returned_and_a_second_one_benches_the_account() {
 
     let (status, _, _) = send(&state, &[], false).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
-    assert!(suspected(&state).is_empty(), "one denial is not enforcement");
+    assert!(
+        suspected(&state).is_empty(),
+        "one denial is not enforcement"
+    );
 
     let (status, _, _) = send(&state, &[], false).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
@@ -382,7 +401,10 @@ async fn a_session_returns_to_its_account_after_a_restart() {
     let state = fx.state();
     assert_eq!(send(&state, &[SESSION], false).await.0, StatusCode::OK);
     let (bound, other, _) = split(&a, &b);
-    state.claude_affinity.flush_blocking(now_ms() / 1000).unwrap();
+    state
+        .claude_affinity
+        .flush_blocking(now_ms() / 1000)
+        .unwrap();
     drop(state);
 
     let restarted = fx.state();
@@ -462,7 +484,9 @@ async fn a_client_request_id_alone_does_not_pin_a_claude_session() {
     let state = fx.state();
     for request_id in ["req-1", "req-2", "req-3"] {
         assert_eq!(
-            send(&state, &[("x-client-request-id", request_id)], false).await.0,
+            send(&state, &[("x-client-request-id", request_id)], false)
+                .await
+                .0,
             StatusCode::OK
         );
     }
@@ -511,11 +535,12 @@ async fn api_key_only_never_sends_to_an_oauth_account() {
     let (key_url, key) = fx.upstream().await;
     fx.oauth("alpha", &oauth_url);
     fx.api_key("keyed", &key_url);
-    let state = fx.state_with_config(Some("logging-to-file: false\nclaude-route-mode: api_key_only\n"));
+    let state = fx.state_with_config(Some(
+        "logging-to-file: false\nclaude-route-mode: api_key_only\n",
+    ));
 
     for session in ["s1", "s2", "s3", "s4"] {
-        let (status, _, body) =
-            send(&state, &[("x-claude-code-session-id", session)], false).await;
+        let (status, _, body) = send(&state, &[("x-claude-code-session-id", session)], false).await;
         assert_eq!(status, StatusCode::OK, "{body}");
     }
     assert_eq!(oauth.hits(), 0);
@@ -525,8 +550,14 @@ async fn api_key_only_never_sends_to_an_oauth_account() {
     assert!(headers.contains_key("x-api-key"));
     assert!(!headers.contains_key("authorization"));
     assert!(!headers.contains_key("x-app"));
-    let system = body.get("system").map(|s| s.to_string()).unwrap_or_default();
-    assert!(!system.contains("Claude Agent SDK") && !system.contains("Claude Code"), "{system}");
+    let system = body
+        .get("system")
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+    assert!(
+        !system.contains("Claude Agent SDK") && !system.contains("Claude Code"),
+        "{system}"
+    );
 }
 
 #[tokio::test]
@@ -548,7 +579,10 @@ async fn the_oauth_profile_matches_the_captured_agent_sdk_wire() {
             assert_eq!(sent, value.as_str(), "header {name}");
         }
     }
-    assert!(body.get("metadata").and_then(|m| m.get("user_id")).is_none());
+    assert!(body
+        .get("metadata")
+        .and_then(|m| m.get("user_id"))
+        .is_none());
 }
 
 #[tokio::test]
@@ -556,7 +590,9 @@ async fn cloak_off_sends_only_the_clients_identity() {
     let mut fx = Fixture::new("claude-safety-cloak-off");
     let (url, upstream) = fx.upstream().await;
     fx.oauth("alpha", &url);
-    let state = fx.state_with_config(Some("logging-to-file: false\ndisable-claude-cloak-mode: true\n"));
+    let state = fx.state_with_config(Some(
+        "logging-to-file: false\ndisable-claude-cloak-mode: true\n",
+    ));
 
     let (status, _, body) = send(
         &state,
@@ -574,7 +610,10 @@ async fn cloak_off_sends_only_the_clients_identity() {
     let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
     assert_eq!(header("user-agent"), Some("my-client/1.0"));
     assert_eq!(header("x-stainless-lang"), Some("python"));
-    assert_eq!(header("anthropic-beta"), Some("oauth-2025-04-20,output-128k-2025-02-19"));
+    assert_eq!(
+        header("anthropic-beta"),
+        Some("oauth-2025-04-20,output-128k-2025-02-19")
+    );
     assert_eq!(header("x-app"), None);
     assert_eq!(header("x-stainless-os"), None);
     assert_eq!(header("anthropic-dangerous-direct-browser-access"), None);
@@ -593,8 +632,7 @@ async fn an_egress_entry_that_does_not_build_keeps_only_that_account_out() {
     ));
 
     for session in ["s1", "s2", "s3"] {
-        let (status, _, _) =
-            send(&state, &[("x-claude-code-session-id", session)], false).await;
+        let (status, _, _) = send(&state, &[("x-claude-code-session-id", session)], false).await;
         assert_eq!(status, StatusCode::OK);
     }
     assert_eq!(upstream.hits(), 3);
@@ -603,7 +641,9 @@ async fn an_egress_entry_that_does_not_build_keeps_only_that_account_out() {
         .lock()
         .unwrap()
         .iter()
-        .filter(|(h, _)| h.get("authorization").and_then(|v| v.to_str().ok()) == Some("Bearer token-alpha"))
+        .filter(|(h, _)| {
+            h.get("authorization").and_then(|v| v.to_str().ok()) == Some("Bearer token-alpha")
+        })
         .count();
     assert_eq!(alpha_calls, 0, "never sent from the host's own address");
 
@@ -616,9 +656,10 @@ async fn an_egress_entry_that_does_not_build_keeps_only_that_account_out() {
     assert!(refused.is_err());
     let accepted = state.settings.mutate(|document| {
         document.claude_account_egress.clear();
-        document
-            .claude_account_egress
-            .insert("beta".into(), "socks5h://user:secret@proxy.example:1080".into());
+        document.claude_account_egress.insert(
+            "beta".into(),
+            "socks5h://user:secret@proxy.example:1080".into(),
+        );
     });
     assert!(accepted.is_ok());
 
@@ -647,7 +688,10 @@ async fn stats_show_the_suspected_reason_and_pinned_sessions() {
     let stats = serde_json::to_value(state.get_stats()).unwrap();
     let alpha = &stats["accounts"][0]["claude"];
     assert_eq!(alpha["affinity_bindings"], 1);
-    assert!(alpha["suspected_reason"].as_str().unwrap().contains("has been disabled"));
+    assert!(alpha["suspected_reason"]
+        .as_str()
+        .unwrap()
+        .contains("has been disabled"));
     assert!(alpha["suspected_at_unix"].as_i64().unwrap() > 0);
     assert_eq!(alpha["probes_24h"], 0);
 }

@@ -151,7 +151,11 @@ pub fn build_cline_refresh_request(refresh_token: &str) -> RefreshRequest {
 }
 
 pub fn parse_refresh_response(json_str: &str) -> Result<Tokens, String> {
-    let mut value: serde_json::Value = serde_json::from_str(json_str).map_err(|e| e.to_string())?;
+    let value = serde_json::from_str(json_str).map_err(|e| e.to_string())?;
+    parse_refresh_value(value)
+}
+
+pub(crate) fn parse_refresh_value(mut value: serde_json::Value) -> Result<Tokens, String> {
     if let Some(object) = value.as_object_mut() {
         for (camel, snake) in [
             ("accessToken", "access_token"),

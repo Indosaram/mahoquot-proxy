@@ -5,18 +5,20 @@
 //! machine can delegate them to a sidecar that lives next to the user's files.
 
 use super::cursor::{
-    exec_delete, exec_grep, exec_ls, exec_read, exec_request_context,
-    exec_shell, exec_shell_run, exec_trace_enabled, exec_write, shell_result_message,
+    exec_delete, exec_grep, exec_ls, exec_read, exec_request_context, exec_shell, exec_shell_run,
+    exec_trace_enabled, exec_write, shell_result_message,
 };
 use super::cursor_proto as proto;
 
 pub fn unsupported(id: u32, exec_id: &str, error: &str) -> Vec<proto::AgentClientMessage> {
     let frame = |message: proto::exec_client_control_message::Message| proto::AgentClientMessage {
-        message: Some(proto::agent_client_message::Message::ExecClientControlMessage(
-            proto::ExecClientControlMessage {
-                message: Some(message),
-            },
-        )),
+        message: Some(
+            proto::agent_client_message::Message::ExecClientControlMessage(
+                proto::ExecClientControlMessage {
+                    message: Some(message),
+                },
+            ),
+        ),
     };
     let _ = exec_id;
     vec![
@@ -192,8 +194,11 @@ pub fn handle_with(
         // Anything we cannot model must still be answered, otherwise the server-side agent
         // waits forever. A throw plus a stream close is a normal tool failure to Cursor.
         None => {
-            for frame in unsupported(id, &exec_id, "exec request is not supported by this executor")
-            {
+            for frame in unsupported(
+                id,
+                &exec_id,
+                "exec request is not supported by this executor",
+            ) {
                 emit(frame);
             }
         }

@@ -75,7 +75,7 @@ pub(crate) async fn send_interactions(
     let client = state
         .try_client_for_member(member)
         .map_err(|error| error.to_string())?;
-    let body = serde_json::to_vec(wire).map_err(|error| error.to_string())?;
+    let body = Bytes::from(serde_json::to_vec(wire).map_err(|error| error.to_string())?);
     let settings = state.settings.current();
     let retries = account_retry_limit(member, settings.request_retry);
     let mut attempt = 0usize;
@@ -530,7 +530,12 @@ impl StreamCapture {
 
         observe_stream_account(&outcome, "finalized", Some(status));
 
+        // The guard's `Drop` balances the in-flight counter exactly once, so a
+        // panic in the recording (or a future dropped before its first poll)
+        // cannot strand the increment and wedge every later quiescence wait.
+        let recording_guard = state.begin_outcome_recording();
         tokio::spawn(async move {
+            let _recording_guard = recording_guard;
             let record = OutcomeRecord {
                 event_id: &outcome.event_id,
                 occurred_at_ms: outcome.occurred_at_ms,
@@ -1291,6 +1296,9 @@ async fn handle_claude_denial(
     }
 }
 
+// The relay resolves routing from these eight independent inputs; bundling
+// them into a struct would only move the same data behind one more layer.
+#[allow(clippy::too_many_arguments)]
 fn resolve_target(
     pool: &crate::state::PoolSnapshot,
     member: &AccountMember,
@@ -1461,7 +1469,7 @@ fn resolve_target(
             .map_err(|e| format!("invalid gemini request: {e}"))?;
         let model = upstream_model.to_string();
         let session_id = session_affinity.map(session_digest);
-        let mut inner = gemini.clone();
+        let mut inner = gemini;
         if let Some(obj) = inner.as_object_mut() {
             obj.remove("model");
             obj.remove("stream");
@@ -1664,9 +1672,15 @@ fn resolve_target(
                     replay: None,
                 });
             }
-            let openai_body = openai_body_with_model(plan, upstream_model)
-                .ok_or_else(|| "generic adapter requires OpenAI-compatible input".to_string())?;
+            if plan.openai_body.is_none() {
+                return Err("generic adapter requires OpenAI-compatible input".to_string());
+            }
+            let openai_body = || {
+                openai_body_with_model(plan, upstream_model)
+                    .ok_or_else(|| "generic adapter requires OpenAI-compatible input".to_string())
+            };
             if adapter == "command-code" {
+                let openai_body = openai_body()?;
                 let session_id = session_affinity
                     .map(str::to_string)
                     .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -1689,6 +1703,7 @@ fn resolve_target(
                 });
             }
             if adapter == "google" {
+                let openai_body = openai_body()?;
                 let model = openai_body
                     .get("model")
                     .and_then(serde_json::Value::as_str)
@@ -1708,6 +1723,7 @@ fn resolve_target(
                 });
             }
             if adapter == "anthropic" {
+                let openai_body = openai_body()?;
                 // The translator enforces the cache-breakpoint cap itself, so
                 // this branch needs no extra step.
                 return Ok(UpstreamTarget {
@@ -1729,7 +1745,7 @@ fn resolve_target(
                             .to_string(),
                     );
                 }
-                let mut body = openai_body.clone();
+                let mut body = openai_body()?;
                 compat::mimo::inject_system_marker(&mut body);
                 return Ok(UpstreamTarget {
                     url: endpoint,
@@ -3584,6 +3600,9 @@ fn prepare_native_replay(
         return None;
     }
     let adapter = member.generic_adapter()?;
+    if adapter != "xai" && !(adapter == "kimi" && protocol == compat::Protocol::Anthropic) {
+        return None;
+    }
     // Unauthenticated local callers still get a stable, non-empty principal.
     let caller = caller.filter(|c| !c.trim().is_empty()).unwrap_or("local");
     let session = session?;
@@ -3731,8 +3750,11 @@ fn final_anthropic_message(bytes: &[u8]) -> Option<serde_json::Value> {
                 let block = blocks.get_mut(index?)?;
                 let delta = &event["delta"];
                 let append = |block: &mut serde_json::Value, key: &str, text: &str| {
-                    let current = block[key].as_str().unwrap_or_default().to_string();
-                    block[key] = serde_json::Value::String(current + text);
+                    if let Some(serde_json::Value::String(current)) = block.get_mut(key) {
+                        current.push_str(text);
+                    } else {
+                        block[key] = serde_json::Value::String(text.to_string());
+                    }
                 };
                 match delta["type"].as_str() {
                     Some("text_delta") => append(block, "text", delta["text"].as_str()?),
@@ -5790,11 +5812,11 @@ const INGRESS_ROUTING_HEADERS: [&str; 12] = [
 /// `RequestBuilder::header` appends. x.ai's edge returns 415 `Expected request
 /// with Content-Type: application/json` when the same header is sent twice,
 /// even if both values are `application/json`.
-fn content_type_to_append<'a>(
+fn content_type_to_append(
     member_sets_content_type: bool,
-    client_content_type: Option<&'a str>,
+    client_content_type: Option<&str>,
     protocol: compat::Protocol,
-) -> Option<&'a str> {
+) -> Option<&str> {
     if member_sets_content_type
         || protocol == compat::Protocol::Cursor
         || protocol == compat::Protocol::Devin
@@ -5931,9 +5953,9 @@ fn hierarchy_turns(body: &serde_json::Value) -> (Vec<String>, String) {
         .or_else(|| body.get("input"))
         .or_else(|| body.get("contents"))
         .and_then(|v| v.as_array())
-        .cloned()
+        .map(Vec::as_slice)
         .unwrap_or_default();
-    for item in &items {
+    for item in items {
         let role = item
             .get("role")
             .and_then(|r| r.as_str())
@@ -5950,9 +5972,8 @@ fn hierarchy_turns(body: &serde_json::Value) -> (Vec<String>, String) {
             .get("content")
             .or_else(|| item.get("parts"))
             .or_else(|| item.get("output"))
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
-        push(role, &content);
+            .unwrap_or(&serde_json::Value::Null);
+        push(role, content);
     }
     (turns, environment)
 }
@@ -7512,8 +7533,7 @@ pub async fn handle_relay(
                             },
                         )
                         .await;
-                        let mut final_bytes = bytes.to_vec();
-                        if let Some(ref plugins) = state.plugins {
+                        let final_bytes = if let Some(ref plugins) = state.plugins {
                             let hooks =
                                 crate::plugins::hooks::PluginHookRegistry::new(plugins.clone());
                             let from_format = target.protocol.as_str();
@@ -7527,13 +7547,13 @@ pub async fn handle_relay(
                             let raw_body = target_body.as_ref();
                             let orig_body = plan.original_body.as_ref();
 
-                            final_bytes = hooks.normalize_response_before(
+                            let mut final_bytes = hooks.normalize_response_before(
                                 from_format,
                                 to_format,
                                 model_name,
                                 orig_body,
                                 raw_body,
-                                &final_bytes,
+                                &bytes,
                                 false,
                             );
 
@@ -7557,7 +7577,10 @@ pub async fn handle_relay(
                                 &final_bytes,
                                 false,
                             );
-                        }
+                            Bytes::from(final_bytes)
+                        } else {
+                            bytes
+                        };
 
                         if let Some(lease) = &member.home_lease {
                             lease.release();
@@ -8274,6 +8297,47 @@ mod routing_tests {
             );
             assert_eq!(state.monitor.in_flight(), 0);
         }
+    }
+
+    #[test]
+    fn kimi_replay_appends_text_and_thinking_with_non_string_fallback() {
+        // Given: existing strings and non-string content fields on SSE blocks.
+        let mut wire = String::new();
+        for (index, block) in [
+            serde_json::json!({"type": "text", "text": "prefix", "thinking": "thought"}),
+            serde_json::json!({"type": "text", "text": 42}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            wire.push_str(&format!(
+                "data: {}\n\n",
+                serde_json::json!({"type": "content_block_start", "index": index, "content_block": block})
+            ));
+            for (kind, key) in [("text_delta", "text"), ("thinking_delta", "thinking")] {
+                for text in ["\u{1f680}", "suffix"] {
+                    let mut delta = serde_json::json!({"type": kind});
+                    delta[key] = serde_json::json!(text);
+                    wire.push_str(&format!(
+                        "data: {}\n\n",
+                        serde_json::json!({"type": "content_block_delta", "index": index, "delta": delta})
+                    ));
+                }
+            }
+        }
+        wire.push_str("data: {\"type\":\"message_stop\"}\n\n");
+
+        // When: the captured stream is reconstructed.
+        let message = final_anthropic_message(wire.as_bytes()).unwrap();
+
+        // Then: deltas append in order, replacing only non-string fields.
+        assert_eq!(
+            message["content"],
+            serde_json::json!([
+                {"type": "text", "text": "prefix\u{1f680}suffix", "thinking": "thought\u{1f680}suffix"},
+                {"type": "text", "text": "\u{1f680}suffix", "thinking": "\u{1f680}suffix"}
+            ])
+        );
     }
 
     #[test]

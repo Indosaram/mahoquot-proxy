@@ -142,7 +142,11 @@ async fn an_empty_codex_turn_fails_over_instead_of_reaching_the_client() {
 
     // Then: the empty turn never reaches the client and the next account serves.
     assert!(text.contains("served-by-peer"), "client saw: {text}");
-    assert_eq!(calls_a.load(Ordering::SeqCst), 1, "empty account tried once");
+    assert_eq!(
+        calls_a.load(Ordering::SeqCst),
+        1,
+        "empty account tried once"
+    );
     assert_eq!(calls_b.load(Ordering::SeqCst), 1, "peer account served");
     assert!(
         state.get_stats().failed_over >= 1,

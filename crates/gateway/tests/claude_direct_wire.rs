@@ -58,7 +58,6 @@ impl Upstream {
             .cloned()
             .expect("at least one upstream call recorded")
     }
-
 }
 
 struct TlsListener {
@@ -93,9 +92,9 @@ fn make_tls_acceptor() -> TlsAcceptor {
         let _ = rustls::crypto::ring::default_provider().install_default();
     });
     let cert_der = CertificateDer::from_slice(include_bytes!("fixtures/claude_direct_cert.der"));
-    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(&include_bytes!(
-        "fixtures/claude_direct_key.der"
-    )[..]));
+    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+        &include_bytes!("fixtures/claude_direct_key.der")[..],
+    ));
     let config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert_der], key_der)
@@ -194,9 +193,17 @@ impl Fixture {
     fn state_with_config(&self, upstream_addr: SocketAddr, yaml: Option<&str>) -> Arc<AppState> {
         for entry in std::fs::read_dir(&self.dir).unwrap() {
             let path = entry.unwrap().path();
-            if path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("claude-") && n.ends_with(".json")) {
-                let mut credential: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-                credential["upstream_override"] = serde_json::json!(format!("https://api.anthropic.com:{}", upstream_addr.port()));
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("claude-") && n.ends_with(".json"))
+            {
+                let mut credential: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                credential["upstream_override"] = serde_json::json!(format!(
+                    "https://api.anthropic.com:{}",
+                    upstream_addr.port()
+                ));
                 std::fs::write(path, credential.to_string()).unwrap();
             }
         }
@@ -220,13 +227,15 @@ impl Fixture {
 
         state.claude_direct_client = make_direct_client(upstream_addr);
         let current = state.proxy.load_full();
-        state.proxy.store(Arc::new(mahoquot_gateway::proxy_policy::ProxySnapshot {
-            runtime: Arc::clone(&current.runtime),
-            default_client: make_direct_client(upstream_addr),
-            direct_client: current.direct_client.clone(),
-            devin_default_client: current.devin_default_client.clone(),
-            devin_direct_client: current.devin_direct_client.clone(),
-        }));
+        state
+            .proxy
+            .store(Arc::new(mahoquot_gateway::proxy_policy::ProxySnapshot {
+                runtime: Arc::clone(&current.runtime),
+                default_client: make_direct_client(upstream_addr),
+                direct_client: current.direct_client.clone(),
+                devin_default_client: current.devin_default_client.clone(),
+                devin_direct_client: current.devin_direct_client.clone(),
+            }));
         Arc::new(state)
     }
 }
@@ -246,7 +255,11 @@ fn write_claude(dir: &Path, id: &str, upstream: Option<&str>, api_key: Option<&s
     if let Some(k) = api_key {
         credential["api_key"] = serde_json::Value::String(k.to_string());
     }
-    std::fs::write(dir.join(format!("claude-{id}.json")), credential.to_string()).unwrap();
+    std::fs::write(
+        dir.join(format!("claude-{id}.json")),
+        credential.to_string(),
+    )
+    .unwrap();
 }
 
 async fn send_request(
@@ -289,27 +302,47 @@ async fn test_direct_oauth_classification_and_2_1_316_profile() {
     });
 
     let (status, _, body) = send_request(&state, &[], req_body).await;
-    assert_eq!(status, StatusCode::OK, "response body: {:?}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "response body: {:?}",
+        String::from_utf8_lossy(&body)
+    );
     assert_eq!(upstream.hits(), 1);
 
     let (headers, body_json) = upstream.last();
 
-    let ua = headers.get("user-agent").and_then(|v| v.to_str().ok()).unwrap_or_default();
+    let ua = headers
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
     assert!(
         ua.contains("2.1.316") && ua.contains("sdk-cli"),
         "expected 2.1.316 sdk-cli UA, got: {ua}"
     );
 
-    let system = body_json.get("system").and_then(|s| s.as_array()).expect("system array");
+    let system = body_json
+        .get("system")
+        .and_then(|s| s.as_array())
+        .expect("system array");
     let billing_block = system.iter().find(|b| {
         b.get("text")
             .and_then(|t| t.as_str())
-            .map_or(false, |t| t.starts_with("x-anthropic-billing-header:"))
+            .is_some_and(|t| t.starts_with("x-anthropic-billing-header:"))
     });
-    assert!(billing_block.is_some(), "missing x-anthropic-billing-header in system: {system:?}");
+    assert!(
+        billing_block.is_some(),
+        "missing x-anthropic-billing-header in system: {system:?}"
+    );
     let billing_text = billing_block.unwrap()["text"].as_str().unwrap();
-    assert!(billing_text.contains("cc_entrypoint=sdk-cli;"), "entrypoint in: {billing_text}");
-    assert!(billing_text.contains("cc_version=2.1.316"), "version in: {billing_text}");
+    assert!(
+        billing_text.contains("cc_entrypoint=sdk-cli;"),
+        "entrypoint in: {billing_text}"
+    );
+    assert!(
+        billing_text.contains("cc_version=2.1.316"),
+        "version in: {billing_text}"
+    );
     assert!(billing_text.contains("cch="), "cch in: {billing_text}");
 
     let user_id_raw = body_json
@@ -317,10 +350,13 @@ async fn test_direct_oauth_classification_and_2_1_316_profile() {
         .and_then(|m| m.get("user_id"))
         .and_then(|u| u.as_str())
         .expect("metadata.user_id string");
-    let user_id_obj: serde_json::Value = serde_json::from_str(user_id_raw).expect("valid user_id json");
+    let user_id_obj: serde_json::Value =
+        serde_json::from_str(user_id_raw).expect("valid user_id json");
     let device_id = user_id_obj["device_id"].as_str().expect("device_id string");
     assert!(!device_id.is_empty(), "device_id must not be empty");
-    let session_id = user_id_obj["session_id"].as_str().expect("session_id string");
+    let session_id = user_id_obj["session_id"]
+        .as_str()
+        .expect("session_id string");
     assert!(!session_id.is_empty(), "session_id must not be empty");
 
     let req_body_2 = serde_json::json!({
@@ -334,7 +370,11 @@ async fn test_direct_oauth_classification_and_2_1_316_profile() {
     let (_, body_json_2) = upstream.last();
     let user_id_raw_2 = body_json_2["metadata"]["user_id"].as_str().unwrap();
     let user_id_obj_2: serde_json::Value = serde_json::from_str(user_id_raw_2).unwrap();
-    assert_eq!(user_id_obj_2["device_id"].as_str().unwrap(), device_id, "device_id must be persistent");
+    assert_eq!(
+        user_id_obj_2["device_id"].as_str().unwrap(),
+        device_id,
+        "device_id must be persistent"
+    );
 }
 
 #[tokio::test]
@@ -356,14 +396,20 @@ async fn test_negative_controls_no_direct_transformation() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let (headers, body_json) = upstream.last();
-    assert!(headers.contains_key("x-api-key"), "expected x-api-key header");
+    assert!(
+        headers.contains_key("x-api-key"),
+        "expected x-api-key header"
+    );
     let body_str = body_json.to_string();
     assert!(
         !body_str.contains("x-anthropic-billing-header"),
         "keyed account must not have direct billing header"
     );
     assert!(
-        body_json.get("metadata").and_then(|m| m.get("user_id")).is_none(),
+        body_json
+            .get("metadata")
+            .and_then(|m| m.get("user_id"))
+            .is_none(),
         "keyed account must not inject direct metadata user_id"
     );
 
@@ -386,10 +432,14 @@ async fn test_negative_controls_no_direct_transformation() {
     assert_eq!(status_cloak, StatusCode::OK);
     let (headers_cloak, body_cloak) = upstream.last();
     assert_eq!(
-        headers_cloak.get("user-agent").and_then(|v| v.to_str().ok()),
+        headers_cloak
+            .get("user-agent")
+            .and_then(|v| v.to_str().ok()),
         Some("custom-client/1.0")
     );
-    assert!(!body_cloak.to_string().contains("x-anthropic-billing-header"));
+    assert!(!body_cloak
+        .to_string()
+        .contains("x-anthropic-billing-header"));
 }
 
 #[tokio::test]
@@ -414,7 +464,9 @@ async fn test_system_message_and_per_turn_preservation() {
 
     let (_, body_json) = upstream.last();
     let blocks = body_json["system"].as_array().unwrap();
-    assert!(blocks.iter().any(|block| block["text"] == req_body["system"][0]["text"]));
+    assert!(blocks
+        .iter()
+        .any(|block| block["text"] == req_body["system"][0]["text"]));
     assert_eq!(body_json["messages"], req_body["messages"]);
 }
 
@@ -482,17 +534,30 @@ async fn test_native_tool_names_preservation_json() {
         .iter()
         .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
         .collect();
-    assert!(tool_names.contains(&"mcp__workspace__lookup"), "missing mcp tool on wire: {tool_names:?}");
-    assert!(tool_names.contains(&"custom_linter"), "missing custom tool on wire: {tool_names:?}");
-    assert!(tool_names.contains(&"Read"), "missing Read tool on wire: {tool_names:?}");
+    assert!(
+        tool_names.contains(&"mcp__workspace__lookup"),
+        "missing mcp tool on wire: {tool_names:?}"
+    );
+    assert!(
+        tool_names.contains(&"custom_linter"),
+        "missing custom tool on wire: {tool_names:?}"
+    );
+    assert!(
+        tool_names.contains(&"Read"),
+        "missing Read tool on wire: {tool_names:?}"
+    );
 
-    let resp_json: serde_json::Value = serde_json::from_slice(&resp_bytes).expect("valid response json");
+    let resp_json: serde_json::Value =
+        serde_json::from_slice(&resp_bytes).expect("valid response json");
     let content = resp_json["content"].as_array().expect("content blocks");
     let resp_tool_names: Vec<&str> = content
         .iter()
         .filter_map(|c| c.get("name").and_then(|n| n.as_str()))
         .collect();
-    assert_eq!(resp_tool_names, vec!["mcp__workspace__lookup", "custom_linter"]);
+    assert_eq!(
+        resp_tool_names,
+        vec!["mcp__workspace__lookup", "custom_linter"]
+    );
 }
 
 #[tokio::test]
@@ -539,8 +604,13 @@ async fn test_native_tool_result_continuation() {
     let wire_messages = wire_body["messages"].as_array().expect("messages on wire");
     assert_eq!(wire_messages.len(), 3, "must have all 3 turns preserved");
     let user_turn_3 = &wire_messages[2];
-    let content_turn_3 = user_turn_3["content"].as_array().expect("array content in turn 3");
-    let tool_res = content_turn_3.iter().find(|c| c["type"] == "tool_result").expect("tool_result block");
+    let content_turn_3 = user_turn_3["content"]
+        .as_array()
+        .expect("array content in turn 3");
+    let tool_res = content_turn_3
+        .iter()
+        .find(|c| c["type"] == "tool_result")
+        .expect("tool_result block");
     assert_eq!(tool_res["tool_use_id"], "tu_read_99");
     assert_eq!(tool_res["content"], "fn main() {}");
 }
@@ -577,7 +647,9 @@ async fn test_native_sse_passthrough_unknown_events_and_fields() {
     let (status, resp_headers, resp_bytes) = send_request(&state, &[], req_body).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
-        resp_headers.get("content-type").and_then(|v| v.to_str().ok()),
+        resp_headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
         Some("text/event-stream")
     );
 
@@ -614,8 +686,12 @@ async fn test_session_affinity_and_no_affinity_isolation() {
     .await;
     assert_eq!(status1, StatusCode::OK);
     let (h1, b1) = upstream.last();
-    let wire_sess_1 = h1.get("x-claude-code-session-id").and_then(|v| v.to_str().ok()).unwrap();
-    let meta_user_1: serde_json::Value = serde_json::from_str(b1["metadata"]["user_id"].as_str().unwrap()).unwrap();
+    let wire_sess_1 = h1
+        .get("x-claude-code-session-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap();
+    let meta_user_1: serde_json::Value =
+        serde_json::from_str(b1["metadata"]["user_id"].as_str().unwrap()).unwrap();
     assert_eq!(meta_user_1["session_id"].as_str().unwrap(), wire_sess_1);
 
     let (status2, _, _) = send_request(
@@ -630,8 +706,14 @@ async fn test_session_affinity_and_no_affinity_isolation() {
     .await;
     assert_eq!(status2, StatusCode::OK);
     let (h2, _) = upstream.last();
-    let wire_sess_2 = h2.get("x-claude-code-session-id").and_then(|v| v.to_str().ok()).unwrap();
-    assert_eq!(wire_sess_1, wire_sess_2, "same affinity must produce stable session ID");
+    let wire_sess_2 = h2
+        .get("x-claude-code-session-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap();
+    assert_eq!(
+        wire_sess_1, wire_sess_2,
+        "same affinity must produce stable session ID"
+    );
 
     let (status3, _, _) = send_request(
         &state,
@@ -645,8 +727,14 @@ async fn test_session_affinity_and_no_affinity_isolation() {
     .await;
     assert_eq!(status3, StatusCode::OK);
     let (h3, _) = upstream.last();
-    let wire_sess_3 = h3.get("x-claude-code-session-id").and_then(|v| v.to_str().ok()).unwrap();
-    assert_ne!(wire_sess_1, wire_sess_3, "distinct affinity sessions must be isolated");
+    let wire_sess_3 = h3
+        .get("x-claude-code-session-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap();
+    assert_ne!(
+        wire_sess_1, wire_sess_3,
+        "distinct affinity sessions must be isolated"
+    );
 
     let (status4, _, _) = send_request(
         &state,
@@ -660,17 +748,29 @@ async fn test_session_affinity_and_no_affinity_isolation() {
     .await;
     assert_eq!(status4, StatusCode::OK);
     let (h4, b4) = upstream.last();
-    let wire_sess_4 = h4.get("x-claude-code-session-id").and_then(|v| v.to_str().ok()).unwrap();
+    let wire_sess_4 = h4
+        .get("x-claude-code-session-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap();
     assert_ne!(wire_sess_4, wire_sess_1);
     assert_ne!(wire_sess_4, wire_sess_3);
-    let meta_user_4: serde_json::Value = serde_json::from_str(b4["metadata"]["user_id"].as_str().unwrap()).unwrap();
+    let meta_user_4: serde_json::Value =
+        serde_json::from_str(b4["metadata"]["user_id"].as_str().unwrap()).unwrap();
     assert_eq!(meta_user_4["session_id"].as_str().unwrap(), wire_sess_4);
-    let (status5, _, _) = send_request(&state, &[], serde_json::json!({
-        "model": MODEL, "max_tokens":16, "messages":[{"role":"user","content":"no affinity"}]
-    })).await;
+    let (status5, _, _) = send_request(
+        &state,
+        &[],
+        serde_json::json!({
+            "model": MODEL, "max_tokens":16, "messages":[{"role":"user","content":"no affinity"}]
+        }),
+    )
+    .await;
     assert_eq!(status5, StatusCode::OK);
     let (h5, _) = upstream.last();
-    assert_ne!(h5["x-claude-code-session-id"], h4["x-claude-code-session-id"]);
+    assert_ne!(
+        h5["x-claude-code-session-id"],
+        h4["x-claude-code-session-id"]
+    );
 }
 
 #[tokio::test]
@@ -686,22 +786,40 @@ async fn test_cch_field_is_present_on_each_signed_request() {
         "messages": [{"role": "user", "content": "reproducible prompt"}],
     });
 
-    let (s1, _, _) = send_request(&state, &[("x-claude-code-session-id", "fixed-sess")], req_body.clone()).await;
+    let (s1, _, _) = send_request(
+        &state,
+        &[("x-claude-code-session-id", "fixed-sess")],
+        req_body.clone(),
+    )
+    .await;
     assert_eq!(s1, StatusCode::OK);
     let (_, b1) = upstream.last();
 
-    let (s2, _, _) = send_request(&state, &[("x-claude-code-session-id", "fixed-sess")], req_body).await;
+    let (s2, _, _) = send_request(
+        &state,
+        &[("x-claude-code-session-id", "fixed-sess")],
+        req_body,
+    )
+    .await;
     assert_eq!(s2, StatusCode::OK);
     let (_, b2) = upstream.last();
 
     let extract_cch = |body: &serde_json::Value| -> String {
         let system = body["system"].as_array().expect("system array");
-        let billing = system.iter().find(|b| {
-            b.get("text")
-                .and_then(|t| t.as_str())
-                .map_or(false, |t| t.starts_with("x-anthropic-billing-header:"))
-        }).expect("billing block")["text"].as_str().unwrap();
-        let cch_part = billing.split(';').find(|part| part.trim().starts_with("cch=")).expect("cch field");
+        let billing = system
+            .iter()
+            .find(|b| {
+                b.get("text")
+                    .and_then(|t| t.as_str())
+                    .is_some_and(|t| t.starts_with("x-anthropic-billing-header:"))
+            })
+            .expect("billing block")["text"]
+            .as_str()
+            .unwrap();
+        let cch_part = billing
+            .split(';')
+            .find(|part| part.trim().starts_with("cch="))
+            .expect("cch field");
         cch_part.trim().to_string()
     };
 

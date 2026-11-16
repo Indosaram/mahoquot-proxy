@@ -20,7 +20,7 @@ use super::events::{CodexEvent, Usage};
 /// provider that splits identity across frames working.
 #[derive(Default)]
 pub struct ChatDecoder {
-     started: bool,
+    started: bool,
     finished: bool,
     usage: Option<Usage>,
     tools: Vec<ChatTool>,
@@ -317,7 +317,10 @@ mod tests {
         for event in events {
             renderer.render(event);
         }
-        assert!(renderer.terminated(), "a chat stream must terminate the renderer");
+        assert!(
+            renderer.terminated(),
+            "a chat stream must terminate the renderer"
+        );
         let body = renderer.current_response().to_string();
         assert!(body.contains("Hello"), "{body}");
     }
@@ -346,7 +349,13 @@ mod tests {
             })
             .collect::<String>();
         assert_eq!(args, "{\"q\":\"x\"}");
-        assert_eq!(events.iter().filter(|e| matches!(e, CodexEvent::ToolCallBegin { .. })).count(), 1);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, CodexEvent::ToolCallBegin { .. }))
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -376,7 +385,9 @@ mod tests {
             &mut events,
         );
         decoder.finish(&mut events);
-        assert!(events.iter().any(|e| matches!(e, CodexEvent::TextDelta(t) if t == "done")));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, CodexEvent::TextDelta(t) if t == "done")));
         let usage = events
             .iter()
             .find_map(|event| match event {

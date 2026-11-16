@@ -58,7 +58,13 @@ impl Fixture {
             ))
             .body(Body::from(body))
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
+        // The router dispatch is in-process, but handlers reached from here do
+        // real I/O: the api-call cases POST to a loopback fixture server. This
+        // bound is a wall-clock hang guard for dispatch plus handler and body
+        // work, not a latency expectation for either. It has to survive a fully
+        // parallel workspace run on a loaded host, where several seconds of
+        // pure scheduling delay is reachable without any deadlock.
+        tokio::time::timeout(Duration::from_secs(60), async {
             let response = self.app.clone().oneshot(request).await.unwrap();
             let status = response.status();
             let bytes = response.into_body().collect().await.unwrap().to_bytes();

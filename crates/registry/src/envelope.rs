@@ -274,10 +274,35 @@ pub fn compute_signing_bytes(
     msg
 }
 
+/// Rebuild a value with every object's keys in lexicographic order.
+///
+/// The workspace enables `serde_json/preserve_order` so wire payloads keep
+/// their insertion order, which means a parsed `Value` no longer sorts keys on
+/// its own. Canonical form must not depend on member order, so the ordering is
+/// applied here explicitly. `str` ordering is byte-wise, matching the
+/// `BTreeMap` ordering serde_json used before the feature was enabled.
+fn sort_object_keys(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<(String, serde_json::Value)> = map.into_iter().collect();
+            entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+            let mut sorted = serde_json::Map::with_capacity(entries.len());
+            for (key, value) in entries {
+                sorted.insert(key, sort_object_keys(value));
+            }
+            serde_json::Value::Object(sorted)
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(sort_object_keys).collect())
+        }
+        other => other,
+    }
+}
+
 pub fn canonicalize_json(bytes: &[u8]) -> Result<Vec<u8>, CatalogVerificationError> {
     let value: serde_json::Value = serde_json::from_slice(bytes)
         .map_err(|e| CatalogVerificationError::MalformedJson(e.to_string()))?;
-    serde_json::to_vec(&value)
+    serde_json::to_vec(&sort_object_keys(value))
         .map_err(|e| CatalogVerificationError::SerializationError(e.to_string()))
 }
 
@@ -359,6 +384,11 @@ pub fn verify_catalog_envelope(
         .verify(&signing_bytes, &signature)
         .map_err(|_| CatalogVerificationError::SignatureVerificationFailed)?;
 
+    // A version-1 receipt signed before key order was part of canonical form
+    // carries a genuine signature over insertion-ordered bytes. It is rejected
+    // here rather than accepted: honouring both byte orders would make the
+    // published payload ambiguous for every downstream consumer, so an affected
+    // catalog is reissued with the current tool instead of tolerated.
     if !is_canonical_json(raw_payload)? {
         return Err(CatalogVerificationError::CanonicalizationMismatch);
     }

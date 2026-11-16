@@ -705,7 +705,6 @@ fn cursor_quota_separates_auto_and_named_pools() {
     assert_eq!(by_name("Plan"), Some(25.64));
 }
 
-
 /// Serves the three Anthropic verbs a Claude reset needs, so the whole claim
 /// path runs against a local mock instead of the live upstream.
 #[derive(Clone, Default)]
@@ -751,12 +750,17 @@ async fn claude_reset_mock(
         .route(
             "/api/organizations/{org}/reset_rate_limits",
             post(
-                |State(state): State<ClaudeResetMock>, axum::extract::Path(org): axum::extract::Path<String>, body: String| async move {
+                |State(state): State<ClaudeResetMock>,
+                 axum::extract::Path(org): axum::extract::Path<String>,
+                 body: String| async move {
                     let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
                     state.claims.lock().unwrap().push((
                         org,
                         parsed["grant_id"].as_str().unwrap_or_default().to_string(),
-                        parsed["request_id"].as_str().unwrap_or_default().to_string(),
+                        parsed["request_id"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string(),
                     ));
                     (state.claim_status, state.claim_body)
                 },
@@ -774,7 +778,14 @@ async fn claude_reset_mock(
     let listener = listener.expect("reserved test port range 18840-18899 is exhausted");
     let base = format!("http://{}", listener.local_addr().unwrap());
     let handle = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
-    (base, ClaudeResetMock { claims, ..Default::default() }, handle)
+    (
+        base,
+        ClaudeResetMock {
+            claims,
+            ..Default::default()
+        },
+        handle,
+    )
 }
 
 /// Build an OAuth Claude account pointed at `base`, optionally pre-banked.
@@ -812,7 +823,9 @@ async fn claude_member_at(base: &str, credits: Option<i64>) -> (Arc<AppState>, s
     (state, auth_dir)
 }
 
-fn claude_oauth_member(state: &Arc<AppState>) -> std::sync::Arc<mahoquot_gateway::account::AccountMember> {
+fn claude_oauth_member(
+    state: &Arc<AppState>,
+) -> std::sync::Arc<mahoquot_gateway::account::AccountMember> {
     state
         .pool
         .load()
@@ -886,4 +899,3 @@ async fn claude_reset_refusal_is_reported_with_its_own_reason() {
     handle.abort();
     std::fs::remove_dir_all(auth_dir).ok();
 }
-

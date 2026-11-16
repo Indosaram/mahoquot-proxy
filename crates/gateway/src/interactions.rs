@@ -38,7 +38,8 @@ struct Continuation {
 
 #[derive(Default)]
 pub struct InteractionsStore {
-    entries: BTreeMap<String, Continuation>,
+    entries: BTreeMap<String, Arc<Continuation>>,
+    next_expiry: Option<Instant>,
 }
 
 pub type SharedInteractionsStore = Arc<Mutex<InteractionsStore>>;
@@ -61,8 +62,24 @@ fn call_key(ids: impl IntoIterator<Item = String>) -> Result<String, String> {
 }
 
 impl InteractionsStore {
-    fn put(&mut self, key: String, entry: Continuation, now: Instant) {
-        self.entries.retain(|_, entry| now < entry.expires);
+    fn prune(&mut self, now: Instant) {
+        if self.next_expiry.is_some_and(|expires| now >= expires) {
+            let mut next_expiry = None;
+            self.entries.retain(|_, entry| {
+                if now >= entry.expires {
+                    return false;
+                }
+                next_expiry = Some(
+                    next_expiry.map_or(entry.expires, |next: Instant| next.min(entry.expires)),
+                );
+                true
+            });
+            self.next_expiry = next_expiry;
+        }
+    }
+
+    fn put(&mut self, key: String, entry: Arc<Continuation>, now: Instant) {
+        self.prune(now);
         if !self.entries.contains_key(&key) && self.entries.len() >= CAPACITY {
             if let Some(oldest) = self
                 .entries
@@ -73,11 +90,15 @@ impl InteractionsStore {
                 self.entries.remove(&oldest);
             }
         }
+        self.next_expiry = Some(
+            self.next_expiry
+                .map_or(entry.expires, |next| next.min(entry.expires)),
+        );
         self.entries.insert(key, entry);
     }
 
-    fn get(&mut self, key: &str, now: Instant) -> Option<Continuation> {
-        self.entries.retain(|_, entry| now < entry.expires);
+    fn get(&mut self, key: &str, now: Instant) -> Option<Arc<Continuation>> {
+        self.prune(now);
         self.entries.get(key).cloned()
     }
 }
@@ -133,19 +154,19 @@ fn namespace(
         .get("x-session-id")
         .and_then(|v| v.to_str().ok())
         .filter(|s| !s.is_empty());
-    let input = body.get("input").cloned().unwrap_or(Value::Null);
-    let prefix = if let Some(steps) = input.as_array() {
-        let last = steps
-            .iter()
-            .rposition(|s| s.get("type").and_then(Value::as_str) == Some("user_input"));
-        last.map(|index| json!(&steps[..=index]))
-            .unwrap_or(json!([]))
-    } else {
-        input
-    };
-    let conversation = session.map(|s| json!(s)).unwrap_or_else(
-        || json!({"input":prefix,"system_instruction":body.get("system_instruction")}),
-    );
+    let conversation = session.map(|s| json!(s)).unwrap_or_else(|| {
+        let input = body.get("input").unwrap_or(&Value::Null);
+        let prefix = if let Some(steps) = input.as_array() {
+            let last = steps
+                .iter()
+                .rposition(|s| s.get("type").and_then(Value::as_str) == Some("user_input"));
+            last.map(|index| json!(&steps[..=index]))
+                .unwrap_or(json!([]))
+        } else {
+            input.clone()
+        };
+        json!({"input":prefix,"system_instruction":body.get("system_instruction")})
+    });
     digest(&json!([caller, credential, model, conversation]))
 }
 
@@ -155,7 +176,7 @@ fn prepare(
     namespace: &str,
     store: &mut InteractionsStore,
     now: Instant,
-) -> Result<Option<Continuation>, String> {
+) -> Result<Option<Arc<Continuation>>, String> {
     if let Some(previous) = body.get("previous_interaction_id") {
         let id = previous
             .as_str()
@@ -365,9 +386,7 @@ pub async fn handle(
         .and_then(Value::as_str)
     {
         let mut cache = store.lock().unwrap_or_else(|p| p.into_inner());
-        cache
-            .entries
-            .retain(|_, entry| Instant::now() < entry.expires);
+        cache.prune(Instant::now());
         let matches: Vec<_> = cache
             .entries
             .values()
@@ -416,7 +435,7 @@ pub async fn handle(
         };
         (url, body, Value::Null)
     } else if devin {
-        let request = match interactions_to_devin(&body, saved.as_ref()) {
+        let request = match interactions_to_devin(&body, saved.as_deref()) {
             Ok(request) => request,
             Err(message) => return error(StatusCode::BAD_REQUEST, message),
         };
@@ -862,12 +881,11 @@ fn devin_events(
                 let index = *calls
                     .get(&output_index)
                     .ok_or("Devin arguments without function call")?;
-                let arguments = observer.steps[index]["arguments"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_string()
-                    + &delta;
-                observer.steps[index]["arguments"] = json!(arguments);
+                if let Value::String(arguments) = &mut observer.steps[index]["arguments"] {
+                    arguments.push_str(&delta);
+                } else {
+                    observer.steps[index]["arguments"] = json!(delta);
+                }
                 out.extend(event(
                     "step.delta",
                     json!({"index":index,"delta":{"type":"arguments_delta","arguments":delta}}),
@@ -1059,7 +1077,7 @@ impl Observer {
             contents.push(json!({"role":"model","parts":self.parts}));
         }
         let now = Instant::now();
-        let entry = Continuation {
+        let entry = Arc::new(Continuation {
             id: id.into(),
             owner: self.owner.clone(),
             namespace: self.namespace.clone(),
@@ -1070,7 +1088,7 @@ impl Observer {
             contents: json!(contents),
             calls,
             expires: now + TTL,
-        };
+        });
         let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
         store.put(
             format!("{}:interaction:{id}", self.namespace),
@@ -1653,6 +1671,150 @@ mod tests {
     }
 
     #[test]
+    fn ulw_gw5_namespace_preserves_session_and_prefix_digests() {
+        for input in [
+            Value::Null,
+            json!("text"),
+            json!([]),
+            json!([{"type":"model_output"}]),
+            json!([{"type":"user_input","content":"first"},{"type":"model_output"},{"type":"user_input","content":"second"},{"type":"function_result"}]),
+        ] {
+            let body = json!({"input":input,"system_instruction":{"text":"system"}});
+            for session in [None, Some(""), Some("session")] {
+                let mut headers = HeaderMap::new();
+                if let Some(session) = session {
+                    headers.insert("x-session-id", session.parse().unwrap());
+                }
+                let prefix = if let Some(steps) = input.as_array() {
+                    steps
+                        .iter()
+                        .rposition(|step| step["type"] == "user_input")
+                        .map(|index| json!(&steps[..=index]))
+                        .unwrap_or(json!([]))
+                } else {
+                    input.clone()
+                };
+                let conversation = session.filter(|session| !session.is_empty())
+                    .map(|session| json!(session))
+                    .unwrap_or_else(|| json!({"input":prefix,"system_instruction":body.get("system_instruction")}));
+                let expected = digest(&json!(["caller", "credential", "model", conversation]));
+                assert_eq!(
+                    namespace(&body, "caller", "credential", "model", &headers),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ulw_gw5_continuation_aliases_and_reads_share_one_snapshot() {
+        let store = Arc::new(Mutex::new(InteractionsStore::default()));
+        let source = observer(false, "scope", store.clone());
+        source
+            .save(&json!({"id":"fixture","status":"requires_action","steps":[{
+                "type":"function_call","id":"call","name":"lookup","arguments":{}
+            }]}))
+            .unwrap();
+        let mut cache = store.lock().unwrap();
+        assert_eq!(cache.entries.len(), 2);
+        let snapshots: Vec<_> = cache.entries.values().cloned().collect();
+        assert!(Arc::ptr_eq(&snapshots[0], &snapshots[1]));
+        let snapshot = cache
+            .get("scope:interaction:fixture", Instant::now())
+            .unwrap();
+        assert!(Arc::ptr_eq(&snapshot, &snapshots[0]));
+        let expiry = snapshot.expires;
+        assert!(cache.get("scope:interaction:fixture", expiry).is_none());
+        assert!(cache.entries.is_empty());
+        assert!(cache.next_expiry.is_none());
+    }
+
+    #[test]
+    fn ulw_gw5_devin_argument_deltas_append_without_replacing_the_prefix() {
+        use crate::compat::events::CodexEvent;
+        let mut source = observer(
+            false,
+            "scope",
+            Arc::new(Mutex::new(InteractionsStore::default())),
+        );
+        let mut calls = BTreeMap::new();
+        devin_events(
+            &mut source,
+            &mut calls,
+            vec![CodexEvent::ToolCallBegin {
+                output_index: 0,
+                call_id: "call".into(),
+                name: "lookup".into(),
+            }],
+        )
+        .unwrap();
+        let Value::String(arguments) = &mut source.steps[0]["arguments"] else {
+            panic!("string arguments");
+        };
+        arguments.reserve(128);
+        let allocation = arguments.as_ptr();
+        let mut parser = SseParser::default();
+        let mut frames = Vec::new();
+        for delta in ["{\"q\":", "1}"] {
+            let bytes = devin_events(
+                &mut source,
+                &mut calls,
+                vec![CodexEvent::ToolArgsDelta {
+                    output_index: 0,
+                    delta: delta.into(),
+                }],
+            )
+            .unwrap();
+            assert_eq!(
+                source.steps[0]["arguments"].as_str().unwrap().as_ptr(),
+                allocation
+            );
+            parser.push_raw_data(&bytes, &mut frames).unwrap();
+            let frame: Value = serde_json::from_slice(&frames.pop().unwrap()).unwrap();
+            assert_eq!(frame["event_type"], "step.delta");
+            assert_eq!(frame["delta"]["arguments"], delta);
+        }
+        assert_eq!(source.steps[0]["arguments"], "{\"q\":1}");
+        assert!(devin_events(
+            &mut source,
+            &mut calls,
+            vec![CodexEvent::ToolArgsDelta {
+                output_index: 1,
+                delta: "ignored".into(),
+            }]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn ulw_gw5_expiry_deadline_can_be_conservative_after_replacement() {
+        let now = Instant::now();
+        let mut cache = InteractionsStore::default();
+        let initial = Arc::new(Continuation {
+            id: "initial".into(),
+            owner: "owner".into(),
+            namespace: "scope".into(),
+            environment: None,
+            contents: json!([]),
+            calls: vec![],
+            expires: now + Duration::from_secs(1),
+        });
+        cache.put("key".into(), initial.clone(), now);
+        let replacement = Arc::new(Continuation {
+            expires: now + TTL,
+            ..(*initial).clone()
+        });
+        cache.put("key".into(), replacement.clone(), now);
+        assert!(Arc::ptr_eq(
+            &cache.get("key", now + Duration::from_secs(1)).unwrap(),
+            &replacement
+        ));
+        assert_eq!(cache.next_expiry, Some(replacement.expires));
+        assert!(cache.get("key", replacement.expires).is_none());
+        assert!(cache.entries.is_empty());
+    }
+
+    #[test]
     fn cache_when_capacity_and_expiry_boundaries_are_reached() {
         let now = Instant::now();
         let mut store = InteractionsStore::default();
@@ -1667,7 +1829,8 @@ mod tests {
                     contents: json!([]),
                     calls: vec![],
                     expires: now + TTL + Duration::from_secs(u64::try_from(index).unwrap()),
-                },
+                }
+                .into(),
                 now,
             );
         }

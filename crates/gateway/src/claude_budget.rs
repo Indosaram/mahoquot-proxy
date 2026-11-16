@@ -108,7 +108,8 @@ impl BudgetTracker {
                 }
             }
         }
-        self.snapshot.store(Arc::new(Snapshot { usage: Some(usage) }));
+        self.snapshot
+            .store(Arc::new(Snapshot { usage: Some(usage) }));
     }
 
     pub fn refresh_from_history(&self, state: &crate::state::AppState, now_unix: i64) {
@@ -154,7 +155,9 @@ impl BudgetTracker {
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_secs() as i64)
                         .unwrap_or(0);
-                    worker.claude_budgets.refresh_from_history(&worker, now_unix);
+                    worker
+                        .claude_budgets
+                        .refresh_from_history(&worker, now_unix);
                 })
                 .await;
             }
@@ -171,7 +174,10 @@ mod tests {
         // 2026-10-01T00:00:00Z and 2026-10-31T23:59:59Z
         let october = 1_790_812_800;
         assert_eq!(month_start_utc_ms(october), october * 1000);
-        assert_eq!(month_start_utc_ms(october + 31 * 86_400 - 1), october * 1000);
+        assert_eq!(
+            month_start_utc_ms(october + 31 * 86_400 - 1),
+            october * 1000
+        );
         // 2026-11-01T00:00:00Z starts a new month.
         let november = october + 31 * 86_400;
         assert_eq!(month_start_utc_ms(november), november * 1000);
@@ -201,7 +207,10 @@ mod tests {
     fn unreadable_history_fails_closed() {
         let tracker = BudgetTracker::default();
         let budgets: BTreeMap<String, u64> = [("key".to_string(), 1_000_000)].into();
-        assert!(tracker.is_over(&budgets, "key"), "unknown before the first read");
+        assert!(
+            tracker.is_over(&budgets, "key"),
+            "unknown before the first read"
+        );
         tracker.refresh_with(&budgets, |_| Err::<u64, _>("database is locked"));
         assert!(tracker.is_over(&budgets, "key"));
         assert!(!tracker.is_over(&budgets, "unbudgeted"));

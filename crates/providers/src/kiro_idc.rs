@@ -15,7 +15,10 @@ pub const KIRO_IDC_SCOPES: [&str; 3] = [
 /// eu-central-1 is `q.`. A tenant's Identity Center region has no host of its
 /// own, so both are asked in order.
 pub const KIRO_PROFILE_ENDPOINTS: [(&str, &str); 2] = [
-    ("us-east-1", "https://codewhisperer.us-east-1.amazonaws.com/"),
+    (
+        "us-east-1",
+        "https://codewhisperer.us-east-1.amazonaws.com/",
+    ),
     ("eu-central-1", "https://q.eu-central-1.amazonaws.com/"),
 ];
 
@@ -80,9 +83,8 @@ pub fn validate_start_url(start_url: &str) -> Result<&str, String> {
         .ok_or_else(|| "start URL must be https".to_string())?;
     let host_end = rest.find('/').unwrap_or(rest.len());
     let host = &rest[..host_end];
-    let host_ok = host.ends_with(".awsapps.com")
-        || host == "awsapps.com"
-        || host == "view.awsapps.com";
+    let host_ok =
+        host.ends_with(".awsapps.com") || host == "awsapps.com" || host == "view.awsapps.com";
     if !host_ok || host.contains('@') {
         return Err("start URL must be an awsapps.com portal".to_string());
     }
@@ -112,7 +114,9 @@ fn error_reason(body: &Value, status: u16) -> String {
     if code.is_empty() && message.is_empty() {
         return format!("HTTP {status}");
     }
-    format!("{code}: {message}").trim_end_matches(": ").to_string()
+    format!("{code}: {message}")
+        .trim_end_matches(": ")
+        .to_string()
 }
 
 fn text_field(body: &Value, key: &str) -> Result<String, String> {
@@ -372,7 +376,10 @@ pub async fn fetch_account_email(
             ("isEmailRequired", "true"),
         ])
         .header("user-agent", "aws-sdk-js/1.0.0 KiroIDE-1.1.70-mahoquot")
-        .header("x-amz-user-agent", "aws-sdk-js/1.0.0 KiroIDE-1.1.70-mahoquot")
+        .header(
+            "x-amz-user-agent",
+            "aws-sdk-js/1.0.0 KiroIDE-1.1.70-mahoquot",
+        )
         .bearer_auth(access_token)
         .send()
         .await
@@ -510,7 +517,10 @@ mod tests {
     fn profile_hosts_are_literal_and_not_a_region_pattern() {
         assert_eq!(
             KIRO_PROFILE_ENDPOINTS[0],
-            ("us-east-1", "https://codewhisperer.us-east-1.amazonaws.com/")
+            (
+                "us-east-1",
+                "https://codewhisperer.us-east-1.amazonaws.com/"
+            )
         );
         assert_eq!(
             KIRO_PROFILE_ENDPOINTS[1],
@@ -530,7 +540,10 @@ mod tests {
             region_from_profile_arn("arn:aws-us-gov:codewhisperer:us-gov-west-1:1:profile/x"),
             Some("us-gov-west-1")
         );
-        assert_eq!(region_from_profile_arn("arn:aws:codewhisperer::1:profile/x"), None);
+        assert_eq!(
+            region_from_profile_arn("arn:aws:codewhisperer::1:profile/x"),
+            None
+        );
         assert_eq!(region_from_profile_arn(""), None);
         assert_eq!(region_from_profile_arn("not-an-arn"), None);
     }

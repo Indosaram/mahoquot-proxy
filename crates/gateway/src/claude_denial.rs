@@ -149,7 +149,6 @@ mod tests {
         assert_eq!(set.len(), 1);
     }
 
-
     #[test]
     fn recorded_bodies_land_in_the_expected_class() {
         let cases: &[(u16, &str, Denial)] = &[
@@ -202,9 +201,15 @@ mod tests {
     fn a_second_denial_inside_the_window_promotes() {
         let tracker = DeniedTracker::default();
         assert!(!tracker.record("a", 1_000));
-        assert!(!tracker.record("b", 1_000), "accounts are tracked separately");
+        assert!(
+            !tracker.record("b", 1_000),
+            "accounts are tracked separately"
+        );
         assert!(tracker.record("a", 1_000 + DENIED_PROMOTION_WINDOW_SECS));
-        assert!(!tracker.record("a", 5_000), "a promotion resets the counter");
+        assert!(
+            !tracker.record("a", 5_000),
+            "a promotion resets the counter"
+        );
         assert!(!tracker.record("a", 5_000 + DENIED_PROMOTION_WINDOW_SECS + 1));
     }
 

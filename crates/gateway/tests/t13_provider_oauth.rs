@@ -2658,13 +2658,19 @@ async fn kiro_auth_url_refuses_a_malformed_region_before_any_upstream_call() {
 
     // then it is refused locally, with no request leaving the process
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let body: Value =
-        serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 1_000_000).await.unwrap())
-            .unwrap();
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), 1_000_000)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
     assert_eq!(body["status"], "error");
     assert_eq!(body["provider"], "kiro");
     assert!(
-        body["error"].as_str().unwrap().contains("invalid AWS region"),
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("invalid AWS region"),
         "unexpected error: {}",
         body["error"]
     );

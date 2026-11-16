@@ -226,11 +226,12 @@ pub async fn refresh(state: Arc<AppState>, base: &str) -> anyhow::Result<()> {
                 .collect();
             next.extend(ids.iter().map(|id| json!(id)));
             let managed: BTreeSet<_> = old.iter().cloned().chain(ids.iter().cloned()).collect();
-            let updated =
-                value["models"] != json!(next) || value["cline_free_models"] != json!(managed);
+            let next = Value::Array(next);
+            let managed = json!(managed);
+            let updated = value["models"] != next || value["cline_free_models"] != managed;
             if updated {
-                value["models"] = json!(next);
-                value["cline_free_models"] = json!(managed);
+                value["models"] = next;
+                value["cline_free_models"] = managed;
                 mahoquot_providers::credential_file::write_credential_atomically(
                     &member.file_path,
                     &serde_json::to_vec_pretty(&value)?,

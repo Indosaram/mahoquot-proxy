@@ -172,7 +172,10 @@ fn ordered_labels(
     if let Some(model_enum) = labels.model_enum.as_deref().filter(|v| !v.is_empty()) {
         out.insert("model_enum".into(), json!(model_enum));
     }
-    out.insert("used_claude".into(), json!(proto_string(labels.used_claude)));
+    out.insert(
+        "used_claude".into(),
+        json!(proto_string(labels.used_claude)),
+    );
     out.insert(
         "used_non_gemini_model".into(),
         json!(proto_string(labels.used_non_gemini_model)),

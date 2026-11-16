@@ -1871,10 +1871,14 @@ mod tests {
             }
         }
 
-        let upstream = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 18858))
+        // Ephemeral, not a fixed fixture port: a hardcoded port makes two
+        // concurrent runs of this binary fail with AddrInUse instead of
+        // exercising the proxy-failure path this test is about.
+        let upstream = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("mock upstream bind");
-        let upstream_url = "http://127.0.0.1:18858";
+        let upstream_port = upstream.local_addr().expect("mock upstream addr").port();
+        let upstream_url = format!("http://127.0.0.1:{upstream_port}");
         let dir = std::env::temp_dir().join(format!("mahoquot-quota-proxy-{}", uuid_v4()));
         std::fs::create_dir_all(&dir).expect("create auth dir");
         let _auth_dir = TempAuthDir(dir.clone());
@@ -1885,7 +1889,7 @@ mod tests {
             "label": "InferX",
             "adapter": "openai-chat",
             "base_url": upstream_url,
-            "upstream_override": "http://127.0.0.1:18858",
+            "upstream_override": upstream_url,
             "api_key": "fixture-key",
             "models": ["inferx/test"],
             "proxy_url": "ftp://invalid-proxy",
