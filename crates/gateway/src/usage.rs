@@ -1469,6 +1469,19 @@ pub fn is_conversation_id(id: &str) -> bool {
         .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
 }
 
+/// Whether an upstream model id marks an entitlement the account cannot use.
+///
+/// Antigravity lists variants the signed-in account is not entitled to under a
+/// `-disabled` suffix: an entitled account is offered
+/// `gemini-4-argon-high/-medium/-low`, while the rest receive a single
+/// `gemini-4-argon-disabled`. The suffix is the upstream's own "not for this
+/// account" marker and a request to it answers `404 NOT_FOUND`, so publishing
+/// it under `/v1/models` advertises a model that can never serve traffic.
+pub fn is_disabled_variant_id(id: &str) -> bool {
+    id.strip_suffix("-disabled")
+        .is_some_and(|rest| !rest.is_empty())
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct WhamAdditionalRateLimit {
     pub limit_name: String,
@@ -1799,7 +1812,7 @@ impl WhamUsage {
         // 4. Model availability metadata (NOT invented percentages from usage counters)
         let model_availability = self.model_usage.map(|mu| {
             mu.into_iter()
-                .filter(|(id, _)| !is_conversation_id(id))
+                .filter(|(id, _)| !is_conversation_id(id) && !is_disabled_variant_id(id))
                 .map(|(k, v)| {
                     (
                         k,
@@ -4140,6 +4153,28 @@ mod tests {
         assert!(avail.contains_key("gemini-3-flash"));
         assert!(avail.contains_key("tab_flash_lite_preview"));
         assert!(!avail.contains_key("chat_20706"));
+    }
+
+    #[test]
+    fn disabled_variants_never_become_model_availability() {
+        let raw = r#"{"model_usage":{"gemini-4-argon-high":{"available":true},"gemini-4-carbon-disabled":{"available":true},"gemini-4-hydrogen-disabled":{"available":true}}}"#;
+        let wham: WhamUsage = serde_json::from_str(raw).expect("deserializes");
+
+        let usage = wham.into_account_usage(1_790_954_000);
+        let avail = usage.model_availability.expect("availability present");
+
+        assert!(avail.contains_key("gemini-4-argon-high"));
+        assert!(!avail.contains_key("gemini-4-carbon-disabled"));
+        assert!(!avail.contains_key("gemini-4-hydrogen-disabled"));
+    }
+
+    #[test]
+    fn disabled_suffix_detection_is_narrow() {
+        assert!(is_disabled_variant_id("gemini-4-argon-disabled"));
+        assert!(is_disabled_variant_id("gemini-4-carbon-disabled"));
+        assert!(!is_disabled_variant_id("-disabled"));
+        assert!(!is_disabled_variant_id("gemini-4-argon-high"));
+        assert!(!is_disabled_variant_id("disabled-model"));
     }
     #[test]
     fn parses_live_pro_wham_payload_with_chatpass_and_model_availability() {

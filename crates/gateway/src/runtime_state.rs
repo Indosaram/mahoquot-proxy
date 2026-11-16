@@ -483,6 +483,12 @@ fn registry_with_account_contributions(
                         if crate::usage::is_conversation_id(model_name) {
                             continue;
                         }
+                        // Upstream marks variants this account is not entitled to
+                        // with a `-disabled` suffix; every request to them is a
+                        // 404, so they must not appear in `/v1/models`.
+                        if crate::usage::is_disabled_variant_id(model_name) {
+                            continue;
+                        }
                         let model_id = match ModelId::new(model_name) {
                             Ok(id) => id,
                             Err(err) => {

@@ -1072,6 +1072,12 @@ async fn try_antigravity_quota(
                 let mut models_map = std::collections::BTreeMap::new();
                 if let Some(models_obj) = models_data.get("models").and_then(|v| v.as_object()) {
                     for (model_id, details) in models_obj {
+                        // Upstream advertises variants the account is not entitled to
+                        // with a `-disabled` suffix; requests to them answer 404, so
+                        // they must never reach the published catalog.
+                        if crate::usage::is_disabled_variant_id(model_id) {
+                            continue;
+                        }
                         let text = |key: &str| {
                             details
                                 .get(key)
