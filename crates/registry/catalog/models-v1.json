@@ -2641,6 +2641,68 @@
         "context_limit": "272000"
       }
     },
+    "gpt-6.2-astra": {
+      "id": "gpt-6.2-astra",
+      "owned_by": "openai",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "codex": {
+          "provider_id": "codex",
+          "policy": "open",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "921600"
+      }
+    },
+    "gpt-6.2-sol": {
+      "id": "gpt-6.2-sol",
+      "owned_by": "openai",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "codex": {
+          "provider_id": "codex",
+          "policy": "open",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "921600"
+      }
+    },
     "gpt-daybreak-blue-latest": {
       "id": "gpt-daybreak-blue-latest",
       "owned_by": "openai",

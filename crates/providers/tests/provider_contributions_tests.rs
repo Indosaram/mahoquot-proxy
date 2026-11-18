@@ -39,7 +39,7 @@ const LEGACY_CLAUDE_MODELS: [&str; 13] = [
     "claude-opus-5",
 ];
 
-const LEGACY_CODEX_MODELS: [&str; 12] = [
+const LEGACY_CODEX_MODELS: [&str; 14] = [
     "gpt-4.1",
     "gpt-4o",
     "gpt-5.3-codex",
@@ -50,6 +50,8 @@ const LEGACY_CODEX_MODELS: [&str; 12] = [
     "gpt-5.6-luna",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
+    "gpt-6.2-astra",
+    "gpt-6.2-sol",
     "gpt-image-1.5",
     "gpt-image-2",
 ];
@@ -199,7 +201,7 @@ fn test_codex_typed_contribution_and_capabilities() {
             "is_codex_model must return true for legacy model {id}"
         );
     }
-    assert_eq!(contrib.models.len(), 14);
+    assert_eq!(contrib.models.len(), 16);
 
     let img_caps = contrib
         .capability_profile("gpt-image-1.5")

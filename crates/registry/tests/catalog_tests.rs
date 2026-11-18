@@ -81,11 +81,13 @@ const LEGACY_VERTEX_MODELS: [&str; 21] = [
     "gemini-3.6-flash",
 ];
 
-// 7. Codex default models (7)
-const LEGACY_CODEX_DEFAULTS: [&str; 7] = [
+// 7. Codex default models (9)
+const LEGACY_CODEX_DEFAULTS: [&str; 9] = [
     "gpt-5.6-sol",
     "gpt-5.6-luna",
     "gpt-5.6-terra",
+    "gpt-6.2-sol",
+    "gpt-6.2-astra",
     "gpt-5.5",
     "gpt-5.4",
     "gpt-5.4-mini",
@@ -241,7 +243,7 @@ fn embedded_catalog_covers_legacy_sources() {
         }
     }
 
-    // 7. Verify all 7 Codex defaults
+    // 7. Verify all 9 Codex defaults
     let codex_provider = ProviderId::codex();
     for id in LEGACY_CODEX_DEFAULTS {
         let model_id = ModelId::new(id).unwrap();
