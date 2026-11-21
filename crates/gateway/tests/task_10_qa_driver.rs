@@ -218,7 +218,7 @@ async fn task_10_http_qa_scenario() {
     // 4. Provider blackout rejection via /oauth-excluded-models
     let excluded_uri = "http://127.0.0.1:18871/v0/management/oauth-excluded-models";
     let all_ag_models = vec![
-        "gemini-3.8-flash-high",
+        "gemini-4-neon-high",
         "gemini-3.7-flash-high",
         "gemini-3.6-flash-high",
         "gemini-3.5-flash-low",

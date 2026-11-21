@@ -611,14 +611,14 @@ mod provider_kind_contract_tests {
         let now_ms = 1_000_000;
         let until_ms = now_ms + 300_000;
 
-        assert!(member.group_available("gemini-3.8-flash-high", now_ms));
+        assert!(member.group_available("gemini-4-neon-high", now_ms));
         assert!(member.group_available("claude-opus-4-6-thinking", now_ms));
 
-        assert!(member.set_group_cooldown("gemini-3.8-flash-high", until_ms));
+        assert!(member.set_group_cooldown("gemini-4-neon-high", until_ms));
 
         // The Gemini bucket is benched until its deadline...
-        assert!(!member.group_available("gemini-3.8-flash-high", now_ms));
-        assert!(member.group_available("gemini-3.8-flash-high", until_ms));
+        assert!(!member.group_available("gemini-4-neon-high", now_ms));
+        assert!(member.group_available("gemini-4-neon-high", until_ms));
         // ...while the untouched third-party bucket keeps serving, and the
         // account itself is never benched account-wide.
         assert!(member.group_available("claude-opus-4-6-thinking", now_ms));
@@ -627,7 +627,7 @@ mod provider_kind_contract_tests {
 
         // A shorter repeat deadline must not cut an active bench short.
         assert!(member.set_group_cooldown("gemini-3-flash", until_ms - 100_000));
-        assert!(!member.group_available("gemini-3.8-flash-high", until_ms - 1));
+        assert!(!member.group_available("gemini-4-neon-high", until_ms - 1));
 
         // Providers that meter one pool have no group split, so the caller
         // falls back to account-wide cooldown.
@@ -743,14 +743,14 @@ mod provider_kind_contract_tests {
         let member = AccountMember::for_test(ProviderAccount::Antigravity(account.clone()));
         let now_ms = 1_000_000;
         let until_ms = now_ms + 300_000;
-        member.set_group_cooldown("gemini-3.8-flash-high", until_ms);
+        member.set_group_cooldown("gemini-4-neon-high", until_ms);
 
         let fresh = AccountMember::for_test(ProviderAccount::Antigravity(account));
-        assert!(fresh.group_available("gemini-3.8-flash-high", now_ms));
+        assert!(fresh.group_available("gemini-4-neon-high", now_ms));
 
         crate::state::adopt_runtime_state(&fresh, &Arc::new(member));
 
-        assert!(!fresh.group_available("gemini-3.8-flash-high", now_ms));
+        assert!(!fresh.group_available("gemini-4-neon-high", now_ms));
         assert!(fresh.group_available("claude-opus-4-6-thinking", now_ms));
     }
 

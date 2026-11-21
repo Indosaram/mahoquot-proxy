@@ -1914,8 +1914,40 @@
         "context_limit": "1048576"
       }
     },
-    "gemini-3.8-flash-high": {
-      "id": "gemini-3.8-flash-high",
+    "gemini-4-neon": {
+      "id": "gemini-4-neon",
+      "owned_by": "google",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "antigravity": {
+          "provider_id": "antigravity",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100,
+          "upstream_model_id": "gemini-4-neon-high"
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1048576"
+      }
+    },
+    "gemini-4-neon-high": {
+      "id": "gemini-4-neon-high",
       "owned_by": "google",
       "capabilities": [
         "chat",
@@ -1944,6 +1976,99 @@
       "metadata": {
         "context_limit": "1048576",
         "thinking.antigravity": "{\"min\":1,\"max\":65535,\"dynamic_allowed\":true,\"levels\":[\"low\",\"medium\",\"high\"]}"
+      }
+    },
+    "gemini-4-neon-medium": {
+      "id": "gemini-4-neon-medium",
+      "owned_by": "google",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "antigravity": {
+          "provider_id": "antigravity",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1048576"
+      }
+    },
+    "gemini-4-neon-low": {
+      "id": "gemini-4-neon-low",
+      "owned_by": "google",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "antigravity": {
+          "provider_id": "antigravity",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1048576"
+      }
+    },
+    "gemini-4-neon-xhigh": {
+      "id": "gemini-4-neon-xhigh",
+      "owned_by": "google",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "antigravity": {
+          "provider_id": "antigravity",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1048576"
       }
     },
     "gemini-pro-agent": {

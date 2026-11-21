@@ -234,7 +234,7 @@ fn test_complete_provider_blackout_rejection() {
 
     // All 14 fallback-routable models for Antigravity in the active catalog
     let all_ag_models = vec![
-        "gemini-3.8-flash-high",
+        "gemini-4-neon-high",
         "gemini-3.7-flash-high",
         "gemini-3.6-flash-high",
         "gemini-3.5-flash-low",

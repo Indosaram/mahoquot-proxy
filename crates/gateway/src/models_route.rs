@@ -878,7 +878,7 @@ mod tests {
         let ag_only = model_entries(&[ProviderKind::Antigravity], None);
         assert_eq!(ag_only.len(), antigravity_ids);
         assert!(ag_only.iter().any(|e| e.id == "gemini-3.7-flash-high"));
-        assert!(ag_only.iter().any(|e| e.id == "gemini-3.8-flash-high"));
+        assert!(ag_only.iter().any(|e| e.id == "gemini-4-neon-high"));
         assert!(ag_only.iter().all(|e| e.owned_by == "google"));
 
         let both = model_entries(&[ProviderKind::Codex, ProviderKind::Antigravity], None);

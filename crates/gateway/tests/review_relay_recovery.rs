@@ -746,7 +746,7 @@ async fn antigravity_validation_identifies_the_account_and_requires_reauthentica
     let (status, body) = relay(
         Arc::clone(&state),
         "/v1/chat/completions",
-        r#"{"model":"gemini-3.8-flash-high","messages":[{"role":"user","content":"hi"}]}"#,
+        r#"{"model":"gemini-4-neon-high","messages":[{"role":"user","content":"hi"}]}"#,
     )
     .await;
 

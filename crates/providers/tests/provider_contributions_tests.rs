@@ -7,7 +7,7 @@ use mahoquot_registry::{
 };
 
 const LEGACY_ANTIGRAVITY_MODELS: [&str; 14] = [
-    "gemini-3.8-flash-high",
+    "gemini-4-neon-high",
     "gemini-3.7-flash-high",
     "gemini-3.6-flash-high",
     "gemini-3.5-flash-low",

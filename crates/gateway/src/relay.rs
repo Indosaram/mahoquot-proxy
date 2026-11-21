@@ -8832,7 +8832,7 @@ mod routing_tests {
         // A Codex cooldown says nothing about a Gemini request, so advertising
         // it as the reset time would point the client at the wrong window.
         assert_eq!(
-            earliest_exhaustion_reset_unix_secs(&pool, Some("gemini-3.8-flash-high")),
+            earliest_exhaustion_reset_unix_secs(&pool, Some("gemini-4-neon-high")),
             None,
             "a cooldown on an account that cannot serve the model is not a reset"
         );

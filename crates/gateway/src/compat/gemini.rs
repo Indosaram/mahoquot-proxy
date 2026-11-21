@@ -1713,7 +1713,10 @@ fn reserve_thinking_budget(model: &str, requested: i64) -> i64 {
 }
 
 fn is_thinking_model(model: &str) -> bool {
-    model.starts_with("gemini-3") || model.starts_with("gemini-2.5") || model.ends_with("-thinking")
+    model.starts_with("gemini-4")
+        || model.starts_with("gemini-3")
+        || model.starts_with("gemini-2.5")
+        || model.ends_with("-thinking")
 }
 
 fn content_to_text(content: Option<&Value>) -> Option<String> {
@@ -2440,7 +2443,7 @@ mod signature_tests {
     #[test]
     fn decoder_parks_the_signature_under_the_native_call_id() {
         let ledger = signature_ledger::SignatureLedger::in_memory();
-        let replay = ledger.scope("gemini-3.8-flash-high", "session-stream-park");
+        let replay = ledger.scope("gemini-4-neon-high", "session-stream-park");
         let mut decoder = GeminiDecoder::with_replay(replay.clone());
         let mut out = Vec::new();
         decoder.decode(
@@ -2462,7 +2465,7 @@ mod signature_tests {
     #[test]
     fn a_parked_signature_replays_into_the_next_request() {
         let ledger = signature_ledger::SignatureLedger::in_memory();
-        let replay = ledger.scope("gemini-3.8-flash-high", "session-replay");
+        let replay = ledger.scope("gemini-4-neon-high", "session-replay");
         let mut decoder = GeminiDecoder::with_replay(replay.clone());
         let mut out = Vec::new();
         decoder.decode(
@@ -2478,7 +2481,7 @@ mod signature_tests {
             .expect("tool call begin");
 
         let body = json!({
-            "model": "gemini-3.8-flash-high",
+            "model": "gemini-4-neon-high",
             "messages": [
                 { "role": "user", "content": "list files" },
                 { "role": "assistant", "tool_calls": [{
@@ -2498,8 +2501,8 @@ mod signature_tests {
     #[test]
     fn a_signature_parked_under_one_session_never_replays_into_another() {
         let ledger = signature_ledger::SignatureLedger::in_memory();
-        let first = ledger.scope("gemini-3.8-flash-high", "session-one");
-        let second = ledger.scope("gemini-3.8-flash-high", "session-two");
+        let first = ledger.scope("gemini-4-neon-high", "session-one");
+        let second = ledger.scope("gemini-4-neon-high", "session-two");
         let other_model = ledger.scope("gemini-3.7-flash-high", "session-one");
         let mut decoder = GeminiDecoder::with_replay(first.clone());
         let mut out = Vec::new();
@@ -2508,7 +2511,7 @@ mod signature_tests {
             &mut out,
         );
         let body = json!({
-            "model": "gemini-3.8-flash-high",
+            "model": "gemini-4-neon-high",
             "messages": [
                 { "role": "user", "content": "go" },
                 { "role": "assistant", "tool_calls": [{
@@ -2550,9 +2553,9 @@ mod signature_tests {
     #[test]
     fn a_scoped_request_carries_a_stable_session_id_and_an_unscoped_one_omits_it() {
         let ledger = signature_ledger::SignatureLedger::in_memory();
-        let replay = ledger.scope("gemini-3.8-flash-high", "session-wire-1");
+        let replay = ledger.scope("gemini-4-neon-high", "session-wire-1");
         let body = json!({
-            "model": "gemini-3.8-flash-high",
+            "model": "gemini-4-neon-high",
             "messages": [{ "role": "user", "content": "hello" }]
         });
 
@@ -2564,7 +2567,7 @@ mod signature_tests {
             "the session id must be stable across requests in one session"
         );
 
-        let other = ledger.scope("gemini-3.8-flash-high", "session-wire-2");
+        let other = ledger.scope("gemini-4-neon-high", "session-wire-2");
         assert_eq!(
             openai_to_gemini_with_replay(&body, &other).expect("translate")["sessionId"],
             "session-wire-2"
@@ -2581,9 +2584,9 @@ mod signature_tests {
     #[test]
     fn an_antigravity_request_nests_the_session_id_under_request() {
         let ledger = signature_ledger::SignatureLedger::in_memory();
-        let replay = ledger.scope("gemini-3.8-flash-high", "session-antigravity");
+        let replay = ledger.scope("gemini-4-neon-high", "session-antigravity");
         let body = json!({
-            "model": "gemini-3.8-flash-high",
+            "model": "gemini-4-neon-high",
             "messages": [{ "role": "user", "content": "hello" }]
         });
 
@@ -2669,8 +2672,8 @@ mod signature_tests {
         });
 
         let ledger = signature_ledger::SignatureLedger::in_memory();
-        let replay = ledger.scope("gemini-3.8-flash-high", "session-large");
-        let out = gemini_json_to_openai_with_replay(&response, "gemini-3.8-flash-high", 0, &replay);
+        let replay = ledger.scope("gemini-4-neon-high", "session-large");
+        let out = gemini_json_to_openai_with_replay(&response, "gemini-4-neon-high", 0, &replay);
         let id = out["choices"][0]["message"]["tool_calls"][0]["id"]
             .as_str()
             .expect("tool call id");
@@ -2681,7 +2684,7 @@ mod signature_tests {
     #[test]
     fn an_unparked_history_call_falls_back_to_the_bypass_sentinel() {
         let body = json!({
-            "model": "gemini-3.8-flash-high",
+            "model": "gemini-4-neon-high",
             "messages": [
                 { "role": "user", "content": "go" },
                 { "role": "assistant", "tool_calls": [{
@@ -2701,10 +2704,10 @@ mod signature_tests {
     #[test]
     fn a_reused_call_id_with_other_arguments_does_not_replay_a_stale_signature() {
         let ledger = signature_ledger::SignatureLedger::in_memory();
-        let replay = ledger.scope("gemini-3.8-flash-high", "session-stale");
+        let replay = ledger.scope("gemini-4-neon-high", "session-stale");
         replay.remember("stale-native-1", "eval", "{\"offset\":10}", "SIGSTALE");
         let body = json!({
-            "model": "gemini-3.8-flash-high",
+            "model": "gemini-4-neon-high",
             "messages": [
                 { "role": "user", "content": "go" },
                 { "role": "assistant", "tool_calls": [{
@@ -2769,7 +2772,7 @@ mod signature_tests {
     #[test]
     fn decoder_carries_a_standalone_signature_part_into_the_next_call_id() {
         let ledger = signature_ledger::SignatureLedger::in_memory();
-        let replay = ledger.scope("gemini-3.8-flash-high", "session-pending");
+        let replay = ledger.scope("gemini-4-neon-high", "session-pending");
         let mut decoder = GeminiDecoder::with_replay(replay.clone());
         let mut out = Vec::new();
         decoder.decode(
@@ -2794,7 +2797,7 @@ mod signature_tests {
     #[test]
     fn decoder_shares_a_pending_signature_across_parallel_calls() {
         let ledger = signature_ledger::SignatureLedger::in_memory();
-        let replay = ledger.scope("gemini-3.8-flash-high", "session-parallel");
+        let replay = ledger.scope("gemini-4-neon-high", "session-parallel");
         let mut decoder = GeminiDecoder::with_replay(replay.clone());
         let mut out = Vec::new();
         decoder.decode(
@@ -2831,7 +2834,7 @@ mod signature_tests {
     #[test]
     fn unsigned_history_pairs_use_bypass_signature_and_are_preserved() {
         let body = json!({
-            "model": "gemini-3.8-flash-high",
+            "model": "gemini-4-neon-high",
             "messages": [
                 { "role": "user", "content": "step 1" },
                 { "role": "assistant", "content": Value::Null, "tool_calls": [
@@ -2862,7 +2865,7 @@ mod signature_tests {
     fn signed_history_calls_keep_their_thought_signature() {
         let signed_id = embed_signature_in_call_id("call_bash_0", "SIGREAL");
         let body = json!({
-            "model": "gemini-3.8-flash-high",
+            "model": "gemini-4-neon-high",
             "messages": [
                 { "role": "user", "content": "step 1" },
                 { "role": "assistant", "content": Value::Null, "tool_calls": [
@@ -2895,7 +2898,7 @@ mod signature_tests {
     fn repeated_openai_call_ids_are_disambiguated_chronologically() {
         let repeated_id = embed_signature_in_call_id("call_eval_0", "SAME-SIGNATURE");
         let body = json!({
-            "model": "gemini-3.8-flash-high",
+            "model": "gemini-4-neon-high",
             "messages": [
                 { "role": "user", "content": "inspect both ranges" },
                 { "role": "assistant", "tool_calls": [{
@@ -2934,7 +2937,7 @@ mod signature_tests {
     #[test]
     fn trailing_model_turn_is_stripped_to_avoid_upstream_rejection() {
         let body = json!({
-            "model": "gemini-3.8-flash-high",
+            "model": "gemini-4-neon-high",
             "messages": [
                 { "role": "user", "content": "hello" },
                 { "role": "assistant", "content": "prefilled text or unfinished response" }
@@ -2949,7 +2952,7 @@ mod signature_tests {
     #[test]
     fn unsigned_tool_call_with_text_is_preserved_with_bypass_signature() {
         let body = json!({
-            "model": "gemini-3.8-flash-high",
+            "model": "gemini-4-neon-high",
             "messages": [
                 { "role": "user", "content": "run command" },
                 {
@@ -2984,7 +2987,7 @@ mod signature_tests {
     #[test]
     fn thinking_config_generated_for_high_flash_models() {
         let body = json!({
-            "model": "gemini-3.8-flash-high",
+            "model": "gemini-4-neon-high",
             "messages": [{ "role": "user", "content": "hello" }]
         });
         let req = openai_to_gemini(&body).expect("translate");
@@ -3006,7 +3009,7 @@ mod signature_tests {
         assert_eq!(thinking_low["includeThoughts"], true);
 
         let body_none = json!({
-            "model": "gemini-3.8-flash-high",
+            "model": "gemini-4-neon-high",
             "reasoning_effort": "none",
             "messages": [{ "role": "user", "content": "hello" }]
         });
@@ -3018,7 +3021,7 @@ mod signature_tests {
     #[test]
     fn safety_settings_are_included_with_block_none() {
         let body = json!({
-            "model": "gemini-3.8-flash-high",
+            "model": "gemini-4-neon-high",
             "messages": [{ "role": "user", "content": "hello" }]
         });
         let req = openai_to_gemini(&body).expect("translate");
@@ -3119,7 +3122,7 @@ mod signature_tests {
                 "totalTokenCount": 27
             }
         });
-        let openai_resp = gemini_json_to_openai(&gemini_resp, "gemini-3.8-flash-high", 1000);
+        let openai_resp = gemini_json_to_openai(&gemini_resp, "gemini-4-neon-high", 1000);
         let choice = &openai_resp["choices"][0]["message"];
         assert_eq!(choice["content"], "Hello world!");
         assert_eq!(choice["reasoning_content"], "I should say hello");
@@ -3133,7 +3136,7 @@ mod signature_tests {
     fn plain_call_id_in_tool_response_matches_signed_assistant_call() {
         let signed_id = embed_signature_in_call_id("call_lookup_0", "SIG999");
         let body = json!({
-            "model": "gemini-3.8-flash-high",
+            "model": "gemini-4-neon-high",
             "messages": [
                 {
                     "role": "assistant",

@@ -97,7 +97,7 @@ async fn gemini_session_survives_history_changes_without_forwarding_ingress_head
                     .header("x-session-id", session)
                     .body(axum::body::Body::from(
                         json!({
-                            "model": "gemini-3.8-flash-high", "stream": false,
+                            "model": "gemini-4-neon-high", "stream": false,
                             "messages": [{"role": "user", "content": content}]
                         })
                         .to_string(),
@@ -262,7 +262,7 @@ async fn antigravity_replays_the_thought_signature_its_own_upstream_emitted() {
                         .header("x-session-id", "session-a")
                         .body(axum::body::Body::from(
                             json!({
-                                "model": "gemini-3.8-flash-high",
+                                "model": "gemini-4-neon-high",
                                 "stream": true,
                                 "messages": messages
                             })
@@ -430,7 +430,7 @@ async fn a_caller_without_a_session_header_keeps_one_stable_replay_scope() {
                     .header("content-type", "application/json")
                     .body(axum::body::Body::from(
                         json!({
-                            "model": "gemini-3.8-flash-high",
+                            "model": "gemini-4-neon-high",
                             "stream": false,
                             "messages": [
                                 {"role": "user", "content": "anchor this conversation"},

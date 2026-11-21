@@ -130,7 +130,7 @@ fn profile() -> Value {
         "compat": {"sendSessionAffinityHeaders": true},
         "models": [
             {"id": "glm-5.3-flash", "contextWindow": 200000},
-            {"id": "gemini-3.8-flash"},
+            {"id": "gemini-4-neon"},
         ],
         "remove": ["retired-model"],
     })
