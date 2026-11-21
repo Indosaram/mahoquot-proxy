@@ -304,10 +304,13 @@ pub fn subscribe_finalizer(
     state.subscribe_finalizer(account_or_event)
 }
 
-/// How long an Anthropic stream is held back waiting for its first text or
-/// tool call. Claude occasionally finishes a turn after thinking alone; only a
-/// hold that outlasts the thinking can turn that into a failover.
-const ANTHROPIC_EMPTY_HOLD: std::time::Duration = std::time::Duration::from_secs(180);
+fn reasoning_stream_hold(headers: &HeaderMap) -> std::time::Duration {
+    if headers.contains_key("x-test-preflight-deadline-ms") {
+        get_preflight_deadline(headers)
+    } else {
+        std::time::Duration::from_secs(180)
+    }
+}
 
 fn get_preflight_deadline(headers: &HeaderMap) -> std::time::Duration {
     let ms = headers
@@ -5520,18 +5523,13 @@ async fn finish_success(
         // The hold now spans leading thinking, which routinely outlasts the
         // generic preflight window; give it room so an empty finish is still
         // caught before the first byte is committed.
-        let hold = if headers.contains_key("x-test-preflight-deadline-ms") {
-            get_preflight_deadline(headers)
-        } else {
-            ANTHROPIC_EMPTY_HOLD
-        };
-        compat::open_anthropic_stream(resp, hold).await?
+        compat::open_anthropic_stream(resp, reasoning_stream_hold(headers)).await?
     } else if protocol == compat::Protocol::Codex && plan.client_stream {
         // Codex-family upstreams can answer 200 with a well-formed stream that
         // carries a role prelude, reasoning, and a terminal event but no text
         // and no tool call. Holding the preamble lets that turn fail over
         // instead of reaching the client as an empty response it must retry.
-        compat::open_codex_stream(resp, get_preflight_deadline(headers)).await?
+        compat::open_codex_stream(resp, reasoning_stream_hold(headers)).await?
     } else {
         compat::open_stream(resp, protocol).await?
     };

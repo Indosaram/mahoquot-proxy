@@ -13,6 +13,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::routing::post;
 use axum::Router;
+use futures::StreamExt;
 use http_body_util::BodyExt;
 use mahoquot_gateway::{
     config::GatewayConfig, inbound::ApiKeys, routes::create_app, state::AppState,
@@ -27,6 +28,7 @@ const EMPTY_CODEX_TURN: &str = concat!(
     "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_empty\",\"status\":\"in_progress\"}}\n\n",
     "event: response.reasoning_summary_text.delta\n",
     "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"considering the question\"}\n\n",
+    "data: {\"type\":\"response.output_text.delta\",\"delta\":\" \\n\"}\n\n",
     "event: response.completed\n",
     "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_empty\",\"status\":\"completed\",\"output\":[]}}\n\n",
 );
@@ -55,7 +57,20 @@ async fn an_empty_codex_turn_fails_over_instead_of_reaching_the_client() {
             let observed = Arc::clone(&observed_a);
             async move {
                 observed.fetch_add(1, Ordering::SeqCst);
-                ([("content-type", "text/event-stream")], EMPTY_CODEX_TURN)
+                let (prelude, terminal) = EMPTY_CODEX_TURN
+                    .split_at(EMPTY_CODEX_TURN.find("event: response.completed").unwrap());
+                let stream =
+                    futures::stream::once(
+                        async move { Ok::<_, std::convert::Infallible>(prelude) },
+                    )
+                    .chain(futures::stream::once(async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(12)).await;
+                        Ok(terminal)
+                    }));
+                (
+                    [("content-type", "text/event-stream")],
+                    Body::from_stream(stream),
+                )
             }
         }),
     );
@@ -110,7 +125,7 @@ async fn an_empty_codex_turn_fails_over_instead_of_reaching_the_client() {
 
     // When: the client streams one chat completion.
     let response = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
+        std::time::Duration::from_secs(30),
         app.oneshot(
             Request::post("/v1/chat/completions")
                 .header("authorization", "Bearer fixture")

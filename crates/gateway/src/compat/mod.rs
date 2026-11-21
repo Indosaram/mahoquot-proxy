@@ -423,7 +423,7 @@ fn codex_frame_has_content(value: &Value) -> Option<bool> {
             value
                 .get("delta")
                 .and_then(Value::as_str)
-                .is_some_and(|text| !text.is_empty()),
+                .is_some_and(|text| !text.trim().is_empty()),
         ),
         Some("response.output_item.added") => Some(
             value
@@ -465,11 +465,17 @@ fn codex_frame_has_content(value: &Value) -> Option<bool> {
                     })
                 }),
         ),
-        Some("response.incomplete") | Some("response.cancelled") => Some(false),
         // An explicit error frame is the stream's answer: let it through so the
         // existing classifier maps rate limits and auth failures as before
         // instead of being flattened into an "empty response".
-        Some("error") | Some("response.failed") => Some(true),
+        Some(
+            "error"
+            | "response.failed"
+            | "response.incomplete"
+            | "response.cancelled"
+            | "response.refusal.delta"
+            | "response.refusal.done",
+        ) => Some(true),
         _ => None,
     }
 }
@@ -502,16 +508,7 @@ fn classify_codex_preamble(buf: &[u8]) -> CodexPreamble {
         if codex_frame_has_content(&value) == Some(true) {
             return CodexPreamble::Served;
         }
-        if value
-            .get("type")
-            .and_then(Value::as_str)
-            .is_some_and(|kind| {
-                matches!(
-                    kind,
-                    "response.completed" | "response.incomplete" | "response.cancelled"
-                )
-            })
-        {
+        if value["type"] == "response.completed" {
             terminal = true;
             continue;
         }
