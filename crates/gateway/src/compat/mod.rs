@@ -582,6 +582,215 @@ async fn hold_codex_preamble(
     }
 }
 
+/// Upper bound on the Antigravity preamble buffered while looking for the
+/// first content-bearing frame. A failure frame is tiny, so this only has to
+/// hold reasoning preludes; it never has to hold a whole answer.
+const GEMINI_PREAMBLE_CAP: usize = 32 * 1024;
+
+/// What the leading complete SSE frames of an Antigravity stream say.
+enum GeminiPreamble {
+    /// Nothing decisive yet; more bytes are needed.
+    Pending,
+    /// Text, a tool call, or an error frame arrived; the stream is served.
+    Served,
+    /// The upstream finished without content and reported a retryable failure
+    /// (`MALFORMED_FUNCTION_CALL`). Callers fail over instead of handing the
+    /// client a turn the model never produced. Deterministic verdicts such as
+    /// `SAFETY` never land here; they are this turn's answer.
+    Failed(String),
+}
+
+/// Whether a Gemini terminal reason is worth spending a failover on.
+///
+/// `MALFORMED_FUNCTION_CALL` is a degenerate generation: the model emitted a
+/// function call it could not finish, which is nondeterministic and routinely
+/// clears on the next attempt — another account or model can serve it.
+///
+/// Every other reason is deterministic for the request: `SAFETY`,
+/// `PROHIBITED_CONTENT`, `RECITATION`, `SPII`, `BLOCKLIST`, `IMAGE_SAFETY` are
+/// content verdicts, `MAX_TOKENS` is a token limit, `STOP` is a clean end. None
+/// of them changes by walking the pool, so retrying only records a failure
+/// streak against healthy accounts before returning the same answer.
+fn gemini_reason_is_retryable(reason: &str) -> bool {
+    matches!(reason, "MALFORMED_FUNCTION_CALL")
+}
+
+/// Marks a failure the relay should retry on the account that produced it.
+///
+/// A malformed function call is a degenerate generation, not an account fault:
+/// the same credential routinely serves the retry, while walking the pool would
+/// spend a healthy peer, drop that account's prompt cache, and change nothing
+/// about the cause. The relay reads this marker, retries in place, and only
+/// fails over once the retry budget is spent.
+const GEMINI_RETRY_MARKER: &str = "gemini_retry: ";
+
+/// The retryable reason behind a `GEMINI_RETRY_MARKER` failure, if any.
+pub(crate) fn gemini_retry_reason(reason: &str) -> Option<&str> {
+    reason.strip_prefix(GEMINI_RETRY_MARKER)
+}
+
+/// Reads one Antigravity SSE frame for the two facts that decide failover:
+/// whether it carries deliverable output, and whether it declares a terminal
+/// failure reason. Returns `None` when the frame says neither.
+fn gemini_frame_verdict(value: &Value) -> Option<Result<(), String>> {
+    let response = value.get("response").unwrap_or(value);
+    if response.get("error").is_some() {
+        // An explicit upstream error is the stream's answer; let the existing
+        // decoder map it rather than flattening it into "empty response".
+        return Some(Ok(()));
+    }
+    // A prompt-level block has no candidate at all. It is a deterministic
+    // verdict on the request, and holding it would stall the client for the
+    // whole window before releasing the same answer.
+    if response
+        .pointer("/promptFeedback/blockReason")
+        .and_then(Value::as_str)
+        .is_some()
+    {
+        return Some(Ok(()));
+    }
+    let candidate = response
+        .get("candidates")
+        .and_then(Value::as_array)
+        .and_then(|candidates| candidates.first())?;
+    if let Some(reason) = candidate.get("finishReason").and_then(Value::as_str) {
+        if gemini_reason_is_retryable(reason) {
+            return Some(Err(format!(
+                "{GEMINI_RETRY_MARKER}Gemini generation failed: {reason}"
+            )));
+        }
+        // Any other terminal reason is this turn's answer, whether it carries
+        // content or not: a content verdict (`SAFETY`, `RECITATION`), a token
+        // limit (`MAX_TOKENS`), or a clean `STOP` that produced nothing. Holding
+        // those would delay the client for the whole window and then release
+        // the same bytes, and the decoder already renders each one correctly.
+        return Some(Ok(()));
+    }
+    let parts = candidate
+        .get("content")
+        .and_then(|content| content.get("parts"))
+        .and_then(Value::as_array);
+    for part in parts.into_iter().flatten() {
+        if part.get("functionCall").is_some() {
+            return Some(Ok(()));
+        }
+        let thought = part
+            .get("thought")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !thought
+            && part
+                .get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.is_empty())
+        {
+            return Some(Ok(()));
+        }
+    }
+    None
+}
+
+fn classify_gemini_preamble(buf: &[u8]) -> GeminiPreamble {
+    let text = String::from_utf8_lossy(buf).replace("\r\n", "\n");
+    let mut frames: Vec<&str> = text.split("\n\n").collect();
+    // The trailing piece is an incomplete frame; judge it once its delimiter lands.
+    frames.pop();
+    // Every buffered frame is judged before the hold is released. The observed
+    // failure arrives as a text fragment (`}`) in one frame and the terminal
+    // `finishReason` in the next one of the same read: releasing on the
+    // fragment alone would commit the very turn this gate exists to retry.
+    let mut served = false;
+    let mut terminal_failure: Option<String> = None;
+    for frame in frames {
+        let data: String = frame
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(str::trim_start)
+            .collect();
+        let trimmed = data.trim();
+        if trimmed.is_empty() || trimmed == "[DONE]" {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+            // Unparseable payloads are not evidence of content, but they are
+            // not evidence of an empty turn either: let the stream through.
+            return GeminiPreamble::Served;
+        };
+        match gemini_frame_verdict(&value) {
+            Some(Ok(())) => served = true,
+            Some(Err(reason)) => terminal_failure = Some(reason),
+            None => {}
+        }
+    }
+    match terminal_failure {
+        Some(reason) => GeminiPreamble::Failed(reason),
+        None if served => GeminiPreamble::Served,
+        None => GeminiPreamble::Pending,
+    }
+}
+
+/// Opens an Antigravity stream, holding back its preamble until the first
+/// content-bearing frame. Gemini reports a degenerate generation as the
+/// `finishReason` of an HTTP 200 stream that carries no output at all, and the
+/// observed shape puts a stray text fragment in the frame *before* that reason.
+/// Committing either to the client spends the one failover the request had,
+/// because the relay contract forbids retrying after the first byte. Holding the
+/// preamble turns those turns into an `Err` the relay can fail over on.
+///
+/// Only a retryable reason (`MALFORMED_FUNCTION_CALL`) triggers that: content
+/// verdicts and token-limit stops are terminal answers and pass through, as does
+/// an upstream error frame. On deadline, cap, or a served stream the buffered
+/// bytes are released unchanged, so no content is ever dropped.
+///
+/// The gate is bounded by the first content-bearing frame, so a failure that
+/// only surfaces after a long answer has begun still reaches the client as
+/// before — the window is deliberately short to keep the first byte prompt.
+pub async fn open_gemini_stream(
+    resp: reqwest::Response,
+    deadline: std::time::Duration,
+) -> Result<(Bytes, UpstreamStream), String> {
+    let (first, stream) = open_stream(resp, Protocol::Antigravity).await?;
+    hold_gemini_preamble(first, stream, deadline).await
+}
+
+async fn hold_gemini_preamble(
+    first: Bytes,
+    mut stream: UpstreamStream,
+    deadline: std::time::Duration,
+) -> Result<(Bytes, UpstreamStream), String> {
+    let until = tokio::time::Instant::now() + deadline;
+    let mut buf = bytes::BytesMut::from(&first[..]);
+    loop {
+        match classify_gemini_preamble(&buf) {
+            GeminiPreamble::Served => return Ok((buf.freeze(), stream)),
+            GeminiPreamble::Failed(reason) => return Err(reason),
+            GeminiPreamble::Pending if buf.len() >= GEMINI_PREAMBLE_CAP => {
+                return Ok((buf.freeze(), stream))
+            }
+            GeminiPreamble::Pending => {}
+        }
+        match tokio::time::timeout_at(until, stream.next()).await {
+            Ok(Some(Ok(chunk))) => buf.extend_from_slice(&chunk),
+            Ok(Some(Err(err))) => return Err(err.to_string()),
+            // End of stream before any decisive frame. The tail may still hold
+            // the answer once its delimiter is supplied, so judge it first: a
+            // content tail is served, a failure reason fails over, and only a
+            // genuinely empty turn is truncated.
+            Ok(None) => {
+                buf.extend_from_slice(b"\n\n");
+                return match classify_gemini_preamble(&buf) {
+                    GeminiPreamble::Failed(reason) => Err(reason),
+                    GeminiPreamble::Served => Ok((buf.freeze(), stream)),
+                    GeminiPreamble::Pending => {
+                        Err("stream truncated before finish reason".to_string())
+                    }
+                };
+            }
+            Err(_) => return Ok((buf.freeze(), stream)),
+        }
+    }
+}
+
 /// The model id an upstream envelope declares as the one it actually served.
 ///
 /// Codex answers `response.created`/`response.completed` with its own
@@ -1752,6 +1961,203 @@ mod bounded_stream_tests {
 #[cfg(test)]
 mod chat_parser_tests {
     use super::*;
+
+    fn gemini_chunks(parts: &[&'static str]) -> UpstreamStream {
+        let items: Vec<reqwest::Result<Bytes>> = parts
+            .iter()
+            .map(|part| Ok(Bytes::from_static(part.as_bytes())))
+            .collect();
+        Box::pin(futures::stream::iter(items))
+    }
+
+    /// The failure this gate exists for: Gemini answers 200 with a stream that
+    /// carries no output at all and reports `MALFORMED_FUNCTION_CALL`. Before
+    /// the hold, the relay had already committed the first byte, so the client
+    /// got a terminal error on a turn another account could have served.
+    #[tokio::test]
+    async fn a_malformed_function_call_preamble_fails_over() {
+        let frame = "data: {\"candidates\":[{\"finishReason\":\"MALFORMED_FUNCTION_CALL\"}]}\n\n";
+        let result = hold_gemini_preamble(
+            Bytes::from_static(frame.as_bytes()),
+            gemini_chunks(&[]),
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        let reason = result.err().expect("a malformed call must retry");
+        assert_eq!(
+            gemini_retry_reason(&reason),
+            Some("Gemini generation failed: MALFORMED_FUNCTION_CALL")
+        );
+    }
+
+    /// The marker is what tells the relay to retry in place instead of walking
+    /// the pool. A content verdict must never carry it.
+    #[test]
+    fn only_a_degenerate_generation_carries_the_retry_marker() {
+        assert_eq!(gemini_retry_reason("upstream exploded"), None);
+        assert_eq!(
+            gemini_retry_reason("gemini_retry: Gemini generation failed: MALFORMED_FUNCTION_CALL"),
+            Some("Gemini generation failed: MALFORMED_FUNCTION_CALL")
+        );
+    }
+
+    /// A failure reason split across chunks must still be caught before commit.
+    /// The split lands mid-frame, which is what a TCP chunk boundary does: the
+    /// buffered prefix carries no newline, so the frame is only judged once its
+    /// delimiter arrives.
+    #[tokio::test]
+    async fn a_failure_reason_arriving_in_a_later_chunk_still_fails_over() {
+        let result = hold_gemini_preamble(
+            Bytes::from_static(b"data: {\"candidates\":[{"),
+            gemini_chunks(&["\"finishReason\":\"MALFORMED_FUNCTION_CALL\"}]}\n\n"]),
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        let reason = result.err().expect("a malformed call must fail over");
+        assert!(reason.contains("MALFORMED_FUNCTION_CALL"), "{reason}");
+    }
+
+    /// A content verdict is deterministic for the request, so retrying it only
+    /// walks the pool, records a failure streak on healthy accounts, and ends
+    /// with the same answer. It must reach the client through the decoder as a
+    /// content-filter stop, exactly as it did before this gate existed.
+    #[tokio::test]
+    async fn content_verdicts_are_passed_through_not_failed_over() {
+        for reason in [
+            "SAFETY",
+            "PROHIBITED_CONTENT",
+            "RECITATION",
+            "SPII",
+            "BLOCKLIST",
+        ] {
+            let frame = format!("data: {{\"candidates\":[{{\"finishReason\":\"{reason}\"}}]}}\n\n");
+            let (first, _) = hold_gemini_preamble(
+                Bytes::from(frame.clone()),
+                gemini_chunks(&[]),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{reason} must not fail over: {error}"));
+            assert_eq!(first, Bytes::from(frame), "{reason} must pass through");
+        }
+    }
+
+    /// The exact shape observed in production on 2026-11-21: the turn streamed
+    /// a one-character text fragment and then reported
+    /// `MALFORMED_FUNCTION_CALL`. Releasing the hold on the fragment would hand
+    /// the client the broken turn this gate exists to retry, so a terminal
+    /// failure anywhere in the buffered window wins over content.
+    #[tokio::test]
+    async fn a_text_fragment_before_a_failure_reason_still_fails_over() {
+        let fragment = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"}\"}]}}]}\n\n";
+        let failure = "data: {\"candidates\":[{\"finishReason\":\"MALFORMED_FUNCTION_CALL\"}]}\n\n";
+        let result = hold_gemini_preamble(
+            Bytes::from(format!("{fragment}{failure}")),
+            gemini_chunks(&[]),
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        let reason = result.err().expect("a malformed call must retry");
+        assert_eq!(
+            gemini_retry_reason(&reason),
+            Some("Gemini generation failed: MALFORMED_FUNCTION_CALL")
+        );
+    }
+
+    /// A thinking prelude alone is not an answer, so it must not release the
+    /// hold; the real text behind it must.
+    #[tokio::test]
+    async fn a_thinking_prelude_keeps_the_hold_until_real_text_arrives() {
+        let thought = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"pondering\",\"thought\":true}]}}]}\n\n";
+        let text = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"answer\"}]},\"finishReason\":\"STOP\"}]}\n\n";
+        let (first, mut rest) = hold_gemini_preamble(
+            Bytes::from_static(thought.as_bytes()),
+            gemini_chunks(&[text]),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("served stream");
+        assert_eq!(first, Bytes::from(format!("{thought}{text}")));
+        assert!(rest.next().await.is_none());
+    }
+
+    /// A tool call is deliverable output; the hold must release immediately so
+    /// the client is never delayed behind a preamble it does not need.
+    #[tokio::test]
+    async fn a_tool_call_preamble_releases_the_stream_unchanged() {
+        let call = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"bash\",\"args\":{}}}]}}]}\n\n";
+        let (first, _) = hold_gemini_preamble(
+            Bytes::from_static(call.as_bytes()),
+            gemini_chunks(&[]),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("a tool call is content");
+        assert_eq!(first, Bytes::from_static(call.as_bytes()));
+    }
+
+    /// An upstream `error` frame is the stream's answer: it must reach the
+    /// client through the existing decoder instead of being flattened into a
+    /// failover, or real rate limits would retry the whole pool.
+    #[tokio::test]
+    async fn an_explicit_error_frame_is_passed_through_not_failed_over() {
+        let error = "data: {\"error\":{\"message\":\"upstream busy\"}}\n\n";
+        let (first, _) = hold_gemini_preamble(
+            Bytes::from_static(error.as_bytes()),
+            gemini_chunks(&[]),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("explicit errors reach the client verbatim");
+        assert_eq!(first, Bytes::from_static(error.as_bytes()));
+    }
+
+    /// A token-limit stop is a legitimate terminal answer, not a failure: it
+    /// must reach the decoder as `length` instead of being held and then
+    /// reported as truncation.
+    #[tokio::test]
+    async fn a_token_limit_stop_is_passed_through_not_failed_over() {
+        let frame = "data: {\"candidates\":[{\"finishReason\":\"MAX_TOKENS\"}]}\n\n";
+        let (first, _) = hold_gemini_preamble(
+            Bytes::from_static(frame.as_bytes()),
+            gemini_chunks(&[]),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("a token limit is not a transport failure");
+        assert_eq!(first, Bytes::from_static(frame.as_bytes()));
+    }
+
+    /// A prompt-level block has no candidate at all. Holding it would stall the
+    /// client for the whole window before releasing the same deterministic
+    /// answer, so it must pass straight through.
+    #[tokio::test]
+    async fn a_prompt_level_block_is_passed_through_not_held() {
+        let frame = "data: {\"promptFeedback\":{\"blockReason\":\"PROHIBITED_CONTENT\"}}\n\n";
+        let (first, _) = hold_gemini_preamble(
+            Bytes::from_static(frame.as_bytes()),
+            gemini_chunks(&[]),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("a prompt block is the request's answer");
+        assert_eq!(first, Bytes::from_static(frame.as_bytes()));
+    }
+
+    /// A stream that closes with its answer still in an unterminated tail frame
+    /// must be served, not reported as truncation.
+    #[tokio::test]
+    async fn a_content_tail_without_a_trailing_delimiter_is_served() {
+        let tail = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"done\"}]}}]}";
+        let (first, _) = hold_gemini_preamble(
+            Bytes::from_static(tail.as_bytes()),
+            gemini_chunks(&[]),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("a content tail is an answer");
+        assert!(first.starts_with(tail.as_bytes()));
+    }
 
     #[test]
     fn a_chat_session_parser_decodes_chat_frames() {

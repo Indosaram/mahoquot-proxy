@@ -25,6 +25,24 @@ fn account_retry_limit(member: &AccountMember, global_retry: i64) -> usize {
         .max(0) as usize
 }
 
+/// How many times a degenerate generation is retried on the account that
+/// produced it before the walk spends a peer. The failure is nondeterministic,
+/// so an in-place retry is cheap and preserves that account's prompt cache;
+/// three attempts clears the observed rate without stalling the request.
+const GEMINI_IN_PLACE_RETRY_LIMIT: usize = 3;
+
+/// Whether a failed attempt should be retried on the same account.
+///
+/// A degenerate generation is the model failing to emit a callable tool
+/// request. It is not a transport or credential fault, and it does not follow
+/// the account: retrying in place routinely succeeds while the credential's
+/// prompt cache is still warm, whereas walking the pool spends a healthy peer
+/// and changes nothing about the cause. Every other failure keeps the normal
+/// failover behaviour.
+fn retries_in_place(failure: &str, retries_used: usize) -> bool {
+    compat::gemini_retry_reason(failure).is_some() && retries_used < GEMINI_IN_PLACE_RETRY_LIMIT
+}
+
 fn retry_round_allows(member: &AccountMember, round: usize, global_retry: i64) -> bool {
     round == 0 || account_retry_limit(member, global_retry) >= round
 }
@@ -5530,6 +5548,17 @@ async fn finish_success(
         // and no tool call. Holding the preamble lets that turn fail over
         // instead of reaching the client as an empty response it must retry.
         compat::open_codex_stream(resp, reasoning_stream_hold(headers)).await?
+    } else if protocol == compat::Protocol::Antigravity && plan.client_stream {
+        // A degenerate generation surfaces as the `finishReason` of an HTTP 200
+        // stream that carries no output. Relaying that verbatim spends the
+        // request's only failover — the relay contract forbids retrying after
+        // the first byte — so the client sees a terminal error on a turn another
+        // account could have served. Hold the preamble and fail over instead.
+        //
+        // The preflight window, not the reasoning hold: the failure arrives
+        // with the turn's first bytes, while a legitimately slow turn must not
+        // sit silent behind a three-minute gate.
+        compat::open_gemini_stream(resp, get_preflight_deadline(headers)).await?
     } else {
         compat::open_stream(resp, protocol).await?
     };
@@ -6885,6 +6914,11 @@ pub async fn handle_relay(
     // router to the failing one.
     let mut attempted: Vec<usize> = Vec::new();
     let mut permission_denied_accounts: Vec<usize> = Vec::new();
+    // Set when the next attempt must land on the account that just failed for a
+    // cause unrelated to that account (a degenerate generation). Selecting by
+    // affinity instead would spend a healthy peer and change nothing.
+    let mut pinned_idx: Option<usize> = None;
+    let mut gemini_in_place_retries = 0usize;
     let mut retry_round = 0usize;
     let mut round_attempts = 0usize;
     let mut round_retryable = false;
@@ -6973,6 +7007,15 @@ pub async fn handle_relay(
                 if home_authoritative {
                     // Home picks the credential; the local index is unused.
                     Some(usize::MAX)
+                } else if let Some(pinned) = pinned_idx.take().filter(|idx| eligible.contains(idx))
+                {
+                    // A cause unrelated to the account (a degenerate generation)
+                    // must retry in place: affinity would spend a healthy peer
+                    // and change nothing about the failure. The pin is one-shot:
+                    // it steers exactly the next attempt, so any other outcome
+                    // (an ineligible account, a different failure) resumes the
+                    // normal walk instead of stranding the request on it.
+                    Some(pinned)
                 } else {
                     durable_bound
                         .as_ref()
@@ -7610,6 +7653,35 @@ pub async fn handle_relay(
                     return Response::from_parts(parts, Body::from_stream(counted));
                 }
                 Err(reason) => {
+                    // A degenerate generation is the account's own model failing
+                    // to emit a callable tool request, not a transport or
+                    // credential fault: the same credential routinely serves the
+                    // retry, and walking the pool would spend a healthy peer and
+                    // drop this account's prompt cache without touching the
+                    // cause. Retry in place first; fail over only once the
+                    // in-place budget is spent.
+                    if let Some(retry_reason) = compat::gemini_retry_reason(&reason) {
+                        if retries_in_place(&reason, gemini_in_place_retries) {
+                            gemini_in_place_retries += 1;
+                            round_attempts = round_attempts.saturating_sub(1);
+                            // The account answered; its credential is fine.
+                            // Rewinding the walk keeps the next iteration on it.
+                            attempted.retain(|idx| *idx != chosen_idx);
+                            pinned_idx = Some(chosen_idx);
+                            tracing::warn!(
+                                account = member.id(),
+                                model = ?plan.model,
+                                attempt = gemini_in_place_retries,
+                                reason = retry_reason,
+                                "degenerate generation; retrying the same account"
+                            );
+                            continue;
+                        }
+                    }
+                    // Any other failure — or an exhausted in-place budget —
+                    // fails over normally: the pin only ever steers a retry of
+                    // the same cause, never a different one.
+                    pinned_idx = None;
                     let (mapped_status, code, description) =
                         if let Some((c, d)) = reason.split_once(": ") {
                             if let Some(norm) = compat::devin::normalize_connect_code(c) {
@@ -8021,6 +8093,47 @@ pub async fn handle_relay(
     )
     .await;
     response
+}
+
+#[cfg(test)]
+mod in_place_retry_tests {
+    use super::*;
+
+    /// The whole point of the policy: a degenerate generation retries on the
+    /// account that produced it, so a healthy peer and its warm prompt cache are
+    /// never spent on a cause the peer did not have.
+    #[test]
+    fn a_degenerate_generation_retries_on_the_same_account() {
+        let failure = "gemini_retry: Gemini generation failed: MALFORMED_FUNCTION_CALL";
+        for used in 0..GEMINI_IN_PLACE_RETRY_LIMIT {
+            assert!(retries_in_place(failure, used), "attempt {used}");
+        }
+    }
+
+    /// The budget is finite: once it is spent the request must be free to fail
+    /// over rather than pinning a broken account forever.
+    #[test]
+    fn the_in_place_budget_is_exhausted_at_the_limit() {
+        let failure = "gemini_retry: Gemini generation failed: MALFORMED_FUNCTION_CALL";
+        assert!(!retries_in_place(failure, GEMINI_IN_PLACE_RETRY_LIMIT));
+        assert!(!retries_in_place(failure, GEMINI_IN_PLACE_RETRY_LIMIT + 7));
+    }
+
+    /// Every other failure keeps the normal failover path. A content verdict in
+    /// particular must never pin the account: retrying it returns the same
+    /// answer and only delays the client.
+    #[test]
+    fn any_other_failure_keeps_the_normal_failover() {
+        for failure in [
+            "Gemini generation failed: SAFETY",
+            "upstream stall timeout",
+            "stream truncated before finish reason",
+            "resource_exhausted: quota spent",
+            "",
+        ] {
+            assert!(!retries_in_place(failure, 0), "{failure}");
+        }
+    }
 }
 
 #[cfg(test)]
