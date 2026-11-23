@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1248,6 +1248,17 @@ pub fn model_quota_group<'a>(provider: &str, model: &'a str) -> Option<&'a str> 
 /// name, which always comes from provider display text.
 const ACCOUNT_BENCH_SCOPE: &str = "\u{0}account";
 
+/// Consecutive failed attempts after which an account counts as degraded for
+/// session affinity.
+///
+/// Health must stay `Available` across upstream 5xx (a transient 5xx never
+/// benches an account), so nothing else stops `Router::select` from re-pinning
+/// a conversation to an account that has failed every attempt since its last
+/// success. Three matches `max-retry-credentials`, so one request exhausting
+/// its failover budget is enough to release the pin — the observed incident
+/// replayed a 503 four hundred times because it never was.
+const DEGRADED_STREAK_THRESHOLD: u32 = 3;
+
 /// Bench-scope key for a single-model cooldown. The NUL prefix keeps it apart
 /// from provider quota-group names.
 fn model_bench_key(model: &str) -> String {
@@ -1312,6 +1323,9 @@ pub struct AccountMember {
     pub proxy_url: Option<String>,
     pub ok_count: Arc<AtomicU64>,
     pub fail_count: Arc<AtomicU64>,
+    /// Consecutive failed attempts since the last success. Cleared by
+    /// `record_ok`, so it measures an unbroken run, not lifetime failures.
+    pub fail_streak: Arc<AtomicU32>,
     pub refresh_lock: Arc<tokio::sync::Mutex<()>>,
     pub unsupported_models: Arc<RwLock<Vec<String>>>,
     pub usage: Arc<RwLock<crate::usage::AccountUsage>>,
@@ -1348,6 +1362,10 @@ impl PoolMember for AccountMember {
 
     fn weight(&self) -> u32 {
         1
+    }
+
+    fn degraded_streak(&self) -> bool {
+        self.fail_streak.load(Ordering::Relaxed) >= DEGRADED_STREAK_THRESHOLD
     }
 }
 
@@ -1394,6 +1412,7 @@ impl AccountMember {
             proxy_url: None,
             ok_count: Arc::new(AtomicU64::new(0)),
             fail_count: Arc::new(AtomicU64::new(0)),
+            fail_streak: Arc::new(AtomicU32::new(0)),
             refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
             unsupported_models: Arc::new(RwLock::new(Vec::new())),
             usage: Arc::new(RwLock::new(Default::default())),
@@ -1414,6 +1433,9 @@ impl AccountMember {
     pub fn record_ok(&self) {
         *self.last_activity.lock().unwrap_or_else(|p| p.into_inner()) = tokio::time::Instant::now();
         self.ok_count.fetch_add(1, Ordering::Relaxed);
+        // Any success ends the run, so a recovered account can hold session
+        // affinity again on the very next turn.
+        self.fail_streak.store(0, Ordering::Relaxed);
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
@@ -1635,6 +1657,16 @@ impl AccountMember {
         self.fail_count.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record an upstream 5xx for this account.
+    ///
+    /// Kept separate from [`Self::record_fail`], which also counts
+    /// client-caused rejections (oversized payloads, model denials, 403s).
+    /// Only a run of upstream server errors says the account itself is
+    /// currently unusable, so only those extend the streak.
+    pub fn record_server_error(&self) {
+        self.fail_streak.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn kind(&self) -> ProviderKind {
         self.inner
             .read()
@@ -1819,6 +1851,7 @@ impl AccountMember {
             proxy_url: self.proxy_url.clone(),
             ok_count: Arc::clone(&self.ok_count),
             fail_count: Arc::clone(&self.fail_count),
+            fail_streak: Arc::clone(&self.fail_streak),
             refresh_lock: Arc::clone(&self.refresh_lock),
             unsupported_models: Arc::clone(&self.unsupported_models),
             usage: Arc::clone(&self.usage),
@@ -4549,6 +4582,7 @@ pub fn load_account_members(auth_dir: &Path) -> anyhow::Result<Vec<Arc<AccountMe
             proxy_url,
             ok_count: Arc::new(AtomicU64::new(0)),
             fail_count: Arc::new(AtomicU64::new(0)),
+            fail_streak: Arc::new(AtomicU32::new(0)),
             refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
             unsupported_models: Arc::new(RwLock::new(Vec::new())),
             usage: Arc::new(RwLock::new(Default::default())),

@@ -7899,6 +7899,9 @@ pub async fn handle_relay(
             // upstream 5xx never benches it for other requests — and never
             // leaves a lingering error banner on it either.
             member.record_fail();
+            // ...but an unbroken run of them must release session affinity, or
+            // the conversation keeps replaying the same failing account.
+            member.record_server_error();
             state
                 .scheduler
                 .record_non_auth_failure(member.id(), &state.pool.load().members);
