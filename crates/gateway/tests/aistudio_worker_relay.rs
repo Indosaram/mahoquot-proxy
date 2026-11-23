@@ -32,6 +32,7 @@ fn gateway_config(auth_dir: &std::path::Path, port: u16) -> GatewayConfig {
         max_concurrent_inference: 1024,
         captcha_config_url: None,
         captcha_solver_bin: None,
+        oauth_callback_port_offset: 0,
     }
 }
 

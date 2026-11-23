@@ -42,11 +42,11 @@ pub fn default_contribution() -> ProviderContribution {
 }
 
 pub fn supported_models(snapshot: &RegistrySnapshot) -> Vec<String> {
-    contribution(snapshot).supported_model_ids()
+    snapshot.supported_model_ids_for_provider(&provider_id())
 }
 
 pub fn is_claude_model_in_snapshot(snapshot: &RegistrySnapshot, model: &str) -> bool {
-    contribution(snapshot).supports_model(model)
+    snapshot.provider_supports_model(&provider_id(), model)
 }
 
 pub fn is_claude_model(model: &str) -> bool {
@@ -226,3 +226,18 @@ mod plan_tests {
         assert_eq!(legacy.plan, None);
     }
 }
+
+pub const AGENT_SDK_IDENTITY_HEADERS: &[(&str, &str)] = &[
+    (
+        "user-agent",
+        "claude-cli/2.1.296 (external, sdk-ts, agent-sdk/0.3.296)",
+    ),
+    ("x-app", "cli"),
+    ("anthropic-dangerous-direct-browser-access", "true"),
+    ("x-stainless-lang", "js"),
+    ("x-stainless-package-version", "0.128.0"),
+    ("x-stainless-os", "Linux"),
+    ("x-stainless-arch", "x64"),
+    ("x-stainless-runtime", "node"),
+    ("x-stainless-runtime-version", "v26.3.0"),
+];

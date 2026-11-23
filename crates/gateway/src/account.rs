@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -251,12 +251,9 @@ impl ProviderKind {
                 model.starts_with("cursor/")
                     || mahoquot_providers::cursor::is_cursor_model_in_snapshot(snapshot, model)
             }
-            ProviderKind::Kiro => {
-                model == "auto-kiro"
-                    || model.strip_prefix("kiro/").is_some_and(|stripped| {
-                        mahoquot_providers::kiro::is_kiro_model_in_snapshot(snapshot, stripped)
-                    })
-            }
+            ProviderKind::Kiro => model.strip_prefix("kiro/").is_some_and(|stripped| {
+                mahoquot_providers::kiro::is_kiro_model_in_snapshot(snapshot, stripped)
+            }),
             ProviderKind::Zcode => {
                 mahoquot_providers::zcode::is_zcode_model_in_snapshot(snapshot, model)
             }
@@ -450,11 +447,11 @@ mod provider_kind_contract_tests {
         let kiro = ProviderKind::Kiro;
         let cursor = ProviderKind::Cursor;
 
-        // Kiro serves prefixed models and auto-kiro
-        assert!(kiro.serves_model("auto-kiro"));
-        assert!(kiro.serves_model("kiro/auto"));
-        assert!(kiro.serves_model("kiro/claude-sonnet-4.6"));
-        assert!(kiro.serves_model("kiro/claude-haiku-4-5-20251001"));
+        // Kiro serves only the single catalog-declared prefixed model
+        assert!(kiro.serves_model("kiro/claude-opus-5.5"));
+        assert!(!kiro.serves_model("kiro/claude-sonnet-4.6"));
+        assert!(!kiro.serves_model("kiro/claude-haiku-4.5"));
+        assert!(!kiro.serves_model("auto-kiro"));
 
         // Kiro rejects bare un-prefixed models
         assert!(!kiro.serves_model("auto"));
@@ -614,14 +611,14 @@ mod provider_kind_contract_tests {
         let now_ms = 1_000_000;
         let until_ms = now_ms + 300_000;
 
-        assert!(member.group_available("gemini-3.8-flash-high", now_ms));
+        assert!(member.group_available("gemini-4-neon-high", now_ms));
         assert!(member.group_available("claude-opus-4-6-thinking", now_ms));
 
-        assert!(member.set_group_cooldown("gemini-3.8-flash-high", until_ms));
+        assert!(member.set_group_cooldown("gemini-4-neon-high", until_ms));
 
         // The Gemini bucket is benched until its deadline...
-        assert!(!member.group_available("gemini-3.8-flash-high", now_ms));
-        assert!(member.group_available("gemini-3.8-flash-high", until_ms));
+        assert!(!member.group_available("gemini-4-neon-high", now_ms));
+        assert!(member.group_available("gemini-4-neon-high", until_ms));
         // ...while the untouched third-party bucket keeps serving, and the
         // account itself is never benched account-wide.
         assert!(member.group_available("claude-opus-4-6-thinking", now_ms));
@@ -630,7 +627,7 @@ mod provider_kind_contract_tests {
 
         // A shorter repeat deadline must not cut an active bench short.
         assert!(member.set_group_cooldown("gemini-3-flash", until_ms - 100_000));
-        assert!(!member.group_available("gemini-3.8-flash-high", until_ms - 1));
+        assert!(!member.group_available("gemini-4-neon-high", until_ms - 1));
 
         // Providers that meter one pool have no group split, so the caller
         // falls back to account-wide cooldown.
@@ -746,14 +743,14 @@ mod provider_kind_contract_tests {
         let member = AccountMember::for_test(ProviderAccount::Antigravity(account.clone()));
         let now_ms = 1_000_000;
         let until_ms = now_ms + 300_000;
-        member.set_group_cooldown("gemini-3.8-flash-high", until_ms);
+        member.set_group_cooldown("gemini-4-neon-high", until_ms);
 
         let fresh = AccountMember::for_test(ProviderAccount::Antigravity(account));
-        assert!(fresh.group_available("gemini-3.8-flash-high", now_ms));
+        assert!(fresh.group_available("gemini-4-neon-high", now_ms));
 
         crate::state::adopt_runtime_state(&fresh, &Arc::new(member));
 
-        assert!(!fresh.group_available("gemini-3.8-flash-high", now_ms));
+        assert!(!fresh.group_available("gemini-4-neon-high", now_ms));
         assert!(fresh.group_available("claude-opus-4-6-thinking", now_ms));
     }
 
@@ -814,8 +811,8 @@ mod provider_kind_contract_tests {
     fn cursor_and_kiro_own_their_reference_models() {
         assert!(ProviderKind::Cursor.serves_model("cursor-small"));
         assert!(!ProviderKind::Codex.serves_model("cursor-small"));
-        assert!(ProviderKind::Kiro.serves_model("kiro/claude-sonnet-4.6"));
-        assert!(!ProviderKind::Codex.serves_model("kiro/claude-sonnet-4.6"));
+        assert!(ProviderKind::Kiro.serves_model("kiro/claude-opus-5.5"));
+        assert!(!ProviderKind::Codex.serves_model("kiro/claude-opus-5.5"));
     }
 }
 
@@ -935,25 +932,18 @@ impl ProviderAccount {
             Self::Claude(a) => {
                 let mut headers = match &a.api_key {
                     Some(key) => vec![("x-api-key".to_string(), key.clone())],
-                    None => vec![
-                        (
+                    None => {
+                        let mut oauth = vec![(
                             "authorization".to_string(),
                             format!("Bearer {}", a.access_token),
-                        ),
-                        (
-                            "user-agent".to_string(),
-                            "@anthropic-ai/sdk/0.74.0".to_string(),
-                        ),
-                        ("x-app".to_string(), "cli".to_string()),
-                        ("x-stainless-lang".to_string(), "js".to_string()),
-                        (
-                            "x-stainless-package-version".to_string(),
-                            "0.74.0".to_string(),
-                        ),
-                        ("x-stainless-os".to_string(), "macos".to_string()),
-                        ("x-stainless-arch".to_string(), "arm64".to_string()),
-                        ("x-stainless-runtime".to_string(), "node".to_string()),
-                    ],
+                        )];
+                        oauth.extend(
+                            mahoquot_providers::claude::AGENT_SDK_IDENTITY_HEADERS
+                                .iter()
+                                .map(|(name, value)| (name.to_string(), value.to_string())),
+                        );
+                        oauth
+                    }
                 };
                 headers.extend(vec![
                     (
@@ -1145,7 +1135,7 @@ impl ProviderAccount {
 
     fn project_id(&self) -> Option<String> {
         match self {
-            Self::Antigravity(a) => Some(a.project_id.clone()),
+            Self::Antigravity(a) if !a.project_id.trim().is_empty() => Some(a.project_id.clone()),
             Self::Vertex(a) => Some(a.effective_project_id().to_string()),
             Self::OpenCode(_) => None,
             Self::Generic(a) if !a.project_id.is_empty() => Some(a.project_id.clone()),
@@ -1258,6 +1248,17 @@ pub fn model_quota_group<'a>(provider: &str, model: &'a str) -> Option<&'a str> 
 /// name, which always comes from provider display text.
 const ACCOUNT_BENCH_SCOPE: &str = "\u{0}account";
 
+/// Consecutive failed attempts after which an account counts as degraded for
+/// session affinity.
+///
+/// Health must stay `Available` across upstream 5xx (a transient 5xx never
+/// benches an account), so nothing else stops `Router::select` from re-pinning
+/// a conversation to an account that has failed every attempt since its last
+/// success. Three matches `max-retry-credentials`, so one request exhausting
+/// its failover budget is enough to release the pin — the observed incident
+/// replayed a 503 four hundred times because it never was.
+const DEGRADED_STREAK_THRESHOLD: u32 = 3;
+
 /// Bench-scope key for a single-model cooldown. The NUL prefix keeps it apart
 /// from provider quota-group names.
 fn model_bench_key(model: &str) -> String {
@@ -1322,6 +1323,9 @@ pub struct AccountMember {
     pub proxy_url: Option<String>,
     pub ok_count: Arc<AtomicU64>,
     pub fail_count: Arc<AtomicU64>,
+    /// Consecutive failed attempts since the last success. Cleared by
+    /// `record_ok`, so it measures an unbroken run, not lifetime failures.
+    pub fail_streak: Arc<AtomicU32>,
     pub refresh_lock: Arc<tokio::sync::Mutex<()>>,
     pub unsupported_models: Arc<RwLock<Vec<String>>>,
     pub usage: Arc<RwLock<crate::usage::AccountUsage>>,
@@ -1330,6 +1334,11 @@ pub struct AccountMember {
     pub cline_trackers: crate::cline_usage::ClineTrackers,
     pub devin_catalog: arc_swap::ArcSwapOption<crate::devin_catalog::DevinAccountCatalogState>,
     pub devin_discovery_seq: Arc<AtomicU64>,
+    /// Set when the issuer rejected the refresh grant itself. The access token
+    /// may still be valid, so inference continues until it actually expires;
+    /// only the grant replay is suppressed. Cleared by any successful rotation.
+    pub grant_rejected: Arc<std::sync::atomic::AtomicBool>,
+    pub claude_device_id: String,
 }
 
 impl PoolMember for AccountMember {
@@ -1354,14 +1363,37 @@ impl PoolMember for AccountMember {
     fn weight(&self) -> u32 {
         1
     }
+
+    fn degraded_streak(&self) -> bool {
+        self.fail_streak.load(Ordering::Relaxed) >= DEGRADED_STREAK_THRESHOLD
+    }
 }
 
 impl AccountMember {
+    pub fn for_test_with_claude_device_id(
+        id: impl Into<String>,
+        inner: ProviderAccount,
+        device_id: impl Into<String>,
+    ) -> Self {
+        let mut member = Self::for_test_with_id(id, inner);
+        member.claude_device_id = device_id.into();
+        member
+    }
+
+    pub fn claude_device_id(&self) -> &str {
+        &self.claude_device_id
+    }
+
     pub fn for_test(inner: ProviderAccount) -> Self {
         Self::for_test_with_id("test", inner)
     }
 
     pub fn for_test_with_id(id: impl Into<String>, inner: ProviderAccount) -> Self {
+        let claude_device_id = if inner.kind() == ProviderKind::Claude {
+            generate_claude_device_id()
+        } else {
+            String::new()
+        };
         Self {
             home_lease: None,
             id: id.into(),
@@ -1380,12 +1412,15 @@ impl AccountMember {
             proxy_url: None,
             ok_count: Arc::new(AtomicU64::new(0)),
             fail_count: Arc::new(AtomicU64::new(0)),
+            fail_streak: Arc::new(AtomicU32::new(0)),
             refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
             unsupported_models: Arc::new(RwLock::new(Vec::new())),
             usage: Arc::new(RwLock::new(Default::default())),
             cline_trackers: crate::cline_usage::ClineTrackers::from_env(),
             devin_catalog: arc_swap::ArcSwapOption::empty(),
             devin_discovery_seq: Arc::new(AtomicU64::new(0)),
+            grant_rejected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            claude_device_id,
         }
     }
 
@@ -1398,6 +1433,9 @@ impl AccountMember {
     pub fn record_ok(&self) {
         *self.last_activity.lock().unwrap_or_else(|p| p.into_inner()) = tokio::time::Instant::now();
         self.ok_count.fetch_add(1, Ordering::Relaxed);
+        // Any success ends the run, so a recovered account can hold session
+        // affinity again on the very next turn.
+        self.fail_streak.store(0, Ordering::Relaxed);
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
@@ -1452,6 +1490,26 @@ impl AccountMember {
     /// account whose token was rotated back into a working state stayed
     /// unroutable forever and the rotation accomplished nothing observable.
     /// `Disabled` is an operator decision and is never cleared here.
+    /// Records that the issuer rejected this refresh grant.
+    ///
+    /// The credential is not dead until its access token expires: the reported
+    /// defect was benching an account two hours early on a refresh rejection
+    /// while a working token remained. Only the turned-over grant is refused.
+    pub fn mark_grant_rejected(&self) {
+        self.grant_rejected
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn is_grant_rejected(&self) -> bool {
+        self.grant_rejected
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn clear_grant_rejection(&self) {
+        self.grant_rejected
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn clear_auth_failure(&self) -> bool {
         let mut guard = self
             .health
@@ -1599,6 +1657,16 @@ impl AccountMember {
         self.fail_count.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record an upstream 5xx for this account.
+    ///
+    /// Kept separate from [`Self::record_fail`], which also counts
+    /// client-caused rejections (oversized payloads, model denials, 403s).
+    /// Only a run of upstream server errors says the account itself is
+    /// currently unusable, so only those extend the streak.
+    pub fn record_server_error(&self) {
+        self.fail_streak.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn kind(&self) -> ProviderKind {
         self.inner
             .read()
@@ -1712,6 +1780,27 @@ impl AccountMember {
         usage.model_availability.clone()
     }
 
+    /// Catalog facts the Antigravity request labels need for `model`.
+    ///
+    /// The catalog is keyed by variant id (`gemini-3.8-flash-low`), and each
+    /// variant maps to its own enum, so an exact lookup is the only correct
+    /// one; a prefix or family match would report another variant's enum.
+    pub fn antigravity_catalog_entry(
+        &self,
+        model: &str,
+    ) -> Option<crate::usage::ModelAvailability> {
+        if self.kind() != ProviderKind::Antigravity {
+            return None;
+        }
+        let stripped = model.strip_prefix("antigravity/").unwrap_or(model);
+        let usage = self.usage.read().unwrap_or_else(|p| p.into_inner());
+        let discovered = usage.model_availability.as_ref()?;
+        discovered
+            .get(model)
+            .or_else(|| discovered.get(stripped))
+            .cloned()
+    }
+
     pub fn supports_antigravity_model(&self, model: &str) -> bool {
         if self.kind() != ProviderKind::Antigravity || self.is_manually_disabled() {
             return false;
@@ -1762,12 +1851,15 @@ impl AccountMember {
             proxy_url: self.proxy_url.clone(),
             ok_count: Arc::clone(&self.ok_count),
             fail_count: Arc::clone(&self.fail_count),
+            fail_streak: Arc::clone(&self.fail_streak),
             refresh_lock: Arc::clone(&self.refresh_lock),
             unsupported_models: Arc::clone(&self.unsupported_models),
             usage: Arc::clone(&self.usage),
             cline_trackers: self.cline_trackers.clone(),
             devin_catalog: arc_swap::ArcSwapOption::new(new_catalog),
             devin_discovery_seq: Arc::clone(&self.devin_discovery_seq),
+            grant_rejected: Arc::clone(&self.grant_rejected),
+            claude_device_id: self.claude_device_id.clone(),
         }
     }
 
@@ -2556,6 +2648,54 @@ impl AccountMember {
                 "credential grant changed before refresh".into(),
             ));
         }
+        let codex_claim = if self.kind() == ProviderKind::Codex {
+            let auth_dir = settings
+                .as_ref()
+                .map(|settings| {
+                    settings
+                        .storage_manager()
+                        .map(|store| store.auth_dir())
+                        .unwrap_or_else(|| PathBuf::from(&settings.current().auth_dir))
+                })
+                .unwrap_or_else(|| {
+                    self.file_path
+                        .parent()
+                        .unwrap_or(Path::new("."))
+                        .to_path_buf()
+                });
+            let client_id = spec
+                .form_fields
+                .iter()
+                .find(|(name, _)| name == "client_id")
+                .map(|(_, value)| value.as_str())
+                .unwrap_or_default();
+            let key = codex_refresh_claim_key(client_id, &self.refresh_token());
+            let (claim, receipt) =
+                tokio::task::spawn_blocking(move || CodexRefreshClaim::acquire(&auth_dir, key))
+                    .await
+                    .map_err(|error| RefreshError::Parse(error.to_string()))??;
+            if let Some(receipt) = receipt {
+                let mut credential = expected.clone();
+                receipt.apply(&mut credential);
+                commit_refresh(self.file_path.clone(), Some(expected), credential, settings)
+                    .await?;
+                self.reload_from_file()
+                    .map_err(|error| RefreshError::Parse(error.to_string()))?;
+                // The credential now carries the recovered tokens; the claim
+                // must not be replayed onto a later grant.
+                claim.release_async().await;
+                self.clear_auth_failure();
+                self.clear_grant_rejection();
+                return Ok(true);
+            }
+            Some(claim)
+        } else {
+            None
+        };
+        // A definite failure means the grant was never consumed, so the claim
+        // must not survive it. Only an unknown outcome stays durable for the
+        // next process to reconcile.
+        let mut codex_claim = codex_claim;
         let tokens = if self.kind() == ProviderKind::Vertex {
             let (token_url, email, private_key, private_key_id) = {
                 let account = self
@@ -2608,7 +2748,24 @@ impl AccountMember {
                 body: "the ZCode plan JWT cannot be refreshed; re-authenticate".to_string(),
             });
         } else {
-            execute_refresh_spec(client, url, &spec).await?
+            match execute_refresh_spec(client, url, &spec).await {
+                Ok(tokens) => tokens,
+                Err(error) => {
+                    // A complete HTTP response without tokens (any status,
+                    // including 5xx) proves the issuer never rotated the
+                    // grant, so the claim is released and the next attempt
+                    // may dispatch. A transport failure, truncated body, or
+                    // unparseable success body may have consumed it, so the
+                    // claim stays durable for the next process to reconcile
+                    // instead of being replayed onto a dead grant.
+                    if matches!(error, RefreshError::Status { .. }) {
+                        if let Some(claim) = codex_claim.take() {
+                            claim.release_async().await;
+                        }
+                    }
+                    return Err(error);
+                }
+            }
         };
         let mut credential = expected.clone();
         apply_refresh_to_value(&mut credential, &tokens, now_unix)?;
@@ -2617,12 +2774,871 @@ impl AccountMember {
             // the refreshed file as a duplicate field on the next load.
             credential.as_object_mut().unwrap().remove("api_key");
         }
+        if let Some(claim) = codex_claim {
+            let receipt = CodexRefreshReceipt::from_credential(claim.key.clone(), &credential);
+            let claim = tokio::task::spawn_blocking(move || {
+                claim.complete(receipt)?;
+                Ok::<_, RefreshError>(claim)
+            })
+            .await
+            .map_err(|error| RefreshError::Parse(error.to_string()))??;
+            // Only a crash between receipt publication and the credential
+            // commit leaves the claim behind for recovery. A completed refresh
+            // must not keep a receipt that a later grant would match.
+            // The receipt is published; from here on a crash or a failed
+            // credential commit leaves a recoverable claim behind.
+            if commit_refresh(self.file_path.clone(), Some(expected), credential, settings)
+                .await
+                .is_ok()
+            {
+                claim.release_async().await;
+            } else {
+                return Err(RefreshError::Io(std::io::Error::other(
+                    CodexRefreshOutcomeUnknown,
+                )));
+            }
+            if let Err(e) = self.reload_from_file() {
+                return Err(RefreshError::Parse(e.to_string()));
+            }
+            self.clear_auth_failure();
+            self.clear_grant_rejection();
+            return Ok(true);
+        }
         commit_refresh(self.file_path.clone(), Some(expected), credential, settings).await?;
         if let Err(e) = self.reload_from_file() {
             return Err(RefreshError::Parse(e.to_string()));
         }
         self.clear_auth_failure();
+        self.clear_grant_rejection();
         Ok(true)
+    }
+}
+
+fn codex_refresh_claim_key(client_id: &str, refresh_token: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut digest = Sha256::new();
+    digest.update(client_id.as_bytes());
+    digest.update([0]);
+    digest.update(refresh_token.as_bytes());
+    format!("{:x}", digest.finalize())
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Codex refresh outcome unknown; pending durable grant claim")]
+pub(crate) struct CodexRefreshOutcomeUnknown;
+
+/// Releases the durable claim unless the outcome is deliberately left unknown.
+struct CodexRefreshClaim {
+    directory: PathBuf,
+    key: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CodexRefreshReceipt {
+    claim_key: String,
+    access_token: String,
+    refresh_token: String,
+    expired: String,
+    fields: BTreeMap<String, serde_json::Value>,
+}
+
+impl CodexRefreshReceipt {
+    fn from_credential(claim_key: String, credential: &serde_json::Value) -> Self {
+        Self {
+            claim_key,
+            access_token: credential["access_token"]
+                .as_str()
+                .unwrap_or_default()
+                .into(),
+            refresh_token: credential["refresh_token"]
+                .as_str()
+                .unwrap_or_default()
+                .into(),
+            expired: credential["expired"].as_str().unwrap_or_default().into(),
+            fields: ["id_token", "last_refresh", "timestamp"]
+                .into_iter()
+                .filter_map(|key| credential.get(key).map(|value| (key.into(), value.clone())))
+                .collect(),
+        }
+    }
+
+    fn apply(self, credential: &mut serde_json::Value) {
+        credential["access_token"] = self.access_token.into();
+        credential["refresh_token"] = self.refresh_token.into();
+        credential["expired"] = self.expired.into();
+        for (key, value) in self.fields {
+            credential[&key] = value;
+        }
+    }
+}
+
+/// A durable claim whose outcome was never resolved (the issuer accepted the
+/// request but no response arrived) must not block the account forever: the
+/// token it guarded expires, and no restart clears a file-backed claim. After
+/// this window the claim is atomically taken over so exactly one caller can
+/// attempt the grant again; if that grant was consumed, the issuer answers
+/// with a grant rejection, which lands in the normal re-authentication path
+/// instead of an unrecoverable stall.
+const CODEX_CLAIM_ABANDON_AFTER: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+
+impl CodexRefreshClaim {
+    fn acquire(
+        auth_dir: &Path,
+        key: String,
+    ) -> Result<(Self, Option<CodexRefreshReceipt>), RefreshError> {
+        let directory = auth_dir.join(".codex-refresh-claims");
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        match builder.create(&directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+        std::fs::File::open(auth_dir)?.sync_all()?;
+        let claim = Self { directory, key };
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(claim.directory.join(format!("{}.claim", claim.key))) {
+            Ok(file) => {
+                file.sync_all()?;
+                std::fs::File::open(&claim.directory)?.sync_all()?;
+                let pending = options.open(
+                    claim
+                        .directory
+                        .join(format!("{}.receipt.pending", claim.key)),
+                )?;
+                pending.sync_all()?;
+                std::fs::File::open(&claim.directory)?.sync_all()?;
+                Ok((claim, None))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let bytes = match std::fs::read(claim.receipt_path()) {
+                    Ok(bytes) => bytes,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        // A claim with no receipt means an earlier attempt was
+                        // cut off before its outcome was known. Until the
+                        // abandonment window elapses the grant must not be
+                        // replayed; afterwards one caller takes it over so the
+                        // account can reach a terminal, actionable state.
+                        if claim.claim_age()? >= CODEX_CLAIM_ABANDON_AFTER {
+                            claim.take_over()?;
+                            return Ok((claim, None));
+                        }
+                        return Err(RefreshError::Io(std::io::Error::other(
+                            CodexRefreshOutcomeUnknown,
+                        )));
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                let receipt: CodexRefreshReceipt = serde_json::from_slice(&bytes)
+                    .map_err(|error| RefreshError::Parse(error.to_string()))?;
+                if receipt.claim_key != claim.key {
+                    return Err(RefreshError::Parse(
+                        "Codex refresh receipt claim mismatch".into(),
+                    ));
+                }
+                Ok((claim, Some(receipt)))
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn claim_path(&self) -> PathBuf {
+        self.directory.join(format!("{}.claim", self.key))
+    }
+
+    fn receipt_path(&self) -> PathBuf {
+        self.directory.join(format!("{}.receipt.json", self.key))
+    }
+
+    fn claim_age(&self) -> Result<std::time::Duration, RefreshError> {
+        let modified = std::fs::metadata(self.claim_path())?.modified()?;
+        Ok(modified.elapsed().unwrap_or_default())
+    }
+
+    /// Atomically replace the abandoned claim so exactly one caller proceeds.
+    ///
+    /// The mutex is a directory whose name is derived from the abandoned
+    /// claim's own modification time: every caller that observed the same
+    /// abandoned file competes for the same name, and `create_dir` is an
+    /// atomic winner-takes-all on every supported platform. The directory is
+    /// deliberately never removed. Deleting it after the swap would let a
+    /// second taker `create_dir` the same name once the winner's replacement
+    /// has a fresh timestamp, which is exactly the double-dispatch this
+    /// guards. Each abandoned claim has its own timestamp, so stale mutexes
+    /// are inert rather than wedging future takeovers.
+    fn take_over(&self) -> Result<(), RefreshError> {
+        // Cheap pre-check: a claim written by a takeover that already ran is
+        // fresh, so a late observer must not even create a guard for it.
+        if self.claim_age()? < CODEX_CLAIM_ABANDON_AFTER {
+            return Err(RefreshError::Io(std::io::Error::other(
+                CodexRefreshOutcomeUnknown,
+            )));
+        }
+        let abandoned = std::fs::metadata(self.claim_path())?.modified()?;
+        let stamp = abandoned
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let mutex = self
+            .directory
+            .join(format!("{}.claim.takeover-{stamp}", self.key));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        match builder.create(&mutex) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Another caller already took this exact abandoned claim over.
+                return Err(RefreshError::Io(std::io::Error::other(
+                    CodexRefreshOutcomeUnknown,
+                )));
+            }
+            Err(error) => return Err(error.into()),
+        }
+        // Recheck under the mutex. Losing the race above is not the only way to
+        // arrive late: the claimed file may already have been replaced by a
+        // refresh that is still dispatching, and replaying the grant it guards
+        // would rotate it twice.
+        if std::fs::metadata(self.claim_path())?.modified()? != abandoned
+            || self.claim_age()? < CODEX_CLAIM_ABANDON_AFTER
+        {
+            return Err(RefreshError::Io(std::io::Error::other(
+                CodexRefreshOutcomeUnknown,
+            )));
+        }
+        // A private replacement name: a shared temp file would let a racing
+        // taker delete or rename bytes another caller is about to publish.
+        let replacement = self
+            .directory
+            .join(format!("{}.claim.next-{stamp}", self.key));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(&replacement)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&replacement, self.claim_path())?;
+        std::fs::File::open(&self.directory)?.sync_all()?;
+        // A receipt from the abandoned attempt is stale by construction.
+        let _ = std::fs::remove_file(self.receipt_path());
+        // The normal acquisition path creates the pending receipt, and `complete`
+        // opens it without `create`, so the takeover path must recreate it. A
+        // successful issuer response after takeover would otherwise fail before
+        // publishing its receipt and the rotated grant would be lost.
+        let pending = self.directory.join(format!("{}.receipt.pending", self.key));
+        let _ = std::fs::remove_file(&pending);
+        options.open(&pending)?.sync_all()?;
+        std::fs::File::open(&self.directory)?.sync_all()?;
+        Ok(())
+    }
+
+    fn complete(&self, receipt: CodexRefreshReceipt) -> Result<(), RefreshError> {
+        use std::io::Write;
+
+        let bytes =
+            serde_json::to_vec(&receipt).map_err(|error| RefreshError::Parse(error.to_string()))?;
+        let pending = self.directory.join(format!("{}.receipt.pending", self.key));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&pending)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(pending, self.receipt_path())?;
+        std::fs::File::open(&self.directory)?.sync_all()?;
+        Ok(())
+    }
+
+    /// Drop the claim once its outcome is durably in the credential file.
+    /// Release the durable claim without blocking a Tokio worker thread:
+    /// release_ref unlinks three files and fsyncs the directory.
+    async fn release_async(self) {
+        let _ = tokio::task::spawn_blocking(move || self.release_ref()).await;
+    }
+
+    fn release_ref(&self) {
+        for path in [
+            self.directory.join(format!("{}.claim", self.key)),
+            self.receipt_path(),
+            self.directory.join(format!("{}.receipt.pending", self.key)),
+        ] {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => {}
+            }
+        }
+        let _ = std::fs::File::open(&self.directory).and_then(|dir| dir.sync_all());
+    }
+}
+
+#[cfg(test)]
+mod codex_refresh_claim_tests {
+    use super::*;
+    use axum::{routing::post, Router};
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
+    use tokio::sync::Notify;
+
+    struct Fixture {
+        root: PathBuf,
+        path: PathBuf,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let root =
+                std::env::temp_dir().join(format!("codex-refresh-claim-{}", uuid::Uuid::new_v4()));
+            let path = root.join("codex.json");
+            write_credential_atomically(
+                &path,
+                &serde_json::to_vec(&serde_json::json!({
+                    "type": "codex",
+                    "email": "claims@example.com",
+                    "account_id": "acct-claims",
+                    "id_token": "claims-id-token",
+                    "last_refresh": "2000-01-01T00:00:00Z",
+                    "access_token": "old-access",
+                    "refresh_token": "old-refresh",
+                    "expired": "2000-01-01T00:00:00Z"
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            Self { root, path }
+        }
+
+        fn member(&self) -> Arc<AccountMember> {
+            let mut member =
+                AccountMember::for_test(ProviderAccount::Codex(CodexAccount::default()));
+            member.file_path = self.path.clone();
+            member.reload_from_file().unwrap();
+            Arc::new(member)
+        }
+
+        fn key(&self) -> String {
+            let spec = self.member().inner.read().unwrap().refresh_request();
+            let client_id = spec
+                .form_fields
+                .iter()
+                .find(|(name, _)| name == "client_id")
+                .unwrap();
+            codex_refresh_claim_key(&client_id.1, "old-refresh")
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.root).unwrap();
+        }
+    }
+
+    struct Issuer {
+        url: String,
+        requests: Arc<AtomicUsize>,
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl Issuer {
+        async fn start() -> Self {
+            let requests = Arc::new(AtomicUsize::new(0));
+            let entered = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            let app = Router::new().route(
+                "/token",
+                post({
+                    let requests = requests.clone();
+                    let entered = entered.clone();
+                    let release = release.clone();
+                    move || {
+                        let requests = requests.clone();
+                        let entered = entered.clone();
+                        let release = release.clone();
+                        async move {
+                            requests.fetch_add(1, Ordering::SeqCst);
+                            let released = release.notified();
+                            tokio::pin!(released);
+                            released.as_mut().enable();
+                            entered.notify_one();
+                            released.await;
+                            axum::Json(serde_json::json!({
+                                "access_token": "new-access",
+                                "refresh_token": "new-refresh",
+                                "expires_in": 7200
+                            }))
+                        }
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/token", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            Self {
+                url,
+                requests,
+                entered,
+                release,
+                server,
+            }
+        }
+    }
+
+    impl Drop for Issuer {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    fn assert_outcome_unknown(error: RefreshError) {
+        let RefreshError::Io(error) = error else {
+            panic!("expected outcome-unknown error");
+        };
+        assert!(error.get_ref().unwrap().is::<CodexRefreshOutcomeUnknown>());
+    }
+
+    #[tokio::test]
+    async fn codex_concurrent_grant_claim_prevents_second_dispatch() {
+        let fixture = Fixture::new();
+        let first = fixture.member();
+        let second = fixture.member();
+        let issuer = Issuer::start().await;
+        let client = reqwest::Client::new();
+        let entered = issuer.entered.notified();
+        tokio::pin!(entered);
+        entered.as_mut().enable();
+        let request = tokio::spawn({
+            let url = issuer.url.clone();
+            let client = client.clone();
+            async move { first.refresh(&client, &url, None).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered)
+            .await
+            .unwrap();
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            second.refresh(&client, &issuer.url, None),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_outcome_unknown(error);
+        assert_eq!(issuer.requests.load(Ordering::SeqCst), 1);
+        issuer.release.notify_one();
+        assert!(tokio::time::timeout(Duration::from_secs(5), request)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap());
+        assert_eq!(issuer.requests.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.member().access_token(), "new-access");
+    }
+
+    #[tokio::test]
+    async fn codex_crash_after_claim_returns_outcome_unknown_without_dispatch() {
+        let fixture = Fixture::new();
+        let issuer = Issuer::start().await;
+        let (claim, receipt) = CodexRefreshClaim::acquire(&fixture.root, fixture.key()).unwrap();
+        assert!(receipt.is_none());
+        drop(claim);
+        let restarted = fixture.member();
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            restarted.refresh(&reqwest::Client::new(), &issuer.url, None),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_outcome_unknown(error);
+        assert_eq!(issuer.requests.load(Ordering::SeqCst), 0);
+        assert_eq!(restarted.access_token(), "old-access");
+    }
+
+    #[tokio::test]
+    async fn codex_completed_receipt_reconciles_without_dispatch() {
+        let fixture = Fixture::new();
+        let issuer = Issuer::start().await;
+        let (claim, _) = CodexRefreshClaim::acquire(&fixture.root, fixture.key()).unwrap();
+        let mut credential: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&fixture.path).unwrap()).unwrap();
+        credential["access_token"] = "receipt-access".into();
+        credential["refresh_token"] = "receipt-refresh".into();
+        credential["expired"] = "2099-01-01T00:00:00Z".into();
+        let receipt = CodexRefreshReceipt::from_credential(claim.key.clone(), &credential);
+        claim.complete(receipt).unwrap();
+        let restarted = fixture.member();
+        assert!(tokio::time::timeout(
+            Duration::from_secs(5),
+            restarted.refresh(&reqwest::Client::new(), &issuer.url, None)
+        )
+        .await
+        .unwrap()
+        .unwrap());
+        assert_eq!(issuer.requests.load(Ordering::SeqCst), 0);
+        assert_eq!(restarted.access_token(), "receipt-access");
+        assert_eq!(restarted.refresh_token(), "receipt-refresh");
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&fixture.path).unwrap()).unwrap();
+        assert_eq!(saved["expired"], "2099-01-01T00:00:00Z");
+    }
+
+    #[tokio::test]
+    async fn codex_claim_write_failure_prevents_dispatch() {
+        let fixture = Fixture::new();
+        let issuer = Issuer::start().await;
+        std::fs::write(
+            fixture.root.join(".codex-refresh-claims"),
+            b"not a directory",
+        )
+        .unwrap();
+        assert!(tokio::time::timeout(
+            Duration::from_secs(5),
+            fixture
+                .member()
+                .refresh(&reqwest::Client::new(), &issuer.url, None)
+        )
+        .await
+        .unwrap()
+        .is_err());
+        assert_eq!(issuer.requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn codex_receipt_preflight_failure_prevents_dispatch() {
+        let fixture = Fixture::new();
+        let issuer = Issuer::start().await;
+        let directory = fixture.root.join(".codex-refresh-claims");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::create_dir(directory.join(format!("{}.receipt.pending", fixture.key()))).unwrap();
+        assert!(tokio::time::timeout(
+            Duration::from_secs(5),
+            fixture
+                .member()
+                .refresh(&reqwest::Client::new(), &issuer.url, None)
+        )
+        .await
+        .unwrap()
+        .is_err());
+        assert_eq!(issuer.requests.load(Ordering::SeqCst), 0);
+    }
+
+    /// The issuer consumes the rotating grant and then drops the connection:
+    /// the caller cannot know whether a new token was minted, so the durable
+    /// claim must survive instead of being replayed onto a dead grant.
+    #[tokio::test]
+    async fn codex_transport_failure_after_dispatch_retains_claim() {
+        let fixture = Fixture::new();
+        // Accept the request, then drop the socket without a response: the
+        // caller cannot tell whether the grant was consumed.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/token", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                drop(socket);
+            }
+        });
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            fixture
+                .member()
+                .refresh(&reqwest::Client::new(), &url, None),
+        )
+        .await
+        .unwrap();
+        assert!(outcome.is_err(), "an ambiguous outcome must not succeed");
+        let claim = fixture
+            .root
+            .join(".codex-refresh-claims")
+            .join(format!("{}.claim", fixture.key()));
+        assert!(
+            claim.exists(),
+            "a possibly-consumed grant must keep its durable claim"
+        );
+        // A concurrent caller must observe the ambiguity, not dispatch again.
+        let replay = fixture.member();
+        let replayed = tokio::time::timeout(
+            Duration::from_secs(5),
+            replay.refresh(&reqwest::Client::new(), &url, None),
+        )
+        .await
+        .unwrap();
+        assert!(replayed.is_err(), "the retained claim blocks a replay");
+        server.abort();
+    }
+
+    /// A positive grant rejection proves the grant was never consumed, so the
+    /// claim is released and the next attempt may dispatch normally.
+    /// A complete HTTP error response proves the grant was not rotated even
+    /// when the status is a transient 5xx, so the claim is released and the
+    /// next request may dispatch again (a retained claim would lock the
+    /// account out until restart).
+    #[tokio::test]
+    async fn codex_http_error_response_releases_claim() {
+        let fixture = Fixture::new();
+        let app = Router::new().route(
+            "/token",
+            post(|| async { (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom") }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/token", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            fixture
+                .member()
+                .refresh(&reqwest::Client::new(), &url, None),
+        )
+        .await
+        .unwrap();
+        assert!(outcome.is_err());
+        let claim = fixture
+            .root
+            .join(".codex-refresh-claims")
+            .join(format!("{}.claim", fixture.key()));
+        assert!(!claim.exists(), "a 5xx leaves no claim behind");
+        server.abort();
+    }
+
+    /// A receipt-less claim (the issuer accepted the request, no response
+    /// arrived) must not wedge the account permanently: after the abandonment
+    /// window one caller takes the grant over, and if the issuer had in fact
+    /// consumed it the attempt ends in the normal grant-rejection state.
+    #[tokio::test]
+    async fn codex_abandoned_claim_reaches_an_actionable_state() {
+        let fixture = Fixture::new();
+        let directory = fixture.root.join(".codex-refresh-claims");
+        std::fs::create_dir(&directory).unwrap();
+        let claim = directory.join(format!("{}.claim", fixture.key()));
+        std::fs::write(&claim, b"").unwrap();
+        let old = std::time::SystemTime::now() - CODEX_CLAIM_ABANDON_AFTER;
+        std::fs::File::options()
+            .write(true)
+            .open(&claim)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        // The grant was consumed by the attempt that never answered.
+        let app = Router::new().route(
+            "/token",
+            post(|| async {
+                (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    axum::Json(serde_json::json!({"error": "invalid_grant"})),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/token", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let member = fixture.member();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            member.refresh(&reqwest::Client::new(), &url, None),
+        )
+        .await
+        .unwrap();
+        assert!(
+            outcome.is_err(),
+            "an abandoned claim must eventually be retried, not stall"
+        );
+        assert!(
+            !claim.exists(),
+            "the rejected takeover leaves no claim behind"
+        );
+        server.abort();
+    }
+
+    /// A takeover must be able to finish a refresh. The abandoned attempt never
+    /// created the pending receipt, and `complete` opens it without `create`,
+    /// so before this was fixed a successful exchange after takeover failed
+    /// after the issuer had already rotated the grant, losing the new token.
+    #[tokio::test]
+    async fn codex_takeover_persists_the_rotated_grant() {
+        let fixture = Fixture::new();
+        abandon_claim(&fixture);
+        let app = Router::new().route(
+            "/token",
+            post(|| async {
+                axum::Json(serde_json::json!({
+                    "access_token": "takeover-access",
+                    "refresh_token": "takeover-refresh",
+                    "expires_in": 7200,
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/token", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let member = fixture.member();
+        let refreshed = tokio::time::timeout(
+            Duration::from_secs(5),
+            member.refresh(&reqwest::Client::new(), &url, None),
+        )
+        .await
+        .unwrap()
+        .expect("a takeover after the abandonment window must complete the refresh");
+        assert!(refreshed, "the takeover actually dispatched the grant");
+        assert_eq!(member.access_token(), "takeover-access");
+        assert_eq!(member.refresh_token(), "takeover-refresh");
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&fixture.path).unwrap()).unwrap();
+        assert_eq!(saved["access_token"], "takeover-access");
+        assert_eq!(saved["refresh_token"], "takeover-refresh");
+        let directory = fixture.root.join(".codex-refresh-claims");
+        assert!(
+            !directory.join(format!("{}.claim", fixture.key())).exists(),
+            "a completed refresh releases its claim"
+        );
+        assert!(
+            !directory
+                .join(format!("{}.receipt.json", fixture.key()))
+                .exists(),
+            "a completed refresh publishes no replayable receipt"
+        );
+        server.abort();
+    }
+
+    /// Two callers that both observed the same abandoned claim must not both
+    /// take it over. Before this was fixed the second call replaced the first
+    /// caller's freshly written claim and both dispatched the rotating grant,
+    /// because `take_over` deleted and re-created a shared temp file with no
+    /// guard between the age check and the swap.
+    ///
+    /// The assertion is sequential on purpose: re-reading the claim under the
+    /// takeover mutex is what makes simultaneous observers safe, and a wedged
+    /// thread schedule would make a genuinely parallel assertion pass or fail
+    /// by luck. Calling the guard twice reproduces the same two observations
+    /// deterministically.
+    #[test]
+    fn codex_takeover_has_exactly_one_winner() {
+        let fixture = Fixture::new();
+        abandon_claim(&fixture);
+        let claim = CodexRefreshClaim {
+            directory: fixture.root.join(".codex-refresh-claims"),
+            key: fixture.key(),
+        };
+        claim.take_over().expect("the first taker wins");
+        let error = claim
+            .take_over()
+            .expect_err("a second taker must be refused, not allowed to replace the winner");
+        assert_outcome_unknown(error);
+        assert!(
+            claim.claim_age().unwrap() < CODEX_CLAIM_ABANDON_AFTER,
+            "the winner's replacement claim stays fresh, so later callers wait"
+        );
+        // The guard must outlive the swap. If it were deleted after winning, a
+        // second taker could create it again and dispatch the same grant.
+        let takeovers = std::fs::read_dir(fixture.root.join(".codex-refresh-claims"))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".claim.takeover-")
+            })
+            .count();
+        assert_eq!(takeovers, 1, "the winning takeover guard is retained");
+    }
+
+    /// A successful issuer response after a takeover must reach the credential
+    /// file. Without a recreated pending receipt the exchange fails after the
+    /// issuer has already rotated the grant, which loses the new token.
+    #[test]
+    fn codex_takeover_recreates_the_pending_receipt() {
+        let fixture = Fixture::new();
+        abandon_claim(&fixture);
+        let claim = CodexRefreshClaim {
+            directory: fixture.root.join(".codex-refresh-claims"),
+            key: fixture.key(),
+        };
+        assert!(
+            !claim
+                .directory
+                .join(format!("{}.receipt.pending", claim.key))
+                .exists(),
+            "the crashed attempt left no pending receipt"
+        );
+        claim.take_over().unwrap();
+        let mut credential: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&fixture.path).unwrap()).unwrap();
+        credential["access_token"] = "takeover-access".into();
+        credential["refresh_token"] = "takeover-refresh".into();
+        let receipt = CodexRefreshReceipt::from_credential(claim.key.clone(), &credential);
+        claim
+            .complete(receipt)
+            .expect("a post-takeover refresh must be able to publish its receipt");
+        assert!(claim.receipt_path().exists());
+    }
+
+    /// Write an empty claim and age it past the abandonment window, which is
+    /// the on-disk shape a crashed process leaves behind.
+    fn abandon_claim(fixture: &Fixture) {
+        let directory = fixture.root.join(".codex-refresh-claims");
+        std::fs::create_dir(&directory).unwrap();
+        let claim = directory.join(format!("{}.claim", fixture.key()));
+        std::fs::write(&claim, b"").unwrap();
+        let old = std::time::SystemTime::now() - CODEX_CLAIM_ABANDON_AFTER;
+        std::fs::File::options()
+            .write(true)
+            .open(&claim)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn codex_grant_rejection_releases_claim() {
+        let fixture = Fixture::new();
+        let app = Router::new().route(
+            "/token",
+            post(|| async {
+                (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    axum::Json(serde_json::json!({"error": "invalid_grant"})),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/token", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            fixture
+                .member()
+                .refresh(&reqwest::Client::new(), &url, None),
+        )
+        .await
+        .unwrap();
+        assert!(outcome.is_err());
+        let claim = fixture
+            .root
+            .join(".codex-refresh-claims")
+            .join(format!("{}.claim", fixture.key()));
+        assert!(!claim.exists(), "a rejected grant leaves no claim behind");
+        server.abort();
     }
 }
 
@@ -2853,6 +3869,206 @@ fn identity_slug_of(account: &ProviderAccount) -> &str {
 }
 
 #[cfg(test)]
+mod codex_grant_claim_tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::sync::Notify;
+
+    struct Issuer {
+        url: String,
+        requests: Arc<AtomicU64>,
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Issuer {
+        async fn start() -> Self {
+            let requests = Arc::new(AtomicU64::new(0));
+            let entered = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            let handler = {
+                let requests = requests.clone();
+                let entered = entered.clone();
+                let release = release.clone();
+                move || {
+                    let requests = requests.clone();
+                    let entered = entered.clone();
+                    let release = release.clone();
+                    async move {
+                        requests.fetch_add(1, Ordering::SeqCst);
+                        entered.notify_one();
+                        release.notified().await;
+                        axum::Json(serde_json::json!({
+                            "access_token": "rotated-access",
+                            "refresh_token": "rotated-refresh",
+                            "expires_in": 3600
+                        }))
+                    }
+                }
+            };
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/token", listener.local_addr().unwrap());
+            let app = axum::Router::new().route("/token", axum::routing::post(handler));
+            let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            Self {
+                url,
+                requests,
+                entered,
+                release,
+                task,
+            }
+        }
+    }
+
+    impl Drop for Issuer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    struct Credential {
+        dir: PathBuf,
+    }
+
+    impl Credential {
+        fn new() -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("mahoquot-codex-claim-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("codex.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "type": "codex", "email": "claim@example.com", "account_id": "claim-test",
+                    "access_token": "old-access", "refresh_token": "old-refresh",
+                    "expired": "2000-01-01T00:00:00Z", "id_token": "", "last_refresh": ""
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            Self { dir }
+        }
+
+        fn member(&self) -> Arc<AccountMember> {
+            load_account_members(&self.dir).unwrap().remove(0)
+        }
+
+        fn claim(&self) -> CodexRefreshClaim {
+            let spec = mahoquot_providers::build_refresh_request("old-refresh");
+            let client_id = &spec
+                .form_fields
+                .iter()
+                .find(|(key, _)| key == "client_id")
+                .unwrap()
+                .1;
+            let key = codex_refresh_claim_key(client_id, "old-refresh");
+            let (claim, receipt) = CodexRefreshClaim::acquire(&self.dir, key).unwrap();
+            assert!(receipt.is_none());
+            claim
+        }
+    }
+
+    impl Drop for Credential {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.dir).unwrap();
+        }
+    }
+
+    fn assert_outcome_unknown(error: RefreshError) {
+        let RefreshError::Io(error) = error else {
+            panic!("expected outcome-unknown error")
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert!(error.get_ref().unwrap().is::<CodexRefreshOutcomeUnknown>());
+    }
+
+    #[tokio::test]
+    async fn codex_concurrent_grant_claim_prevents_second_dispatch() {
+        let credential = Credential::new();
+        let first = credential.member();
+        let second = credential.member();
+        let issuer = Issuer::start().await;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let entered = issuer.entered.notified();
+        let first_refresh = {
+            let client = client.clone();
+            let url = issuer.url.clone();
+            tokio::spawn(async move { first.refresh(&client, &url, None).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), entered)
+            .await
+            .unwrap();
+        let result = second.refresh(&client, &issuer.url, None).await;
+        assert_outcome_unknown(result.unwrap_err());
+        assert_eq!(issuer.requests.load(Ordering::SeqCst), 1);
+        issuer.release.notify_one();
+        assert!(tokio::time::timeout(Duration::from_secs(5), first_refresh)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap());
+        assert_eq!(issuer.requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn codex_pending_claim_survives_restart_without_dispatch() {
+        let credential = Credential::new();
+        drop(credential.claim());
+        let restarted = credential.member();
+        let issuer = Issuer::start().await;
+        let result = restarted
+            .refresh(
+                &reqwest::Client::builder()
+                    .timeout(Duration::from_secs(5))
+                    .build()
+                    .unwrap(),
+                &issuer.url,
+                None,
+            )
+            .await;
+        assert_outcome_unknown(result.unwrap_err());
+        assert_eq!(issuer.requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn codex_completed_receipt_reconciles_without_dispatch() {
+        let credential = Credential::new();
+        let claim = credential.claim();
+        let mut receipt: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(credential.dir.join("codex.json")).unwrap())
+                .unwrap();
+        receipt["access_token"] = "receipt-access".into();
+        receipt["refresh_token"] = "receipt-refresh".into();
+        receipt["expired"] = "2099-01-01T00:00:00Z".into();
+        let receipt = CodexRefreshReceipt::from_credential(claim.key.clone(), &receipt);
+        claim.complete(receipt).unwrap();
+        let restarted = credential.member();
+        let issuer = Issuer::start().await;
+        assert!(restarted
+            .refresh(
+                &reqwest::Client::builder()
+                    .timeout(Duration::from_secs(5))
+                    .build()
+                    .unwrap(),
+                &issuer.url,
+                None
+            )
+            .await
+            .unwrap());
+        assert_eq!(restarted.access_token(), "receipt-access");
+        assert_eq!(restarted.refresh_token(), "receipt-refresh");
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(credential.dir.join("codex.json")).unwrap())
+                .unwrap();
+        assert_eq!(persisted["expired"], "2099-01-01T00:00:00Z");
+        assert_eq!(issuer.requests.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[cfg(test)]
 mod identity_tests {
     use super::*;
 
@@ -3010,6 +4226,20 @@ mod identity_tests {
 /// real Codex credentials carry their PLAN there (`plus`, `pro`), so dispatching
 /// on `type` alone would reject live accounts. `type` is consulted only as a
 /// fallback for files whose name carries no known prefix.
+/// Whether a JSON file in the auth directory is meant to be a credential.
+///
+/// The gateway stores its own state (usage samples, scheduler state,
+/// telemetry, signature ledgers) in the same directory, so a `*.json` name is
+/// not enough. A file qualifies when its name carries a provider prefix or
+/// when the parsed document declares a provider `type`.
+fn is_credential_like(file_path: &Path, value: Option<&serde_json::Value>) -> bool {
+    let declared_type = value
+        .and_then(|value| value.get("type"))
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    classify_credential(file_path, declared_type).is_some()
+}
+
 fn classify_credential(file_path: &Path, declared_type: &str) -> Option<ProviderKind> {
     let name = file_path
         .file_name()
@@ -3083,13 +4313,17 @@ fn list_all_auth_files(auth_dir: &Path) -> Result<Vec<PathBuf>, LoadError> {
     // Explicit order manifest determines pool position; unlisted credentials
     // append to the end sorted alphabetically.
     let order = ordered_manifest_names(auth_dir);
+    let mut ranks = std::collections::HashMap::with_capacity(order.len());
+    for (index, name) in order.iter().enumerate() {
+        ranks.entry(name.as_str()).or_insert(index);
+    }
     files.sort_by(|a, b| {
         let a_name = a.file_name().and_then(|s| s.to_str()).unwrap_or("");
         let b_name = b.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        let a_index = order.iter().position(|name| name == a_name);
-        let b_index = order.iter().position(|name| name == b_name);
+        let a_index = ranks.get(a_name);
+        let b_index = ranks.get(b_name);
         match (a_index, b_index) {
-            (Some(ai), Some(bi)) => ai.cmp(&bi),
+            (Some(ai), Some(bi)) => ai.cmp(bi),
             (Some(_), None) => std::cmp::Ordering::Less,
             (None, Some(_)) => std::cmp::Ordering::Greater,
             (None, None) => a.cmp(b),
@@ -3105,8 +4339,15 @@ pub fn load_account_members(auth_dir: &Path) -> anyhow::Result<Vec<Arc<AccountMe
     let files = list_all_auth_files(auth_dir)
         .map_err(|e| anyhow::anyhow!("failed to list auth files in {:?}: {}", auth_dir, e))?;
 
+    let identity_store_path = auth_dir.join(CLAUDE_DEVICE_IDENTITY_STORE);
+    let mut identity_store = load_claude_device_identities(&identity_store_path)?;
+    let mut identity_store_dirty = false;
+
     let mut members = Vec::with_capacity(files.len());
     for file_path in files {
+        if file_path == identity_store_path {
+            continue;
+        }
         let content = match std::fs::read_to_string(&file_path) {
             Ok(content) => content,
             Err(e) => {
@@ -3118,10 +4359,26 @@ pub fn load_account_members(auth_dir: &Path) -> anyhow::Result<Vec<Arc<AccountMe
         let value: serde_json::Value = match serde_json::from_str(&content) {
             Ok(value) => value,
             Err(e) => {
-                tracing::warn!(path = ?file_path, error = %e, "skipping malformed credential");
+                // The auth directory also holds state files written by the
+                // gateway itself. Only a file that looks like a credential is
+                // worth a warning; an empty or truncated one is not a pool
+                // defect.
+                if is_credential_like(&file_path, None) {
+                    tracing::warn!(path = ?file_path, error = %e, "skipping malformed credential");
+                } else {
+                    tracing::debug!(path = ?file_path, error = %e, "ignoring non-credential json");
+                }
                 continue;
             }
         };
+
+        // Provider state written into the same directory (usage samples,
+        // scheduler state, telemetry, signature ledgers) is not a credential.
+        // A real credential is named for its provider or declares a type.
+        if !is_credential_like(&file_path, Some(&value)) {
+            tracing::debug!(path = ?file_path, "ignoring non-credential json");
+            continue;
+        }
 
         let declared_type = value
             .get("type")
@@ -3170,6 +4427,14 @@ pub fn load_account_members(auth_dir: &Path) -> anyhow::Result<Vec<Arc<AccountMe
             .and_then(|v| v.as_str())
             .map(str::to_string);
 
+        let credential_device_id = value
+            .get("device_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let credential_account_id = value
+            .get("account_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
         let mut inner = match provider_account_from_value(kind, value) {
             Ok(inner) => inner,
             Err(e) => {
@@ -3260,7 +4525,42 @@ pub fn load_account_members(auth_dir: &Path) -> anyhow::Result<Vec<Arc<AccountMe
                 .to_string()
         };
 
+        let claude_device_id = if kind == ProviderKind::Claude {
+            let from_cred = credential_device_id
+                .as_deref()
+                .filter(|s| is_valid_claude_device_id(s))
+                .map(str::to_string);
+
+            let from_store = identity_store
+                .get(&id)
+                .cloned()
+                .filter(|s| is_valid_claude_device_id(s))
+                .or_else(|| {
+                    credential_account_id
+                        .as_deref()
+                        .and_then(|acc| identity_store.get(acc).cloned())
+                        .filter(|s| is_valid_claude_device_id(s))
+                });
+
+            if let Some(dev_id) = from_cred.or(from_store) {
+                dev_id
+            } else {
+                let new_id = generate_claude_device_id();
+                identity_store.insert(id.clone(), new_id.clone());
+                if let Some(acc) = credential_account_id.as_deref() {
+                    if !acc.is_empty() {
+                        identity_store.insert(acc.to_string(), new_id.clone());
+                    }
+                }
+                identity_store_dirty = true;
+                new_id
+            }
+        } else {
+            String::new()
+        };
+
         members.push(Arc::new(AccountMember {
+            claude_device_id,
             home_lease: None,
             config_retry_override: None,
             id,
@@ -3282,15 +4582,20 @@ pub fn load_account_members(auth_dir: &Path) -> anyhow::Result<Vec<Arc<AccountMe
             proxy_url,
             ok_count: Arc::new(AtomicU64::new(0)),
             fail_count: Arc::new(AtomicU64::new(0)),
+            fail_streak: Arc::new(AtomicU32::new(0)),
             refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
             unsupported_models: Arc::new(RwLock::new(Vec::new())),
             usage: Arc::new(RwLock::new(Default::default())),
             cline_trackers: crate::cline_usage::ClineTrackers::from_env(),
             devin_catalog: arc_swap::ArcSwapOption::empty(),
             devin_discovery_seq: Arc::new(AtomicU64::new(0)),
+            grant_rejected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }));
     }
 
+    if identity_store_dirty {
+        save_claude_device_identities(&identity_store_path, &identity_store)?;
+    }
     Ok(members)
 }
 
@@ -3418,4 +4723,46 @@ pub fn load_account_members_from_store(
         .sync_all_to_spool()
         .map_err(|e| anyhow::Error::new(e).context("failed to sync store to spool"))?;
     load_account_members(&store.auth_dir())
+}
+
+pub const CLAUDE_DEVICE_IDENTITY_STORE: &str = "claude-device-identity.json";
+
+pub fn is_valid_claude_device_id(s: &str) -> bool {
+    s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+pub fn generate_claude_device_id() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let mut s = String::with_capacity(64);
+    for b in bytes {
+        use std::fmt::Write;
+        let _ = write!(s, "{:02x}", b);
+    }
+    s
+}
+
+pub fn load_claude_device_identities(path: &Path) -> std::io::Result<BTreeMap<String, String>> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(error) => return Err(error),
+    };
+    serde_json::from_str(&content)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
+pub fn save_claude_device_identities(
+    path: &Path,
+    store: &BTreeMap<String, String>,
+) -> Result<(), std::io::Error> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    if !parent.as_os_str().is_empty() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let json =
+        serde_json::to_string_pretty(store).map_err(|e| std::io::Error::other(e.to_string()))?;
+    write_credential_atomically(path, json.as_bytes())
+        .map_err(|e| std::io::Error::other(e.to_string()))
 }

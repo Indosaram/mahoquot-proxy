@@ -54,6 +54,17 @@ pub trait PoolMember: Send + Sync {
     fn weight(&self) -> u32 {
         1
     }
+    /// True when the member's recent attempts all failed with an upstream 5xx
+    /// and no success has landed since.
+    ///
+    /// Deliberately separate from [`PoolMember::health`]: a transient upstream
+    /// 5xx must not bench an account for other requests, so health stays
+    /// `Available`. But a *sustained* streak has to stop session affinity from
+    /// pinning every later turn of that conversation to the same broken
+    /// account, which is what left one session replaying 503s for minutes.
+    fn degraded_streak(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

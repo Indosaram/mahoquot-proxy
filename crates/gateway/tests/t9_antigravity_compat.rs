@@ -1,5 +1,8 @@
 use mahoquot_gateway::compat::events::{CodexEvent, Usage};
-use mahoquot_gateway::compat::gemini::{openai_to_antigravity, GeminiDecoder};
+use mahoquot_gateway::compat::gemini::{
+    gemini_json_to_openai, openai_to_antigravity, GeminiDecoder,
+};
+use mahoquot_gateway::compat::render::{Aggregator, ChunkRenderer, GeminiChunkRenderer};
 use serde_json::json;
 
 fn decode_all(frames: &[&str]) -> Vec<CodexEvent> {
@@ -10,6 +13,94 @@ fn decode_all(frames: &[&str]) -> Vec<CodexEvent> {
     }
     dec.finish(&mut out);
     out
+}
+
+fn l2_03_gemini_usage_fixture() -> serde_json::Value {
+    json!({
+        "candidates": [{"content": {"parts": [{"text": "OK"}]}, "finishReason": "STOP"}],
+        "usageMetadata": {
+            "promptTokenCount": 40,
+            "candidatesTokenCount": 5,
+            "thoughtsTokenCount": 42,
+            "cachedContentTokenCount": 7,
+            "totalTokenCount": 87
+        }
+    })
+}
+
+fn assert_l2_03_openai_usage(usage: &serde_json::Value) {
+    assert_eq!(usage["prompt_tokens"], 40);
+    assert_eq!(usage["completion_tokens"], 47);
+    assert_eq!(usage["total_tokens"], 87);
+    assert_eq!(usage["completion_tokens_details"]["reasoning_tokens"], 42);
+    assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 7);
+}
+
+#[test]
+fn test_t9_l2_03_gemini_stream_and_buffered_usage_match() {
+    let fixture = l2_03_gemini_usage_fixture();
+    let buffered = gemini_json_to_openai(&fixture, "gemini-2.5-flash", 0);
+    assert_l2_03_openai_usage(&buffered["usage"]);
+
+    let events = decode_all(&[&fixture.to_string()]);
+    let usage = events
+        .iter()
+        .find_map(|event| match event {
+            CodexEvent::Completed { usage } => usage.as_ref(),
+            _ => None,
+        })
+        .expect("decoded usage");
+    assert_eq!(usage.prompt_tokens, 40);
+    assert_eq!(usage.completion_tokens, 47);
+    assert_eq!(usage.reasoning_tokens, 42);
+    assert_eq!(usage.total_tokens, 87);
+    assert_eq!(usage.cached_tokens, 7);
+    assert!(usage.cached_tokens_known);
+
+    let mut renderer = ChunkRenderer::new("gemini-2.5-flash".into(), 0, true);
+    let mut aggregate = Aggregator::new("gemini-2.5-flash".into(), 0);
+    let mut streamed_usage = None;
+    for event in events {
+        aggregate.push(event.clone());
+        for frame in renderer.render(event) {
+            let text = std::str::from_utf8(&frame).unwrap();
+            let data = text.strip_prefix("data: ").unwrap().trim();
+            if data == "[DONE]" {
+                continue;
+            }
+            let payload: serde_json::Value = serde_json::from_str(data).unwrap();
+            if payload.get("usage").is_some_and(|usage| !usage.is_null()) {
+                streamed_usage = Some(payload["usage"].clone());
+            }
+        }
+    }
+    assert_l2_03_openai_usage(&streamed_usage.expect("OpenAI usage chunk"));
+    assert_l2_03_openai_usage(&aggregate.into_completion()["usage"]);
+}
+
+#[test]
+fn test_t9_l2_03_gemini_native_usage_roundtrips() {
+    let fixture = l2_03_gemini_usage_fixture();
+    let events = decode_all(&[&fixture.to_string()]);
+    let mut renderer = GeminiChunkRenderer::new("gemini-2.5-flash".into(), 0);
+    let mut aggregate = Aggregator::new("gemini-2.5-flash".into(), 0);
+    let mut streamed_usage = None;
+    for event in events {
+        aggregate.push(event.clone());
+        for frame in renderer.render(event) {
+            let text = std::str::from_utf8(&frame).unwrap();
+            let payload: serde_json::Value =
+                serde_json::from_str(text.strip_prefix("data: ").unwrap().trim()).unwrap();
+            if let Some(usage) = payload.get("usageMetadata") {
+                streamed_usage = Some(usage.clone());
+            }
+        }
+    }
+    assert_eq!(streamed_usage.unwrap(), fixture["usageMetadata"]);
+    assert_eq!(
+        aggregate.into_gemini().unwrap()["usageMetadata"],
+        fixture["usageMetadata"]
+    );
 }
 
 #[test]
@@ -90,7 +181,8 @@ fn test_t9_live_captured_frame_decodes_to_text_and_usage() {
         CodexEvent::Completed {
             usage: Some(Usage {
                 prompt_tokens: 6,
-                completion_tokens: 2,
+                // L2-03: OpenAI completion usage includes the 60 thought tokens.
+                completion_tokens: 62,
                 total_tokens: 68,
                 cached_tokens: 0,
                 cached_tokens_known: false,

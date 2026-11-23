@@ -301,6 +301,7 @@ impl SettingsStore {
                 ))
             })?;
             document.effective.validate_proxy_settings()?;
+            document.effective.validate_claude_egress()?;
             let active_snapshot = self.active_snapshot();
             let candidate_registry = document
                 .effective
@@ -377,6 +378,7 @@ impl SettingsStore {
         next.payload
             .validate()
             .map_err(|error| v8_store_error(v8_config::ConfigError::InvalidConfig(error)))?;
+        next.validate_claude_egress()?;
         next.validate_proxy_settings().map_err(|error| {
             SettingsError::Validation(mahoquot_registry::RegistryError::DeserializationError(
                 error.to_string(),
@@ -442,6 +444,7 @@ impl SettingsStore {
             ))
         })?;
         document.effective.validate_proxy_settings()?;
+        document.effective.validate_claude_egress()?;
         let candidate_registry = document
             .effective
             .validate_against_registry(&self.active_snapshot())?;

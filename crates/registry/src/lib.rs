@@ -1119,6 +1119,48 @@ impl RegistrySnapshot {
         Ok(resolved.effective_capabilities)
     }
 
+    pub fn supported_model_ids_for_provider(&self, provider_id: &ProviderId) -> Vec<String> {
+        self.models
+            .values()
+            .filter(|desc| desc.bindings.contains_key(provider_id))
+            .map(|desc| desc.id.as_str().to_string())
+            .collect()
+    }
+
+    pub fn provider_supports_model(&self, provider_id: &ProviderId, model: &str) -> bool {
+        let unstripped_kiro = model.strip_prefix("kiro/").unwrap_or(model);
+        let mut has_prefix_support = false;
+        for desc in self.models.values() {
+            let Some(binding) = desc.binding_for(provider_id) else {
+                continue;
+            };
+            has_prefix_support |= binding.authority.prefixes;
+            let upstream = binding.effective_upstream_id(&desc.id);
+            if desc.id.as_str() == model
+                || upstream == model
+                || upstream == unstripped_kiro
+                || desc.id.as_str().strip_prefix("kiro/") == Some(unstripped_kiro)
+                || desc.aliases.iter().any(|alias| alias.as_str() == model)
+            {
+                return true;
+            }
+        }
+        if self.aliases.values().any(|rule| {
+            rule.alias.as_str() == model
+                && (rule.provider_id.as_ref() == Some(provider_id)
+                    || (rule.provider_id.is_none()
+                        && self
+                            .models
+                            .get(&rule.target)
+                            .is_some_and(|desc| desc.bindings.contains_key(provider_id))))
+        }) {
+            return true;
+        }
+        provider_id.as_str() == "vertex"
+            && has_prefix_support
+            && (model.starts_with("gemini-") || model.starts_with("google/"))
+    }
+
     pub fn contribution_for_provider(&self, provider_id: &ProviderId) -> ProviderContribution {
         let policy = self
             .providers

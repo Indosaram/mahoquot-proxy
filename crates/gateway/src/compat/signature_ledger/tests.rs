@@ -5,7 +5,7 @@ use super::store::{LruStore, SnapshotRecord, TTL};
 use super::{LedgerConfig, ReplayScope, SignatureLedger};
 
 fn scope(ledger: &Arc<SignatureLedger>) -> ReplayScope {
-    ledger.scope("gemini-3.8-flash-high", "session-a")
+    ledger.scope("gemini-4-neon-high", "session-a")
 }
 
 fn temp_snapshot(label: &str) -> std::path::PathBuf {
@@ -75,8 +75,8 @@ fn a_byte_budget_evicts_least_recently_used_entries_first() {
 #[test]
 fn scopes_do_not_share_entries_across_models_or_sessions() {
     let ledger = SignatureLedger::in_memory();
-    let first = ledger.scope("gemini-3.8-flash-high", "session-a");
-    let other_session = ledger.scope("gemini-3.8-flash-high", "session-b");
+    let first = ledger.scope("gemini-4-neon-high", "session-a");
+    let other_session = ledger.scope("gemini-4-neon-high", "session-b");
     let other_model = ledger.scope("gemini-3.7-flash-high", "session-a");
     first.remember("shared-id", "bash", "{}", "SIG-SCOPED");
 
@@ -134,7 +134,7 @@ fn a_restored_snapshot_replays_after_a_restart() {
     ledger.flush_blocking().expect("flush");
 
     let reopened = SignatureLedger::open(&path);
-    let restored = reopened.scope("gemini-3.8-flash-high", "session-a");
+    let restored = reopened.scope("gemini-4-neon-high", "session-a");
     assert_eq!(
         restored
             .recall("durable", "bash", r#"{"command":"ls"}"#)
@@ -143,7 +143,7 @@ fn a_restored_snapshot_replays_after_a_restart() {
         "a restart must answer from the durable snapshot"
     );
     assert_eq!(
-        reopened.scope("gemini-3.8-flash-high", "other").recall(
+        reopened.scope("gemini-4-neon-high", "other").recall(
             "durable",
             "bash",
             r#"{"command":"ls"}"#
@@ -177,7 +177,7 @@ fn a_bounded_snapshot_keeps_the_most_recently_used_entries() {
         snapshot_max_entries: 2,
         ..LedgerConfig::default()
     });
-    let restored = reopened.scope("gemini-3.8-flash-high", "session-a");
+    let restored = reopened.scope("gemini-4-neon-high", "session-a");
     assert_eq!(
         restored.recall("oldest", "tool", "{}").as_deref(),
         Some("SIG-OLDEST")
@@ -203,7 +203,7 @@ fn a_corrupt_snapshot_starts_empty_instead_of_failing() {
     ledger.flush_blocking().expect("flush");
     assert_eq!(
         SignatureLedger::open(&path)
-            .scope("gemini-3.8-flash-high", "session-a")
+            .scope("gemini-4-neon-high", "session-a")
             .recall("after-corrupt", "tool", "{}")
             .as_deref(),
         Some("SIG-OK")
@@ -268,7 +268,7 @@ async fn shutdown_flushes_the_pending_snapshot() {
 
     assert_eq!(
         SignatureLedger::open(&path)
-            .scope("gemini-3.8-flash-high", "session-a")
+            .scope("gemini-4-neon-high", "session-a")
             .recall("pending", "tool", "{}")
             .as_deref(),
         Some("SIG-PENDING")

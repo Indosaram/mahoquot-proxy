@@ -446,6 +446,95 @@ fn signed_catalog_non_canonical_json_rejection() {
     assert_eq!(err, Err(CatalogVerificationError::CanonicalizationMismatch));
 }
 
+/// A receipt signed before key order was part of canonical form.
+///
+/// Such a receipt carries a genuine signature over compact, insertion-ordered
+/// bytes, the exact shape `serde_json::to_vec` produces for a snapshot. The
+/// verifier rejects it, and that rejection is deliberate: accepting two byte
+/// orders for one logical payload would leave the published catalog ambiguous.
+/// This test pins the decision so a future "be liberal in what you accept"
+/// change cannot silently widen the accepted wire form. An affected catalog is
+/// reissued with the canonical signer instead.
+#[test]
+fn signed_catalog_legacy_insertion_order_receipt_is_rejected() {
+    let (signer, keyring) = test_keys();
+    let now = 1000;
+    let snapshot = sample_snapshot(10);
+
+    // Compact, insertion-ordered bytes: what the pre-sort signer signed.
+    let legacy_payload = serde_json::to_vec(&snapshot).unwrap();
+    let canonical = canonical_payload(&snapshot);
+    assert_ne!(
+        legacy_payload, canonical,
+        "insertion order must differ from sorted order for this test to mean anything"
+    );
+    assert_eq!(
+        is_canonical_json(&legacy_payload),
+        Ok(false),
+        "insertion-ordered bytes must not be canonical"
+    );
+
+    // The signature itself is valid over those bytes: verification must fail on
+    // the payload form, not because the receipt was forged.
+    let mut rng = rand::rngs::OsRng;
+    let legacy_sk = SigningKey::generate(&mut rng);
+    let legacy_kr = Keyring::new().with_key("legacy-key", legacy_sk.verifying_key());
+    let signing_bytes = compute_signing_bytes(
+        SCHEMA_VERSION_V1,
+        snapshot.version(),
+        now,
+        None,
+        "legacy-key",
+        &legacy_payload,
+    );
+    use base64::Engine as _;
+    use ed25519_dalek::Signer as _;
+    let signature = legacy_sk.sign(&signing_bytes);
+    assert!(
+        legacy_sk
+            .verifying_key()
+            .verify_strict(&signing_bytes, &signature)
+            .is_ok(),
+        "the fixture must carry a cryptographically valid legacy signature"
+    );
+    let envelope = CatalogEnvelope::new(
+        snapshot.version(),
+        "legacy-key",
+        now,
+        None,
+        base64::engine::general_purpose::STANDARD.encode(signature.to_bytes()),
+    );
+
+    assert_eq!(
+        verify_catalog_envelope(
+            &envelope,
+            &legacy_payload,
+            &legacy_kr,
+            None,
+            None,
+            now,
+            DEFAULT_CLOCK_SKEW_SECS
+        ),
+        Err(CatalogVerificationError::CanonicalizationMismatch)
+    );
+
+    // Reissuing the same snapshot in canonical form verifies, so the rejection
+    // above is a reissue requirement and not a dead end for the signer.
+    let reissued = signer
+        .sign_catalog(snapshot.version(), now, None, &canonical)
+        .expect("canonical payload must sign");
+    assert!(verify_catalog_envelope(
+        &reissued,
+        &canonical,
+        &keyring,
+        None,
+        None,
+        now,
+        DEFAULT_CLOCK_SKEW_SECS
+    )
+    .is_ok());
+}
+
 #[test]
 fn signed_catalog_zero_fallback_routable_bindings_rejection() {
     let (signer, keyring) = test_keys();

@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const RETENTION_MINUTES: i64 = 30 * 24 * 60;
 
@@ -191,6 +192,32 @@ impl TelemetryStore {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    /// Like [`snapshot`], but only the last `minutes` of buckets, and a zero
+    /// window returns none at all.
+    ///
+    /// `/admin/stats` is polled every few seconds by the desktop console, and it
+    /// used to serialize the whole retained store (a month of per-minute
+    /// buckets, with a `providers` and an `accounts` array inside each one) on
+    /// every poll: tens of megabytes, taking longer to render than the poll
+    /// interval on a busy gateway. Callers that only need live counters ask for
+    /// a zero or short window; the console asks once for the chart's own range.
+    pub fn snapshot_window(&self, minutes: i64) -> Vec<TelemetryBucket> {
+        if minutes <= 0 {
+            return Vec::new();
+        }
+        let cutoff = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs() as i64 - minutes * 60)
+            .unwrap_or(i64::MAX);
+        self.buckets
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter(|bucket| bucket.minute_unix >= cutoff)
+            .cloned()
+            .collect()
     }
 
     pub fn remove_history_groups(&self, groups: &[crate::request_history::HistoryGroup]) -> usize {
@@ -429,6 +456,29 @@ fn load_buckets(path: &Path) -> Vec<TelemetryBucket> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `/admin/stats` feeds a console that polls every few seconds, so a caller
+    /// that only needs live counters must be able to say so. A zero window
+    /// returns nothing; a positive one excludes buckets older than its radius.
+    #[test]
+    fn snapshot_window_bounds_history_by_age() {
+        let store = TelemetryStore::load(PathBuf::from("unused.json"));
+        // `record_with_account` takes unix seconds and stores a minute-aligned
+        // bucket, so build the fixture in seconds.
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_secs() as i64;
+        store.record_with_account(now_secs - 120 * 60, "codex", None, true);
+        store.record_with_account(now_secs - 5 * 60, "codex", None, true);
+        store.record_with_account(now_secs, "codex", None, true);
+
+        assert!(store.snapshot_window(0).is_empty());
+        assert_eq!(store.snapshot_window(30).len(), 2);
+        assert_eq!(store.snapshot_window(600).len(), 3);
+        // No window keeps the whole retained store, so older clients are intact.
+        assert_eq!(store.snapshot().len(), 3);
+    }
 
     #[test]
     fn persisted_buckets_survive_store_recreation() {

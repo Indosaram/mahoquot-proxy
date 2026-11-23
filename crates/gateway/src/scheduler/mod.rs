@@ -473,24 +473,28 @@ impl SchedulerRegistry {
         let selected =
             select_candidate(&candidates, now).map(|candidate| candidate.key.to_string());
         runtime.selected = selected.clone();
-        let mut order: Vec<String> = candidates
+        let mut first_by_key = BTreeMap::new();
+        for candidate in &candidates {
+            first_by_key.entry(candidate.key).or_insert(candidate);
+        }
+        let mut ordered_candidates: Vec<_> = candidates
             .iter()
             .filter(|candidate| {
                 !candidate.manually_disabled && candidate.remaining_percent.is_some()
             })
-            .map(|candidate| candidate.key.to_string())
+            .map(|candidate| first_by_key[candidate.key])
             .collect();
-        order.sort_by_key(|id| {
-            let candidate = candidates
-                .iter()
-                .find(|candidate| candidate.key == id)
-                .unwrap();
+        ordered_candidates.sort_by_key(|candidate| {
             (
                 candidate.manual_priority.unwrap_or(u32::MAX),
                 candidate.reset_at_unix.unwrap_or(i64::MAX),
-                id.clone(),
+                candidate.key,
             )
         });
+        let mut order: Vec<String> = ordered_candidates
+            .into_iter()
+            .map(|candidate| candidate.key.to_string())
+            .collect();
         if let Some(selected) = selected.as_ref() {
             if let Some(position) = order.iter().position(|id| id == selected) {
                 order.remove(position);
@@ -644,6 +648,58 @@ fn persist_json_background(
 #[cfg(test)]
 mod persistence_tests {
     use super::*;
+
+    #[test]
+    fn ulw_gw5_order_keeps_first_candidate_ranking_for_duplicate_ids() {
+        use crate::account::{GenericAccount, ProviderAccount};
+        use crate::usage::{AccountUsage, QuotaWindow};
+        let root = std::env::temp_dir().join(format!("scheduler-ranking-{}", uuid::Uuid::new_v4()));
+        let now = now_unix();
+        let members: Vec<_> = [
+            ("duplicate", 500),
+            ("peer", 100),
+            ("duplicate", 10),
+            ("selected", 1),
+        ]
+        .into_iter()
+        .map(|(id, reset)| {
+            let member = AccountMember::for_test_with_id(
+                id,
+                ProviderAccount::Generic(GenericAccount::default()),
+            );
+            member.set_usage(AccountUsage {
+                primary: QuotaWindow {
+                    used_percent: Some(50.0),
+                    reset_at_unix: Some(now + reset),
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+            Arc::new(member)
+        })
+        .collect();
+        let registry = SchedulerRegistry::load(&root.join("config.yaml"), &members);
+        let snapshot = registry
+            .update_settings(
+                SchedulerSettings {
+                    enabled: true,
+                    priorities: [
+                        ("selected".into(), 0),
+                        ("duplicate".into(), 1),
+                        ("peer".into(), 1),
+                    ]
+                    .into(),
+                },
+                &members,
+            )
+            .unwrap();
+        assert_eq!(snapshot.selected.as_deref(), Some("selected"));
+        assert_eq!(
+            snapshot.order,
+            ["selected", "peer", "duplicate", "duplicate"]
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn delayed_generation_cannot_overwrite_newer_state() {

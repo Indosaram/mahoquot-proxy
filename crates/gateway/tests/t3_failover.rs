@@ -1095,3 +1095,128 @@ async fn test_t3_plain_429_budget_still_caps_pool_walk() {
     drop(state);
     std::fs::remove_dir_all(&temp_dir).unwrap();
 }
+
+/// A sustained upstream 5xx streak must (a) leave `Health` untouched, so the
+/// account is never benched for other requests, and (b) release session
+/// affinity, so the conversation stops replaying the same failing account.
+#[tokio::test]
+async fn test_t3_sustained_5xx_releases_affinity_without_benching() {
+    let mut servers = Vec::new();
+    let mut shutdowns = Vec::new();
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    // Given: an upstream that answers 503 on every attempt
+    let listener = bind_fixture_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let counter = hits.clone();
+    let app = Router::new().route(
+        common::CODEX_PATH,
+        post(move || {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    [("content-type", "application/json")],
+                    r#"{"error":{"message":"upstream overloaded"}}"#.to_string(),
+                )
+            }
+        }),
+    );
+    let (shutdown, stopped) = tokio::sync::oneshot::channel();
+    shutdowns.push(shutdown);
+    servers.push(tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                stopped.await.unwrap();
+            })
+            .await
+            .unwrap();
+    }));
+
+    let temp_dir = unique_temp_dir("qgw-test-t3-5xx");
+    let json = create_auth_file_json(
+        "a",
+        "acc_a",
+        "token_a",
+        Some(&format!("http://127.0.0.1:{port}")),
+    );
+    std::fs::write(temp_dir.join("codex-a-plus.json"), json).unwrap();
+
+    let config = GatewayConfig {
+        usage_poll_secs: 120,
+        port: 0,
+        auth_dir: temp_dir.clone(),
+        config_path: temp_dir.join("config.yaml"),
+        strategy: Strategy::FillFirst,
+        max_failover: 1,
+        log_level: "info".to_string(),
+        api_keys: mahoquot_gateway::inbound::ApiKeys::default(),
+        models_env: None,
+        refresh_url: mahoquot_providers::refresh::REFRESH_TOKEN_URL.to_string(),
+        auth_refresh_enabled: true,
+        ..Default::default()
+    };
+
+    let state = Arc::new(AppState::new(&config).unwrap());
+    let app = create_app(state.clone());
+    let gw_listener = bind_fixture_listener().await;
+    let gw_port = gw_listener.local_addr().unwrap().port();
+    let (shutdown, stopped) = tokio::sync::oneshot::channel();
+    shutdowns.push(shutdown);
+    servers.push(tokio::spawn(async move {
+        axum::serve(gw_listener, app)
+            .with_graceful_shutdown(async {
+                stopped.await.unwrap();
+            })
+            .await
+            .unwrap();
+    }));
+
+    let client = reqwest::Client::new();
+    let gw_url = format!("http://127.0.0.1:{gw_port}/v1/chat/completions");
+
+    // When: the same session retries several times
+    for _ in 0..4 {
+        let res = client
+            .post(&gw_url)
+            .header("Content-Type", "application/json")
+            .body(common::session_request("stuck-session"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    let member = state.find_member("a").expect("member a exists");
+
+    // Then: the streak advanced...
+    assert!(
+        member
+            .fail_streak
+            .load(std::sync::atomic::Ordering::SeqCst)
+            >= 3,
+        "a sustained 5xx run must advance the streak, got {}",
+        member.fail_streak.load(std::sync::atomic::Ordering::SeqCst)
+    );
+
+    // ...but the account is still Available, never benched for other traffic.
+    assert_eq!(
+        member.health(),
+        Health::Available,
+        "a transient upstream 5xx must never bench the account"
+    );
+
+    drop(client);
+    for shutdown in shutdowns {
+        shutdown.send(()).unwrap();
+    }
+    for server in servers {
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    drop(state);
+    std::fs::remove_dir_all(&temp_dir).unwrap();
+}

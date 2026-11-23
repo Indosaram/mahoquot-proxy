@@ -1,7 +1,7 @@
 // allow: SIZE_OK — single-loop failover relay state machine with auth refresh, retry, and in-flight tracking
 
 use std::hash::Hasher;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -23,6 +23,24 @@ fn account_retry_limit(member: &AccountMember, global_retry: i64) -> usize {
         .request_retry_override()
         .unwrap_or(global_retry.max(0))
         .max(0) as usize
+}
+
+/// How many times a degenerate generation is retried on the account that
+/// produced it before the walk spends a peer. The failure is nondeterministic,
+/// so an in-place retry is cheap and preserves that account's prompt cache;
+/// three attempts clears the observed rate without stalling the request.
+const GEMINI_IN_PLACE_RETRY_LIMIT: usize = 3;
+
+/// Whether a failed attempt should be retried on the same account.
+///
+/// A degenerate generation is the model failing to emit a callable tool
+/// request. It is not a transport or credential fault, and it does not follow
+/// the account: retrying in place routinely succeeds while the credential's
+/// prompt cache is still warm, whereas walking the pool spends a healthy peer
+/// and changes nothing about the cause. Every other failure keeps the normal
+/// failover behaviour.
+fn retries_in_place(failure: &str, retries_used: usize) -> bool {
+    compat::gemini_retry_reason(failure).is_some() && retries_used < GEMINI_IN_PLACE_RETRY_LIMIT
 }
 
 fn retry_round_allows(member: &AccountMember, round: usize, global_retry: i64) -> bool {
@@ -75,7 +93,7 @@ pub(crate) async fn send_interactions(
     let client = state
         .try_client_for_member(member)
         .map_err(|error| error.to_string())?;
-    let body = serde_json::to_vec(wire).map_err(|error| error.to_string())?;
+    let body = Bytes::from(serde_json::to_vec(wire).map_err(|error| error.to_string())?);
     let settings = state.settings.current();
     let retries = account_retry_limit(member, settings.request_retry);
     let mut attempt = 0usize;
@@ -304,10 +322,13 @@ pub fn subscribe_finalizer(
     state.subscribe_finalizer(account_or_event)
 }
 
-/// How long an Anthropic stream is held back waiting for its first text or
-/// tool call. Claude occasionally finishes a turn after thinking alone; only a
-/// hold that outlasts the thinking can turn that into a failover.
-const ANTHROPIC_EMPTY_HOLD: std::time::Duration = std::time::Duration::from_secs(180);
+fn reasoning_stream_hold(headers: &HeaderMap) -> std::time::Duration {
+    if headers.contains_key("x-test-preflight-deadline-ms") {
+        get_preflight_deadline(headers)
+    } else {
+        std::time::Duration::from_secs(180)
+    }
+}
 
 fn get_preflight_deadline(headers: &HeaderMap) -> std::time::Duration {
     let ms = headers
@@ -530,7 +551,12 @@ impl StreamCapture {
 
         observe_stream_account(&outcome, "finalized", Some(status));
 
+        // The guard's `Drop` balances the in-flight counter exactly once, so a
+        // panic in the recording (or a future dropped before its first poll)
+        // cannot strand the increment and wedge every later quiescence wait.
+        let recording_guard = state.begin_outcome_recording();
         tokio::spawn(async move {
+            let _recording_guard = recording_guard;
             let record = OutcomeRecord {
                 event_id: &outcome.event_id,
                 occurred_at_ms: outcome.occurred_at_ms,
@@ -757,6 +783,7 @@ async fn record_request_outcome(state: &AppState, record: OutcomeRecord<'_>) {
     // injector rewrote is not by itself proof that the request left fast.
     let fast = record.fast && record.provider == "codex";
     let token_usage = record.token_usage.unwrap_or_default();
+    let tokens_reported = record.token_usage.is_some();
     let total_tokens = token_usage.total_tokens();
     if total_tokens > 0 {
         if let Some(entry) = record.scoped_entry {
@@ -787,6 +814,7 @@ async fn record_request_outcome(state: &AppState, record: OutcomeRecord<'_>) {
         total_tokens: token_usage.total_tokens(),
         latency_ms: record.elapsed_ms,
         fast,
+        tokens_reported,
     });
     state.telemetry.record_with_account(
         timestamp,
@@ -975,6 +1003,106 @@ struct ResolvedRoute {
     provider_classes: Vec<ResolvedProviderClass>,
 }
 
+/// Text carried by a Responses content value: either a bare string or an
+/// array of typed text parts. Non-text parts (images, files) are dropped here
+/// because only system text is being hoisted out of `input`.
+fn responses_content_text(content: Option<&serde_json::Value>) -> Option<String> {
+    match content? {
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Array(parts) => {
+            let joined = parts
+                .iter()
+                .filter(|part| {
+                    matches!(
+                        part.get("type").and_then(serde_json::Value::as_str),
+                        Some("input_text" | "output_text" | "text")
+                    )
+                })
+                .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            (!joined.is_empty()).then_some(joined)
+        }
+        _ => None,
+    }
+}
+
+/// Shape a public Responses request for the strict Codex backend.
+///
+/// The public surface accepts envelope fields the Codex endpoint rejects, and
+/// Codex only reads a structured `input` array whose system text belongs in
+/// top-level `instructions`. Function calls, encrypted reasoning and every
+/// other item pass through byte-for-byte: this is a sanitizer, not a rebuild.
+fn normalize_native_codex_responses(body: &Bytes) -> Result<Bytes, String> {
+    let Ok(mut document) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return Ok(body.clone());
+    };
+    let Some(object) = document.as_object_mut() else {
+        return Ok(body.clone());
+    };
+    // Verified rejections: the Codex backend answers `Unsupported parameter`
+    // for these public-Responses envelope fields. Keyed prompt caching,
+    // streaming and no-store are the values it requires.
+    object.remove("metadata");
+    object.remove("truncation");
+    object.remove("max_output_tokens");
+    object.insert("stream".into(), serde_json::Value::Bool(true));
+    object.insert("store".into(), serde_json::Value::Bool(false));
+
+    let Some(input) = object.remove("input") else {
+        return Ok(Bytes::from(document.to_string()));
+    };
+    let items = match input {
+        serde_json::Value::String(text) => vec![serde_json::json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": text}],
+        })],
+        serde_json::Value::Array(items) => items,
+        other => {
+            object.insert("input".into(), other);
+            return Ok(Bytes::from(document.to_string()));
+        }
+    };
+
+    let mut system_text = Vec::new();
+    let mut kept = Vec::with_capacity(items.len());
+    for item in items {
+        let is_message = matches!(
+            item.get("type").and_then(serde_json::Value::as_str),
+            None | Some("message")
+        );
+        if is_message
+            && matches!(
+                item.get("role").and_then(serde_json::Value::as_str),
+                Some("system" | "developer")
+            )
+        {
+            if let Some(text) = responses_content_text(item.get("content")) {
+                if !text.trim().is_empty() {
+                    system_text.push(text);
+                }
+            }
+            continue;
+        }
+        kept.push(item);
+    }
+    if !system_text.is_empty() {
+        let hoisted = system_text.join("\n\n");
+        let merged = match object
+            .get("instructions")
+            .and_then(serde_json::Value::as_str)
+            .filter(|existing| !existing.trim().is_empty())
+        {
+            Some(existing) => format!("{hoisted}\n\n{existing}"),
+            None => hoisted,
+        };
+        object.insert("instructions".into(), serde_json::Value::String(merged));
+    }
+    object.insert("input".into(), serde_json::Value::Array(kept));
+    Ok(Bytes::from(document.to_string()))
+}
+
 fn normalize_developer_role(value: &mut serde_json::Value) {
     if let Some(messages) = value.get_mut("messages").and_then(|m| m.as_array_mut()) {
         for msg in messages {
@@ -1007,13 +1135,34 @@ fn body_with_model(body: &Bytes, model: &str) -> Bytes {
 
 fn openai_body_with_model(plan: &RelayPlan, model: &str) -> Option<serde_json::Value> {
     let mut body = plan.openai_body.clone()?;
-    // Internal translation marker (Anthropic tool_result origin); it never
-    // leaves the gateway.
+    // Internal translation markers never leave the gateway. A mid-conversation
+    // effort update is folded back into the ordinary `reasoning.effort` field:
+    // providers consuming this body have no `configuration_update` item, and
+    // their effort settings live outside the prompt prefix anyway.
+    let mut effort_update: Option<String> = None;
     if let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        messages.retain(|message| {
+            if let Some(effort) = message
+                .get("x_effort_update")
+                .and_then(serde_json::Value::as_str)
+            {
+                effort_update = Some(effort.to_string());
+                return false;
+            }
+            true
+        });
         for message in messages {
             if let Some(object) = message.as_object_mut() {
                 object.remove("x_anthropic_tool_result");
             }
+        }
+    }
+    if let Some(effort) = effort_update {
+        if let Some(object) = body.as_object_mut() {
+            object.insert(
+                "reasoning".to_string(),
+                serde_json::json!({"effort": effort}),
+            );
         }
     }
     if let Some(object) = body.as_object_mut() {
@@ -1042,10 +1191,32 @@ fn openai_body_with_model_keep_suffix(plan: &RelayPlan, model: &str) -> Option<s
         Some(suffix)
             if compat::request::parse_model_suffix(model).is_ok_and(|(_, s)| s.is_none()) =>
         {
-            openai_body_with_model(plan, &format!("{model}({suffix})"))
+            anthropic_openai_body(plan, &format!("{model}({suffix})"))
         }
-        _ => openai_body_with_model(plan, model),
+        _ => anthropic_openai_body(plan, model),
     }
+}
+
+/// The OpenAI-shaped body for a Claude upstream. Unlike the general helper this
+/// keeps the mid-conversation effort marker: `openai_to_anthropic` turns it into
+/// the beta-gated `role: "system"` effort message that preserves the cache.
+fn anthropic_openai_body(plan: &RelayPlan, model: &str) -> Option<serde_json::Value> {
+    let mut body = plan.openai_body.clone()?;
+    if let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        for message in messages {
+            if let Some(object) = message.as_object_mut() {
+                object.remove("x_anthropic_tool_result");
+            }
+        }
+    }
+    if let Some(object) = body.as_object_mut() {
+        object.insert(
+            "model".to_string(),
+            serde_json::Value::String(model.to_string()),
+        );
+    }
+    normalize_developer_role(&mut body);
+    Some(body)
 }
 
 /// Stable CLIProxyAPI-compatible session id: `-` + a 63-bit suffix of
@@ -1083,6 +1254,74 @@ fn body_session_anchor(body: &serde_json::Value) -> Option<String> {
     None
 }
 
+/// A Claude OAuth account whose messages go to api.anthropic.com itself gets
+/// the full Claude Code wire profile; relays (ccapi) keep the legacy shape.
+fn is_direct_claude_oauth(member: &AccountMember, state: &AppState) -> bool {
+    member.kind() == crate::account::ProviderKind::Claude
+        && member.relay_api_key().is_none()
+        && !state.settings.current().disable_claude_cloak_mode
+        && crate::claude_wire::is_direct_base(member.upstream_override.as_deref())
+}
+
+fn is_claude_member(member: &AccountMember) -> bool {
+    member.kind() == crate::account::ProviderKind::Claude && !member.is_nekos_relay()
+}
+
+/// Record the denial on the account. Enforcement (or a second plain denial
+/// inside the window) adds the account to the persisted suspected list, which
+/// only an operator clears.
+async fn handle_claude_denial(
+    state: &AppState,
+    member: &AccountMember,
+    status: u16,
+    message: &str,
+    denial: crate::claude_denial::Denial,
+) {
+    member.record_fail();
+    let now = now_unix_secs();
+    let promote = match denial {
+        crate::claude_denial::Denial::Enforcement => true,
+        crate::claude_denial::Denial::Denied => state.claude_denials.record(member.id(), now),
+        crate::claude_denial::Denial::Other => false,
+    };
+    if !promote {
+        state
+            .monitor
+            .record_error(member.id(), status, "claude permission denial");
+        return;
+    }
+    let reason = crate::claude_denial::enforcement_reason(status, message);
+    state.monitor.record_error(
+        member.id(),
+        status,
+        &format!("suspected enforcement: {reason}"),
+    );
+    tracing::warn!(account = %member.id(), %reason, "claude account benched as suspected");
+    state.claude_quarantine.insert(member.id());
+    let account = member.id().to_string();
+    let settings = Arc::clone(&state.settings);
+    let result = tokio::task::spawn_blocking(move || {
+        settings.mutate(|document| {
+            document.claude_suspected_accounts.insert(
+                account,
+                crate::management::settings::SuspectedAccount {
+                    reason,
+                    at_unix: now,
+                },
+            );
+        })
+    })
+    .await;
+    match result {
+        Ok(Err(err)) => tracing::warn!("failed to persist suspected claude account: {err}"),
+        Err(err) => tracing::warn!("suspected claude account persistence task failed: {err}"),
+        Ok(Ok(_)) => {}
+    }
+}
+
+// The relay resolves routing from these eight independent inputs; bundling
+// them into a struct would only move the same data behind one more layer.
+#[allow(clippy::too_many_arguments)]
 fn resolve_target(
     pool: &crate::state::PoolSnapshot,
     member: &AccountMember,
@@ -1091,6 +1330,7 @@ fn resolve_target(
     upstream_model: &str,
     session_affinity: Option<&str>,
     state: &AppState,
+    client_headers: &HeaderMap,
 ) -> Result<UpstreamTarget, String> {
     // Generic accounts keep the host on base_url. upstream_override is only a
     // redirect; ignoring base_url posts xAI chat at a relative path and never
@@ -1100,6 +1340,61 @@ fn resolve_target(
         member.upstream_override.as_deref(),
         stored_base.as_deref(),
     );
+    if is_direct_claude_oauth(member, state) {
+        let anthropic_val: serde_json::Value = if plan.mode == RelayMode::Anthropic {
+            let bytes = body_with_model(&plan.original_body, upstream_model);
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&bytes).unwrap_or_else(|_| serde_json::json!({}));
+            // A thinking suffix on the client's model (claude-x(2048)) is
+            // resolved exactly as on the translated paths (Task 5).
+            let requested = serde_json::from_slice::<serde_json::Value>(&plan.original_body)
+                .ok()
+                .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_string))
+                .unwrap_or_default();
+            compat::claude::apply_native_thinking_suffix(&requested, upstream_model, &mut value)?;
+            value
+        } else {
+            let openai =
+                openai_body_with_model_keep_suffix(plan, upstream_model).ok_or_else(|| {
+                    "Anthropic provider requires an OpenAI-shaped request".to_string()
+                })?;
+            compat::claude::openai_to_anthropic(&openai)?
+        };
+
+        let account_uuid = member.account_id().unwrap_or_default();
+        let wire_affinity = affinity_header(client_headers, true).or_else(|| {
+            match body_affinity_material(&plan.original_body) {
+                Some(BodyAffinity::Id(id)) => Some(id),
+                Some(BodyAffinity::FirstUser(_)) | None => None,
+            }
+        });
+        let mut wire = crate::claude_wire::build_with_headers(
+            anthropic_val,
+            &crate::claude_wire::Identity {
+                account_key: member.id(),
+                account_uuid: &account_uuid,
+                session_affinity: wire_affinity.as_deref(),
+                device_id: member.claude_device_id(),
+            },
+            Some(client_headers),
+            crate::claude_wire::is_subagent(client_headers),
+        )?;
+        if plan.mode == RelayMode::Anthropic {
+            crate::claude_wire::preserve_native_bytes(&mut wire, &plan.original_body)?;
+        }
+        let mut headers = wire.headers;
+        if let Some(auth) = headers.iter_mut().find(|(k, _)| k == "authorization") {
+            auth.1 = format!("Bearer {}", selected_token);
+        }
+        return Ok(UpstreamTarget {
+            url: crate::claude_wire::messages_url(member.upstream_override.as_deref()),
+            body: Bytes::from(wire.body),
+            protocol: compat::Protocol::Anthropic,
+            headers: Some(headers),
+            replay: None,
+        });
+    }
+
     if plan.mode == RelayMode::Image {
         let base = upstream.unwrap_or_default();
         return Ok(UpstreamTarget {
@@ -1197,7 +1492,7 @@ fn resolve_target(
             .map_err(|e| format!("invalid gemini request: {e}"))?;
         let model = upstream_model.to_string();
         let session_id = session_affinity.map(session_digest);
-        let mut inner = gemini.clone();
+        let mut inner = gemini;
         if let Some(obj) = inner.as_object_mut() {
             obj.remove("model");
             obj.remove("stream");
@@ -1207,7 +1502,10 @@ fn resolve_target(
                 obj.insert("sessionId".to_string(), serde_json::json!(session_id));
             }
         }
-        let wrapped = crate::v1beta::wrap_for_antigravity(&model, &project, &inner);
+        // Claude-ness follows the model identity; the step count is separate.
+        let labels = crate::v1beta::labels_for(member, &model, model.starts_with("claude-"));
+        let wrapped =
+            crate::v1beta::wrap_for_antigravity_with_labels(&model, &project, &inner, &labels);
         return Ok(UpstreamTarget {
             url: crate::url::build_antigravity_url(upstream),
             body: Bytes::from(wrapped.to_string()),
@@ -1293,8 +1591,14 @@ fn resolve_target(
             let path = format!(
                 "/v1/projects/{project}/locations/{location}/publishers/google/models/{model}:{action}"
             );
+            // Vertex publishes per-location hosts; the global host rejects a
+            // regional resource path.
+            let url = match upstream {
+                Some(base) => crate::url::join_provider_path(base, &path),
+                None => format!("{}{path}", crate::url::vertex_base_url(&location)),
+            };
             return Ok(UpstreamTarget {
-                url: crate::url::build_provider_url(member.kind(), upstream, &path),
+                url,
                 body: Bytes::from({
                     let mut gemini = compat::gemini::openai_to_gemini(&openai)?;
                     apply_vertex_thinking(plan, model, &mut gemini)?;
@@ -1391,9 +1695,38 @@ fn resolve_target(
                     replay: None,
                 });
             }
-            let openai_body = openai_body_with_model(plan, upstream_model)
-                .ok_or_else(|| "generic adapter requires OpenAI-compatible input".to_string())?;
+            if plan.openai_body.is_none() {
+                return Err("generic adapter requires OpenAI-compatible input".to_string());
+            }
+            let openai_body = || {
+                openai_body_with_model(plan, upstream_model)
+                    .ok_or_else(|| "generic adapter requires OpenAI-compatible input".to_string())
+            };
+            if adapter == "command-code" {
+                let openai_body = openai_body()?;
+                let session_id = session_affinity
+                    .map(str::to_string)
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                return Ok(UpstreamTarget {
+                    url: crate::url::join_provider_path(
+                        upstream.unwrap_or("https://api.commandcode.ai"),
+                        "/alpha/generate",
+                    ),
+                    body: Bytes::from(
+                        compat::command_code::openai_to_command_code(&openai_body)?.to_string(),
+                    ),
+                    protocol: compat::Protocol::CommandCode,
+                    headers: Some(
+                        compat::command_code::command_code_headers(selected_token, &session_id)
+                            .into_iter()
+                            .map(|(name, value)| (name.to_string(), value))
+                            .collect(),
+                    ),
+                    replay: None,
+                });
+            }
             if adapter == "google" {
+                let openai_body = openai_body()?;
                 let model = openai_body
                     .get("model")
                     .and_then(serde_json::Value::as_str)
@@ -1413,6 +1746,9 @@ fn resolve_target(
                 });
             }
             if adapter == "anthropic" {
+                let openai_body = openai_body()?;
+                // The translator enforces the cache-breakpoint cap itself, so
+                // this branch needs no extra step.
                 return Ok(UpstreamTarget {
                     url: crate::url::build_provider_url(member.kind(), upstream, "/v1/messages"),
                     body: Bytes::from(
@@ -1432,7 +1768,7 @@ fn resolve_target(
                             .to_string(),
                     );
                 }
-                let mut body = openai_body.clone();
+                let mut body = openai_body()?;
                 compat::mimo::inject_system_marker(&mut body);
                 return Ok(UpstreamTarget {
                     url: endpoint,
@@ -1460,14 +1796,31 @@ fn resolve_target(
                     replay: None,
                 });
             }
+            // A Responses request is not a chat request: forwarding the
+            // client document verbatim would put `input` on a wire that only
+            // reads `messages`. The translated body is the chat-shaped one.
+            let chat_body = match plan.mode {
+                RelayMode::Responses => plan
+                    .openai_body
+                    .clone()
+                    .map(|mut body| {
+                        normalize_developer_role(&mut body);
+                        body["model"] = serde_json::Value::String(upstream_model.to_string());
+                        Bytes::from(body.to_string())
+                    })
+                    .unwrap_or_else(|| body_with_model(&plan.original_body, upstream_model)),
+                _ => body_with_model(&plan.original_body, upstream_model),
+            };
             return Ok(UpstreamTarget {
                 url: crate::url::build_provider_url(
                     member.kind(),
                     upstream,
                     "/v1/chat/completions",
                 ),
-                body: body_with_model(&plan.original_body, upstream_model),
-                protocol: compat::Protocol::Codex,
+                body: chat_body,
+                // A chat upstream answers with choices[].delta, which the
+                // Responses decoder does not understand.
+                protocol: compat::Protocol::Chat,
                 headers: None,
                 replay: None,
             });
@@ -1542,8 +1895,16 @@ fn resolve_target(
                 && !member.is_nekos_relay()
                 && member.relay_api_key().is_none()
             {
-                compat::claude::ensure_claude_code_system_instruction(&mut anthropic_val);
-                compat::claude::apply_prompt_cache_breakpoints(&mut anthropic_val);
+                if !state.settings.current().disable_claude_cloak_mode {
+                    compat::claude::ensure_claude_code_system_instruction(&mut anthropic_val);
+                    compat::claude::apply_prompt_cache_breakpoints(&mut anthropic_val);
+                }
+                if let Some(metadata) = anthropic_val
+                    .get_mut("metadata")
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    metadata.remove("user_id");
+                }
                 if let Some(session) = session_affinity {
                     if let Some(found) = state.claude_prefix_watch.observe(session, &anthropic_val)
                     {
@@ -1574,6 +1935,16 @@ fn resolve_target(
                 );
             }
 
+            // Anthropic answers a fifth cache_control breakpoint with HTTP 400.
+            // Every Anthropic-shaped body built in THIS branch (subscription,
+            // relay, Zcode) leaves here, so the cap runs last: after the
+            // path-specific placement above may have added its own markers. The
+            // Generic anthropic adapter returns earlier and is capped by the
+            // translator itself.
+            compat::claude::enforce_cache_control_limit(
+                &mut anthropic_val,
+                compat::claude::MAX_CACHE_BREAKPOINTS,
+            );
             let body = Bytes::from(serde_json::to_vec(&anthropic_val).map_err(|e| e.to_string())?);
             return Ok(UpstreamTarget {
                 url: crate::url::build_provider_url(member.kind(), upstream, "/v1/messages"),
@@ -1611,6 +1982,14 @@ fn resolve_target(
         Some(replay) => compat::openai_to_antigravity_with_replay(&openai_body, &project, replay)?,
         None => compat::openai_to_antigravity(&openai_body, &project)?,
     };
+    // The enum and vendor flags describe the upstream model, so they are
+    // looked up by the catalog key rather than derived from the name.
+    let translated = crate::v1beta::apply_catalog_labels(
+        translated,
+        member,
+        upstream_model,
+        compat::gemini::openai_request_uses_claude(&openai_body),
+    );
 
     Ok(UpstreamTarget {
         url: crate::url::build_antigravity_url(upstream),
@@ -1671,6 +2050,32 @@ impl UpstreamSendError {
     }
 }
 
+fn uncloaked_claude_headers(
+    member_headers: Vec<(String, String)>,
+    client_headers: &HeaderMap,
+) -> Vec<(String, String)> {
+    let mut kept: Vec<(String, String)> = member_headers
+        .into_iter()
+        .filter(|(name, _)| {
+            matches!(
+                name.as_str(),
+                "authorization" | "anthropic-version" | "content-type"
+            )
+        })
+        .collect();
+    kept.push(("anthropic-beta".to_string(), "oauth-2025-04-20".to_string()));
+    for (name, value) in client_headers {
+        let name = name.as_str();
+        if !(name == "user-agent" || name == "x-app" || name.starts_with("x-stainless-")) {
+            continue;
+        }
+        if let Ok(value) = value.to_str() {
+            kept.push((name.to_string(), value.to_string()));
+        }
+    }
+    kept
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn send_upstream(
     state: &AppState,
@@ -1697,9 +2102,28 @@ async fn send_upstream(
         member.build_upstream_headers()
     };
 
+    // W4: with cloaking off a Claude OAuth request carries no gateway-chosen
+    // identity: only auth, version, the OAuth beta, and whatever identity the
+    // client itself sent.
+    if custom_headers.is_none()
+        && member.kind() == crate::account::ProviderKind::Claude
+        && !member.is_nekos_relay()
+        && member.relay_api_key().is_none()
+        && state.settings.current().disable_claude_cloak_mode
+    {
+        member_headers = uncloaked_claude_headers(member_headers, headers);
+    }
+
+    let claude_direct = protocol == compat::Protocol::Anthropic
+        && custom_headers.is_some()
+        && is_direct_claude_oauth(member, state);
     // If client provided anthropic-beta headers, merge them with member headers
     // so client-requested beta features (e.g. prompt-caching, output-128k) are preserved.
-    if let Some(client_beta) = headers.get("anthropic-beta").and_then(|v| v.to_str().ok()) {
+    if let Some(client_beta) = headers
+        .get("anthropic-beta")
+        .and_then(|v| v.to_str().ok())
+        .filter(|_| !claude_direct)
+    {
         if let Some((_, val)) = member_headers
             .iter_mut()
             .find(|(k, _)| k == "anthropic-beta")
@@ -1715,6 +2139,20 @@ async fn send_upstream(
         } else if member.kind() == crate::account::ProviderKind::Claude {
             member_headers.push(("anthropic-beta".to_string(), client_beta.to_string()));
         }
+    }
+
+    // The translated body may itself require a beta: a per-message
+    // `output_config.effort` (the cache-preserving effort switch) is rejected
+    // outright by Anthropic unless this header rides along, and the client
+    // never sent it because the gateway synthesized the message.
+    if protocol == compat::Protocol::Anthropic
+        && !claude_direct
+        && compat::claude::uses_mid_conversation_effort_bytes(body_bytes)
+    {
+        merge_beta_header(
+            &mut member_headers,
+            compat::claude::MID_CONVERSATION_EFFORT_BETA,
+        );
     }
 
     // ChatGPT-backend prompt-cache affinity rides the session_id HEADER (codex
@@ -1755,7 +2193,9 @@ async fn send_upstream(
             solve_gate: &state.captcha_solve_gate,
         }
     });
-    strip_ingress_headers(&mut member_headers, headers);
+    if protocol != compat::Protocol::CommandCode {
+        strip_ingress_headers(&mut member_headers, headers);
+    }
     let member_sets_content_type = member_headers
         .iter()
         .any(|(name, _)| name.eq_ignore_ascii_case("content-type"));
@@ -1768,7 +2208,7 @@ async fn send_upstream(
             accept.unwrap_or(compat::devin::STREAM_CONTENT_TYPE),
         );
     } else {
-        if let Some(accept) = accept {
+        if let Some(accept) = accept.filter(|_| !claude_direct) {
             req_builder = req_builder.header(header::ACCEPT, accept);
         }
         // reqwest appends. x.ai's edge answers 415 when content-type is
@@ -2042,6 +2482,17 @@ fn rebuild_plan_response(
     )
 }
 
+fn rebuild_response(failure: FinalFailure) -> reqwest::Response {
+    let mut builder = http::Response::builder().status(failure.status);
+    if let Some(content_type) = failure.content_type {
+        builder = builder.header(header::CONTENT_TYPE, content_type);
+    }
+    builder
+        .body(failure.body)
+        .map(reqwest::Response::from)
+        .unwrap_or_else(|_| reqwest::Response::from(http::Response::new(Bytes::new())))
+}
+
 async fn extract_failure(resp: reqwest::Response, status_code: u16) -> FinalFailure {
     let content_type = resp
         .headers()
@@ -2097,6 +2548,36 @@ fn cooldown_deadline_ms(now_ms: i64, retry_after_secs: i64) -> i64 {
     now_ms.saturating_add(bounded.saturating_mul(1000))
 }
 
+/// Parses a Retry-After header value in either RFC 9110 form: an integer
+/// number of seconds, or an HTTP-date. The date form is honoured because an
+/// upstream that sends it expects the account to return at that instant;
+/// falling back to the fixed default would release it early (or bench it past
+/// the stated window). Obsolete RFC 850 / asctime forms are accepted too,
+/// since HTTP-date explicitly allows them.
+fn parse_retry_after(value: &str, now_ms: i64) -> Option<i64> {
+    if let Ok(secs) = value.parse::<i64>() {
+        return Some(secs.max(0));
+    }
+    let deadline_ms = chrono::DateTime::parse_from_rfc2822(value)
+        .map(|at| at.timestamp_millis())
+        .or_else(|_| {
+            // RFC 850 form. chrono's %y maps two-digit years into the
+            // nearest century, which is enough for a cooldown deadline: the
+            // MAX_COOLDOWN_SECS clamp bounds any century misread.
+            chrono::NaiveDateTime::parse_from_str(value, "%A, %d-%b-%y %H:%M:%S GMT")
+                .map(|at| at.and_utc().timestamp_millis())
+        })
+        .or_else(|_| {
+            // asctime carries no zone; HTTP-date defines it as GMT.
+            chrono::NaiveDateTime::parse_from_str(value, "%a %b %e %H:%M:%S %Y")
+                .map(|at| at.and_utc().timestamp_millis())
+        })
+        .ok()?;
+    // Round up so a sub-second remainder does not shorten the stated delay.
+    let delay_ms = deadline_ms.saturating_sub(now_ms);
+    Some(delay_ms.max(0).saturating_add(999) / 1000)
+}
+
 pub fn cooldown_deadline_from_headers(headers: &reqwest::header::HeaderMap, now_ms: i64) -> i64 {
     let now_unix = now_ms / 1000;
     // Prefer an explicit Retry-After, then a reset timestamp the Codex quota
@@ -2106,7 +2587,7 @@ pub fn cooldown_deadline_from_headers(headers: &reqwest::header::HeaderMap, now_
     let retry_after_secs = headers
         .get(reqwest::header::RETRY_AFTER)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.trim().parse::<i64>().ok())
+        .and_then(|v| parse_retry_after(v.trim(), now_ms))
         .or_else(|| {
             headers
                 .iter()
@@ -2214,6 +2695,22 @@ fn failure_is_limit_exhaustion(body: &[u8]) -> bool {
         })
         .map(|code| code == mahoquot_providers::zcode::PLAN_QUOTA_BIZ_CODE)
         .unwrap_or(false)
+}
+
+/// A 400 whose body says the request itself was too large for the upstream
+/// (kiro answers `CONTENT_LENGTH_EXCEEDS_THRESHOLD`).
+///
+/// This is a property of the payload, not of the account that happened to
+/// serve it: every peer would reject the same bytes. It must therefore bypass
+/// account-fault accounting, or the pool slowly attributes one oversized
+/// conversation to whichever account drew it. The body is still forwarded so
+/// the client sees the real reason instead of a bare status code.
+fn failure_is_request_too_large(body: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(body) else {
+        return false;
+    };
+    text.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD")
+        || text.contains("Input content length exceeds threshold")
 }
 
 /// Cline answers 402 `insufficient_credits` when a free-tier account's
@@ -2550,7 +3047,280 @@ fn content_type_of(resp: &reqwest::Response) -> Option<String> {
         .map(ToString::to_string)
 }
 
+/// Downstream SSE dialect of a raw passthrough. Only the terminal event is
+/// inspected: the bytes themselves are copied unchanged.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RawSseWire {
+    Chat,
+    Responses,
+    Anthropic,
+    Gemini,
+}
+
+/// Which terminal event a raw passthrough client waits for. A wire with no
+/// known terminal (image, token count) is not inspected at all.
+fn raw_sse_wire(plan: &RelayPlan) -> Option<RawSseWire> {
+    match plan.mode {
+        RelayMode::Native | RelayMode::Responses => Some(RawSseWire::Responses),
+        RelayMode::GeminiNative => Some(RawSseWire::Gemini),
+        RelayMode::Anthropic => Some(RawSseWire::Anthropic),
+        RelayMode::OpenAiCompat | RelayMode::LegacyCompletions => Some(RawSseWire::Chat),
+        RelayMode::Image | RelayMode::GeminiCountTokens => None,
+    }
+}
+
+#[derive(Default)]
+struct SseTerminalScan {
+    /// Only inspection is buffered; the relay forwards the original chunks.
+    carry: Vec<u8>,
+    discarding_frame: bool,
+    saw_terminal: bool,
+}
+
+impl SseTerminalScan {
+    fn observe(&mut self, chunk: &[u8], wire: RawSseWire) {
+        if self.saw_terminal {
+            return;
+        }
+        // Oversized frames cannot prove completion. Discard through their
+        // delimiter rather than mistaking a suffix for a fresh SSE frame.
+        const MAX_FRAME_BYTES: usize = 64 * 1024;
+        for &byte in chunk {
+            self.carry.push(byte);
+            let delimiter = self.carry.ends_with(b"\n\n") || self.carry.ends_with(b"\r\n\r\n");
+            if delimiter {
+                if !self.discarding_frame && Self::frame_is_terminal(&self.carry, wire) {
+                    self.saw_terminal = true;
+                    self.carry.clear();
+                    return;
+                }
+                self.carry.clear();
+                self.discarding_frame = false;
+            } else if self.discarding_frame || self.carry.len() >= MAX_FRAME_BYTES {
+                self.discarding_frame = true;
+                let keep = self.carry.len().saturating_sub(3);
+                self.carry.drain(..keep);
+            }
+        }
+    }
+
+    fn frame_is_terminal(frame: &[u8], wire: RawSseWire) -> bool {
+        use serde_json::Value;
+
+        let Ok(text) = std::str::from_utf8(frame) else {
+            return false;
+        };
+        let mut event = None;
+        let mut data = Vec::new();
+        for line in text.lines() {
+            if let Some(value) = line.strip_prefix("event:") {
+                event = Some(value.strip_prefix(' ').unwrap_or(value));
+            } else if let Some(value) = line.strip_prefix("data:") {
+                data.push(value.strip_prefix(' ').unwrap_or(value));
+            }
+        }
+        let data = data.join("\n");
+        let value = serde_json::from_str::<Value>(&data).ok();
+        let event_type = event.or_else(|| value.as_ref()?.get("type")?.as_str());
+        match wire {
+            // Some Codex-compatible upstreams end the stream with the chat
+            // sentinel instead of a event; that is still an explicit terminator.
+            RawSseWire::Responses => {
+                data == "[DONE]"
+                    || matches!(
+                        event_type,
+                        Some("response.completed" | "response.incomplete")
+                    )
+            }
+            RawSseWire::Anthropic => event_type == Some("message_stop"),
+            RawSseWire::Chat => {
+                data == "[DONE]"
+                    || value.as_ref().is_some_and(|value| {
+                        value.is_object()
+                            && (value.get("finish_reason").is_some_and(Value::is_string)
+                                || value.get("choices").and_then(Value::as_array).is_some_and(
+                                    |choices| {
+                                        choices.iter().any(|choice| {
+                                            choice
+                                                .get("finish_reason")
+                                                .is_some_and(Value::is_string)
+                                        })
+                                    },
+                                ))
+                    })
+            }
+            RawSseWire::Gemini => value.as_ref().is_some_and(|value| {
+                value
+                    .get("candidates")
+                    .and_then(Value::as_array)
+                    .is_some_and(|candidates| {
+                        candidates.iter().any(|candidate| {
+                            candidate.get("finishReason").is_some_and(Value::is_string)
+                        })
+                    })
+            }),
+        }
+    }
+}
+
+/// Copy a raw upstream body after proving it is a real event stream.
+///
+/// Two guarantees a direct copy lacks: an SSE response whose stream is already
+/// empty fails here, before the client sees HTTP 200, so the dispatcher can
+/// still fail over; and an SSE body that ends without its terminal event
+/// becomes a transport error at the client instead of a clean success.
+/// Non-SSE bodies keep their exact bytes.
+async fn raw_stream_response(
+    resp: reqwest::Response,
+    status_code: u16,
+    wire: Option<RawSseWire>,
+    deadline: std::time::Duration,
+) -> Result<Response, String> {
+    let Some(wire) = wire else {
+        return Ok(stream_response(resp, status_code));
+    };
+    if !content_type_of(&resp)
+        .as_deref()
+        .is_some_and(|ct| ct.trim_start().starts_with("text/event-stream"))
+    {
+        return Ok(stream_response(resp, status_code));
+    }
+    let mut upstream: compat::UpstreamStream = Box::pin(resp.bytes_stream());
+    let first = match tokio::time::timeout(deadline, upstream.next()).await {
+        Err(_) => return Err("upstream request timed out during preflight".to_string()),
+        Ok(None) => return Err("upstream SSE ended before delivering any event".to_string()),
+        Ok(Some(Err(error))) => return Err(error.to_string()),
+        Ok(Some(Ok(first))) => first,
+    };
+    // The preflight chunk is replayed through `source` below, so it must be
+    // observed there exactly once: scanning it here as well would duplicate
+    // its prefix and corrupt a terminal frame split across the first chunks.
+    let source = futures::stream::once(async { Ok::<Bytes, std::io::Error>(first) })
+        .chain(upstream.map(|chunk| chunk.map_err(std::io::Error::other)));
+    let observed = terminated_raw_stream(Box::pin(source), wire);
+    Ok(Response::builder()
+        .status(StatusCode::from_u16(status_code).unwrap_or(StatusCode::OK))
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from_stream(observed))
+        .unwrap_or_else(|_| {
+            (StatusCode::INTERNAL_SERVER_ERROR, "failed to build body").into_response()
+        }))
+}
+
+/// Wrap an upstream byte stream so a clean EOF is legitimate only after the
+/// scanner proved a terminal SSE event. Each chunk is observed exactly once.
+fn terminated_raw_stream<S>(
+    source: S,
+    wire: RawSseWire,
+) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>>
+where
+    S: futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+{
+    futures::stream::unfold(
+        (
+            Box::pin(source),
+            SseTerminalScan::default(),
+            /* done */ false,
+        ),
+        move |(mut source, mut scan, mut done)| async move {
+            match source.next().await {
+                Some(Ok(chunk)) => {
+                    scan.observe(&chunk, wire);
+                    done |= scan.saw_terminal;
+                    Some((Ok(chunk), (source, scan, done)))
+                }
+                Some(Err(error)) => Some((Err(error), (source, scan, done))),
+                None if done => None,
+                // A clean EOF is legitimate only after a terminal event.
+                None => Some((
+                    Err(std::io::Error::other(
+                        "upstream SSE ended before a terminal event",
+                    )),
+                    (source, scan, true),
+                )),
+            }
+        },
+    )
+}
+
+/// Scans the leading bytes of an SSE stream for an upstream enforcement
+/// error without touching what the client receives. Best effort: only
+/// complete frames inside the first 64 KiB are classified.
+#[derive(Debug, Default)]
+struct SseFrameScanner {
+    leading: Vec<u8>,
+    seen: usize,
+    done: bool,
+}
+
+impl SseFrameScanner {
+    const LIMIT: usize = 64 * 1024;
+
+    /// Feed one chunk. Returns the matching frame once, then stops scanning.
+    fn push(&mut self, chunk: &[u8]) -> Option<String> {
+        if self.done || self.seen >= Self::LIMIT {
+            return None;
+        }
+        let take = chunk.len().min(Self::LIMIT - self.seen);
+        self.leading.extend_from_slice(&chunk[..take]);
+        self.seen += take;
+        // Inspect complete SSE frames only; chunk boundaries are not frame
+        // boundaries.
+        while let Some((end, delimiter)) = self
+            .leading
+            .windows(2)
+            .position(|w| w == b"\n\n")
+            .map(|end| (end, 2))
+            .into_iter()
+            .chain(
+                self.leading
+                    .windows(4)
+                    .position(|w| w == b"\r\n\r\n")
+                    .map(|end| (end, 4)),
+            )
+            .min_by_key(|(end, _)| *end)
+        {
+            let frame = String::from_utf8_lossy(&self.leading[..end]).into_owned();
+            let matched = is_enforcement_event(&frame);
+            self.leading.drain(..end + delimiter);
+            if matched {
+                self.done = true;
+                self.leading.clear();
+                return Some(frame);
+            }
+        }
+        if self.seen >= Self::LIMIT {
+            self.done = true;
+            self.leading.clear();
+        }
+        None
+    }
+}
+
+fn is_enforcement_event(frame: &str) -> bool {
+    let error_event = frame.lines().any(|line| {
+        line.strip_prefix("event:")
+            .is_some_and(|event| event.trim() == "error")
+    });
+    if !error_event {
+        return false;
+    }
+    let lowered = frame.to_ascii_lowercase();
+    lowered.contains("permission_error")
+        || lowered.contains("enforcement")
+        || crate::claude_denial::is_enforcement_text(frame)
+}
+
 fn stream_response(resp: reqwest::Response, status_code: u16) -> Response {
+    stream_response_observed(resp, status_code, None::<fn(String)>)
+}
+
+fn stream_response_observed(
+    resp: reqwest::Response,
+    status_code: u16,
+    observe: Option<impl FnOnce(String) + Send + 'static>,
+) -> Response {
     let status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::OK);
     let mut res_builder = Response::builder().status(status);
     if let Some(ct) = resp.headers().get(reqwest::header::CONTENT_TYPE) {
@@ -2558,11 +3328,75 @@ fn stream_response(resp: reqwest::Response, status_code: u16) -> Response {
             res_builder = res_builder.header(header::CONTENT_TYPE, v);
         }
     }
+    let mut observe = observe;
+    let mut scanner = SseFrameScanner::default();
+    let stream = resp.bytes_stream().inspect(move |chunk| {
+        if observe.is_none() {
+            return;
+        }
+        let Ok(chunk) = chunk else { return };
+        if let Some(frame) = scanner.push(chunk) {
+            if let Some(observe) = observe.take() {
+                observe(frame);
+            }
+        }
+    });
     res_builder
-        .body(Body::from_stream(resp.bytes_stream()))
+        .body(Body::from_stream(stream))
         .unwrap_or_else(|_| {
             (StatusCode::INTERNAL_SERVER_ERROR, "failed to build body").into_response()
         })
+}
+
+/// Watches the head of a relayed stream for a model substitution.
+///
+/// The passthrough branch relays upstream bytes unchanged, so the log line and
+/// the history row would attribute the turn to the *requested* model even when
+/// the upstream answered with another one. The scan is bounded to the head of
+/// the stream and never delays a chunk: once the model is seen, or the budget
+/// is spent, the tap stops inspecting and only forwards.
+fn observe_served_model(
+    body: Body,
+    requested: String,
+    account: String,
+    provider: String,
+    substitutions: Arc<AtomicU64>,
+) -> Body {
+    const OBSERVE_BUDGET: usize = 16 * 1024;
+    let mut seen = 0usize;
+    let mut decided = false;
+    let mut head: Vec<u8> = Vec::new();
+    let tapped = body.into_data_stream().map(move |chunk| {
+        if !decided {
+            if let Ok(bytes) = &chunk {
+                if seen < OBSERVE_BUDGET {
+                    let take = bytes.len().min(OBSERVE_BUDGET - seen);
+                    head.extend_from_slice(&bytes[..take]);
+                    seen += take;
+                }
+                let served = compat::served_codex_model(&head);
+                if let Some(served) = served {
+                    decided = true;
+                    head.clear();
+                    if served != requested {
+                        substitutions.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(
+                            requested_model = %requested,
+                            served_model = %served,
+                            %account,
+                            %provider,
+                            "upstream served a different model than requested"
+                        );
+                    }
+                } else if seen >= OBSERVE_BUDGET {
+                    decided = true;
+                    head.clear();
+                }
+            }
+        }
+        chunk
+    });
+    Body::from_stream(tapped)
 }
 
 fn body_response(status: StatusCode, content_type: Option<&str>, body: Bytes) -> Response {
@@ -2805,6 +3639,9 @@ fn prepare_native_replay(
         return None;
     }
     let adapter = member.generic_adapter()?;
+    if adapter != "xai" && !(adapter == "kimi" && protocol == compat::Protocol::Anthropic) {
+        return None;
+    }
     // Unauthenticated local callers still get a stable, non-empty principal.
     let caller = caller.filter(|c| !c.trim().is_empty()).unwrap_or("local");
     let session = session?;
@@ -2952,8 +3789,11 @@ fn final_anthropic_message(bytes: &[u8]) -> Option<serde_json::Value> {
                 let block = blocks.get_mut(index?)?;
                 let delta = &event["delta"];
                 let append = |block: &mut serde_json::Value, key: &str, text: &str| {
-                    let current = block[key].as_str().unwrap_or_default().to_string();
-                    block[key] = serde_json::Value::String(current + text);
+                    if let Some(serde_json::Value::String(current)) = block.get_mut(key) {
+                        current.push_str(text);
+                    } else {
+                        block[key] = serde_json::Value::String(text.to_string());
+                    }
                 };
                 match delta["type"].as_str() {
                     Some("text_delta") => append(block, "text", delta["text"].as_str()?),
@@ -3158,16 +3998,27 @@ fn build_plan(
     prompt_cache_key: Option<&str>,
 ) -> Result<RelayPlan, String> {
     match mode {
-        RelayMode::Native => Ok(RelayPlan {
-            upstream_path: req_path.to_string(),
-            model: compat::extract_model(&body_bytes),
-            body: body_bytes.clone(),
-            mode,
-            client_stream: true,
-            include_usage: false,
-            openai_body: None,
-            original_body: body_bytes.clone(),
-        }),
+        RelayMode::Native => {
+            // The native Responses passthrough targets the strict Codex
+            // backend, which rejects public-Responses envelope fields that
+            // other providers accept. Compact and alpha/search are different
+            // endpoints and keep the client document verbatim.
+            let body = if req_path == crate::cp_routes::CODEX_RESPONSES_PATH {
+                normalize_native_codex_responses(&body_bytes)?
+            } else {
+                body_bytes.clone()
+            };
+            Ok(RelayPlan {
+                upstream_path: req_path.to_string(),
+                model: compat::extract_model(&body),
+                body,
+                mode,
+                client_stream: true,
+                include_usage: false,
+                openai_body: None,
+                original_body: body_bytes.clone(),
+            })
+        }
         RelayMode::GeminiCountTokens | RelayMode::Image => Ok(RelayPlan {
             upstream_path: req_path.to_string(),
             model: compat::extract_model(&body_bytes),
@@ -3506,6 +4357,114 @@ fn resolve_route(
     }))
 }
 
+fn claude_account_permitted(member: &AccountMember, state: &AppState) -> bool {
+    if !is_claude_member(member) {
+        return true;
+    }
+    let settings = state.settings.current();
+    if settings.claude_suspected_accounts.contains_key(member.id())
+        || state.claude_quarantine.contains(member.id())
+        || state.claude_egress_invalid(member)
+    {
+        return false;
+    }
+    if member.relay_api_key().is_some() {
+        return !state
+            .claude_budgets
+            .is_over(&settings.claude_api_key_budgets, member.id());
+    }
+    settings.claude_route_mode != crate::management::settings::ClaudeRouteMode::ApiKeyOnly
+}
+
+fn is_claude_oauth(member: &AccountMember) -> bool {
+    member.kind() == crate::account::ProviderKind::Claude
+        && !member.is_nekos_relay()
+        && member.relay_api_key().is_none()
+}
+
+/// A Claude bound cooldown at most this long holds the session (429) rather
+/// than moving it to an account without its prompt cache.
+const BOUND_COOLDOWN_HOLD_MS: i64 = 120_000;
+
+fn route_serves_claude(route: Option<&ResolvedRoute>) -> bool {
+    route.is_none_or(|route| {
+        route
+            .provider_classes
+            .iter()
+            .any(|p| p.binding.provider_id == mahoquot_registry::ProviderId::claude())
+    })
+}
+
+enum BoundMember {
+    Eligible,
+    ShortCooldown { retry_after_secs: i64 },
+    Unusable,
+}
+
+/// Where the durable binding stands for this request. The bound account must
+/// be a Claude OAuth member that passes this request's model and key scope;
+/// a plain-429 cooldown ending within two minutes holds the session.
+#[allow(clippy::too_many_arguments)]
+fn bound_member_state(
+    pool: &crate::state::PoolSnapshot,
+    route: Option<&ResolvedRoute>,
+    requested_model: Option<&str>,
+    bound_id: &str,
+    eligible: &[usize],
+    api_key_binding: Option<&crate::management::settings::ApiKeyBinding>,
+    scoped_key: Option<&crate::management::settings::ScopedApiKey>,
+    state: &AppState,
+    now_ms: i64,
+) -> BoundMember {
+    let Some(index) = pool.members.iter().position(|m| m.id() == bound_id) else {
+        return BoundMember::Unusable;
+    };
+    let member = &pool.members[index];
+    if !is_claude_oauth(member) {
+        return BoundMember::Unusable;
+    }
+    if eligible.contains(&index) {
+        return BoundMember::Eligible;
+    }
+    let Health::Cooldown { until_unix_ms } = member.health() else {
+        return BoundMember::Unusable;
+    };
+    let remaining_ms = until_unix_ms - now_ms;
+    if remaining_ms <= 0 || remaining_ms > BOUND_COOLDOWN_HOLD_MS {
+        return BoundMember::Unusable;
+    }
+    // Same request filters, health aside: the binding counts only if the
+    // account would serve this request once its cooldown ends.
+    if !member_matches_api_key_binding(member, api_key_binding)
+        || !crate::models_route::member_matches_scope(member, scoped_key)
+        || !claude_account_permitted(member, state)
+        || member
+            .usage_snapshot()
+            .is_claude_included_quota_exhausted(now_ms / 1000)
+    {
+        return BoundMember::Unusable;
+    }
+    if let Some(route) = route {
+        let model = requested_model.unwrap_or(&route.canonical_model);
+        let declared = route.provider_classes.iter().any(|provider| {
+            member_provider_id(member).as_ref() == Some(&provider.binding.provider_id)
+                && account_declares_binding_model(
+                    pool,
+                    member,
+                    model,
+                    &route.canonical_model,
+                    provider,
+                )
+        });
+        if !declared || !member.group_available(&route.canonical_model, until_unix_ms) {
+            return BoundMember::Unusable;
+        }
+    }
+    BoundMember::ShortCooldown {
+        retry_after_secs: (remaining_ms + 999) / 1000,
+    }
+}
+
 fn eligible_indices(
     pool: &crate::state::PoolSnapshot,
     route: Option<&ResolvedRoute>,
@@ -3523,6 +4482,7 @@ fn eligible_indices(
             .members
             .iter()
             .enumerate()
+            .filter(|(_, member)| claude_account_permitted(member, state))
             .filter(|(_, member)| member.health().is_available(now_ms))
             .filter(|(_, member)| state.scheduler.permits(member.id()))
             .filter(|(_, member)| member_matches_api_key_binding(member, api_key_binding))
@@ -3576,6 +4536,9 @@ fn eligible_indices(
     // same behaviour the pre-regression code had.
     let mut ranked: Vec<(usize, i32)> = Vec::new();
     for (index, member) in pool.members.iter().enumerate() {
+        if !claude_account_permitted(member, state) {
+            continue;
+        }
         if !member.health().is_available(now_ms) {
             continue;
         }
@@ -3659,6 +4622,11 @@ fn eligible_indices(
     // Stable: equal priorities retain pool order.
     ranked.sort_by_key(|item| std::cmp::Reverse(item.1));
     let mut ordered: Vec<usize> = ranked.into_iter().map(|(index, _)| index).collect();
+    if state.settings.current().claude_route_mode
+        == crate::management::settings::ClaudeRouteMode::ApiKeyFirst
+    {
+        prefer_claude_api_keys(&mut ordered, &pool.members);
+    }
     let ranks = state.claude_reset_order.ranks(&pool.members, now_ms / 1000);
     crate::claude_reset_order::reorder_claude_slots(
         &mut ordered,
@@ -3667,6 +4635,32 @@ fn eligible_indices(
         now_ms / 1000,
     );
     ordered
+}
+
+fn is_claude_api_key(member: &AccountMember) -> bool {
+    member.kind() == crate::account::ProviderKind::Claude
+        && !member.is_nekos_relay()
+        && member.relay_api_key().is_some()
+}
+
+/// Within the slots Claude members occupy, move API-key members ahead of
+/// OAuth members, stable inside each group. Other providers keep their slots.
+fn prefer_claude_api_keys(ordered: &mut [usize], members: &[Arc<AccountMember>]) {
+    let slots: Vec<usize> = ordered
+        .iter()
+        .enumerate()
+        .filter(|(_, index)| {
+            members
+                .get(**index)
+                .is_some_and(|m| is_claude_oauth(m) || is_claude_api_key(m))
+        })
+        .map(|(slot, _)| slot)
+        .collect();
+    let mut claude: Vec<usize> = slots.iter().map(|slot| ordered[*slot]).collect();
+    claude.sort_by_key(|index| !is_claude_api_key(&members[*index]));
+    for (slot, index) in slots.into_iter().zip(claude) {
+        ordered[slot] = index;
+    }
 }
 
 pub(crate) fn eligible_account_ids_for_model(
@@ -3999,6 +4993,35 @@ mod usage_capture_tests {
         assert_eq!(cooldown_deadline_ms(now, 0), now);
     }
 
+    #[test]
+    fn cooldown_retry_after_http_date_precedes_reset() {
+        use super::parse_retry_after;
+        // 2026-01-01T00:00:00Z; +10min in the three obsolete/current forms a
+        // Retry-After date may take.
+        let now_ms = 1_767_225_600_000_i64;
+        assert_eq!(
+            parse_retry_after("Thu, 01 Jan 2026 00:10:00 GMT", now_ms),
+            Some(600)
+        );
+        assert_eq!(
+            parse_retry_after("Thursday, 01-Jan-26 00:10:00 GMT", now_ms),
+            Some(600)
+        );
+        assert_eq!(
+            parse_retry_after("Thu Jan  1 00:10:00 2026", now_ms),
+            Some(600)
+        );
+        // Integer seconds keep their existing meaning, and a past date means
+        // no delay rather than a negative one.
+        assert_eq!(parse_retry_after("120", now_ms), Some(120));
+        assert_eq!(
+            parse_retry_after("Thu, 01 Jan 2026 00:00:00 GMT", now_ms),
+            Some(0)
+        );
+        // Garbage still falls through to the reset/default path.
+        assert_eq!(parse_retry_after("soon", now_ms), None);
+    }
+
     use super::usage_header_prefix;
     use crate::account::ProviderKind;
 
@@ -4025,6 +5048,9 @@ async fn collect_antigravity_once(
         Some(replay) => compat::gemini::GeminiDecoder::with_replay(replay),
         None => compat::gemini::GeminiDecoder::new(),
     };
+    if let Some(names) = session.gemini_tool_names.clone() {
+        decoder = decoder.with_tool_names(names);
+    }
     let mut aggregator = compat::render::Aggregator::new(model.clone(), created);
     if let Some(replay) = session.replay {
         aggregator = aggregator.with_replay(replay);
@@ -4287,8 +5313,8 @@ async fn acquire_devin_first_frame(
 
 #[allow(clippy::too_many_arguments)]
 async fn finish_success(
-    state: &AppState,
-    member: &AccountMember,
+    state: &Arc<AppState>,
+    member: &Arc<AccountMember>,
     plan: &RelayPlan,
     headers: &HeaderMap,
     resp: reqwest::Response,
@@ -4323,8 +5349,11 @@ async fn finish_success(
     if member.kind() == crate::account::ProviderKind::Generic
         && !matches!(
             member.generic_adapter().as_deref(),
-            Some("google") | Some("anthropic")
+            Some("google") | Some("anthropic") | Some("command-code")
         )
+        // A Responses client cannot consume a chat-shaped passthrough; the
+        // translated renderer below owns that shape conversion.
+        && plan.mode != RelayMode::Responses
     {
         if content_type
             .as_deref()
@@ -4332,7 +5361,32 @@ async fn finish_success(
         {
             return Err("upstream returned html instead of an api response".to_string());
         }
-        return Ok(stream_response(resp, status_code));
+        let passthrough = raw_stream_response(
+            resp,
+            status_code,
+            raw_sse_wire(plan),
+            get_preflight_deadline(headers),
+        )
+        .await?;
+        // The bytes are relayed unchanged, so nothing downstream would notice a
+        // substituted model; tap the head of the stream to record it.
+        let requested = plan
+            .model
+            .clone()
+            .filter(|model| !model.is_empty())
+            .unwrap_or_default();
+        if requested.is_empty() {
+            return Ok(passthrough);
+        }
+        let (parts, body) = passthrough.into_parts();
+        let body = observe_served_model(
+            body,
+            requested,
+            member.id().to_string(),
+            member.provider_name(),
+            Arc::clone(&state.metrics.served_model_substitutions),
+        );
+        return Ok(Response::from_parts(parts, body));
     }
 
     if matches!(
@@ -4348,7 +5402,13 @@ async fn finish_success(
         {
             return Err("upstream returned html instead of an api response".to_string());
         }
-        return Ok(stream_response(resp, status_code));
+        return raw_stream_response(
+            resp,
+            status_code,
+            raw_sse_wire(plan),
+            get_preflight_deadline(headers),
+        )
+        .await;
     }
 
     if content_type
@@ -4356,6 +5416,59 @@ async fn finish_success(
         .is_some_and(|ct| ct.trim_start().starts_with("text/html"))
     {
         return Err("upstream body is not an event stream: html response".to_string());
+    }
+
+    // Native direct-Claude traffic owns its wire bytes, including future SSE
+    // events and fields. Keep the empty-stream hold for translated paths.
+    if plan.mode == RelayMode::Anthropic
+        && plan.client_stream
+        && protocol == compat::Protocol::Anthropic
+        && is_direct_claude_oauth(member, state)
+    {
+        let state = Arc::clone(state);
+        let member = Arc::clone(member);
+        let runtime = tokio::runtime::Handle::current();
+        return Ok(stream_response_observed(
+            resp,
+            status_code,
+            Some(move |message: String| {
+                let denial = crate::claude_denial::classify(403, &message);
+                let denial = if message.to_ascii_lowercase().contains("enforcement") {
+                    crate::claude_denial::Denial::Enforcement
+                } else {
+                    denial
+                };
+                runtime.spawn(async move {
+                    handle_claude_denial(&state, &member, 403, &message, denial).await;
+                });
+            }),
+        ));
+    }
+
+    // A chat upstream answers a buffered Responses call with one chat
+    // completion object, so it needs the same shape conversion the streaming
+    // decoder performs frame by frame.
+    if !plan.client_stream
+        && protocol == compat::Protocol::Chat
+        && content_type
+            .as_deref()
+            .is_some_and(|ct| ct.starts_with("application/json"))
+    {
+        let raw = bounded_response_bytes(resp).await?;
+        let value: serde_json::Value = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
+        let model = plan.model.clone().unwrap_or_default();
+        let output = match plan.mode {
+            RelayMode::Responses => chat_completion_to_responses(&value, &model, created),
+            _ => value,
+        };
+        member.record_ok();
+        state.metrics.served.fetch_add(1, Ordering::Relaxed);
+        state.router.feedback(member.id(), Outcome::Success);
+        return Ok(body_response(
+            StatusCode::OK,
+            Some("application/json"),
+            Bytes::from(output.to_string()),
+        ));
     }
 
     if !plan.client_stream
@@ -4404,11 +5517,20 @@ async fn finish_success(
         let raw = bounded_response_bytes(resp).await?;
         let value: serde_json::Value =
             serde_json::from_slice(&raw).map_err(|error| error.to_string())?;
-        let mut output = compat::gemini::gemini_json_to_openai(
-            &value,
-            &plan.model.clone().unwrap_or_default(),
-            created,
-        );
+        let mut output = match plan.openai_body.as_ref() {
+            Some(body) => compat::gemini::gemini_json_to_openai_with_tool_names(
+                &value,
+                &plan.model.clone().unwrap_or_default(),
+                created,
+                None,
+                &compat::gemini::GeminiToolNames::from_body(body),
+            ),
+            None => compat::gemini::gemini_json_to_openai(
+                &value,
+                &plan.model.clone().unwrap_or_default(),
+                created,
+            ),
+        };
         if plan.mode == RelayMode::Responses {
             output = chat_completion_to_responses(
                 &output,
@@ -4437,16 +5559,34 @@ async fn finish_success(
         // The hold now spans leading thinking, which routinely outlasts the
         // generic preflight window; give it room so an empty finish is still
         // caught before the first byte is committed.
-        let hold = if headers.contains_key("x-test-preflight-deadline-ms") {
-            get_preflight_deadline(headers)
-        } else {
-            ANTHROPIC_EMPTY_HOLD
-        };
-        compat::open_anthropic_stream(resp, hold).await?
+        compat::open_anthropic_stream(resp, reasoning_stream_hold(headers)).await?
+    } else if protocol == compat::Protocol::Codex && plan.client_stream {
+        // Codex-family upstreams can answer 200 with a well-formed stream that
+        // carries a role prelude, reasoning, and a terminal event but no text
+        // and no tool call. Holding the preamble lets that turn fail over
+        // instead of reaching the client as an empty response it must retry.
+        compat::open_codex_stream(resp, reasoning_stream_hold(headers)).await?
+    } else if protocol == compat::Protocol::Antigravity && plan.client_stream {
+        // A degenerate generation surfaces as the `finishReason` of an HTTP 200
+        // stream that carries no output. Relaying that verbatim spends the
+        // request's only failover — the relay contract forbids retrying after
+        // the first byte — so the client sees a terminal error on a turn another
+        // account could have served. Hold the preamble and fail over instead.
+        //
+        // The preflight window, not the reasoning hold: the failure arrives
+        // with the turn's first bytes, while a legitimately slow turn must not
+        // sit silent behind a three-minute gate.
+        compat::open_gemini_stream(resp, get_preflight_deadline(headers)).await?
     } else {
         compat::open_stream(resp, protocol).await?
     };
-    let model = plan.model.clone().unwrap_or_default();
+    // The upstream envelope is authoritative for the model that actually ran.
+    // Codex can answer a request for one id with another (its safety-buffering
+    // path serves a faster surface and announces it in `response.model`);
+    // re-labelling those frames with the requested id would hide that from the
+    // client. Fall back to the requested id when the preamble names none.
+    let model = compat::served_codex_model(&first)
+        .unwrap_or_else(|| plan.model.clone().unwrap_or_default());
 
     if protocol == compat::Protocol::Antigravity && !plan.client_stream {
         let completion = collect_antigravity_once(
@@ -4717,11 +5857,11 @@ const INGRESS_ROUTING_HEADERS: [&str; 12] = [
 /// `RequestBuilder::header` appends. x.ai's edge returns 415 `Expected request
 /// with Content-Type: application/json` when the same header is sent twice,
 /// even if both values are `application/json`.
-fn content_type_to_append<'a>(
+fn content_type_to_append(
     member_sets_content_type: bool,
-    client_content_type: Option<&'a str>,
+    client_content_type: Option<&str>,
     protocol: compat::Protocol,
-) -> Option<&'a str> {
+) -> Option<&str> {
     if member_sets_content_type
         || protocol == compat::Protocol::Cursor
         || protocol == compat::Protocol::Devin
@@ -4758,6 +5898,22 @@ mod content_type_append_tests {
             content_type_to_append(false, Some("text/plain"), Protocol::Codex),
             Some("text/plain")
         );
+    }
+}
+
+/// Merges one beta flag into a header list, keeping the existing order.
+fn merge_beta_header(headers: &mut Vec<(String, String)>, beta: &str) {
+    match headers
+        .iter_mut()
+        .find(|(name, _)| name.eq_ignore_ascii_case("anthropic-beta"))
+    {
+        Some((_, value)) => {
+            if !value.split(',').any(|existing| existing.trim() == beta) {
+                value.push(',');
+                value.push_str(beta);
+            }
+        }
+        None => headers.push(("anthropic-beta".to_string(), beta.to_string())),
     }
 }
 
@@ -4842,9 +5998,9 @@ fn hierarchy_turns(body: &serde_json::Value) -> (Vec<String>, String) {
         .or_else(|| body.get("input"))
         .or_else(|| body.get("contents"))
         .and_then(|v| v.as_array())
-        .cloned()
+        .map(Vec::as_slice)
         .unwrap_or_default();
-    for item in &items {
+    for item in items {
         let role = item
             .get("role")
             .and_then(|r| r.as_str())
@@ -4861,9 +6017,8 @@ fn hierarchy_turns(body: &serde_json::Value) -> (Vec<String>, String) {
             .get("content")
             .or_else(|| item.get("parts"))
             .or_else(|| item.get("output"))
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
-        push(role, &content);
+            .unwrap_or(&serde_json::Value::Null);
+        push(role, content);
     }
     (turns, environment)
 }
@@ -5147,6 +6302,13 @@ fn scoped_affinity_key(
 }
 
 fn affinity_key(headers: &HeaderMap) -> Option<String> {
+    affinity_header(headers, false)
+}
+
+/// The session header chain. `claude_only` drops `x-client-request-id`: it is
+/// a per-request id for Claude callers, so binding on it pins nothing and
+/// would fill the durable store with one-shot keys.
+fn affinity_header(headers: &HeaderMap, claude_only: bool) -> Option<String> {
     for name in [
         "x-claude-code-session-id",
         "session_id",
@@ -5162,6 +6324,9 @@ fn affinity_key(headers: &HeaderMap) -> Option<String> {
         "x-conversation-id",
         "anthropic-client-session",
     ] {
+        if claude_only && name == "x-client-request-id" {
+            continue;
+        }
         if let Some(v) = headers.get(name).and_then(|v| v.to_str().ok()) {
             let v = v.trim();
             if !v.is_empty() {
@@ -5172,7 +6337,55 @@ fn affinity_key(headers: &HeaderMap) -> Option<String> {
     None
 }
 
+/// The session key chain used for routing (`affinity_key`, then the body
+/// fallbacks), minus `x-client-request-id` on Claude-only routes.
+fn routing_affinity_key(headers: &HeaderMap, body: &[u8], claude_only: bool) -> Option<String> {
+    affinity_header(headers, claude_only)
+        .or_else(|| body_affinity_key(body))
+        .or_else(|| body_prefix_affinity_key(body))
+}
+
+/// Stable digest of the same chain for the durable Claude store. The
+/// `DefaultHasher` keys are not stable across builds, so the body fallbacks are
+/// re-hashed from their original bytes with FNV-1a.
+fn durable_affinity_digest(headers: &HeaderMap, body: &[u8], claude_only: bool) -> Option<u64> {
+    use crate::affinity_store::digest;
+    if let Some(value) = affinity_header(headers, claude_only) {
+        return Some(digest("header", value.as_bytes()));
+    }
+    match body_affinity_material(body) {
+        Some(BodyAffinity::Id(id)) => return Some(digest("body-id", id.as_bytes())),
+        Some(BodyAffinity::FirstUser(text)) => return Some(digest("first-user", text.as_bytes())),
+        None => {}
+    }
+    if body.len() < BODY_AFFINITY_MIN_BYTES {
+        return None;
+    }
+    Some(digest(
+        "body-prefix",
+        &body[..body.len().min(BODY_AFFINITY_HEAD_BYTES)],
+    ))
+}
+
+enum BodyAffinity {
+    /// An explicit conversation/thread/session id from the body.
+    Id(String),
+    /// The trimmed text of the first user message.
+    FirstUser(String),
+}
+
 fn body_affinity_key(body: &[u8]) -> Option<String> {
+    match body_affinity_material(body)? {
+        BodyAffinity::Id(id) => Some(format!("body-id-{id}")),
+        BodyAffinity::FirstUser(text) => {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            hasher.write(text.as_bytes());
+            Some(format!("body-first-user-{:016x}", hasher.finish()))
+        }
+    }
+}
+
+fn body_affinity_material(body: &[u8]) -> Option<BodyAffinity> {
     let value: serde_json::Value = serde_json::from_slice(body).ok()?;
     let obj = value.as_object()?;
 
@@ -5200,7 +6413,7 @@ fn body_affinity_key(body: &[u8]) -> Option<String> {
         "session-id",
     ] {
         if let Some(v) = obj.get(field).and_then(extract_val) {
-            return Some(format!("body-id-{v}"));
+            return Some(BodyAffinity::Id(v));
         }
     }
 
@@ -5214,7 +6427,7 @@ fn body_affinity_key(body: &[u8]) -> Option<String> {
             "session-id",
         ] {
             if let Some(v) = metadata.get(field).and_then(extract_val) {
-                return Some(format!("body-id-{v}"));
+                return Some(BodyAffinity::Id(v));
             }
         }
     }
@@ -5223,7 +6436,7 @@ fn body_affinity_key(body: &[u8]) -> Option<String> {
         let user = user.trim();
         if user.starts_with("session_") || user.starts_with("conv_") || user.starts_with("thread_")
         {
-            return Some(format!("body-id-{user}"));
+            return Some(BodyAffinity::Id(user.to_string()));
         }
     }
 
@@ -5236,18 +6449,14 @@ fn body_affinity_key(body: &[u8]) -> Option<String> {
                 if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
                     let trimmed = content.trim();
                     if !trimmed.is_empty() {
-                        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                        hasher.write(trimmed.as_bytes());
-                        return Some(format!("body-first-user-{:016x}", hasher.finish()));
+                        return Some(BodyAffinity::FirstUser(trimmed.to_string()));
                     }
                 } else if let Some(parts) = msg.get("content").and_then(|c| c.as_array()) {
                     for part in parts {
                         if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
                             let trimmed = text.trim();
                             if !trimmed.is_empty() {
-                                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                                hasher.write(trimmed.as_bytes());
-                                return Some(format!("body-first-user-{:016x}", hasher.finish()));
+                                return Some(BodyAffinity::FirstUser(trimmed.to_string()));
                             }
                         }
                     }
@@ -5568,6 +6777,59 @@ pub async fn handle_relay(
         scoped_key.as_deref(),
         &state,
     );
+    // W2: the durable Claude OAuth binding is consulted before the empty-pool
+    // exits, so a bound account in a short cooldown answers 429 instead of
+    // the request moving (and re-writing its prompt cache) elsewhere.
+    let claude_only = route.as_ref().is_some_and(|route| {
+        !route.provider_classes.is_empty()
+            && route
+                .provider_classes
+                .iter()
+                .all(|p| p.binding.provider_id == mahoquot_registry::ProviderId::claude())
+    });
+    let durable_key = (state.settings.current().claude_route_mode
+        != crate::management::settings::ClaudeRouteMode::ApiKeyOnly
+        && route_serves_claude(route.as_ref()))
+    .then(|| durable_affinity_digest(headers, &plan.original_body, claude_only))
+    .flatten();
+    let mut durable_bound: Option<String> = None;
+    if let Some(key) = durable_key {
+        if let Some(bound_id) = state.claude_affinity.get(key, now_unix_secs()) {
+            match bound_member_state(
+                &pool,
+                route.as_ref(),
+                plan.model.as_deref(),
+                &bound_id,
+                &eligible,
+                binding.as_ref(),
+                scoped_key.as_deref(),
+                &state,
+                now_ms,
+            ) {
+                BoundMember::Eligible => {
+                    if let Some(pos) = eligible
+                        .iter()
+                        .position(|&idx| pool.members.get(idx).is_some_and(|m| m.id() == bound_id))
+                    {
+                        let idx = eligible.remove(pos);
+                        eligible.insert(0, idx);
+                    }
+                    durable_bound = Some(bound_id);
+                }
+                BoundMember::ShortCooldown { retry_after_secs } => {
+                    let mut response = json_error(
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "the account serving this session is cooling down; retry shortly",
+                    );
+                    if let Ok(value) = HeaderValue::from_str(&retry_after_secs.to_string()) {
+                        response.headers_mut().insert(header::RETRY_AFTER, value);
+                    }
+                    return response;
+                }
+                BoundMember::Unusable => {}
+            }
+        }
+    }
     let initial_eligible = eligible.clone();
     if eligible.is_empty() && scoped_key.is_some() {
         return json_error(
@@ -5615,9 +6877,7 @@ pub async fn handle_relay(
     // happened to answer with a buffered HTTP failure: transport and
     // proactive-refresh failures end an attempt without an HTTP response.
     let mut last_attempted: Option<(String, String)> = None;
-    let affinity = affinity_key(headers)
-        .or_else(|| body_affinity_key(plan.original_body.as_ref()))
-        .or_else(|| body_prefix_affinity_key(plan.original_body.as_ref()));
+    let affinity = routing_affinity_key(headers, &plan.original_body, claude_only);
     let affinity_session = affinity.as_deref().map(session_digest);
     let session = affinity_session.clone().or_else(|| {
         let value: serde_json::Value = serde_json::from_slice(&plan.original_body).ok()?;
@@ -5634,6 +6894,13 @@ pub async fn handle_relay(
         route.as_ref(),
         plan.model.as_deref(),
     );
+    if let Some(bound) = durable_bound.as_ref() {
+        if eligible.iter().any(|i| pool.members[*i].id() == bound) {
+            if let Some(h) = hierarchy.as_mut() {
+                h.preferred_member = Some(bound.clone());
+            }
+        }
+    }
     let hint = SessionHint {
         affinity_key: if routing_settings.session_affinity == Some(false) {
             None
@@ -5665,6 +6932,11 @@ pub async fn handle_relay(
     // router to the failing one.
     let mut attempted: Vec<usize> = Vec::new();
     let mut permission_denied_accounts: Vec<usize> = Vec::new();
+    // Set when the next attempt must land on the account that just failed for a
+    // cause unrelated to that account (a degenerate generation). Selecting by
+    // affinity instead would spend a healthy peer and change nothing.
+    let mut pinned_idx: Option<usize> = None;
+    let mut gemini_in_place_retries = 0usize;
     let mut retry_round = 0usize;
     let mut round_attempts = 0usize;
     let mut round_retryable = false;
@@ -5753,11 +7025,34 @@ pub async fn handle_relay(
                 if home_authoritative {
                     // Home picks the credential; the local index is unused.
                     Some(usize::MAX)
+                } else if let Some(pinned) = pinned_idx.take().filter(|idx| eligible.contains(idx))
+                {
+                    // A cause unrelated to the account (a degenerate generation)
+                    // must retry in place: affinity would spend a healthy peer
+                    // and change nothing about the failure. The pin is one-shot:
+                    // it steers exactly the next attempt, so any other outcome
+                    // (an ineligible account, a different failure) resumes the
+                    // normal walk instead of stranding the request on it.
+                    Some(pinned)
                 } else {
-                    hierarchy
+                    durable_bound
                         .as_ref()
-                        .and_then(|h| h.preferred_index(&pool, &eligible, &attempted, now_ms))
-                        .or_else(|| select_index(&state, &pool, &hint, &eligible, &attempted))
+                        .and_then(|bound| {
+                            eligible
+                                .iter()
+                                .copied()
+                                .find(|i| !attempted.contains(i) && pool.members[*i].id() == bound)
+                        })
+                        .or_else(|| {
+                            hierarchy
+                                .as_ref()
+                                .and_then(|h| {
+                                    h.preferred_index(&pool, &eligible, &attempted, now_ms)
+                                })
+                                .or_else(|| {
+                                    select_index(&state, &pool, &hint, &eligible, &attempted)
+                                })
+                        })
                 }
             })
             .flatten()
@@ -5864,7 +7159,10 @@ pub async fn handle_relay(
             match state.refresh_member(&member, None).await {
                 Ok(_) => refreshed_this_account = true,
                 Err(e) => {
-                    if e.is_auth_failure() {
+                    if e.is_grant_rejection() {
+                        // The access token has already expired here, so there is
+                        // no working credential left; bench and stop replaying.
+                        member.mark_grant_rejected();
                         member.set_health(Health::AuthFailed);
                         state.monitor.record_error(
                             member.id(),
@@ -5905,11 +7203,15 @@ pub async fn handle_relay(
             upstream_model,
             affinity.as_deref(),
             state.as_ref(),
+            headers,
         ) {
             Ok(t) => t,
             Err(message) => return json_error(StatusCode::BAD_REQUEST, &message),
         };
 
+        let is_claude_direct_wire = target.protocol == compat::Protocol::Anthropic
+            && target.headers.is_some()
+            && is_direct_claude_oauth(&member, &state);
         let mut target_body = target.body;
         if let Some(h) = hierarchy.as_ref() {
             if let Some(body) =
@@ -5919,7 +7221,7 @@ pub async fn handle_relay(
             }
         }
         let mut target_url = target.url;
-        let target_headers = target.headers;
+        let mut target_headers = target.headers;
 
         let payload_settings = &state.settings.current().payload.extra;
         if !payload_settings.is_empty() {
@@ -6032,6 +7334,13 @@ pub async fn handle_relay(
             }
         }
 
+        if is_claude_direct_wire {
+            let mut signed = target_body.to_vec();
+            if crate::claude_wire::sign_cch(&mut signed).is_ok() {
+                target_body = Bytes::from(signed);
+            }
+        }
+
         // The MiMo anti-abuse gate inspects Accept the way it inspects the
         // User-Agent, so mirror what its own CLI client sends.
         let accept = (member.kind() == crate::account::ProviderKind::Generic
@@ -6082,9 +7391,33 @@ pub async fn handle_relay(
         // Only a 401 earns the refresh-and-replay: a 403 carries a valid
         // credential that was merely denied (workspace/entitlement/model), so
         // refreshing it changes nothing (opencodex #1789, 1fa0f6aad).
+        if is_claude_member(&member) && status_code == 401 {
+            let failure = extract_failure(resp, status_code).await;
+            let message = String::from_utf8_lossy(&failure.body);
+            let denial = crate::claude_denial::classify(status_code, &message);
+            if denial != crate::claude_denial::Denial::Other {
+                handle_claude_denial(&state, &member, status_code, &message, denial).await;
+                return body_response(
+                    failure.status,
+                    failure.content_type.as_deref(),
+                    failure.body,
+                );
+            }
+            resp = rebuild_response(failure);
+        }
         if status_code == 401 && state.auth_refresh_enabled && !refreshed_this_account {
             match state.refresh_member(&member, Some(&member_at)).await {
                 Ok(_) => {
+                    if is_claude_direct_wire {
+                        if let Some(ref mut headers) = target_headers {
+                            if let Some(auth) = headers
+                                .iter_mut()
+                                .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+                            {
+                                auth.1 = format!("Bearer {}", member.access_token());
+                            }
+                        }
+                    }
                     match send_upstream(
                         &state,
                         &target_url,
@@ -6111,7 +7444,8 @@ pub async fn handle_relay(
                     }
                 }
                 Err(e) => {
-                    if e.is_auth_failure() {
+                    if e.is_grant_rejection() {
+                        member.mark_grant_rejected();
                         member.set_health(Health::AuthFailed);
                         state.monitor.record_error(
                             member.id(),
@@ -6147,11 +7481,27 @@ pub async fn handle_relay(
                     protocol: target.protocol,
                     cursor_reply,
                     replay: target.replay,
+                    gemini_tool_names: plan
+                        .openai_body
+                        .as_ref()
+                        .map(compat::gemini::GeminiToolNames::from_body),
                 },
             )
             .await
             {
                 Ok(mut response) => {
+                    if is_claude_oauth(&member) {
+                        if let Some(key) = durable_key {
+                            // A bound session that keeps working must not expire
+                            // on its creation timestamp alone.
+                            state
+                                .claude_affinity
+                                .touch(key, member.id(), now_unix_secs());
+                            if durable_bound.is_none() {
+                                state.claude_affinity.put(key, member.id(), now_unix_secs());
+                            }
+                        }
+                    }
                     if let Some(h) = hierarchy.as_mut() {
                         h.bind(&state, member.id(), now_ms);
                     }
@@ -6242,8 +7592,7 @@ pub async fn handle_relay(
                             },
                         )
                         .await;
-                        let mut final_bytes = bytes.to_vec();
-                        if let Some(ref plugins) = state.plugins {
+                        let final_bytes = if let Some(ref plugins) = state.plugins {
                             let hooks =
                                 crate::plugins::hooks::PluginHookRegistry::new(plugins.clone());
                             let from_format = target.protocol.as_str();
@@ -6257,13 +7606,13 @@ pub async fn handle_relay(
                             let raw_body = target_body.as_ref();
                             let orig_body = plan.original_body.as_ref();
 
-                            final_bytes = hooks.normalize_response_before(
+                            let mut final_bytes = hooks.normalize_response_before(
                                 from_format,
                                 to_format,
                                 model_name,
                                 orig_body,
                                 raw_body,
-                                &final_bytes,
+                                &bytes,
                                 false,
                             );
 
@@ -6287,7 +7636,10 @@ pub async fn handle_relay(
                                 &final_bytes,
                                 false,
                             );
-                        }
+                            Bytes::from(final_bytes)
+                        } else {
+                            bytes
+                        };
 
                         if let Some(lease) = &member.home_lease {
                             lease.release();
@@ -6319,6 +7671,35 @@ pub async fn handle_relay(
                     return Response::from_parts(parts, Body::from_stream(counted));
                 }
                 Err(reason) => {
+                    // A degenerate generation is the account's own model failing
+                    // to emit a callable tool request, not a transport or
+                    // credential fault: the same credential routinely serves the
+                    // retry, and walking the pool would spend a healthy peer and
+                    // drop this account's prompt cache without touching the
+                    // cause. Retry in place first; fail over only once the
+                    // in-place budget is spent.
+                    if let Some(retry_reason) = compat::gemini_retry_reason(&reason) {
+                        if retries_in_place(&reason, gemini_in_place_retries) {
+                            gemini_in_place_retries += 1;
+                            round_attempts = round_attempts.saturating_sub(1);
+                            // The account answered; its credential is fine.
+                            // Rewinding the walk keeps the next iteration on it.
+                            attempted.retain(|idx| *idx != chosen_idx);
+                            pinned_idx = Some(chosen_idx);
+                            tracing::warn!(
+                                account = member.id(),
+                                model = ?plan.model,
+                                attempt = gemini_in_place_retries,
+                                reason = retry_reason,
+                                "degenerate generation; retrying the same account"
+                            );
+                            continue;
+                        }
+                    }
+                    // Any other failure — or an exhausted in-place budget —
+                    // fails over normally: the pin only ever steers a retry of
+                    // the same cause, never a different one.
+                    pinned_idx = None;
                     let (mapped_status, code, description) =
                         if let Some((c, d)) = reason.split_once(": ") {
                             if let Some(norm) = compat::devin::normalize_connect_code(c) {
@@ -6329,6 +7710,31 @@ pub async fn handle_relay(
                         } else {
                             (StatusCode::BAD_GATEWAY, "unknown", reason.as_str())
                         };
+
+                    if is_claude_member(&member) {
+                        let denial =
+                            crate::claude_denial::classify(mapped_status.as_u16(), description);
+                        let enforcement = denial == crate::claude_denial::Denial::Enforcement;
+                        // A repeat plain denial inside the promotion window also
+                        // benches the account, but the current request still
+                        // fails over to a peer that may serve it.
+                        let escalate = enforcement
+                            || (denial == crate::claude_denial::Denial::Denied
+                                && state.claude_denials.record(member.id(), now_unix_secs()));
+                        if escalate {
+                            handle_claude_denial(
+                                &state,
+                                &member,
+                                mapped_status.as_u16(),
+                                description,
+                                crate::claude_denial::Denial::Enforcement,
+                            )
+                            .await;
+                        }
+                        if enforcement {
+                            return body_response(mapped_status, Some("application/json"), Bytes::from(serde_json::json!({"error":{"message":description,"type":"upstream_error","code":code}}).to_string()));
+                        }
+                    }
 
                     member.record_fail();
                     state.metrics.failed_over.fetch_add(1, Ordering::Relaxed);
@@ -6457,12 +7863,45 @@ pub async fn handle_relay(
             continue;
         }
 
-        if (500..=504).contains(&status_code) {
+        if is_claude_member(&member) && matches!(status_code, 400 | 401 | 403) {
+            let failure = extract_failure(resp, status_code).await;
+            let message = String::from_utf8_lossy(&failure.body);
+            let denial = crate::claude_denial::classify(status_code, &message);
+            if denial != crate::claude_denial::Denial::Other {
+                // Account- or org-level enforcement never lets another account
+                // see the request.
+                let escalate = denial == crate::claude_denial::Denial::Enforcement
+                    || state.claude_denials.record(member.id(), now_unix_secs());
+                if escalate {
+                    handle_claude_denial(
+                        &state,
+                        &member,
+                        status_code,
+                        &message,
+                        crate::claude_denial::Denial::Enforcement,
+                    )
+                    .await;
+                    if denial == crate::claude_denial::Denial::Enforcement {
+                        return body_response(
+                            failure.status,
+                            failure.content_type.as_deref(),
+                            failure.body,
+                        );
+                    }
+                }
+            }
+            resp = rebuild_response(failure);
+        }
+
+        if (500..=504).contains(&status_code) || (status_code == 529 && is_claude_member(&member)) {
             // Contract: ServerError leaves health unchanged. The account is
             // excluded from this request's remaining attempts, but a transient
             // upstream 5xx never benches it for other requests — and never
             // leaves a lingering error banner on it either.
             member.record_fail();
+            // ...but an unbroken run of them must release session affinity, or
+            // the conversation keeps replaying the same failing account.
+            member.record_server_error();
             state
                 .scheduler
                 .record_non_auth_failure(member.id(), &state.pool.load().members);
@@ -6581,6 +8020,40 @@ pub async fn handle_relay(
             continue;
         }
 
+        if status_code == 400 && failure_is_request_too_large(&failure.body) {
+            // The payload is too large for every peer, so no account is at
+            // fault and no failover can help. Record the outcome (it is real
+            // traffic) but skip the account-error accounting and return the
+            // upstream body verbatim so the client sees why.
+            record_request_outcome(
+                &state,
+                OutcomeRecord {
+                    event_id: &event_id,
+                    occurred_at_ms,
+                    provider: member.provider_name(),
+                    account: Some(member.id()),
+                    model: plan.model.as_deref(),
+                    key_identifier: key_identifier.as_deref(),
+                    session: session.as_deref(),
+                    scoped_entry: scoped_entry.as_deref(),
+                    status: failure.status.as_u16(),
+                    success: false,
+                    elapsed_ms: request_started.elapsed().as_millis() as u64,
+                    bytes_in: plan.original_body.len(),
+                    bytes_out: failure.body.len() as u64,
+                    tokens: None,
+                    fast,
+                    token_usage: None,
+                },
+            )
+            .await;
+            return body_response(
+                failure.status,
+                failure.content_type.as_deref(),
+                failure.body,
+            );
+        }
+
         state
             .metrics
             .exposed_client_errors
@@ -6678,6 +8151,101 @@ pub async fn handle_relay(
 }
 
 #[cfg(test)]
+mod in_place_retry_tests {
+    use super::*;
+
+    /// The whole point of the policy: a degenerate generation retries on the
+    /// account that produced it, so a healthy peer and its warm prompt cache are
+    /// never spent on a cause the peer did not have.
+    #[test]
+    fn a_degenerate_generation_retries_on_the_same_account() {
+        let failure = "gemini_retry: Gemini generation failed: MALFORMED_FUNCTION_CALL";
+        for used in 0..GEMINI_IN_PLACE_RETRY_LIMIT {
+            assert!(retries_in_place(failure, used), "attempt {used}");
+        }
+    }
+
+    /// The budget is finite: once it is spent the request must be free to fail
+    /// over rather than pinning a broken account forever.
+    #[test]
+    fn the_in_place_budget_is_exhausted_at_the_limit() {
+        let failure = "gemini_retry: Gemini generation failed: MALFORMED_FUNCTION_CALL";
+        assert!(!retries_in_place(failure, GEMINI_IN_PLACE_RETRY_LIMIT));
+        assert!(!retries_in_place(failure, GEMINI_IN_PLACE_RETRY_LIMIT + 7));
+    }
+
+    /// Every other failure keeps the normal failover path. A content verdict in
+    /// particular must never pin the account: retrying it returns the same
+    /// answer and only delays the client.
+    #[test]
+    fn any_other_failure_keeps_the_normal_failover() {
+        for failure in [
+            "Gemini generation failed: SAFETY",
+            "upstream stall timeout",
+            "stream truncated before finish reason",
+            "resource_exhausted: quota spent",
+            "",
+        ] {
+            assert!(!retries_in_place(failure, 0), "{failure}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod sse_frame_scanner_tests {
+    use super::*;
+
+    #[test]
+    fn a_permission_error_event_is_reported_once() {
+        let mut scanner = SseFrameScanner::default();
+        let chunk = b"event: message_start\ndata: {}\n\nevent: error\ndata: {\"error\":{\"type\":\"permission_error\"}}\n\n";
+        let found = scanner.push(chunk).expect("frame");
+        assert!(found.contains("permission_error"));
+        // Later enforcement frames are not reported twice.
+        assert!(scanner
+            .push(b"event: error\ndata: {\"error\":{\"type\":\"permission_error\"}}\n\n")
+            .is_none());
+    }
+
+    #[test]
+    fn ordinary_frames_are_ignored() {
+        let mut scanner = SseFrameScanner::default();
+        assert!(scanner
+            .push(b"event: content_block_delta\ndata: {\"text\":\"hi\"}\n\n")
+            .is_none());
+    }
+
+    #[test]
+    fn frames_split_across_chunks_are_joined() {
+        let mut scanner = SseFrameScanner::default();
+        assert!(scanner.push(b"event: err").is_none());
+        let found = scanner
+            .push(b"or\ndata: {\"error\":{\"type\":\"permission_error\"}}\n\n")
+            .expect("frame");
+        assert!(found.contains("permission_error"));
+    }
+
+    #[test]
+    fn crlf_frames_are_recognized() {
+        let mut scanner = SseFrameScanner::default();
+        let found = scanner
+            .push(b"event: error\r\ndata: {\"error\":{\"type\":\"permission_error\"}}\r\n\r\n")
+            .expect("frame");
+        assert!(found.contains("permission_error"));
+    }
+
+    #[test]
+    fn scanning_stops_after_the_limit() {
+        let mut scanner = SseFrameScanner::default();
+        let filler = vec![b'a'; SseFrameScanner::LIMIT];
+        assert!(scanner.push(&filler).is_none());
+        assert!(scanner
+            .push(b"event: error\ndata: {\"error\":{\"type\":\"permission_error\"}}\n\n")
+            .is_none());
+    }
+}
+
+#[cfg(test)]
 mod limit_exhaustion_tests {
     use super::*;
 
@@ -6734,6 +8302,27 @@ mod limit_exhaustion_tests {
         assert!(!failure_is_limit_exhaustion(br#"{"error":"rate limited"}"#));
         assert!(!failure_is_limit_exhaustion(br#"{"error":{"code":1006}}"#));
         assert!(!failure_is_limit_exhaustion(b"not json"));
+    }
+
+    #[test]
+    fn kiro_content_length_threshold_is_a_payload_error() {
+        // Exact body kiro returns for an oversized conversation.
+        let body = br#"{"message":"Input content length exceeds threshold.","reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}"#;
+        assert!(failure_is_request_too_large(body));
+    }
+
+    #[test]
+    fn payload_errors_do_not_match_unrelated_bodies() {
+        assert!(!failure_is_request_too_large(
+            br#"{"error":{"message":"invalid model","type":"invalid_request_error"}}"#
+        ));
+        assert!(!failure_is_request_too_large(
+            br#"{"error":{"code":"insufficient_credits"}}"#
+        ));
+        assert!(!failure_is_request_too_large(b"not json"));
+        assert!(!failure_is_request_too_large(b""));
+        // Not UTF-8: must not panic.
+        assert!(!failure_is_request_too_large(&[0xff, 0xfe, 0x00]));
     }
 
     #[test]
@@ -6898,6 +8487,47 @@ mod routing_tests {
     }
 
     #[test]
+    fn kimi_replay_appends_text_and_thinking_with_non_string_fallback() {
+        // Given: existing strings and non-string content fields on SSE blocks.
+        let mut wire = String::new();
+        for (index, block) in [
+            serde_json::json!({"type": "text", "text": "prefix", "thinking": "thought"}),
+            serde_json::json!({"type": "text", "text": 42}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            wire.push_str(&format!(
+                "data: {}\n\n",
+                serde_json::json!({"type": "content_block_start", "index": index, "content_block": block})
+            ));
+            for (kind, key) in [("text_delta", "text"), ("thinking_delta", "thinking")] {
+                for text in ["\u{1f680}", "suffix"] {
+                    let mut delta = serde_json::json!({"type": kind});
+                    delta[key] = serde_json::json!(text);
+                    wire.push_str(&format!(
+                        "data: {}\n\n",
+                        serde_json::json!({"type": "content_block_delta", "index": index, "delta": delta})
+                    ));
+                }
+            }
+        }
+        wire.push_str("data: {\"type\":\"message_stop\"}\n\n");
+
+        // When: the captured stream is reconstructed.
+        let message = final_anthropic_message(wire.as_bytes()).unwrap();
+
+        // Then: deltas append in order, replacing only non-string fields.
+        assert_eq!(
+            message["content"],
+            serde_json::json!([
+                {"type": "text", "text": "prefix\u{1f680}suffix", "thinking": "thought\u{1f680}suffix"},
+                {"type": "text", "text": "\u{1f680}suffix", "thinking": "\u{1f680}suffix"}
+            ])
+        );
+    }
+
+    #[test]
     fn kimi_replay_rejects_oversized_block_index() {
         for index in [1024, 1_000_000_000, u64::MAX] {
             let wire = format!("data: {{\"type\":\"content_block_start\",\"index\":{index},\"content_block\":{{\"type\":\"text\",\"text\":\"x\"}}}}\n\ndata: {{\"type\":\"message_stop\"}}\n\n");
@@ -6923,6 +8553,7 @@ mod routing_tests {
                     protocol: compat::Protocol::Antigravity,
                     cursor_reply: None,
                     replay: Some(replay.clone()),
+                    gemini_tool_names: None,
                 },
                 "gemini-test".into(),
                 1,
@@ -7027,6 +8658,7 @@ mod routing_tests {
                 None,
             )
             .unwrap();
+            let state = Arc::new(state);
             let result = finish_success(
                 &state,
                 &member,
@@ -7039,6 +8671,7 @@ mod routing_tests {
                     protocol,
                     cursor_reply: None,
                     replay: None,
+                    gemini_tool_names: None,
                 },
             )
             .await;
@@ -7388,7 +9021,7 @@ mod routing_tests {
         // A Codex cooldown says nothing about a Gemini request, so advertising
         // it as the reset time would point the client at the wrong window.
         assert_eq!(
-            earliest_exhaustion_reset_unix_secs(&pool, Some("gemini-3.8-flash-high")),
+            earliest_exhaustion_reset_unix_secs(&pool, Some("gemini-4-neon-high")),
             None,
             "a cooldown on an account that cannot serve the model is not a reset"
         );
@@ -7526,15 +9159,15 @@ mod routing_tests {
         let (state, auth_dir) = six_provider_state();
         let pool = state.pool.load_full();
 
-        let kiro = resolve_route(&pool, Some("auto-kiro"), None)
+        let kiro = resolve_route(&pool, Some("kiro/claude-opus-5.5"), None)
             .unwrap()
             .unwrap();
-        assert_eq!(kiro.canonical_model, "kiro/auto");
+        assert_eq!(kiro.canonical_model, "kiro/claude-opus-5.5");
         assert_eq!(
             kiro.provider_classes[0].binding.provider_id.as_str(),
             "kiro"
         );
-        assert_eq!(kiro.provider_classes[0].upstream_model, "auto");
+        assert_eq!(kiro.provider_classes[0].upstream_model, "claude-opus-5.5");
 
         let cursor = resolve_route(&pool, Some("cursor/auto-cost"), None)
             .unwrap()
@@ -7719,7 +9352,7 @@ mod routing_tests {
             "gemini-3.7-flash-high",
             "claude-sonnet-4-5-20250929",
             "glm-5.3",
-            "kiro/claude-haiku-4-5-20251001",
+            "kiro/claude-opus-5.5",
             "cursor/auto",
         ] {
             let route = resolve_route(&pool, Some(model), None).unwrap().unwrap();
@@ -8189,5 +9822,253 @@ mod codex_fast_mode_tests {
             apply_codex_fast_mode(&mut target);
             assert_eq!(target.body, Bytes::from(original.to_string()));
         }
+    }
+}
+
+#[cfg(test)]
+mod native_responses_tests {
+    use super::*;
+
+    fn normalized(body: &str) -> serde_json::Value {
+        let out = normalize_native_codex_responses(&Bytes::from(body.to_string()))
+            .expect("valid JSON normalizes");
+        serde_json::from_slice(&out).expect("normalizer emits JSON")
+    }
+
+    #[test]
+    fn native_codex_responses_drops_envelope_fields_the_backend_rejects() {
+        let body = normalized(
+            r#"{"model":"gpt-6.1-sol","metadata":{"a":1},"truncation":"auto","max_output_tokens":10,"stream":false,"store":true,"input":[]}"#,
+        );
+        assert!(body.get("metadata").is_none());
+        assert!(body.get("truncation").is_none());
+        assert!(body.get("max_output_tokens").is_none());
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["store"], false);
+        assert_eq!(body["model"], "gpt-6.1-sol");
+    }
+
+    #[test]
+    fn native_codex_responses_hoists_system_text_into_instructions() {
+        let body = normalized(
+            r#"{"model":"m","instructions":"existing rule","input":[
+                {"type":"message","role":"system","content":[{"type":"input_text","text":"sys rule"}]},
+                {"type":"message","role":"developer","content":"dev rule"},
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}
+            ]}"#,
+        );
+        assert_eq!(
+            body["instructions"],
+            "sys rule\n\ndev rule\n\nexisting rule"
+        );
+        let items = body["input"].as_array().expect("input stays an array");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["role"], "user");
+    }
+
+    #[test]
+    fn native_codex_responses_wraps_a_bare_string_input() {
+        let body = normalized(r#"{"model":"m","input":"hello"}"#);
+        let items = body["input"].as_array().expect("string becomes items");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["type"], "message");
+        assert_eq!(items[0]["role"], "user");
+        assert_eq!(items[0]["content"][0]["text"], "hello");
+    }
+
+    #[test]
+    fn native_codex_responses_preserves_calls_and_reasoning_items() {
+        let body = normalized(
+            r#"{"model":"m","input":[
+                {"type":"function_call","call_id":"c1","name":"f","arguments":"{}"},
+                {"type":"reasoning","id":"r1","encrypted_content":"opaque","summary":[]},
+                {"type":"message","role":"user","content":"go"}
+            ]}"#,
+        );
+        let items = body["input"].as_array().expect("items");
+        assert_eq!(items[0]["type"], "function_call");
+        assert_eq!(items[0]["call_id"], "c1");
+        assert_eq!(items[1]["type"], "reasoning");
+        assert_eq!(items[1]["encrypted_content"], "opaque");
+    }
+
+    #[test]
+    fn native_codex_responses_leaves_non_object_bodies_untouched() {
+        for original in ["[1,2,3]", "not json"] {
+            let bytes = Bytes::from(original.to_string());
+            assert_eq!(
+                normalize_native_codex_responses(&bytes).expect("passthrough"),
+                bytes
+            );
+        }
+    }
+
+    #[test]
+    fn raw_sse_wire_matches_the_downstream_dialect() {
+        let mut plan = RelayPlan {
+            upstream_path: compat::CODEX_PATH.to_string(),
+            body: Bytes::new(),
+            model: None,
+            mode: RelayMode::Native,
+            client_stream: true,
+            include_usage: false,
+            openai_body: None,
+            original_body: Bytes::new(),
+        };
+        assert_eq!(
+            raw_sse_wire(&plan).map(|w| w as u8),
+            Some(RawSseWire::Responses as u8)
+        );
+        plan.mode = RelayMode::Anthropic;
+        assert_eq!(
+            raw_sse_wire(&plan).map(|w| w as u8),
+            Some(RawSseWire::Anthropic as u8)
+        );
+        plan.mode = RelayMode::Image;
+        assert!(raw_sse_wire(&plan).is_none());
+    }
+
+    #[test]
+    fn terminal_scan_ignores_null_finish_reason_and_detects_real_ones() {
+        let mut scan = SseTerminalScan::default();
+        scan.observe(
+            b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":null}]}\n\n",
+            RawSseWire::Chat,
+        );
+        assert!(!scan.saw_terminal);
+        scan.observe(
+            b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            RawSseWire::Chat,
+        );
+        assert!(scan.saw_terminal);
+    }
+
+    #[tokio::test]
+    async fn raw_sse_terminal_frames_control_eof_and_preserve_bytes() {
+        for (wire, payload, succeeds) in [
+            (RawSseWire::Responses, "data: {\"type\":\"response.output_text.delta\",\"delta\":\"response.completed\"}\n\n", false),
+            (RawSseWire::Chat, "data: {\"choices\":[{\"finish_reason\": \"stop\"}]}\n\n", true),
+            (RawSseWire::Responses, "event: response.completed\r\ndata: {}\r\n\r\n", true),
+            (RawSseWire::Anthropic, "event: message_stop\ndata: {}\n\n", true),
+            (RawSseWire::Chat, "data: [DONE]\n\n", true),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let app = axum::Router::new().route("/", axum::routing::get(move || async move {
+                ([("content-type", "text/event-stream")], payload)
+            }));
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let upstream = reqwest::get(format!("http://{addr}/")).await.unwrap();
+            let response = raw_stream_response(upstream, 200, Some(wire), std::time::Duration::from_secs(5)).await.unwrap();
+            let result = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+            server.abort();
+            if succeeds {
+                assert_eq!(result.unwrap().as_ref(), payload.as_bytes());
+            } else {
+                assert!(result.unwrap_err().to_string().contains("upstream SSE ended before a terminal event"));
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_scan_requires_complete_bounded_frames() {
+        for wire in [
+            RawSseWire::Responses,
+            RawSseWire::Anthropic,
+            RawSseWire::Chat,
+        ] {
+            let mut scan = SseTerminalScan::default();
+            scan.observe(b"data: {\"delta\":\"response.completed message_stop [DONE] \\\"finish_reason\\\":\\\"stop\\\"\"}\n\n", wire);
+            assert!(!scan.saw_terminal);
+        }
+        let mut scan = SseTerminalScan::default();
+        scan.observe(
+            b"event: response.completed\r\ndata: {}\r\n",
+            RawSseWire::Responses,
+        );
+        assert!(!scan.saw_terminal);
+        scan.observe(b"\r\n", RawSseWire::Responses);
+        assert!(scan.saw_terminal);
+
+        let mut scan = SseTerminalScan::default();
+        scan.observe(&vec![b'x'; 128 * 1024], RawSseWire::Chat);
+        assert!(scan.carry.len() <= 3);
+        scan.observe(b"data: [DONE]\n\n", RawSseWire::Chat);
+        assert!(!scan.saw_terminal);
+        scan.observe(b"data: [DONE]\n\n", RawSseWire::Chat);
+        assert!(scan.saw_terminal);
+    }
+
+    /// The preflight chunk is replayed through the body stream; observing it
+    /// twice duplicated its prefix and lost a terminal frame split across the
+    /// first two chunks.
+    #[tokio::test]
+    async fn raw_stream_observes_the_preflight_chunk_exactly_once() {
+        for (wire, first, rest) in [
+            (
+                RawSseWire::Responses,
+                &b"event: response.comp"[..],
+                &b"leted\ndata: {}\n\n"[..],
+            ),
+            (
+                RawSseWire::Chat,
+                &b"data: {\"choices\":[{\"finish_reason\":"[..],
+                &b" \"stop\"}]}\n\n"[..],
+            ),
+        ] {
+            let chunks: Vec<Result<bytes::Bytes, std::io::Error>> = vec![
+                Ok(bytes::Bytes::from_static(first)),
+                Ok(bytes::Bytes::from_static(rest)),
+            ];
+            let source = futures::stream::iter(chunks);
+            // The SSE content type is what keeps this on the inspecting path:
+            // without it raw_stream_response passes the body straight through
+            // and the test would not cover the scan at all.
+            let response = reqwest::Response::from(
+                http::Response::builder()
+                    .status(200)
+                    .header("content-type", "text/event-stream")
+                    .body(reqwest::Body::wrap_stream(source))
+                    .unwrap(),
+            );
+            let response =
+                raw_stream_response(response, 200, Some(wire), std::time::Duration::from_secs(5))
+                    .await
+                    .unwrap();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("a terminal frame split across the first two chunks must terminate");
+            assert_eq!(body.len(), first.len() + rest.len());
+        }
+    }
+
+    /// Observing one chunk twice corrupts a frame split across chunk
+    /// boundaries: the second observation prepends the first chunk's bytes to
+    /// the carried fragment. The body builder must therefore observe each
+    /// forwarded chunk exactly once.
+    #[test]
+    fn double_observation_corrupts_a_split_terminal_frame() {
+        let mut once = SseTerminalScan::default();
+        once.observe(b"event: response.comp", RawSseWire::Responses);
+        once.observe(b"leted\ndata: {}\n\n", RawSseWire::Responses);
+        assert!(once.saw_terminal, "single observation sees the frame");
+
+        let mut twice = SseTerminalScan::default();
+        twice.observe(b"event: response.comp", RawSseWire::Responses);
+        twice.observe(b"event: response.comp", RawSseWire::Responses);
+        twice.observe(b"leted\ndata: {}\n\n", RawSseWire::Responses);
+        assert!(
+            !twice.saw_terminal,
+            "double observation must be detectable as the bug it is"
+        );
+    }
+
+    #[test]
+    fn terminal_marker_split_across_chunks_is_still_seen() {
+        let mut scan = SseTerminalScan::default();
+        scan.observe(b"event: response.comp", RawSseWire::Responses);
+        assert!(!scan.saw_terminal);
+        scan.observe(b"leted\ndata: {}\n\n", RawSseWire::Responses);
+        assert!(scan.saw_terminal);
     }
 }

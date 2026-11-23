@@ -933,6 +933,9 @@ pub struct AppState {
     /// gateway (config/env-resolved at startup; tests inject directly).
     pub captcha_config_url: Option<String>,
     pub captcha_solver_bin: Option<PathBuf>,
+    /// Added to each provider's fixed OAuth callback port (production 0; tests
+    /// shift the set into a free range).
+    pub oauth_callback_port_offset: u16,
     /// Verify params are single-use — challenge solves serialize on this gate
     /// (per-state, never a global static).
     pub captcha_solve_gate: tokio::sync::Mutex<()>,
@@ -942,6 +945,22 @@ pub struct AppState {
     pub settings: Arc<SettingsStore>,
     pub scheduler: crate::scheduler::SchedulerRegistry,
     pub claude_reset_order: crate::claude_reset_order::ClaudeResetOrder,
+    /// W0: cached monthly usage of budgeted Claude API-key accounts.
+    pub claude_budgets: crate::claude_budget::BudgetTracker,
+    /// W1: recent plain denials per Claude account, for promotion.
+    pub claude_denials: crate::claude_denial::DeniedTracker,
+    /// Last logged quota-poll outcome per account, so one persistent failure
+    /// is logged once instead of on every poll cycle.
+    pub quota_poll_failures: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    pub claude_quarantine: crate::claude_denial::QuarantineSet,
+    /// W2: durable Claude OAuth session -> account bindings.
+    pub claude_affinity: Arc<crate::affinity_store::AffinityStore>,
+    /// W5: prebuilt per-account egress clients, rebuilt on every published
+    /// settings document. A configured account whose entry did not build maps
+    /// to `None` and is never served.
+    pub claude_egress_clients: Arc<arc_swap::ArcSwap<ClaudeEgressClients>>,
+    pub claude_direct_client: reqwest::Client,
+    pub claude_invalid_client: reqwest::Client,
     pub claude_prefix_watch: crate::claude_prefix_watch::ClaudePrefixWatch,
     pub history: crate::request_history::HistoryService,
     pub signature_ledger: Arc<crate::compat::signature_ledger::SignatureLedger>,
@@ -967,6 +986,13 @@ pub struct AppState {
     pub finalizer_notifiers: Arc<
         std::sync::Mutex<std::collections::HashMap<String, Vec<tokio::sync::mpsc::Sender<()>>>>,
     >,
+    /// Outcome recordings still running on detached tasks. The relay increments
+    /// this before spawning and decrements after the record (including its file
+    /// append) finishes, so a caller that owns the auth directory can wait for
+    /// quiescence instead of racing the writer. A `watch` channel keeps the
+    /// latest count, so a completion that lands before a waiter subscribes is
+    /// still observed.
+    outcome_recordings_in_flight: Arc<tokio::sync::watch::Sender<usize>>,
     pub aistudio: Arc<crate::aistudio::Relay>,
     pub plugins: Option<Arc<crate::plugins::loader::PluginHost>>,
     pub home: Option<Arc<crate::home::HomeClient>>,
@@ -979,6 +1005,37 @@ pub struct AppState {
     pub lcp: std::sync::Mutex<mahoquot_router::lcp::Matcher>,
     /// Explicit/inherited session bindings with wall-clock TTL (Task 13).
     pub session_bindings: std::sync::Mutex<std::collections::HashMap<String, (String, i64)>>,
+}
+
+/// Prebuilt egress clients keyed by Claude account id. `None` marks an entry
+/// that did not build (a hand-edited settings file): that account must not be
+/// served rather than leave from the host's own IP.
+#[derive(Debug, Default)]
+pub struct ClaudeEgressClients {
+    clients: std::collections::HashMap<String, Option<reqwest::Client>>,
+}
+
+impl ClaudeEgressClients {
+    pub fn build(entries: &std::collections::BTreeMap<String, String>) -> Self {
+        let clients = entries
+            .iter()
+            .map(|(account, url)| {
+                let client = crate::proxy_policy::build_decompressing_http_client(Some(url));
+                if client.is_err() {
+                    tracing::warn!(
+                        account = %account,
+                        "claude-account-egress entry does not build; account will not be served"
+                    );
+                }
+                (account.clone(), client.ok())
+            })
+            .collect();
+        Self { clients }
+    }
+
+    pub fn get(&self, account: &str) -> Option<&Option<reqwest::Client>> {
+        self.clients.get(account)
+    }
 }
 
 pub(crate) fn adopt_runtime_state(target: &AccountMember, previous: &Arc<AccountMember>) {
@@ -1039,6 +1096,26 @@ pub(crate) fn adopt_runtime_state(target: &AccountMember, previous: &Arc<Account
     }
 }
 
+/// Keeps the detached outcome-recording counter balanced.
+///
+/// `begin_outcome_recording` increments the counter before the relay spawns the
+/// recording task and hands back this guard. The guard lives inside that task's
+/// future, so the decrement runs exactly once: on the normal path, when the
+/// future is dropped before its first poll, and while unwinding from a panic.
+/// It is liveness bookkeeping for `wait_for_outcome_recordings`, not a claim
+/// that the record was persisted.
+#[must_use = "the in-flight counter stays unbalanced unless the guard lives as long as the recording"]
+pub struct OutcomeRecordingGuard {
+    in_flight: Arc<tokio::sync::watch::Sender<usize>>,
+}
+
+impl Drop for OutcomeRecordingGuard {
+    fn drop(&mut self) {
+        self.in_flight
+            .send_modify(|in_flight| *in_flight = in_flight.saturating_sub(1));
+    }
+}
+
 impl AppState {
     pub fn new(config: &GatewayConfig) -> anyhow::Result<Self> {
         let router = Router::new(config.strategy);
@@ -1048,6 +1125,7 @@ impl AppState {
         let auth_refresh_enabled = config.auth_refresh_enabled;
         let captcha_config_url = config.captcha_config_url.clone();
         let captcha_solver_bin = config.captcha_solver_bin.clone();
+        let oauth_callback_port_offset = config.oauth_callback_port_offset;
         let captcha_solve_gate = tokio::sync::Mutex::new(());
         let settings = Arc::new(SettingsStore::load_or(
             config.config_path.clone(),
@@ -1086,6 +1164,15 @@ impl AppState {
         // is revoked or re-scoped through the management API takes effect on
         // the next request without a restart.
         let scoped_keys_for_observer = Arc::clone(&scoped_keys);
+        let claude_egress_clients = Arc::new(arc_swap::ArcSwap::from_pointee(
+            ClaudeEgressClients::build(&initial_settings.claude_account_egress),
+        ));
+        let claude_egress_obs = Arc::clone(&claude_egress_clients);
+        settings.add_observer(Arc::new(move |published| {
+            claude_egress_obs.store(Arc::new(ClaudeEgressClients::build(
+                &published.claude_account_egress,
+            )));
+        }));
         settings.add_observer(Arc::new(move |published| {
             scoped_keys_for_observer.reconcile(&published.scoped_api_keys);
         }));
@@ -1212,6 +1299,26 @@ impl AppState {
             settings,
             scheduler,
             claude_reset_order: crate::claude_reset_order::ClaudeResetOrder::default(),
+            claude_budgets: crate::claude_budget::BudgetTracker::default(),
+            claude_denials: crate::claude_denial::DeniedTracker::default(),
+            quota_poll_failures: std::sync::Mutex::default(),
+            claude_quarantine: crate::claude_denial::QuarantineSet::default(),
+            claude_affinity: Arc::new(if config.auth_dir.as_os_str().is_empty() {
+                crate::affinity_store::AffinityStore::in_memory()
+            } else {
+                crate::affinity_store::AffinityStore::load(
+                    config.auth_dir.join(crate::affinity_store::STORE_FILE),
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0),
+                )
+            }),
+            claude_egress_clients,
+            claude_direct_client: crate::proxy_policy::build_decompressing_http_client(None)?,
+            claude_invalid_client: crate::proxy_policy::build_decompressing_http_client(Some(
+                "http://127.0.0.1:0",
+            ))?,
             claude_prefix_watch: crate::claude_prefix_watch::ClaudePrefixWatch::default(),
             history,
             signature_ledger,
@@ -1244,6 +1351,7 @@ impl AppState {
             auth_refresh_enabled,
             captcha_config_url,
             captcha_solver_bin,
+            oauth_callback_port_offset,
             captcha_solve_gate,
             refreshed: AtomicU64::new(0),
             max_failover: if config.max_failover == 0 {
@@ -1254,6 +1362,7 @@ impl AppState {
             model_restrictions: AtomicBool::new(false),
             devin_cache: Arc::new(crate::devin_catalog::DevinDiscoveryCache::new()),
             finalizer_notifiers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            outcome_recordings_in_flight: Arc::new(tokio::sync::watch::channel(0).0),
             aistudio: Arc::new(crate::aistudio::Relay::new()),
             plugins: None,
             home: None,
@@ -1442,17 +1551,16 @@ impl AppState {
         member: &AccountMember,
         presented_token: Option<&str>,
     ) -> Result<bool, mahoquot_providers::refresh_exec::RefreshError> {
-        let client = if crate::proxy_policy::token_endpoint_bypasses_egress_proxy(
-            &member.provider_name(),
-        ) {
-            self.direct_client()
-        } else {
-            self.try_client_for_member(member).map_err(|error| {
-                mahoquot_providers::refresh_exec::RefreshError::Parse(format!(
-                    "proxy client construction failed: {error}"
-                ))
-            })?
-        };
+        let client =
+            if crate::proxy_policy::token_endpoint_bypasses_egress_proxy(&member.provider_name()) {
+                self.direct_client()
+            } else {
+                self.try_client_for_member(member).map_err(|error| {
+                    mahoquot_providers::refresh_exec::RefreshError::Parse(format!(
+                        "proxy client construction failed: {error}"
+                    ))
+                })?
+            };
         let did_refresh = member
             .refresh_with_store(
                 &client,
@@ -1487,9 +1595,54 @@ impl AppState {
         self.proxy.load().devin_direct_client.clone()
     }
 
+    pub fn claude_device_id<'a>(&self, member: &'a AccountMember) -> &'a str {
+        member.claude_device_id()
+    }
+
+    pub fn claude_device_id_for_account(&self, account_id: &str) -> Option<String> {
+        self.find_member(account_id)
+            .map(|m| m.claude_device_id().to_string())
+    }
+
+    /// True when the account has an egress entry that failed to build. Such
+    /// an account is not served at all rather than sent out direct.
+    pub fn claude_egress_invalid(&self, member: &AccountMember) -> bool {
+        if member.kind() != crate::account::ProviderKind::Claude {
+            return false;
+        }
+        if matches!(
+            self.claude_egress_clients.load().get(member.id()),
+            Some(None)
+        ) {
+            return true;
+        }
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let snapshot = self.proxy.load();
+        let runtime = &snapshot.runtime;
+        if let Some(proxy_url) = runtime.session_proxy_url("claude", member.id(), now_unix) {
+            if reqwest::Proxy::all(proxy_url.trim()).is_err() {
+                return true;
+            }
+        } else if !runtime.scoped_routing_active()
+            && !runtime.global_proxy_url.is_empty()
+            && reqwest::Proxy::all(runtime.global_proxy_url.trim()).is_err()
+        {
+            return true;
+        }
+        false
+    }
+
     pub fn client_for_member(&self, member: &AccountMember) -> reqwest::Client {
-        self.try_client_for_member(member)
-            .unwrap_or_else(|_| self.direct_client())
+        self.try_client_for_member(member).unwrap_or_else(|_| {
+            if member.kind() == crate::account::ProviderKind::Claude {
+                self.claude_invalid_client.clone()
+            } else {
+                self.direct_client()
+            }
+        })
     }
 
     pub fn try_client_for_member(
@@ -1508,6 +1661,15 @@ impl AppState {
         member: &AccountMember,
         now_unix: u64,
     ) -> Result<reqwest::Client, crate::proxy_policy::ProxyClientBuildError> {
+        if member.kind() == crate::account::ProviderKind::Claude {
+            if let Some(entry) = self.claude_egress_clients.load().get(member.id()) {
+                return entry.clone().ok_or_else(|| {
+                    crate::proxy_policy::ProxyClientBuildError::ProxyConfig(
+                        "invalid Claude account egress".into(),
+                    )
+                });
+            }
+        }
         self.try_client_for_target_at_with_override(
             &member.provider_name(),
             member.id(),
@@ -1561,6 +1723,8 @@ impl AppState {
         credential_proxy: Option<&str>,
         now_unix: u64,
     ) -> Result<reqwest::Client, crate::proxy_policy::ProxyClientBuildError> {
+        let is_claude = provider_name.eq_ignore_ascii_case("claude")
+            || provider_name.eq_ignore_ascii_case("claude-code");
         let snapshot = self.proxy.load();
         let runtime = &snapshot.runtime;
         let cache_gen = self.proxy_clients.generation();
@@ -1586,14 +1750,47 @@ impl AppState {
             // Toggling a provider on at runtime must not retroactively proxy
             // the providers that were never opted in.
             return Ok(if runtime.scoped_routing_active() {
-                snapshot.direct_client.clone()
+                if is_claude {
+                    self.claude_direct_client.clone()
+                } else {
+                    snapshot.direct_client.clone()
+                }
+            } else if is_claude {
+                if runtime.global_proxy_url.is_empty() {
+                    return Ok(self.claude_direct_client.clone());
+                }
+                let cache_key = format!("{provider_name}|{member_id}|{}", runtime.global_proxy_url);
+                if let Some(client) = self.proxy_clients.get(&cache_key) {
+                    return Ok(client);
+                }
+                let client = crate::proxy_policy::build_decompressing_http_client(Some(
+                    &runtime.global_proxy_url,
+                ))
+                .map_err(|_| {
+                    crate::proxy_policy::ProxyClientBuildError::ProxyConfig(
+                        "invalid Claude outbound proxy".into(),
+                    )
+                })?;
+                let scope = format!("{provider_name}|{member_id}|");
+                self.proxy_clients.replace_scoped_generation(
+                    cache_gen,
+                    cache_key,
+                    &scope,
+                    member_id,
+                    client.clone(),
+                );
+                client
             } else {
                 snapshot.default_client.clone()
             });
         };
 
         if crate::proxy_policy::is_direct_or_none(&proxy_url) {
-            return Ok(snapshot.direct_client.clone());
+            return Ok(if is_claude {
+                self.claude_direct_client.clone()
+            } else {
+                snapshot.direct_client.clone()
+            });
         }
 
         let cache_key = format!("{provider_name}|{member_id}|{proxy_url}");
@@ -1601,7 +1798,11 @@ impl AppState {
             return Ok(client);
         }
 
-        match crate::proxy_policy::build_http_client(Some(&proxy_url)) {
+        match if is_claude {
+            crate::proxy_policy::build_decompressing_http_client(Some(&proxy_url))
+        } else {
+            crate::proxy_policy::build_http_client(Some(&proxy_url))
+        } {
             Ok(client) => {
                 let scope = format!("{provider_name}|{member_id}|");
                 self.proxy_clients.replace_scoped_generation(
@@ -1680,6 +1881,38 @@ impl AppState {
             .or_default()
             .push(tx);
         rx
+    }
+
+    /// Mark one detached outcome recording as started and return the guard that
+    /// marks it finished when dropped.
+    ///
+    /// Call this before spawning the recording task and move the guard into the
+    /// task, so neither a panic nor a future dropped before its first poll can
+    /// strand the increment.
+    pub fn begin_outcome_recording(&self) -> OutcomeRecordingGuard {
+        self.outcome_recordings_in_flight
+            .send_modify(|in_flight| *in_flight += 1);
+        OutcomeRecordingGuard {
+            in_flight: Arc::clone(&self.outcome_recordings_in_flight),
+        }
+    }
+
+    /// Resolve once no detached outcome recording is in flight, including the
+    /// file append that logging performs. Returns `false` if the wait elapsed.
+    pub async fn wait_for_outcome_recordings(&self, timeout: std::time::Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut in_flight = self.outcome_recordings_in_flight.subscribe();
+        loop {
+            if *in_flight.borrow_and_update() == 0 {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, in_flight.changed())
+                .await
+                .is_err()
+            {
+                return false;
+            }
+        }
     }
 
     pub fn notify_finalizer(&self, account: Option<&str>, event_id: &str) {
@@ -1797,7 +2030,40 @@ impl AppState {
         }
     }
 
+    /// W6 visibility for one Claude account. Only the egress host is exposed:
+    /// a proxy URL may carry credentials.
+    fn claude_account_safety(
+        &self,
+        member: &AccountMember,
+        affinity_counts: &std::collections::HashMap<String, usize>,
+        now_unix: i64,
+    ) -> crate::metrics::ClaudeAccountSafety {
+        let settings = self.settings.current();
+        let suspected = settings.claude_suspected_accounts.get(member.id());
+        crate::metrics::ClaudeAccountSafety {
+            route_mode: settings.claude_route_mode.as_str().to_string(),
+            suspected_reason: suspected.map(|s| s.reason.clone()),
+            suspected_at_unix: suspected.map(|s| s.at_unix),
+            affinity_bindings: affinity_counts.get(member.id()).copied().unwrap_or(0),
+            probes_24h: self.warmup.probes_last_24h(member.id(), now_unix),
+            egress_host: settings
+                .claude_account_egress
+                .get(member.id())
+                .and_then(|url| reqwest::Url::parse(url).ok())
+                .and_then(|url| url.host_str().map(str::to_string)),
+        }
+    }
+
     pub fn get_stats(&self) -> AdminStatsResponse {
+        // Callers that do not name a window keep the previous behaviour: the
+        // whole retained range. New callers pass an explicit window so the
+        // response stays small.
+        self.get_stats_with_history(None)
+    }
+
+    /// `history_minutes`: `None` keeps the full retained history, `Some(0)`
+    /// omits it entirely, `Some(n)` returns the last `n` minutes.
+    pub fn get_stats_with_history(&self, history_minutes: Option<i64>) -> AdminStatsResponse {
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
@@ -1828,6 +2094,7 @@ impl AppState {
             })
             .collect();
 
+        let affinity_counts = self.claude_affinity.counts(now_ms / 1000);
         let accounts = self
             .pool
             .load()
@@ -1871,6 +2138,8 @@ impl AppState {
                     Health::Disabled => (crate::metrics::HealthStats::Disabled, None),
                 };
                 crate::metrics::AccountStats {
+                    claude: (m.kind() == crate::account::ProviderKind::Claude)
+                        .then(|| self.claude_account_safety(m, &affinity_counts, now_ms / 1000)),
                     id: m.id.clone(),
                     provider: m.provider_name(),
                     plan: m.relay_plan(),
@@ -1963,12 +2232,19 @@ impl AppState {
             in_flight: self.monitor.in_flight(),
             served: self.metrics.served.load(Ordering::Relaxed),
             failed_over: self.metrics.failed_over.load(Ordering::Relaxed),
+            served_model_substitutions: self
+                .metrics
+                .served_model_substitutions
+                .load(Ordering::Relaxed),
             refreshed: self.refreshed.load(Ordering::Relaxed),
             exposed_errors: self.metrics.exposed_errors.load(Ordering::Relaxed),
             exposed_client_errors: self.metrics.exposed_client_errors.load(Ordering::Relaxed),
             ttft: self.monitor.ttft_percentiles(),
             accounts,
-            history: self.telemetry.snapshot(),
+            history: match history_minutes {
+                None => self.telemetry.snapshot(),
+                Some(minutes) => self.telemetry.snapshot_window(minutes),
+            },
             signature_ledger: self.signature_ledger.stats(),
         }
     }
@@ -2035,6 +2311,26 @@ mod stats_tests {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0)
+    }
+
+    /// The console polls `/admin/stats` repeatedly and only needs the bucket
+    /// history for its chart backfill, so the route has to be able to leave it
+    /// out. Omitting the parameter must keep the old full response alive.
+    #[test]
+    fn stats_history_is_omitted_by_a_zero_window_and_kept_when_unset() {
+        let (state, _member) = state_with_cline_account();
+        // `record_with_account` takes unix seconds, not minutes.
+        let now_secs = now_ms() / 1000;
+        state
+            .telemetry
+            .record_with_account(now_secs - 60 * 60, "codex", None, true);
+        state
+            .telemetry
+            .record_with_account(now_secs, "codex", None, true);
+
+        assert!(state.get_stats_with_history(Some(0)).history.is_empty());
+        assert_eq!(state.get_stats_with_history(Some(30)).history.len(), 1);
+        assert_eq!(state.get_stats().history.len(), 2);
     }
 
     #[test]

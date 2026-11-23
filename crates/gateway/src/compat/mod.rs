@@ -1,8 +1,12 @@
+pub mod chat;
 pub mod claude;
+pub mod command_code;
 pub mod cursor;
-mod cursor_proto;
+pub mod cursor_proto;
 pub mod devin;
 pub mod devin_proto;
+pub mod exec_bridge;
+pub mod exec_ops;
 pub mod meta;
 pub mod xai;
 pub mod zcode;
@@ -87,6 +91,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use axum::body::Body;
+
+const STREAM_IDLE_TICK: std::time::Duration = std::time::Duration::from_secs(15);
+const STREAM_UPSTREAM_SILENCE_BUDGET: std::time::Duration = std::time::Duration::from_secs(300);
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use serde_json::{json, Value};
@@ -145,7 +152,7 @@ pub async fn open_stream(
         Some(Ok(first))
             if matches!(
                 protocol,
-                Protocol::Kiro | Protocol::Cursor | Protocol::Devin
+                Protocol::Kiro | Protocol::CommandCode | Protocol::Cursor | Protocol::Devin
             ) || looks_like_sse(&first) =>
         {
             Ok((first, stream))
@@ -203,7 +210,11 @@ fn classify_anthropic_preamble(buf: &[u8]) -> AnthropicPreamble {
                 if matches!(
                     value["content_block"]["type"].as_str(),
                     Some("thinking") | Some("redacted_thinking")
-                ) =>
+                ) || (value["content_block"]["type"] == "text"
+                    && value["content_block"]["text"]
+                        .as_str()
+                        .unwrap_or("")
+                        .is_empty()) =>
             {
                 continue
             }
@@ -211,7 +222,8 @@ fn classify_anthropic_preamble(buf: &[u8]) -> AnthropicPreamble {
                 if matches!(
                     value["delta"]["type"].as_str(),
                     Some("thinking_delta") | Some("signature_delta")
-                ) =>
+                ) || (value["delta"]["type"] == "text_delta"
+                    && value["delta"]["text"].as_str().unwrap_or("").is_empty()) =>
             {
                 continue
             }
@@ -344,14 +356,492 @@ pub(crate) fn extend_nonstream_bounded(raw: &mut Vec<u8>, chunk: &[u8]) -> Resul
     Ok(())
 }
 
+/// tool call well below it; past the cap the stream is released unchanged so a
+/// reasoning-heavy turn never stalls behind a fixed buffer.
+const CODEX_PREAMBLE_CAP: usize = 32 * 1024;
+
+/// What the leading complete SSE frames of an OpenAI-shaped stream say.
+enum CodexPreamble {
+    /// Nothing content-bearing yet; more bytes are needed.
+    Pending,
+    /// Text, reasoning-free content, or a tool call arrived; the stream is served.
+    Served,
+    /// The upstream closed (or reported completion) without ever emitting
+    /// content. Callers fail over instead of handing the client an empty turn.
+    Empty,
+}
+
+fn codex_frame_has_content(value: &Value) -> Option<bool> {
+    if value.as_str() == Some("[DONE]") {
+        return Some(false);
+    }
+    if let Some(choices) = value.get("choices").and_then(Value::as_array) {
+        for choice in choices {
+            // Legacy completions put the text directly on the choice.
+            if choice
+                .get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.trim().is_empty())
+            {
+                return Some(true);
+            }
+            for holder in ["delta", "message"] {
+                let Some(part) = choice.get(holder) else {
+                    continue;
+                };
+                if part
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| !text.trim().is_empty())
+                {
+                    return Some(true);
+                }
+                // A refusal is an answer the user must see; never discard it.
+                if part
+                    .get("refusal")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| !text.trim().is_empty())
+                {
+                    return Some(true);
+                }
+                if part
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .is_some_and(|calls| !calls.is_empty())
+                {
+                    return Some(true);
+                }
+            }
+            if choice.get("finish_reason").is_some_and(|r| !r.is_null()) {
+                return Some(false);
+            }
+        }
+        return Some(false);
+    }
+    match value.get("type").and_then(Value::as_str) {
+        Some("response.output_text.delta") => Some(
+            value
+                .get("delta")
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.trim().is_empty()),
+        ),
+        Some("response.output_item.added") => Some(
+            value
+                .pointer("/item/type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind == "function_call"),
+        ),
+        Some("response.function_call_arguments.delta") => Some(
+            value
+                .get("delta")
+                .and_then(Value::as_str)
+                .is_some_and(|delta| !delta.is_empty()),
+        ),
+        // Reasoning is deliberately not content: a stream that spends its whole
+        // turn thinking and then stops is the case this gate exists to catch.
+        Some("response.reasoning_summary_text.delta") | Some("response.reasoning_text.delta") => {
+            Some(false)
+        }
+        Some("response.created") | Some("response.in_progress") => Some(false),
+        // A completed turn normally carried its text as deltas. Trust the final
+        // document only as a rescue for an upstream that suppressed them.
+        Some("response.completed") => Some(
+            value
+                .pointer("/response/output")
+                .and_then(Value::as_array)
+                .is_some_and(|items| {
+                    items.iter().any(|item| {
+                        item.get("type").and_then(Value::as_str) == Some("function_call")
+                            || item
+                                .get("content")
+                                .and_then(Value::as_array)
+                                .is_some_and(|parts| {
+                                    parts.iter().any(|part| {
+                                        part.get("text")
+                                            .and_then(Value::as_str)
+                                            .is_some_and(|text| !text.trim().is_empty())
+                                    })
+                                })
+                    })
+                }),
+        ),
+        // An explicit error frame is the stream's answer: let it through so the
+        // existing classifier maps rate limits and auth failures as before
+        // instead of being flattened into an "empty response".
+        Some(
+            "error"
+            | "response.failed"
+            | "response.incomplete"
+            | "response.cancelled"
+            | "response.refusal.delta"
+            | "response.refusal.done",
+        ) => Some(true),
+        _ => None,
+    }
+}
+
+fn classify_codex_preamble(buf: &[u8]) -> CodexPreamble {
+    let text = String::from_utf8_lossy(buf).replace("\r\n", "\n");
+    let mut frames: Vec<&str> = text.split("\n\n").collect();
+    // The trailing piece is an incomplete frame; judge it once its delimiter lands.
+    frames.pop();
+    let mut terminal = false;
+    for frame in frames {
+        let data: String = frame
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(str::trim_start)
+            .collect();
+        if data.trim().is_empty() {
+            continue;
+        }
+        let trimmed = data.trim();
+        if trimmed == "[DONE]" {
+            terminal = true;
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+            // Unparseable payloads are not evidence of content, but they are not
+            // evidence of an empty turn either: let the stream through.
+            return CodexPreamble::Served;
+        };
+        if codex_frame_has_content(&value) == Some(true) {
+            return CodexPreamble::Served;
+        }
+        if value["type"] == "response.completed" {
+            terminal = true;
+            continue;
+        }
+        if value
+            .get("choices")
+            .and_then(Value::as_array)
+            .is_some_and(|choices| {
+                choices
+                    .iter()
+                    .any(|c| c.get("finish_reason").is_some_and(|r| !r.is_null()))
+            })
+        {
+            terminal = true;
+        }
+    }
+    if terminal {
+        CodexPreamble::Empty
+    } else {
+        CodexPreamble::Pending
+    }
+}
+
+/// Opens an OpenAI-shaped stream, holding back its preamble until the first
+/// content-bearing event. Upstreams in this pool answer with HTTP 200 and a
+/// short, well-formed stream that carries a role prelude, reasoning deltas, and
+/// a terminal event but no text and no tool call. Relaying that verbatim makes
+/// the client consume an empty turn; surfacing `Err` before any byte is
+/// committed lets the relay fail over to another account instead. On deadline,
+/// cap, or a closed-but-content-bearing stream the buffered bytes are released
+/// unchanged.
+pub async fn open_codex_stream(
+    resp: reqwest::Response,
+    deadline: std::time::Duration,
+) -> Result<(Bytes, UpstreamStream), String> {
+    let (first, stream) = open_stream(resp, Protocol::Codex).await?;
+    hold_codex_preamble(first, stream, deadline).await
+}
+
+async fn hold_codex_preamble(
+    first: Bytes,
+    mut stream: UpstreamStream,
+    deadline: std::time::Duration,
+) -> Result<(Bytes, UpstreamStream), String> {
+    let until = tokio::time::Instant::now() + deadline;
+    let mut buf = bytes::BytesMut::from(&first[..]);
+    loop {
+        match classify_codex_preamble(&buf) {
+            CodexPreamble::Served => return Ok((buf.freeze(), stream)),
+            CodexPreamble::Empty => {
+                return Err(
+                    "empty_response: upstream stream ended without text or tool calls".to_string(),
+                )
+            }
+            CodexPreamble::Pending if buf.len() >= CODEX_PREAMBLE_CAP => {
+                return Ok((buf.freeze(), stream))
+            }
+            CodexPreamble::Pending => {}
+        }
+        match tokio::time::timeout_at(until, stream.next()).await {
+            Ok(Some(Ok(chunk))) => buf.extend_from_slice(&chunk),
+            Ok(Some(Err(err))) => return Err(err.to_string()),
+            // End of stream with nothing content-bearing: this turn is empty by
+            // construction, so fail over rather than commit it to the client.
+            Ok(None) => {
+                return Err(
+                    "empty_response: upstream stream ended without text or tool calls".to_string(),
+                )
+            }
+            Err(_) => return Ok((buf.freeze(), stream)),
+        }
+    }
+}
+
+/// Upper bound on the Antigravity preamble buffered while looking for the
+/// first content-bearing frame. A failure frame is tiny, so this only has to
+/// hold reasoning preludes; it never has to hold a whole answer.
+const GEMINI_PREAMBLE_CAP: usize = 32 * 1024;
+
+/// What the leading complete SSE frames of an Antigravity stream say.
+enum GeminiPreamble {
+    /// Nothing decisive yet; more bytes are needed.
+    Pending,
+    /// Text, a tool call, or an error frame arrived; the stream is served.
+    Served,
+    /// The upstream finished without content and reported a retryable failure
+    /// (`MALFORMED_FUNCTION_CALL`). Callers fail over instead of handing the
+    /// client a turn the model never produced. Deterministic verdicts such as
+    /// `SAFETY` never land here; they are this turn's answer.
+    Failed(String),
+}
+
+/// Whether a Gemini terminal reason is worth spending a failover on.
+///
+/// `MALFORMED_FUNCTION_CALL` is a degenerate generation: the model emitted a
+/// function call it could not finish, which is nondeterministic and routinely
+/// clears on the next attempt — another account or model can serve it.
+///
+/// Every other reason is deterministic for the request: `SAFETY`,
+/// `PROHIBITED_CONTENT`, `RECITATION`, `SPII`, `BLOCKLIST`, `IMAGE_SAFETY` are
+/// content verdicts, `MAX_TOKENS` is a token limit, `STOP` is a clean end. None
+/// of them changes by walking the pool, so retrying only records a failure
+/// streak against healthy accounts before returning the same answer.
+fn gemini_reason_is_retryable(reason: &str) -> bool {
+    matches!(reason, "MALFORMED_FUNCTION_CALL")
+}
+
+/// Marks a failure the relay should retry on the account that produced it.
+///
+/// A malformed function call is a degenerate generation, not an account fault:
+/// the same credential routinely serves the retry, while walking the pool would
+/// spend a healthy peer, drop that account's prompt cache, and change nothing
+/// about the cause. The relay reads this marker, retries in place, and only
+/// fails over once the retry budget is spent.
+const GEMINI_RETRY_MARKER: &str = "gemini_retry: ";
+
+/// The retryable reason behind a `GEMINI_RETRY_MARKER` failure, if any.
+pub(crate) fn gemini_retry_reason(reason: &str) -> Option<&str> {
+    reason.strip_prefix(GEMINI_RETRY_MARKER)
+}
+
+/// Reads one Antigravity SSE frame for the two facts that decide failover:
+/// whether it carries deliverable output, and whether it declares a terminal
+/// failure reason. Returns `None` when the frame says neither.
+fn gemini_frame_verdict(value: &Value) -> Option<Result<(), String>> {
+    let response = value.get("response").unwrap_or(value);
+    if response.get("error").is_some() {
+        // An explicit upstream error is the stream's answer; let the existing
+        // decoder map it rather than flattening it into "empty response".
+        return Some(Ok(()));
+    }
+    // A prompt-level block has no candidate at all. It is a deterministic
+    // verdict on the request, and holding it would stall the client for the
+    // whole window before releasing the same answer.
+    if response
+        .pointer("/promptFeedback/blockReason")
+        .and_then(Value::as_str)
+        .is_some()
+    {
+        return Some(Ok(()));
+    }
+    let candidate = response
+        .get("candidates")
+        .and_then(Value::as_array)
+        .and_then(|candidates| candidates.first())?;
+    if let Some(reason) = candidate.get("finishReason").and_then(Value::as_str) {
+        if gemini_reason_is_retryable(reason) {
+            return Some(Err(format!(
+                "{GEMINI_RETRY_MARKER}Gemini generation failed: {reason}"
+            )));
+        }
+        // Any other terminal reason is this turn's answer, whether it carries
+        // content or not: a content verdict (`SAFETY`, `RECITATION`), a token
+        // limit (`MAX_TOKENS`), or a clean `STOP` that produced nothing. Holding
+        // those would delay the client for the whole window and then release
+        // the same bytes, and the decoder already renders each one correctly.
+        return Some(Ok(()));
+    }
+    let parts = candidate
+        .get("content")
+        .and_then(|content| content.get("parts"))
+        .and_then(Value::as_array);
+    for part in parts.into_iter().flatten() {
+        if part.get("functionCall").is_some() {
+            return Some(Ok(()));
+        }
+        let thought = part
+            .get("thought")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !thought
+            && part
+                .get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.is_empty())
+        {
+            return Some(Ok(()));
+        }
+    }
+    None
+}
+
+fn classify_gemini_preamble(buf: &[u8]) -> GeminiPreamble {
+    let text = String::from_utf8_lossy(buf).replace("\r\n", "\n");
+    let mut frames: Vec<&str> = text.split("\n\n").collect();
+    // The trailing piece is an incomplete frame; judge it once its delimiter lands.
+    frames.pop();
+    // Every buffered frame is judged before the hold is released. The observed
+    // failure arrives as a text fragment (`}`) in one frame and the terminal
+    // `finishReason` in the next one of the same read: releasing on the
+    // fragment alone would commit the very turn this gate exists to retry.
+    let mut served = false;
+    let mut terminal_failure: Option<String> = None;
+    for frame in frames {
+        let data: String = frame
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(str::trim_start)
+            .collect();
+        let trimmed = data.trim();
+        if trimmed.is_empty() || trimmed == "[DONE]" {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+            // Unparseable payloads are not evidence of content, but they are
+            // not evidence of an empty turn either: let the stream through.
+            return GeminiPreamble::Served;
+        };
+        match gemini_frame_verdict(&value) {
+            Some(Ok(())) => served = true,
+            Some(Err(reason)) => terminal_failure = Some(reason),
+            None => {}
+        }
+    }
+    match terminal_failure {
+        Some(reason) => GeminiPreamble::Failed(reason),
+        None if served => GeminiPreamble::Served,
+        None => GeminiPreamble::Pending,
+    }
+}
+
+/// Opens an Antigravity stream, holding back its preamble until the first
+/// content-bearing frame. Gemini reports a degenerate generation as the
+/// `finishReason` of an HTTP 200 stream that carries no output at all, and the
+/// observed shape puts a stray text fragment in the frame *before* that reason.
+/// Committing either to the client spends the one failover the request had,
+/// because the relay contract forbids retrying after the first byte. Holding the
+/// preamble turns those turns into an `Err` the relay can fail over on.
+///
+/// Only a retryable reason (`MALFORMED_FUNCTION_CALL`) triggers that: content
+/// verdicts and token-limit stops are terminal answers and pass through, as does
+/// an upstream error frame. On deadline, cap, or a served stream the buffered
+/// bytes are released unchanged, so no content is ever dropped.
+///
+/// The gate is bounded by the first content-bearing frame, so a failure that
+/// only surfaces after a long answer has begun still reaches the client as
+/// before — the window is deliberately short to keep the first byte prompt.
+pub async fn open_gemini_stream(
+    resp: reqwest::Response,
+    deadline: std::time::Duration,
+) -> Result<(Bytes, UpstreamStream), String> {
+    let (first, stream) = open_stream(resp, Protocol::Antigravity).await?;
+    hold_gemini_preamble(first, stream, deadline).await
+}
+
+async fn hold_gemini_preamble(
+    first: Bytes,
+    mut stream: UpstreamStream,
+    deadline: std::time::Duration,
+) -> Result<(Bytes, UpstreamStream), String> {
+    let until = tokio::time::Instant::now() + deadline;
+    let mut buf = bytes::BytesMut::from(&first[..]);
+    loop {
+        match classify_gemini_preamble(&buf) {
+            GeminiPreamble::Served => return Ok((buf.freeze(), stream)),
+            GeminiPreamble::Failed(reason) => return Err(reason),
+            GeminiPreamble::Pending if buf.len() >= GEMINI_PREAMBLE_CAP => {
+                return Ok((buf.freeze(), stream))
+            }
+            GeminiPreamble::Pending => {}
+        }
+        match tokio::time::timeout_at(until, stream.next()).await {
+            Ok(Some(Ok(chunk))) => buf.extend_from_slice(&chunk),
+            Ok(Some(Err(err))) => return Err(err.to_string()),
+            // End of stream before any decisive frame. The tail may still hold
+            // the answer once its delimiter is supplied, so judge it first: a
+            // content tail is served, a failure reason fails over, and only a
+            // genuinely empty turn is truncated.
+            Ok(None) => {
+                buf.extend_from_slice(b"\n\n");
+                return match classify_gemini_preamble(&buf) {
+                    GeminiPreamble::Failed(reason) => Err(reason),
+                    GeminiPreamble::Served => Ok((buf.freeze(), stream)),
+                    GeminiPreamble::Pending => {
+                        Err("stream truncated before finish reason".to_string())
+                    }
+                };
+            }
+            Err(_) => return Ok((buf.freeze(), stream)),
+        }
+    }
+}
+
+/// The model id an upstream envelope declares as the one it actually served.
+///
+/// Codex answers `response.created`/`response.completed` with its own
+/// `response.model`, and that value is authoritative: the backend may answer a
+/// request for one id with a different one (its safety-buffering path answers
+/// `gpt-6-astra` with the faster `gpt-6-luna` surface and announces that plan in
+/// `x-codex-safety-buffering-faster-model`). Nothing in this gateway rewrites
+/// that field, so it is the only place a caller can learn that the id it asked
+/// for was not the id that ran.
+pub fn served_codex_model(buf: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(buf).ok()?;
+    for block in text.split("\n\n") {
+        for line in block.lines() {
+            let Some(data) = line.strip_prefix("data:") else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<Value>(data.trim()) else {
+                continue;
+            };
+            if !matches!(
+                value.get("type").and_then(Value::as_str),
+                Some("response.created" | "response.completed" | "response.in_progress")
+            ) {
+                continue;
+            }
+            if let Some(model) = value
+                .get("response")
+                .and_then(|response| response.get("model"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+            {
+                return Some(model.to_string());
+            }
+        }
+    }
+    None
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Protocol {
     Codex,
     Antigravity,
     Anthropic,
     Kiro,
+    CommandCode,
     Cursor,
     Devin,
+    /// A generic OpenAI chat-completions upstream. Only the reply shape
+    /// differs from Codex: the request is already chat-shaped.
+    Chat,
 }
 
 impl Protocol {
@@ -361,8 +851,10 @@ impl Protocol {
             Self::Antigravity => "antigravity",
             Self::Anthropic => "anthropic",
             Self::Kiro => "kiro",
+            Self::CommandCode => "command-code",
             Self::Cursor => "cursor",
             Self::Devin => "devin",
+            Self::Chat => "chat",
         }
     }
 }
@@ -371,6 +863,10 @@ pub struct ProtocolSession {
     pub protocol: Protocol,
     pub cursor_reply: Option<tokio::sync::mpsc::Sender<Bytes>>,
     pub replay: Option<signature_ledger::ReplayScope>,
+    /// Request-scoped Gemini tool-name codec. Names outside Gemini's identifier
+    /// set are rewritten on the way out, so the same mapping must decode the
+    /// reply or the client sees names it never sent.
+    pub gemini_tool_names: Option<gemini::GeminiToolNames>,
 }
 
 struct ProtocolParser {
@@ -378,8 +874,10 @@ struct ProtocolParser {
     gemini: Option<gemini::GeminiDecoder>,
     anthropic: Option<claude::AnthropicDecoder>,
     kiro: Option<kiro::KiroDecoder>,
+    command_code: Option<command_code::CommandCodeDecoder>,
     cursor: Option<cursor::CursorDecoder>,
     devin: Option<devin::DevinDecoder>,
+    chat: Option<chat::ChatDecoder>,
 }
 
 impl ProtocolParser {
@@ -392,10 +890,11 @@ impl ProtocolParser {
     /// turn, so the decoder writes it into the same scope the request was
     /// translated with.
     fn with_session(session: &ProtocolSession) -> Self {
-        Self::with_parts(
+        Self::with_session_parts(
             session.protocol,
             session.cursor_reply.clone(),
             session.replay.clone(),
+            session.gemini_tool_names.clone(),
         )
     }
 
@@ -411,31 +910,55 @@ impl ProtocolParser {
         cursor_reply: Option<tokio::sync::mpsc::Sender<Bytes>>,
         replay: Option<signature_ledger::ReplayScope>,
     ) -> Self {
+        Self::with_session_parts(protocol, cursor_reply, replay, None)
+    }
+
+    fn with_session_parts(
+        protocol: Protocol,
+        cursor_reply: Option<tokio::sync::mpsc::Sender<Bytes>>,
+        replay: Option<signature_ledger::ReplayScope>,
+        gemini_tool_names: Option<gemini::GeminiToolNames>,
+    ) -> Self {
         Self {
             sse: SseParser::default(),
             gemini: match protocol {
                 Protocol::Codex => None,
-                Protocol::Antigravity => Some(match replay {
-                    Some(replay) => gemini::GeminiDecoder::with_replay(replay),
-                    None => gemini::GeminiDecoder::new(),
+                Protocol::Antigravity => Some({
+                    let decoder = match replay {
+                        Some(replay) => gemini::GeminiDecoder::with_replay(replay),
+                        None => gemini::GeminiDecoder::new(),
+                    };
+                    match gemini_tool_names {
+                        Some(names) => decoder.with_tool_names(names),
+                        None => decoder,
+                    }
                 }),
                 Protocol::Anthropic => None,
                 Protocol::Kiro => None,
+                Protocol::CommandCode => None,
                 Protocol::Cursor => None,
                 Protocol::Devin => None,
+                Protocol::Chat => None,
             },
             anthropic: (protocol == Protocol::Anthropic).then(claude::AnthropicDecoder::new),
             kiro: (protocol == Protocol::Kiro).then(kiro::KiroDecoder::new),
+            command_code: (protocol == Protocol::CommandCode)
+                .then(command_code::CommandCodeDecoder::new),
             cursor: (protocol == Protocol::Cursor).then(|| match cursor_reply {
                 Some(sender) => cursor::CursorDecoder::with_reply_sender(sender),
                 None => cursor::CursorDecoder::new(),
             }),
             devin: (protocol == Protocol::Devin).then(devin::DevinDecoder::new),
+            chat: (protocol == Protocol::Chat).then(chat::ChatDecoder::new),
         }
     }
 
     fn push(&mut self, chunk: &[u8], events: &mut Vec<CodexEvent>) {
         if let Some(decoder) = self.cursor.as_mut() {
+            decoder.decode(chunk, events);
+            return;
+        }
+        if let Some(decoder) = self.command_code.as_mut() {
             decoder.decode(chunk, events);
             return;
         }
@@ -445,6 +968,15 @@ impl ProtocolParser {
         }
         if let Some(decoder) = self.devin.as_mut() {
             decoder.decode(chunk, events);
+            return;
+        }
+        if let Some(decoder) = self.chat.as_mut() {
+            let mut frames = Vec::new();
+            let result = self.sse.push_raw_data(chunk, &mut frames);
+            for frame in frames {
+                decoder.decode_frame(&frame, events);
+            }
+            push_limit_failure(result, events);
             return;
         }
         if let Some(decoder) = self.anthropic.as_mut() {
@@ -474,11 +1006,25 @@ impl ProtocolParser {
             decoder.finish(events);
             return;
         }
+        if let Some(decoder) = self.command_code.as_mut() {
+            decoder.finish(events);
+            return;
+        }
         if let Some(decoder) = self.kiro.as_mut() {
             decoder.finish(events);
             return;
         }
         if let Some(decoder) = self.devin.as_mut() {
+            decoder.finish(events);
+            return;
+        }
+        if let Some(decoder) = self.chat.as_mut() {
+            let mut frames = Vec::new();
+            let result = self.sse.finish_raw_data(&mut frames);
+            for frame in frames {
+                decoder.decode_frame(&frame, events);
+            }
+            push_limit_failure(result, events);
             decoder.finish(events);
             return;
         }
@@ -518,12 +1064,28 @@ fn push_limit_failure(result: Result<(), events::SseLimitError>, events: &mut Ve
     }
 }
 
+// Only the elapsed upstream poll is charged; downstream pulls and generated
+// ticks do not consume or reset the silence budget.
+fn remaining_upstream_budget(
+    remaining: std::time::Duration,
+    upstream_wait: std::time::Duration,
+    received_chunk: bool,
+) -> std::time::Duration {
+    if received_chunk {
+        STREAM_UPSTREAM_SILENCE_BUDGET
+    } else {
+        remaining.saturating_sub(upstream_wait)
+    }
+}
+
 struct TranslateState {
     upstream: UpstreamStream,
     parser: ProtocolParser,
     renderer: StreamRenderer,
     pending: VecDeque<Bytes>,
     drained: bool,
+    last_emit: std::time::Instant,
+    upstream_budget: std::time::Duration,
 }
 
 /// Streaming surfaces differ per client protocol: OpenAI chunk objects versus
@@ -560,6 +1122,21 @@ impl StreamRenderer {
             Self::Gemini(r) => r.terminated(),
             Self::Anthropic(r) => r.terminated(),
             Self::Responses(r) => r.terminated(),
+        }
+    }
+
+    fn open(&mut self) -> Vec<Bytes> {
+        match self {
+            Self::OpenAi(renderer) => renderer.open(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn tick(&mut self) -> Bytes {
+        match self {
+            Self::OpenAi(renderer) => renderer.tick(),
+            Self::Anthropic(renderer) => renderer.tick(),
+            Self::Gemini(_) | Self::Responses(_) => Bytes::from_static(b": keepalive\n\n"),
         }
     }
 }
@@ -608,11 +1185,16 @@ pub fn streaming_body(params: StreamingBodyParams) -> Body {
         renderer,
         pending: VecDeque::new(),
         drained: false,
+        last_emit: std::time::Instant::now(),
+        upstream_budget: STREAM_UPSTREAM_SILENCE_BUDGET,
     };
     let mut events = Vec::new();
     state.parser.push(&first, &mut events);
     for event in events {
         handle_stream_event(event, &mut state, upstream_capture.as_ref());
+    }
+    if session.protocol == Protocol::Cursor && state.pending.is_empty() {
+        state.pending.extend(state.renderer.open());
     }
 
     Body::from_stream(futures::stream::unfold(
@@ -620,6 +1202,9 @@ pub fn streaming_body(params: StreamingBodyParams) -> Body {
         |(mut state, upstream_capture, devin_outcome)| async move {
             loop {
                 if let Some(frame) = state.pending.pop_front() {
+                    if !frame.is_empty() {
+                        state.last_emit = std::time::Instant::now();
+                    }
                     return Some((
                         Ok::<Bytes, std::io::Error>(frame),
                         (state, upstream_capture, devin_outcome),
@@ -629,7 +1214,43 @@ pub fn streaming_body(params: StreamingBodyParams) -> Body {
                     capture_devin_outcome(&state.parser, devin_outcome.as_ref());
                     return None;
                 }
-                match state.upstream.next().await {
+                if state.last_emit.elapsed() >= STREAM_IDLE_TICK {
+                    let frame = state.renderer.tick();
+                    state.last_emit = std::time::Instant::now();
+                    if !frame.is_empty() {
+                        state.pending.push_back(frame);
+                    }
+                    continue;
+                }
+                let poll_budget = STREAM_IDLE_TICK.min(state.upstream_budget);
+                let poll_started = std::time::Instant::now();
+                let next = tokio::time::timeout(poll_budget, state.upstream.next()).await;
+                state.upstream_budget = remaining_upstream_budget(
+                    state.upstream_budget,
+                    poll_started.elapsed(),
+                    matches!(&next, Ok(Some(Ok(_)))),
+                );
+                let next = match next {
+                    Ok(item) => item,
+                    Err(_) => {
+                        if state.upstream_budget.is_zero() {
+                            state.drained = true;
+                            state.upstream = Box::pin(futures::stream::empty());
+                            state.pending.extend(error_frames(
+                                &mut state.renderer,
+                                "upstream stall timeout",
+                            ));
+                            continue;
+                        }
+                        let frame = state.renderer.tick();
+                        state.last_emit = std::time::Instant::now();
+                        if !frame.is_empty() {
+                            state.pending.push_back(frame);
+                        }
+                        continue;
+                    }
+                };
+                match next {
                     Some(Ok(chunk)) => {
                         let mut events = Vec::new();
                         state.parser.push(&chunk, &mut events);
@@ -1008,6 +1629,7 @@ mod bounded_stream_tests {
                 protocol,
                 cursor_reply: None,
                 replay: None,
+                gemini_tool_names: None,
             },
             upstream_capture: None,
             devin_outcome: None,
@@ -1198,7 +1820,7 @@ mod bounded_stream_tests {
     #[tokio::test]
     async fn thinking_followed_by_text_is_released_whole() {
         let thinking = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n";
-        let text = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n";
+        let text = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"answer\"}}\n\n";
         let tail = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         let (first, mut rest) = hold_anthropic_preamble(
             Bytes::from_static(MESSAGE_START.as_bytes()),
@@ -1218,6 +1840,109 @@ mod bounded_stream_tests {
     }
 
     #[test]
+    fn responses_and_gemini_idle_tick_is_complete_comment() {
+        for mut renderer in [
+            StreamRenderer::Responses(Box::new(responses::ResponsesStreamRenderer::new(
+                "fixture".into(),
+                0,
+            ))),
+            StreamRenderer::Gemini(Box::new(GeminiChunkRenderer::new("fixture".into(), 0))),
+        ] {
+            assert!(!renderer.terminated());
+            assert_eq!(renderer.tick(), Bytes::from_static(b": keepalive\n\n"));
+            assert!(!renderer.terminated());
+            assert_eq!(renderer.tick(), Bytes::from_static(b": keepalive\n\n"));
+        }
+    }
+
+    #[tokio::test]
+    async fn anthropic_empty_text_preamble_remains_retryable() {
+        for content in [
+            json!({"type":"content_block_start","content_block":{"type":"text"}}),
+            json!({"type":"content_block_start","content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","delta":{"type":"text_delta"}}),
+            json!({"type":"content_block_delta","delta":{"type":"text_delta","text":""}}),
+        ] {
+            let first = Bytes::from(format!("{MESSAGE_START}data: {content}\n\n"));
+            assert!(matches!(
+                classify_anthropic_preamble(&first),
+                AnthropicPreamble::Pending
+            ));
+            for (terminal, expected_code) in [
+                (json!({"type":"message_stop"}), "unavailable:"),
+                (
+                    json!({"type":"error","error":{"type":"rate_limit_error","message":"limited"}}),
+                    "resource_exhausted:",
+                ),
+            ] {
+                let (send, receive) = tokio::sync::oneshot::channel();
+                let source: UpstreamStream = Box::pin(futures::stream::once(async move {
+                    Ok(receive.await.expect("terminal gate"))
+                }));
+                let preamble = hold_anthropic_preamble(
+                    first.clone(),
+                    source,
+                    std::time::Duration::from_secs(5),
+                );
+                tokio::pin!(preamble);
+                assert!(futures::poll!(&mut preamble).is_pending());
+                send.send(Bytes::from(format!("data: {terminal}\n\n")))
+                    .expect("preamble must still be waiting");
+                let reason = preamble.await.err().expect("empty text must be retryable");
+                assert!(reason.starts_with(expected_code), "{reason}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn anthropic_nonempty_text_releases_preamble() {
+        for content in [
+            json!({"type":"content_block_start","content_block":{"type":"text","text":"answer"}}),
+            json!({"type":"content_block_delta","delta":{"type":"text_delta","text":"answer"}}),
+        ] {
+            let first = Bytes::from(format!("{MESSAGE_START}data: {content}\n\n"));
+            let source: UpstreamStream = Box::pin(futures::stream::pending());
+            let preamble =
+                hold_anthropic_preamble(first.clone(), source, std::time::Duration::from_secs(5));
+            tokio::pin!(preamble);
+            match futures::poll!(&mut preamble) {
+                Poll::Ready(Ok((buffered, _))) => assert_eq!(buffered, first),
+                _ => panic!("nonempty text must release without another upstream poll"),
+            }
+        }
+    }
+
+    #[test]
+    fn translate_stall_budget_accounts_only_upstream_wait() {
+        use std::time::Duration;
+
+        let remaining =
+            remaining_upstream_budget(STREAM_UPSTREAM_SILENCE_BUDGET, STREAM_IDLE_TICK, false);
+        assert_eq!(remaining, Duration::from_secs(285));
+        // Downstream backpressure and tick generation supply no upstream wait.
+        assert_eq!(
+            remaining_upstream_budget(remaining, Duration::ZERO, false),
+            remaining
+        );
+        assert_eq!(
+            remaining_upstream_budget(remaining, Duration::from_secs(1), true),
+            STREAM_UPSTREAM_SILENCE_BUDGET
+        );
+        assert_eq!(
+            remaining_upstream_budget(remaining, Duration::from_secs(285), false),
+            Duration::ZERO
+        );
+        assert_eq!(
+            remaining_upstream_budget(remaining, Duration::from_secs(600), false),
+            Duration::ZERO
+        );
+        assert_eq!(
+            STREAM_IDLE_TICK.min(Duration::from_secs(3)),
+            Duration::from_secs(3)
+        );
+    }
+
+    #[test]
     fn bounded_nonstream_append_allows_exactly_the_cap() {
         let mut raw = vec![0u8; MAX_NONSTREAM_RESPONSE_BYTES - 3];
         assert!(extend_nonstream_bounded(&mut raw, &[1, 2, 3]).is_ok());
@@ -1230,5 +1955,231 @@ mod bounded_stream_tests {
         let error = extend_nonstream_bounded(&mut raw, &[1]).unwrap_err();
         assert!(error.contains("limit"), "{error}");
         assert_eq!(raw.len(), MAX_NONSTREAM_RESPONSE_BYTES);
+    }
+}
+
+#[cfg(test)]
+mod chat_parser_tests {
+    use super::*;
+
+    fn gemini_chunks(parts: &[&'static str]) -> UpstreamStream {
+        let items: Vec<reqwest::Result<Bytes>> = parts
+            .iter()
+            .map(|part| Ok(Bytes::from_static(part.as_bytes())))
+            .collect();
+        Box::pin(futures::stream::iter(items))
+    }
+
+    /// The failure this gate exists for: Gemini answers 200 with a stream that
+    /// carries no output at all and reports `MALFORMED_FUNCTION_CALL`. Before
+    /// the hold, the relay had already committed the first byte, so the client
+    /// got a terminal error on a turn another account could have served.
+    #[tokio::test]
+    async fn a_malformed_function_call_preamble_fails_over() {
+        let frame = "data: {\"candidates\":[{\"finishReason\":\"MALFORMED_FUNCTION_CALL\"}]}\n\n";
+        let result = hold_gemini_preamble(
+            Bytes::from_static(frame.as_bytes()),
+            gemini_chunks(&[]),
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        let reason = result.err().expect("a malformed call must retry");
+        assert_eq!(
+            gemini_retry_reason(&reason),
+            Some("Gemini generation failed: MALFORMED_FUNCTION_CALL")
+        );
+    }
+
+    /// The marker is what tells the relay to retry in place instead of walking
+    /// the pool. A content verdict must never carry it.
+    #[test]
+    fn only_a_degenerate_generation_carries_the_retry_marker() {
+        assert_eq!(gemini_retry_reason("upstream exploded"), None);
+        assert_eq!(
+            gemini_retry_reason("gemini_retry: Gemini generation failed: MALFORMED_FUNCTION_CALL"),
+            Some("Gemini generation failed: MALFORMED_FUNCTION_CALL")
+        );
+    }
+
+    /// A failure reason split across chunks must still be caught before commit.
+    /// The split lands mid-frame, which is what a TCP chunk boundary does: the
+    /// buffered prefix carries no newline, so the frame is only judged once its
+    /// delimiter arrives.
+    #[tokio::test]
+    async fn a_failure_reason_arriving_in_a_later_chunk_still_fails_over() {
+        let result = hold_gemini_preamble(
+            Bytes::from_static(b"data: {\"candidates\":[{"),
+            gemini_chunks(&["\"finishReason\":\"MALFORMED_FUNCTION_CALL\"}]}\n\n"]),
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        let reason = result.err().expect("a malformed call must fail over");
+        assert!(reason.contains("MALFORMED_FUNCTION_CALL"), "{reason}");
+    }
+
+    /// A content verdict is deterministic for the request, so retrying it only
+    /// walks the pool, records a failure streak on healthy accounts, and ends
+    /// with the same answer. It must reach the client through the decoder as a
+    /// content-filter stop, exactly as it did before this gate existed.
+    #[tokio::test]
+    async fn content_verdicts_are_passed_through_not_failed_over() {
+        for reason in [
+            "SAFETY",
+            "PROHIBITED_CONTENT",
+            "RECITATION",
+            "SPII",
+            "BLOCKLIST",
+        ] {
+            let frame = format!("data: {{\"candidates\":[{{\"finishReason\":\"{reason}\"}}]}}\n\n");
+            let (first, _) = hold_gemini_preamble(
+                Bytes::from(frame.clone()),
+                gemini_chunks(&[]),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{reason} must not fail over: {error}"));
+            assert_eq!(first, Bytes::from(frame), "{reason} must pass through");
+        }
+    }
+
+    /// The exact shape observed in production on 2026-11-21: the turn streamed
+    /// a one-character text fragment and then reported
+    /// `MALFORMED_FUNCTION_CALL`. Releasing the hold on the fragment would hand
+    /// the client the broken turn this gate exists to retry, so a terminal
+    /// failure anywhere in the buffered window wins over content.
+    #[tokio::test]
+    async fn a_text_fragment_before_a_failure_reason_still_fails_over() {
+        let fragment = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"}\"}]}}]}\n\n";
+        let failure = "data: {\"candidates\":[{\"finishReason\":\"MALFORMED_FUNCTION_CALL\"}]}\n\n";
+        let result = hold_gemini_preamble(
+            Bytes::from(format!("{fragment}{failure}")),
+            gemini_chunks(&[]),
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        let reason = result.err().expect("a malformed call must retry");
+        assert_eq!(
+            gemini_retry_reason(&reason),
+            Some("Gemini generation failed: MALFORMED_FUNCTION_CALL")
+        );
+    }
+
+    /// A thinking prelude alone is not an answer, so it must not release the
+    /// hold; the real text behind it must.
+    #[tokio::test]
+    async fn a_thinking_prelude_keeps_the_hold_until_real_text_arrives() {
+        let thought = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"pondering\",\"thought\":true}]}}]}\n\n";
+        let text = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"answer\"}]},\"finishReason\":\"STOP\"}]}\n\n";
+        let (first, mut rest) = hold_gemini_preamble(
+            Bytes::from_static(thought.as_bytes()),
+            gemini_chunks(&[text]),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("served stream");
+        assert_eq!(first, Bytes::from(format!("{thought}{text}")));
+        assert!(rest.next().await.is_none());
+    }
+
+    /// A tool call is deliverable output; the hold must release immediately so
+    /// the client is never delayed behind a preamble it does not need.
+    #[tokio::test]
+    async fn a_tool_call_preamble_releases_the_stream_unchanged() {
+        let call = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"bash\",\"args\":{}}}]}}]}\n\n";
+        let (first, _) = hold_gemini_preamble(
+            Bytes::from_static(call.as_bytes()),
+            gemini_chunks(&[]),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("a tool call is content");
+        assert_eq!(first, Bytes::from_static(call.as_bytes()));
+    }
+
+    /// An upstream `error` frame is the stream's answer: it must reach the
+    /// client through the existing decoder instead of being flattened into a
+    /// failover, or real rate limits would retry the whole pool.
+    #[tokio::test]
+    async fn an_explicit_error_frame_is_passed_through_not_failed_over() {
+        let error = "data: {\"error\":{\"message\":\"upstream busy\"}}\n\n";
+        let (first, _) = hold_gemini_preamble(
+            Bytes::from_static(error.as_bytes()),
+            gemini_chunks(&[]),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("explicit errors reach the client verbatim");
+        assert_eq!(first, Bytes::from_static(error.as_bytes()));
+    }
+
+    /// A token-limit stop is a legitimate terminal answer, not a failure: it
+    /// must reach the decoder as `length` instead of being held and then
+    /// reported as truncation.
+    #[tokio::test]
+    async fn a_token_limit_stop_is_passed_through_not_failed_over() {
+        let frame = "data: {\"candidates\":[{\"finishReason\":\"MAX_TOKENS\"}]}\n\n";
+        let (first, _) = hold_gemini_preamble(
+            Bytes::from_static(frame.as_bytes()),
+            gemini_chunks(&[]),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("a token limit is not a transport failure");
+        assert_eq!(first, Bytes::from_static(frame.as_bytes()));
+    }
+
+    /// A prompt-level block has no candidate at all. Holding it would stall the
+    /// client for the whole window before releasing the same deterministic
+    /// answer, so it must pass straight through.
+    #[tokio::test]
+    async fn a_prompt_level_block_is_passed_through_not_held() {
+        let frame = "data: {\"promptFeedback\":{\"blockReason\":\"PROHIBITED_CONTENT\"}}\n\n";
+        let (first, _) = hold_gemini_preamble(
+            Bytes::from_static(frame.as_bytes()),
+            gemini_chunks(&[]),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("a prompt block is the request's answer");
+        assert_eq!(first, Bytes::from_static(frame.as_bytes()));
+    }
+
+    /// A stream that closes with its answer still in an unterminated tail frame
+    /// must be served, not reported as truncation.
+    #[tokio::test]
+    async fn a_content_tail_without_a_trailing_delimiter_is_served() {
+        let tail = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"done\"}]}}]}";
+        let (first, _) = hold_gemini_preamble(
+            Bytes::from_static(tail.as_bytes()),
+            gemini_chunks(&[]),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("a content tail is an answer");
+        assert!(first.starts_with(tail.as_bytes()));
+    }
+
+    #[test]
+    fn a_chat_session_parser_decodes_chat_frames() {
+        let session = ProtocolSession {
+            protocol: Protocol::Chat,
+            cursor_reply: None,
+            replay: None,
+            gemini_tool_names: None,
+        };
+        let mut parser = ProtocolParser::with_session(&session);
+        let mut events = Vec::new();
+        parser.push(
+            b"data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            &mut events,
+        );
+        parser.push(b"data: [DONE]\n\n", &mut events);
+        parser.finish(&mut events);
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, CodexEvent::TextDelta(text) if text == "hi")),
+            "{events:?}"
+        );
     }
 }

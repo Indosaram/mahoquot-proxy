@@ -797,6 +797,36 @@ pub struct Settings {
     )]
     pub credit_codex_account_ids: Vec<String>,
 
+    /// Which Claude members serve first: subscription OAuth, Console API keys,
+    /// or API keys only (OAuth never receives a request).
+    #[serde(rename = "claude-route-mode", default)]
+    pub claude_route_mode: ClaudeRouteMode,
+    /// Monthly (UTC) limit per Claude API-key account, in weighted token
+    /// units: input + output + cache writes + cache reads / 10. An
+    /// operator-defined approximation, not Anthropic's billing formula.
+    #[serde(
+        rename = "claude-api-key-budgets",
+        default,
+        skip_serializing_if = "std::collections::BTreeMap::is_empty"
+    )]
+    pub claude_api_key_budgets: std::collections::BTreeMap<String, u64>,
+    /// Claude accounts benched because an upstream answer looked like account
+    /// enforcement. Never cleared automatically; an operator removes entries.
+    #[serde(
+        rename = "claude-suspected-accounts",
+        default,
+        skip_serializing_if = "std::collections::BTreeMap::is_empty"
+    )]
+    pub claude_suspected_accounts: std::collections::BTreeMap<String, SuspectedAccount>,
+    /// Fixed outbound proxy per Claude account. Never rotated, never falls
+    /// back to the direct client.
+    #[serde(
+        rename = "claude-account-egress",
+        default,
+        skip_serializing_if = "std::collections::BTreeMap::is_empty"
+    )]
+    pub claude_account_egress: std::collections::BTreeMap<String, String>,
+
     #[serde(flatten)]
     pub extra: serde_yaml::Mapping,
 }
@@ -865,6 +895,10 @@ impl Default for Settings {
             omo_profile: None,
             warmup: WarmupSettings::default(),
             credit_codex_account_ids: Vec::new(),
+            claude_route_mode: ClaudeRouteMode::default(),
+            claude_api_key_budgets: Default::default(),
+            claude_suspected_accounts: Default::default(),
+            claude_account_egress: Default::default(),
             extra: serde_yaml::Mapping::new(),
         }
     }
@@ -919,11 +953,36 @@ pub enum SettingsError {
     InvalidCatalogConfig(String),
     #[error("invalid warmup policy: {0}")]
     InvalidWarmupPolicy(String),
+    #[error("invalid claude-account-egress entry for {account}: {message}")]
+    InvalidClaudeEgress { account: String, message: String },
     #[error("invalid proxy url: {0}")]
     InvalidProxyUrl(String),
 }
 
 impl Settings {
+    pub fn validate_claude_egress(&self) -> Result<(), SettingsError> {
+        for (account, url) in &self.claude_account_egress {
+            let scheme_ok = reqwest::Url::parse(url.trim())
+                .map(|u| matches!(u.scheme(), "http" | "https" | "socks5" | "socks5h"))
+                .unwrap_or(false);
+            if !scheme_ok {
+                return Err(SettingsError::InvalidClaudeEgress {
+                    account: account.clone(),
+                    message: "must be an http, https or socks5 URL".to_string(),
+                });
+            }
+            crate::proxy_policy::build_http_client(Some(url)).map_err(|_| {
+                // The builder's message echoes the URL, which may carry proxy
+                // credentials; keep it out of errors and logs.
+                SettingsError::InvalidClaudeEgress {
+                    account: account.clone(),
+                    message: "proxy client could not be built".to_string(),
+                }
+            })?;
+        }
+        Ok(())
+    }
+
     pub fn validate_proxy_settings(&self) -> Result<(), SettingsError> {
         // An unrecognised routing strategy is invalid configuration: it is
         // rejected before anything is persisted or published (Task 7).
@@ -1487,4 +1546,33 @@ mod tests {
         let loaded_camel = Settings::from_yaml(camel).expect("from camelCase");
         assert!(loaded_camel.is_codex_account_credit_enabled("codex-camel"));
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeRouteMode {
+    /// Today's order: no preference between OAuth and API-key members.
+    #[default]
+    OauthFirst,
+    /// API-key members are tried before OAuth members.
+    ApiKeyFirst,
+    /// OAuth members never receive a request.
+    ApiKeyOnly,
+}
+
+impl ClaudeRouteMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OauthFirst => "oauth_first",
+            Self::ApiKeyFirst => "api_key_first",
+            Self::ApiKeyOnly => "api_key_only",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SuspectedAccount {
+    pub reason: String,
+    #[serde(rename = "at-unix")]
+    pub at_unix: i64,
 }

@@ -275,7 +275,6 @@ mod tests {
             ("", "round-robin"),
             ("rr", "round-robin"),
             ("RoundRobin", "round-robin"),
-            ("wrr", "weighted-round-robin"),
             ("ff", "fill-first"),
             ("Fill-First", "fill-first"),
         ] {
@@ -288,6 +287,21 @@ mod tests {
         }
         // and an unknown strategy is rejected
         assert_eq!(normalize_routing_strategy("nonsense"), None);
+    }
+
+    #[test]
+    fn weighted_round_robin_is_refused_because_no_selector_implements_it() {
+        // given every spelling a client may send for the weighted strategy
+        for input in ["wrr", "weighted-round-robin", "WeightedRoundRobin"] {
+            // then the write is refused rather than reported as active
+            assert_eq!(normalize_routing_strategy(input), None, "{input}");
+        }
+        // and the router keeps a strategy it can actually execute
+        let scalar = find("/routing/strategy").expect("registered");
+        let mut settings = Settings::default();
+        settings.routing.strategy = "fill-first".to_string();
+        assert!((scalar.write)(&mut settings, &json!({ "value": "wrr" })).is_err());
+        assert_eq!(settings.routing.strategy, "fill-first");
     }
 
     #[test]

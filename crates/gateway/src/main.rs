@@ -328,6 +328,10 @@ impl ServeArgs {
                 .ok()
                 .map(PathBuf::from)
                 .filter(|value| !value.as_os_str().is_empty()),
+            oauth_callback_port_offset: std::env::var("MAHOQUOT_OAUTH_CALLBACK_PORT_OFFSET")
+                .ok()
+                .and_then(|value| value.parse::<u16>().ok())
+                .unwrap_or(mahoquot_gateway::config::DEFAULT_OAUTH_CALLBACK_PORT_OFFSET),
         })
     }
 }
@@ -443,6 +447,11 @@ fn run_accounts(auth_dir: PathBuf) -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if let Ok(address) = std::env::var("MAHOQUOT_EXEC_SERVER") {
+        if !address.trim().is_empty() {
+            return Ok(mahoquot_gateway::compat::exec_bridge::serve(address.trim()).await?);
+        }
+    }
     // Both aws-lc-rs and ring are compiled into rustls through dependencies,
     // so rustls cannot pick a process default on its own; libraries that use
     // the default (webrtc DTLS for realtime media) would panic. Install the
@@ -700,6 +709,17 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&state),
         mahoquot_gateway::registry::catalog_refresh_check_interval(),
     );
+    // Claude API-key budgets are read from the request history; the affinity
+    // store keeps Claude sessions pinned across restarts.
+    let claude_budget_refresher =
+        mahoquot_gateway::claude_budget::BudgetTracker::spawn_refresher(Arc::clone(&state));
+    let claude_affinity_shutdown = Arc::new(tokio::sync::Notify::new());
+    let mut claude_affinity_worker =
+        mahoquot_gateway::affinity_store::AffinityStore::spawn_persistence(
+            Arc::clone(&state.claude_affinity),
+            std::time::Duration::from_secs(5),
+            Arc::clone(&claude_affinity_shutdown),
+        );
     // Rotates OAuth credentials ahead of expiry. Every other refresh trigger is
     // reactive, so an identity provider that expires its refresh token with the
     // access token turns the first post-expiry attempt into a terminal failure.
@@ -726,6 +746,26 @@ async fn main() -> anyhow::Result<()> {
     catalog_refresh.shutdown().await;
     cline_catalog.shutdown().await;
     pre_expiry_refresh.shutdown().await;
+    claude_budget_refresher.abort();
+    claude_affinity_shutdown.notify_one();
+    if tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        &mut claude_affinity_worker,
+    )
+    .await
+    .is_err()
+    {
+        warn!("claude affinity persistence is still running; waiting before final flush");
+        let _ = claude_affinity_worker.await;
+    }
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    if let Err(error) = state.claude_affinity.flush_blocking(now_unix) {
+        warn!(%error, "failed to persist claude affinity at shutdown");
+    }
+
     flush_worker.shutdown().await;
     let discovery_result = tokio::task::spawn_blocking(move || discovery_mgr.shutdown()).await;
     // Final snapshot before the process exits, so a replay that arrived inside

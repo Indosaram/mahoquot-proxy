@@ -429,7 +429,10 @@ fn tools_14_gemini_and_non_claude_antigravity_keep_existing_conversion() {
         request["model"] = json!(model);
         let native = openai_to_gemini(&request).expect("Gemini");
         let envelope = openai_to_antigravity(&request, "test-project").expect("Antigravity");
-        assert_eq!(envelope["request"], native);
+        // The envelope now carries client identity labels beside the converted
+        // body; everything the conversion produces must still match exactly.
+        assert_eq!(envelope["request"]["contents"], native["contents"]);
+        assert_eq!(envelope["request"]["tools"], native["tools"]);
         assert_eq!(
             native["tools"][0]["functionDeclarations"][14]["parameters"],
             json!({"properties": {"query": {"type": "string"}}})

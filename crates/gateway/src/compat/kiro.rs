@@ -1,6 +1,6 @@
 use serde_json::{json, Map, Value};
 
-use super::events::CodexEvent;
+use super::events::{CodexEvent, Usage};
 
 pub fn openai_to_kiro(body: &Value) -> Result<Value, String> {
     openai_to_kiro_with_profile(body, None)
@@ -15,7 +15,6 @@ pub fn openai_to_kiro_with_profile(
         .and_then(Value::as_str)
         .ok_or_else(|| "missing model".to_string())?;
     let model = model.strip_prefix("kiro/").unwrap_or(model);
-    let model = if model == "auto-kiro" { "auto" } else { model };
     let messages = body
         .get("messages")
         .and_then(Value::as_array)
@@ -39,59 +38,6 @@ pub fn openai_to_kiro_with_profile(
     }
     if conversational.is_empty() {
         return Err("messages contain no user turn".to_string());
-    }
-
-    let mut tool_results = Vec::new();
-    let mut current_images = Vec::new();
-    while conversational
-        .last()
-        .is_some_and(|(role, _, _)| *role == "tool")
-    {
-        let (_, content, message) = conversational.pop().unwrap();
-        let id = message
-            .get("tool_call_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "Kiro tool result missing tool_call_id".to_string())?;
-        let text = if content.trim().is_empty() {
-            "Tool completed without textual output".to_string()
-        } else {
-            content
-        };
-        current_images.extend(images_content(
-            message.get("content").unwrap_or(&Value::Null),
-        ));
-        tool_results.push(json!({
-            "toolUseId": normalize_tool_id(id),
-            "content": [{"text": text}],
-            "status": if message.get("is_error").and_then(Value::as_bool) == Some(true) {
-                "error"
-            } else {
-                "success"
-            },
-        }));
-    }
-    tool_results.reverse();
-
-    let mut current = String::new();
-    if let Some((current_role, current_text, current_message)) = conversational.pop() {
-        if current_role == "user" {
-            current = current_text;
-            current_images.extend(images_content(
-                current_message.get("content").unwrap_or(&Value::Null),
-            ));
-        } else {
-            conversational.push((current_role, current_text, current_message));
-        }
-    }
-    if current.is_empty() && !tool_results.is_empty() {
-        current = "Tool results are available in the message context".to_string();
-    }
-    if !system.is_empty() {
-        current = if current.is_empty() {
-            system.join("\n\n")
-        } else {
-            format!("{}\n\n{}", system.join("\n\n"), current)
-        };
     }
 
     let mut history = Vec::new();
@@ -125,13 +71,51 @@ pub fn openai_to_kiro_with_profile(
             }
             history.push(json!({ "assistantResponseMessage": assistant }));
         } else {
-            history.push(json!({
-                "userInputMessage": {
-                    "content": content,
-                    "modelId": model,
-                    "origin": "AI_EDITOR",
-                }
-            }));
+            let mut user = json!({"content": content, "modelId": model, "origin": "AI_EDITOR",
+                "images": images_content(message.get("content").unwrap_or(&Value::Null)),
+                "userInputMessageContext": {"toolResults": []}});
+            if role == "tool" {
+                let id = message
+                    .get("tool_call_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "Kiro tool result missing tool_call_id".to_string())?;
+                user["content"] = json!("");
+                user["userInputMessageContext"]["toolResults"] = json!([{
+                    "toolUseId": normalize_tool_id(id),
+                    "content": [{"text": if content.trim().is_empty() { "Tool completed without textual output" } else { &content }}],
+                    "status": if message["is_error"].as_bool() == Some(true) { "error" } else { "success" }
+                }]);
+            }
+            if let Some(previous) = history
+                .last_mut()
+                .and_then(|entry: &mut Value| entry.get_mut("userInputMessage"))
+            {
+                let text = [
+                    previous["content"].as_str().unwrap_or_default(),
+                    user["content"].as_str().unwrap_or_default(),
+                ]
+                .into_iter()
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+                previous["content"] = json!(text);
+                previous["images"]
+                    .as_array_mut()
+                    .unwrap()
+                    .extend(user["images"].as_array().unwrap().iter().cloned());
+                previous["userInputMessageContext"]["toolResults"]
+                    .as_array_mut()
+                    .unwrap()
+                    .extend(
+                        user["userInputMessageContext"]["toolResults"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .cloned(),
+                    );
+            } else {
+                history.push(json!({"userInputMessage": user}));
+            }
         }
     }
 
@@ -160,19 +144,36 @@ pub fn openai_to_kiro_with_profile(
         }
     }
 
-    if !tool_results.is_empty() {
-        context.insert("toolResults".to_string(), Value::Array(tool_results));
+    let mut user_input = if history
+        .last()
+        .is_some_and(|entry| entry.get("userInputMessage").is_some())
+    {
+        history.pop().unwrap()["userInputMessage"].take()
+    } else {
+        json!({"content": "", "modelId": model, "origin": "AI_EDITOR", "userInputMessageContext": {}})
+    };
+    let current = user_input["content"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    if !system.is_empty() {
+        user_input["content"] = json!([system.join("\n\n"), current]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n"));
+    } else if current.is_empty()
+        && user_input
+            .pointer("/userInputMessageContext/toolResults")
+            .and_then(Value::as_array)
+            .is_some_and(|results| !results.is_empty())
+    {
+        user_input["content"] = json!("Tool results are available in the message context");
     }
-
-    let mut user_input = json!({
-        "content": current,
-        "modelId": model,
-        "origin": "AI_EDITOR",
-        "userInputMessageContext": Value::Object(context),
-    });
-    if !current_images.is_empty() {
-        user_input["images"] = Value::Array(current_images);
-    }
+    user_input["userInputMessageContext"]
+        .as_object_mut()
+        .unwrap()
+        .extend(context);
 
     let mut payload = json!({
         "conversationState": {
@@ -258,6 +259,24 @@ pub const MAX_KIRO_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// request.
 pub const MAX_KIRO_JSON_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 
+/// Context window Kiro charges `contextUsagePercentage` against, in tokens.
+///
+/// The models advertise 1,000,000, but the runtime charges 1.50x per token
+/// against that number while every other model charges 1.00x. kiro-lb inverted
+/// the measured slopes and landed on 665,853 / 667,824 / 668,300 / 667,364
+/// across four models - all within 0.3% of 666,667 - so the percentage is of
+/// 666,667, not of the advertised window. Using 1,000,000 here would inflate
+/// every derived count by 1.50x.
+///
+/// Only `claude-opus-5.5` is enabled for Kiro, so one constant covers the
+/// closed catalog. Replace with a per-model table before enabling more.
+pub const KIRO_CONTEXT_WINDOW_TOKENS: u64 = 666_667;
+
+/// Chars per token used when splitting the context total into input/output.
+/// Upstream never reports the split, so the output side is approximated from
+/// the text it streamed and the input side is the remainder.
+const KIRO_CHARS_PER_TOKEN: u64 = 4;
+
 #[derive(Default)]
 pub struct KiroDecoder {
     wire: Vec<u8>,
@@ -266,12 +285,56 @@ pub struct KiroDecoder {
     /// Bytes of a character split across chunk boundaries, awaiting completion.
     pending: Vec<u8>,
     completed: bool,
+    usage: Option<Usage>,
+    /// Authoritative context occupancy reported by upstream. Kiro never sends
+    /// `tokenUsage`, but it does send this, and it is the only real signal of
+    /// how much context a turn occupied.
+    context_usage_percentage: Option<f64>,
+    /// Characters of assistant text streamed this turn, used to split the
+    /// context total into input and output.
+    output_chars: u64,
     current_tool: Option<(String, String, u64)>,
 }
 
 impl KiroDecoder {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Builds the usage to report when upstream sent `contextUsagePercentage`
+    /// but no `tokenUsage`.
+    ///
+    /// The total is upstream's own context occupancy, so it is measured, not
+    /// invented. The input/output split is not reported by upstream: the output
+    /// side is approximated from the streamed text and the input side is what
+    /// remains, which mirrors how kiro-lb derives `prompt_tokens`.
+    fn derived_usage(&self) -> Option<Usage> {
+        let percentage = self.context_usage_percentage?;
+        if !(percentage > 0.0) || !percentage.is_finite() {
+            return None;
+        }
+        let capped = percentage.min(100.0);
+        let total_tokens = ((capped / 100.0) * KIRO_CONTEXT_WINDOW_TOKENS as f64).ceil() as u64;
+        if total_tokens == 0 {
+            return None;
+        }
+        let completion_tokens = (self.output_chars / KIRO_CHARS_PER_TOKEN).min(total_tokens);
+        Some(Usage {
+            prompt_tokens: total_tokens.saturating_sub(completion_tokens),
+            completion_tokens,
+            total_tokens,
+            cached_tokens: 0,
+            cached_tokens_known: false,
+            reasoning_tokens: 0,
+            cache_write_tokens: 0,
+            cache_write_tokens_known: false,
+        })
+    }
+
+    /// Usage to report: whatever upstream sent verbatim, else the context
+    /// derivation, else nothing.
+    fn take_usage(&mut self) -> Option<Usage> {
+        self.usage.take().or_else(|| self.derived_usage())
     }
 
     pub fn decode(&mut self, bytes: &[u8], out: &mut Vec<CodexEvent>) {
@@ -390,6 +453,44 @@ impl KiroDecoder {
                 self.fail("Invalid Kiro JSON payload".to_string(), out);
                 return;
             };
+            if let Some(tokens) = value.get("tokenUsage") {
+                let count = |key: &str| tokens.get(key).and_then(Value::as_u64).unwrap_or(0);
+                let prompt = count("uncachedInputTokens")
+                    + count("cacheReadInputTokens")
+                    + count("cacheWriteInputTokens");
+                let output = count("outputTokens");
+                self.usage = Some(Usage {
+                    prompt_tokens: prompt,
+                    completion_tokens: output,
+                    total_tokens: tokens
+                        .get("totalTokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(prompt + output),
+                    cached_tokens: count("cacheReadInputTokens"),
+                    cached_tokens_known: tokens
+                        .get("cacheReadInputTokens")
+                        .and_then(Value::as_u64)
+                        .is_some(),
+                    cache_write_tokens: count("cacheWriteInputTokens"),
+                    cache_write_tokens_known: tokens
+                        .get("cacheWriteInputTokens")
+                        .and_then(Value::as_u64)
+                        .is_some(),
+                    reasoning_tokens: 0,
+                });
+            }
+            // Read before the `stopReason` branch below, because the frame
+            // that ends the turn is also the frame that carries this.
+            if let Some(percentage) = value
+                .get("contextUsagePercentage")
+                .and_then(Value::as_f64)
+                .filter(|value| value.is_finite() && *value > 0.0)
+            {
+                self.context_usage_percentage = Some(percentage);
+            }
+            if let Some(redacted) = value.get("redactedContent").and_then(Value::as_str) {
+                out.push(CodexEvent::KiroRedactedReasoning(redacted.to_string()));
+            }
             if value.get("__type").is_some() || value.get("error").is_some() {
                 self.fail(
                     kiro_error_message(&value).unwrap_or_else(|| "Kiro upstream error".to_string()),
@@ -397,6 +498,9 @@ impl KiroDecoder {
                 );
                 return;
             } else if let Some(content) = value.get("content").and_then(Value::as_str) {
+                self.output_chars = self
+                    .output_chars
+                    .saturating_add(content.chars().count() as u64);
                 out.push(CodexEvent::TextDelta(content.to_string()));
             } else if let (Some(name), Some(id)) = (
                 value.get("name").and_then(Value::as_str),
@@ -426,12 +530,17 @@ impl KiroDecoder {
                     });
                 }
             } else if let Some(text) = value.get("text").and_then(Value::as_str) {
+                self.output_chars = self
+                    .output_chars
+                    .saturating_add(text.chars().count() as u64);
                 out.push(CodexEvent::ReasoningDelta(text.to_string()));
             } else if let Some(signature) = value.get("signature").and_then(Value::as_str) {
                 out.push(CodexEvent::ReasoningSignature(signature.to_string()));
-            } else if value.get("stopReason").is_some() {
+            }
+            if value.get("stopReason").is_some() {
                 self.completed = true;
-                out.push(CodexEvent::Completed { usage: None });
+                let usage = self.take_usage();
+                out.push(CodexEvent::Completed { usage });
                 return;
             }
         }
@@ -449,7 +558,8 @@ impl KiroDecoder {
                 self.fail("Truncated Kiro stream".to_string(), out);
                 return;
             }
-            out.push(CodexEvent::Completed { usage: None });
+            let usage = self.take_usage();
+            out.push(CodexEvent::Completed { usage });
             self.completed = true;
         }
     }
@@ -503,6 +613,255 @@ fn next_json_object(input: &str) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kiro_prior_tool_result_survives_new_user() {
+        let body = json!({"model":"kiro/claude-opus-5.5", "messages":[
+            {"role":"user","content":"look"},
+            {"role":"assistant","content":"", "tool_calls":[{"id":"a|b","function":{"name":"read","arguments":"{}"}}]},
+            {"role":"tool","tool_call_id":"a|b","is_error":true,"content":[{"type":"text","text":"done"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AQID"}}]},
+            {"role":"user","content":"next"}
+        ]});
+        let wire = openai_to_kiro(&body).unwrap();
+        let state = &wire["conversationState"];
+        assert_eq!(state["history"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            state["history"][1]["assistantResponseMessage"]["toolUses"][0]["toolUseId"],
+            "a_b"
+        );
+        let user = &state["currentMessage"]["userInputMessage"];
+        assert_eq!(user["content"], "next");
+        let results = user["userInputMessageContext"]["toolResults"]
+            .as_array()
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["toolUseId"], "a_b");
+        assert_eq!(results[0]["status"], "error");
+        assert_eq!(user["images"][0]["source"]["bytes"], "AQID");
+    }
+
+    #[test]
+    fn kiro_redacted_reasoning_roundtrips() {
+        for with_tool in [false, true] {
+            let mut decoder = KiroDecoder::new();
+            let mut events = Vec::new();
+            decoder.decode(
+                &aws_frame("event", br#"{"redactedContent":"opaque-1"}"#),
+                &mut events,
+            );
+            if with_tool {
+                decoder.decode(
+                    &aws_frame(
+                        "event",
+                        br#"{"name":"lookup","toolUseId":"call_1","input":"{}","stop":true}"#,
+                    ),
+                    &mut events,
+                );
+            }
+            decoder.decode(
+                &aws_frame("event", br#"{"stopReason":"end_turn"}"#),
+                &mut events,
+            );
+            decoder.finish(&mut events);
+            assert!(events.iter().any(|event| matches!(
+                event, CodexEvent::KiroRedactedReasoning(blob) if blob == "opaque-1"
+            )));
+            let mut renderer = super::super::responses::ResponsesStreamRenderer::new(
+                "kiro/claude-opus-5.5".into(),
+                0,
+            );
+            let frames: Vec<_> = events
+                .into_iter()
+                .flat_map(|event| renderer.render(event))
+                .collect();
+            let completed = frames
+                .iter()
+                .find_map(|frame| {
+                    let text = std::str::from_utf8(frame).unwrap();
+                    text.lines().find_map(|line| {
+                        let value: Value =
+                            serde_json::from_str(line.strip_prefix("data: ")?).ok()?;
+                        (value["type"] == "response.completed").then_some(value)
+                    })
+                })
+                .expect("completed Responses SSE event");
+            let mut input = vec![json!({"role":"user","content":"hi"})];
+            input.extend(
+                completed["response"]["output"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .cloned(),
+            );
+            if with_tool {
+                input.push(
+                    json!({"type":"function_call_output","call_id":"call_1","output":"found"}),
+                );
+            } else {
+                input.push(json!({"role":"user","content":"next"}));
+            }
+            let chat = super::super::responses::responses_to_openai(
+                &json!({"model":"kiro/claude-opus-5.5","input":input}),
+            )
+            .unwrap();
+            let replay = openai_to_kiro(&chat).unwrap();
+            let assistant = &replay["conversationState"]["history"][1]["assistantResponseMessage"];
+            assert_eq!(assistant["reasoningContent"]["redactedContent"], "opaque-1");
+            if with_tool {
+                assert_eq!(assistant["toolUses"][0]["toolUseId"], "call_1");
+                assert_eq!(assistant["toolUses"][0]["name"], "lookup");
+                assert_eq!(assistant["toolUses"][0]["input"], json!({}));
+                assert_eq!(
+                    replay["conversationState"]["currentMessage"]["userInputMessage"]
+                        ["userInputMessageContext"]["toolResults"][0]["toolUseId"],
+                    "call_1"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn kiro_metadata_usage_survives_stop_and_eof() {
+        for stop in [false, true] {
+            let mut metadata = json!({"tokenUsage":{"uncachedInputTokens":10,"cacheReadInputTokens":3,"cacheWriteInputTokens":2,"outputTokens":4,"totalTokens":19}});
+            if stop {
+                metadata["stopReason"] = json!("end_turn");
+            }
+            let mut decoder = KiroDecoder::new();
+            let mut events = Vec::new();
+            decoder.decode(
+                &aws_frame("event", &serde_json::to_vec(&metadata).unwrap()),
+                &mut events,
+            );
+            decoder.finish(&mut events);
+            let CodexEvent::Completed { usage: Some(usage) } = &events[0] else {
+                panic!("missing usage: {events:?}")
+            };
+            assert_eq!(
+                (
+                    usage.prompt_tokens,
+                    usage.completion_tokens,
+                    usage.total_tokens,
+                    usage.cached_tokens,
+                    usage.cache_write_tokens
+                ),
+                (15, 4, 19, 3, 2)
+            );
+            assert!(usage.cached_tokens_known && usage.cache_write_tokens_known);
+        }
+        let mut decoder = KiroDecoder::new();
+        let mut events = Vec::new();
+        decoder.decode(br#"{"tokenUsage":{"cacheReadInputTokens":0,"cacheWriteInputTokens":0},"stopReason":"end_turn"}"#, &mut events);
+        assert!(
+            matches!(&events[0], CodexEvent::Completed { usage: Some(usage) } if usage.cached_tokens_known && usage.cache_write_tokens_known)
+        );
+    }
+
+    #[test]
+    fn kiro_context_usage_fills_tokens_when_upstream_sends_no_token_usage() {
+        // The shape live CodeWhisperer sends: contextUsagePercentage, no
+        // tokenUsage. Without this path the turn reports zero tokens.
+        let mut decoder = KiroDecoder::new();
+        let mut events = Vec::new();
+        decoder.decode(
+            &aws_frame("event", br#"{"content":"abcdefgh"}"#),
+            &mut events,
+        );
+        decoder.decode(
+            &aws_frame(
+                "event",
+                br#"{"contextUsagePercentage":42.0,"stopReason":"end_turn"}"#,
+            ),
+            &mut events,
+        );
+        let CodexEvent::Completed { usage: Some(usage) } = &events[1] else {
+            panic!("missing usage: {events:?}")
+        };
+        // 42% of the 666,667 window the runtime actually charges against.
+        assert_eq!(usage.total_tokens, 280_001);
+        // 8 streamed chars at 4 chars/token.
+        assert_eq!(usage.completion_tokens, 2);
+        assert_eq!(usage.prompt_tokens, 279_999);
+        assert_eq!(
+            usage.prompt_tokens + usage.completion_tokens,
+            usage.total_tokens
+        );
+        // Upstream reported no cache detail, so none is invented.
+        assert!(!usage.cached_tokens_known && !usage.cache_write_tokens_known);
+        assert_eq!((usage.cached_tokens, usage.cache_write_tokens), (0, 0));
+    }
+
+    #[test]
+    fn kiro_context_usage_is_capped_at_a_full_window() {
+        let mut decoder = KiroDecoder::new();
+        let mut events = Vec::new();
+        decoder.decode(
+            &aws_frame(
+                "event",
+                br#"{"contextUsagePercentage":180.0,"stopReason":"end_turn"}"#,
+            ),
+            &mut events,
+        );
+        let CodexEvent::Completed { usage: Some(usage) } = &events[0] else {
+            panic!("missing usage: {events:?}")
+        };
+        assert_eq!(usage.total_tokens, KIRO_CONTEXT_WINDOW_TOKENS);
+    }
+
+    #[test]
+    fn kiro_token_usage_wins_over_context_usage() {
+        // Both signals present: upstream's own tokenUsage is exact, so the
+        // context derivation must not overwrite it.
+        let mut decoder = KiroDecoder::new();
+        let mut events = Vec::new();
+        decoder.decode(
+            &aws_frame(
+                "event",
+                br#"{"tokenUsage":{"uncachedInputTokens":10,"outputTokens":4,"totalTokens":14},"contextUsagePercentage":42.0,"stopReason":"end_turn"}"#,
+            ),
+            &mut events,
+        );
+        let CodexEvent::Completed { usage: Some(usage) } = &events[0] else {
+            panic!("missing usage: {events:?}")
+        };
+        assert_eq!(
+            (
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.total_tokens
+            ),
+            (10, 4, 14)
+        );
+    }
+
+    #[test]
+    fn kiro_without_any_usage_signal_reports_none() {
+        let mut decoder = KiroDecoder::new();
+        let mut events = Vec::new();
+        decoder.decode(
+            &aws_frame("event", br#"{"content":"hello","stopReason":"end_turn"}"#),
+            &mut events,
+        );
+        assert!(
+            matches!(events.last(), Some(CodexEvent::Completed { usage: None })),
+            "a turn with no usage signal must not fabricate one: {events:?}"
+        );
+    }
+
+    #[test]
+    fn kiro_zero_context_usage_is_ignored() {
+        // 0% means "not reported" in this field, not "an empty context".
+        let mut decoder = KiroDecoder::new();
+        let mut events = Vec::new();
+        decoder.decode(
+            &aws_frame(
+                "event",
+                br#"{"contextUsagePercentage":0.0,"stopReason":"end_turn"}"#,
+            ),
+            &mut events,
+        );
+        assert!(matches!(&events[0], CodexEvent::Completed { usage: None }));
+    }
 
     fn aws_frame(message_type: &str, payload: &[u8]) -> Vec<u8> {
         fn crc(bytes: &[u8]) -> u32 {
@@ -766,7 +1125,7 @@ mod tests {
     #[test]
     fn replays_tool_results_images_and_reasoning_on_kiro_wire() {
         let payload = openai_to_kiro(&json!({
-            "model": "kiro/claude-haiku-4-5-20251001",
+            "model": "kiro/claude-opus-5.5",
             "messages": [
                 {"role":"user","content":"look"},
                 {"role":"assistant","content":"", "kiroRedactedReasoning":"blob", "tool_calls":[{
@@ -806,7 +1165,7 @@ mod tests {
     fn profile_reasoning_and_object_tool_input_follow_reference_wire() {
         let payload = openai_to_kiro_with_profile(
             &json!({
-                "model":"kiro/claude-sonnet-4.6",
+                "model":"kiro/claude-opus-5.5",
                 "messages":[{"role":"user","content":"hi"}]
             }),
             Some("arn:aws:codewhisperer:us-east-1:123:profile/abc"),

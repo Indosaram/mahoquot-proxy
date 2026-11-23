@@ -57,7 +57,7 @@ async fn post_chat_completion(body_bytes: Vec<u8>) -> StatusCode {
 
 fn chat_body(filler_bytes: usize) -> Vec<u8> {
     let body = json!({
-        "model": "gemini-3.8-flash-high",
+        "model": "gemini-4-neon-high",
         "messages": [{ "role": "user", "content": "x".repeat(filler_bytes) }]
     });
     serde_json::to_vec(&body).expect("serialize body")

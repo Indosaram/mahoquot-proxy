@@ -34,10 +34,15 @@ struct VideoBinding {
     expires_at: Instant,
 }
 
-fn video_bindings() -> &'static RwLock<HashMap<String, VideoBinding>> {
-    static BINDINGS: std::sync::OnceLock<RwLock<HashMap<String, VideoBinding>>> =
-        std::sync::OnceLock::new();
-    BINDINGS.get_or_init(|| RwLock::new(HashMap::new()))
+#[derive(Default)]
+struct VideoBindings {
+    entries: HashMap<String, VideoBinding>,
+    next_expiry: Option<Instant>,
+}
+
+fn video_bindings() -> &'static RwLock<VideoBindings> {
+    static BINDINGS: std::sync::OnceLock<RwLock<VideoBindings>> = std::sync::OnceLock::new();
+    BINDINGS.get_or_init(|| RwLock::new(VideoBindings::default()))
 }
 
 async fn bind_video(
@@ -48,8 +53,27 @@ async fn bind_video(
     requested_model: &str,
 ) {
     let mut bindings = video_bindings().write().await;
-    bindings.retain(|_, value| value.expires_at > Instant::now());
-    bindings.insert(
+    let now = Instant::now();
+    if bindings.next_expiry.is_some_and(|expires| now >= expires) {
+        let mut next_expiry = None;
+        bindings.entries.retain(|_, value| {
+            if value.expires_at <= now {
+                return false;
+            }
+            next_expiry = Some(
+                next_expiry.map_or(value.expires_at, |next: Instant| next.min(value.expires_at)),
+            );
+            true
+        });
+        bindings.next_expiry = next_expiry;
+    }
+    let expires_at = Instant::now() + VIDEO_BINDING_TTL;
+    bindings.next_expiry = Some(
+        bindings
+            .next_expiry
+            .map_or(expires_at, |next| next.min(expires_at)),
+    );
+    bindings.entries.insert(
         id.to_owned(),
         VideoBinding {
             caller_key: caller_key.map(str::to_owned),
@@ -57,7 +81,7 @@ async fn bind_video(
             provider: member.provider_name().to_owned(),
             model: model.to_owned(),
             requested_model: requested_model.to_owned(),
-            expires_at: Instant::now() + VIDEO_BINDING_TTL,
+            expires_at,
         },
     );
 }
@@ -65,12 +89,13 @@ async fn bind_video(
 async fn bound_video(id: &str) -> Option<VideoBinding> {
     let mut bindings = video_bindings().write().await;
     if bindings
+        .entries
         .get(id)
         .is_some_and(|binding| binding.expires_at <= Instant::now())
     {
-        bindings.remove(id);
+        bindings.entries.remove(id);
     }
-    bindings.get(id).cloned()
+    bindings.entries.get(id).cloned()
 }
 
 fn video_error(status: StatusCode, code: &str, message: &str) -> Response {
@@ -1042,6 +1067,53 @@ mod tests {
             StatusCode::BAD_REQUEST
         );
         tokio::fs::remove_file(&upload.path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ulw_gw5_video_bind_prunes_at_the_earliest_expiry() {
+        let member = AccountMember::for_test(crate::account::ProviderAccount::Generic(
+            crate::account::GenericAccount::default(),
+        ));
+        let prefix = uuid::Uuid::new_v4().to_string();
+        let expired_id = format!("{prefix}-expired");
+        let live_id = format!("{prefix}-live");
+        let new_id = format!("{prefix}-new");
+        let now = Instant::now();
+        {
+            let mut bindings = video_bindings().write().await;
+            let binding = VideoBinding {
+                caller_key: Some("caller".into()),
+                account_id: member.id().into(),
+                provider: member.provider_name(),
+                model: "model".into(),
+                requested_model: "model".into(),
+                expires_at: now,
+            };
+            bindings.entries.insert(expired_id.clone(), binding.clone());
+            bindings.entries.insert(
+                live_id.clone(),
+                VideoBinding {
+                    expires_at: now + VIDEO_BINDING_TTL,
+                    ..binding
+                },
+            );
+            bindings.next_expiry = Some(now);
+        }
+        bind_video(&new_id, Some("caller"), &member, "model", "model").await;
+        {
+            let bindings = video_bindings().read().await;
+            assert!(!bindings.entries.contains_key(&expired_id));
+            assert!(bindings.entries.contains_key(&live_id));
+            assert!(bindings.entries.contains_key(&new_id));
+            assert!(bindings.next_expiry.unwrap() > now);
+        }
+        assert!(bound_video(&live_id).await.is_some());
+        {
+            let mut bindings = video_bindings().write().await;
+            bindings.entries.get_mut(&live_id).unwrap().expires_at = now;
+        }
+        assert!(bound_video(&live_id).await.is_none());
+        video_bindings().write().await.entries.remove(&new_id);
     }
 
     #[tokio::test]

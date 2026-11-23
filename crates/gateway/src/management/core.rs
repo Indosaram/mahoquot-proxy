@@ -69,6 +69,7 @@ const REDACTED_SECRET_MARKER: &str = "# mahoquot: secret withheld";
 /// hand-edited flow mapping or quoted key would slip past it, so the result is
 /// verified against the actual secret and falls back to the normalized document
 /// (comments lost, secret provably gone) when anything survives.
+#[cfg(test)]
 fn redact_yaml_secret(raw: &str, secret: &str, normalized: &str) -> String {
     if secret.is_empty() {
         return raw.to_string();
@@ -122,18 +123,25 @@ async fn get_config_yaml(State(state): State<Arc<AppState>>) -> Response {
         Ok(raw) => {
             let settings = state.settings.configured();
             let secret = settings.remote_management.secret_key.clone();
+            let redacted = if secret.is_empty() {
+                raw
+            } else {
+                blank_block_secret(&raw)
+            };
             // The fallback shape: the same settings with the secret blanked and
             // rendered by serde, so it cannot carry the value regardless of how
             // the on-disk document was laid out.
-            let normalized = {
+            let served = if !secret.is_empty() && redacted.contains(&secret) {
                 let mut blanked = settings;
                 blanked.remote_management.secret_key.clear();
                 serde_yaml::to_string(&blanked).unwrap_or_else(|_| "remote-management: {}\n".into())
+            } else {
+                redacted
             };
             (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, "application/yaml; charset=utf-8")],
-                redact_yaml_secret(&raw, &secret, &normalized),
+                served,
             )
                 .into_response()
         }

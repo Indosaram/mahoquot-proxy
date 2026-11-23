@@ -210,6 +210,7 @@ async fn terminal_stream_drops_upstream_without_waiting_for_eof() {
                 protocol: compat::Protocol::Codex,
                 cursor_reply: None,
                 replay: None,
+                gemini_tool_names: None,
             },
             upstream_capture: None,
             devin_outcome: None,

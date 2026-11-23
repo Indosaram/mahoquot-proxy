@@ -41,11 +41,11 @@ pub fn default_contribution() -> ProviderContribution {
 }
 
 pub fn supported_models(snapshot: &RegistrySnapshot) -> Vec<String> {
-    contribution(snapshot).supported_model_ids()
+    snapshot.supported_model_ids_for_provider(&provider_id())
 }
 
 pub fn is_kiro_model_in_snapshot(snapshot: &RegistrySnapshot, model: &str) -> bool {
-    contribution(snapshot).supports_model(model)
+    snapshot.provider_supports_model(&provider_id(), model)
 }
 
 pub fn is_kiro_model(model: &str) -> bool {
@@ -229,9 +229,14 @@ mod tests {
 
     #[test]
     fn model_matcher_accepts_known_models_only() {
-        assert!(is_kiro_model("claude-sonnet-4.6"));
-        assert!(is_kiro_model("claude-opus-4.6"));
-        assert!(is_kiro_model("claude-haiku-4-5-20251001"));
+        assert!(is_kiro_model("claude-opus-5.5"));
+        // Retired ids and the auto shim are outside the closed catalog now.
+        assert!(!is_kiro_model("claude-sonnet-4.6"));
+        assert!(!is_kiro_model("claude-opus-4.6"));
+        assert!(!is_kiro_model("claude-haiku-4.5"));
+        assert!(!is_kiro_model("auto"));
         assert!(!is_kiro_model("claude-opus-4-5-20251101"));
+        // Date-suffixed ids are rejected upstream with INVALID_MODEL_ID.
+        assert!(!is_kiro_model("claude-haiku-4-5-20251001"));
     }
 }

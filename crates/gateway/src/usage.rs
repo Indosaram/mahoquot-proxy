@@ -64,6 +64,12 @@ pub struct ResetCredit {
     pub granted_at_unix: Option<i64>,
     pub expires_at_unix: Option<i64>,
     pub status: Option<String>,
+    /// Human-readable name of the grant when the provider supplies one.
+    /// Anthropic hands out several different offers at once (a full reset and
+    /// a single-model launch reset), so a bare count would hide which one a
+    /// spend actually uses. Codex reports no label and leaves this empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 /// Upstream model availability metadata (e.g. from `model_usage` in Codex wham).
@@ -75,6 +81,21 @@ pub struct ModelAvailability {
     pub available_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credits_would_enable: Option<bool>,
+    /// The upstream's own enum for this catalog entry (`ModelDetails.model`),
+    /// e.g. `MODEL_PLACEHOLDER_M320`. The client echoes it back in the request
+    /// `labels.model_enum`, so it must be the catalog's value for the exact
+    /// variant id, never a value derived from the model name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_enum: Option<String>,
+    /// Vendor reported by the catalog (`api_provider`/`model_provider`). Used
+    /// to set the `used_claude*` and `used_non_gemini_model` request labels
+    /// without hardcoding model ids.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -827,6 +848,13 @@ pub fn parse_claude_usage_summary(body: &serde_json::Value, now_unix: i64) -> Ac
     } else {
         Some(now_unix)
     };
+    // Anthropic ships the reset offer in the same payload, but only when the
+    // caller asks for it as the CLI; an absent block leaves the account with
+    // no reset affordance rather than a zero count.
+    let (reset_credits_available, reset_credits) = parse_cedar_ember_status(body)
+        .map_or((None, Vec::new()), |status| {
+            status.into_reset_credits(now_unix)
+        });
 
     AccountUsage {
         plan_type: None,
@@ -844,11 +872,24 @@ pub fn parse_claude_usage_summary(body: &serde_json::Value, now_unix: i64) -> Ac
         credits_balance: None,
         credits_unlimited: None,
         has_credits: None,
-        reset_credits_available: None,
+        reset_credits_available,
+        reset_credits,
         groups: Vec::new(),
         observed_at_unix: observed,
         ..Default::default()
     }
+}
+
+/// Read the reset offer out of a usage payload.
+///
+/// Absent, null, or malformed all mean "no offer": the caller must not be able
+/// to spend a reset the upstream never granted.
+pub fn parse_cedar_ember_status(body: &serde_json::Value) -> Option<CedarEmberStatus> {
+    let node = body.get("cedar_ember")?;
+    if !node.is_object() {
+        return None;
+    }
+    serde_json::from_value(node.clone()).ok()
 }
 
 fn usage_bucket(
@@ -876,6 +917,17 @@ pub fn parse_cursor_usage_summary(body: &serde_json::Value, now_unix: i64) -> Ac
     let usage = body
         .get("individualUsage")
         .or_else(|| body.get("individual_usage"));
+    let plan = usage.and_then(|usage| usage.get("plan"));
+    // Cursor meters two pools independently and reports each as its own percentage:
+    // `autoPercentUsed` for the auto router and `apiPercentUsed` for named models. The
+    // plan's limit/remaining only covers the combined total, so a total-only bucket hides
+    // an exhausted named pool behind a healthy percentage - exactly the state that makes
+    // `cursor/claude-opus-5.5` fail while `cursor/auto` keeps working.
+    for (key, label) in [("autoPercentUsed", "Auto"), ("apiPercentUsed", "Named")] {
+        if let Some(percent) = plan.and_then(|plan| plan.get(key)).and_then(|v| v.as_f64()) {
+            buckets.push(usage_bucket(label, percent, reset_at_unix, now_unix));
+        }
+    }
     for (key, label) in [("plan", "Plan"), ("onDemand", "On-Demand")] {
         let value = usage.and_then(|usage| usage.get(key));
         if !value
@@ -1236,6 +1288,122 @@ pub fn zcode_balances_usage(balances: &[ZcodeBalanceEntry], now_unix: i64) -> Ac
     }
 }
 
+/// Coding-plan monitor payload from `GET /api/monitor/usage/quota/limit`.
+///
+/// `percentage` is consumption, the same orientation as every other provider.
+/// Reset times arrive as unix milliseconds. A body with no measured limit is
+/// not a snapshot, so the caller keeps the previous one instead of painting 0%.
+pub fn parse_coding_plan_quota(body: &serde_json::Value, now_unix: i64) -> AccountUsage {
+    let data = body.get("data").unwrap_or(body);
+    let Some(limits) = data.get("limits").and_then(|value| value.as_array()) else {
+        return AccountUsage::default();
+    };
+    let mut tokens = Vec::new();
+    let mut tools = Vec::new();
+    for limit in limits {
+        let Some(used) = coding_plan_used_percent(limit) else {
+            continue;
+        };
+        let kind = limit
+            .get("type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let unit = json_i64(limit.get("unit")).unwrap_or(0);
+        let number = json_i64(limit.get("number")).unwrap_or(0);
+        let (label, window) = coding_plan_limit_label(kind, unit, number);
+        let bucket = QuotaBucket {
+            display_name: Some(label),
+            window,
+            used_percent: Some((used.clamp(0.0, 100.0) * 100.0).round() / 100.0),
+            reset_at_unix: limit
+                .get("nextResetTime")
+                .or_else(|| limit.get("next_reset_time"))
+                .and_then(coding_plan_reset_unix),
+            ..QuotaBucket::default()
+        };
+        if kind.eq_ignore_ascii_case("TIME_LIMIT") {
+            tools.push(bucket);
+        } else {
+            tokens.push(bucket);
+        }
+    }
+    tokens.append(&mut tools);
+    if tokens.is_empty() {
+        return AccountUsage::default();
+    }
+    AccountUsage {
+        plan_type: data
+            .get("level")
+            .or_else(|| data.get("plan"))
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        groups: vec![QuotaGroup {
+            display_name: Some("GLM Coding Plan".to_string()),
+            buckets: tokens,
+            models: None,
+        }],
+        observed_at_unix: Some(now_unix),
+        ..AccountUsage::default()
+    }
+}
+
+fn coding_plan_limit_label(kind: &str, unit: i64, number: i64) -> (String, Option<String>) {
+    if kind.eq_ignore_ascii_case("TIME_LIMIT") {
+        return ("Tools".to_string(), None);
+    }
+    match (unit, number) {
+        (3, 5) => ("5h".to_string(), Some("5h".to_string())),
+        (6, 1) => ("Week".to_string(), Some("week".to_string())),
+        _ => {
+            let name = if kind.is_empty() {
+                "Quota".to_string()
+            } else {
+                kind.to_string()
+            };
+            (name, None)
+        }
+    }
+}
+
+fn coding_plan_used_percent(limit: &serde_json::Value) -> Option<f64> {
+    if let Some(percent) =
+        json_f64(limit.get("percentage")).or_else(|| json_f64(limit.get("percent")))
+    {
+        return Some(percent);
+    }
+    json_f64(limit.get("remaining")).map(|remaining| 100.0 - remaining)
+}
+
+fn coding_plan_reset_unix(value: &serde_json::Value) -> Option<i64> {
+    let raw = value
+        .as_i64()
+        .or_else(|| value.as_f64().map(|number| number as i64))?;
+    if raw <= 0 {
+        return None;
+    }
+    Some(if raw > 1_000_000_000_000 {
+        raw / 1000
+    } else {
+        raw
+    })
+}
+
+fn json_f64(value: Option<&serde_json::Value>) -> Option<f64> {
+    value.and_then(|value| {
+        value
+            .as_f64()
+            .or_else(|| value.as_i64().map(|number| number as f64))
+    })
+}
+
+fn json_i64(value: Option<&serde_json::Value>) -> Option<i64> {
+    value.and_then(|value| {
+        value
+            .as_i64()
+            .or_else(|| value.as_f64().map(|number| number as i64))
+    })
+}
+
 /// Seconds until the window resets, preferring the absolute timestamp because
 /// the relative value ages as the snapshot sits in memory.
 pub fn seconds_until_reset(
@@ -1299,6 +1467,19 @@ pub struct WhamModelUsageEntry {
 pub fn is_conversation_id(id: &str) -> bool {
     id.strip_prefix("chat_")
         .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Whether an upstream model id marks an entitlement the account cannot use.
+///
+/// Antigravity lists variants the signed-in account is not entitled to under a
+/// `-disabled` suffix: an entitled account is offered
+/// `gemini-4-argon-high/-medium/-low`, while the rest receive a single
+/// `gemini-4-argon-disabled`. The suffix is the upstream's own "not for this
+/// account" marker and a request to it answers `404 NOT_FOUND`, so publishing
+/// it under `/v1/models` advertises a model that can never serve traffic.
+pub fn is_disabled_variant_id(id: &str) -> bool {
+    id.strip_suffix("-disabled")
+        .is_some_and(|rest| !rest.is_empty())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1386,6 +1567,84 @@ pub struct WhamResetCreditEntry {
     pub status: Option<String>,
 }
 
+/// Anthropic's own reset offer ("cedar_ember") from the OAuth usage payload.
+///
+/// The offer is surface-gated: the same endpoint answers an empty block unless
+/// the caller presents the Claude Code CLI user agent, and ineligible orgs
+/// (Enterprise, or a team org outside the promotion) report
+/// `ineligible_reason: "org_not_eligible"` with no grants at all. Only an
+/// explicit `eligible: true` is treated as "this account has resets", so an
+/// absent or refused block never fabricates a reset button.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CedarEmberStatus {
+    #[serde(default)]
+    pub eligible: Option<bool>,
+    #[serde(default)]
+    pub ineligible_reason: Option<String>,
+    #[serde(default)]
+    pub next_grant_id: Option<String>,
+    #[serde(default)]
+    pub grants: Vec<CedarEmberGrant>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CedarEmberGrant {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub resets_total: Option<i64>,
+    #[serde(default)]
+    pub resets_left: Option<i64>,
+    #[serde(default)]
+    pub starts_at: Option<String>,
+    #[serde(default)]
+    pub ends_at: Option<String>,
+    #[serde(default)]
+    pub paused: Option<bool>,
+    #[serde(default)]
+    pub usable_now: Option<bool>,
+}
+
+impl CedarEmberStatus {
+    /// Count and per-grant expiry in the shared reset-credit shape.
+    ///
+    /// A grant that has lapsed or is paused cannot be spent, so it is dropped
+    /// from the count rather than offered; a grant with no expiry is kept,
+    /// because unknown is not the same as gone.
+    pub fn into_reset_credits(self, now_unix: i64) -> (Option<i64>, Vec<ResetCredit>) {
+        if self.eligible != Some(true) {
+            return (None, Vec::new());
+        }
+        let mut credits: Vec<ResetCredit> = self
+            .grants
+            .into_iter()
+            .filter(|grant| grant.paused != Some(true))
+            .filter(|grant| grant.resets_left.unwrap_or(0) > 0)
+            .map(|grant| ResetCredit {
+                granted_at_unix: grant
+                    .starts_at
+                    .as_deref()
+                    .and_then(parse_offset_datetime_unix),
+                expires_at_unix: grant
+                    .ends_at
+                    .as_deref()
+                    .and_then(parse_offset_datetime_unix),
+                status: None,
+                label: grant.label,
+            })
+            .filter(|credit| credit.expires_at_unix.is_none_or(|at| at > now_unix))
+            .collect();
+        credits.sort_by_key(|credit| credit.expires_at_unix.unwrap_or(i64::MAX));
+        let available = credits
+            .iter()
+            .filter(|credit| credit.expires_at_unix.is_none_or(|at| at > now_unix))
+            .count() as i64;
+        (Some(available), credits)
+    }
+}
+
 /// Statuses that mean the credit is gone. Anything else - including a status
 /// this build has never seen - is kept, because dropping an unknown state
 /// would hide a credit the account can still spend.
@@ -1412,6 +1671,7 @@ impl WhamResetCreditList {
                 granted_at_unix: c.granted_at.as_deref().and_then(parse_offset_datetime_unix),
                 expires_at_unix: c.expires_at.as_deref().and_then(parse_offset_datetime_unix),
                 status: c.status,
+                label: None,
             })
             .filter(|c| c.expires_at_unix.is_none_or(|at| at > now_unix))
             .collect();
@@ -1552,7 +1812,7 @@ impl WhamUsage {
         // 4. Model availability metadata (NOT invented percentages from usage counters)
         let model_availability = self.model_usage.map(|mu| {
             mu.into_iter()
-                .filter(|(id, _)| !is_conversation_id(id))
+                .filter(|(id, _)| !is_conversation_id(id) && !is_disabled_variant_id(id))
                 .map(|(k, v)| {
                     (
                         k,
@@ -1560,6 +1820,7 @@ impl WhamUsage {
                             available: v.available,
                             available_at: v.available_at,
                             credits_would_enable: v.credits_would_enable,
+                            ..Default::default()
                         },
                     )
                 })
@@ -1633,10 +1894,16 @@ impl HeadTailCapture {
             let take = head_room.min(chunk.len());
             self.head.extend_from_slice(&chunk[..take]);
         }
-        self.tail.extend_from_slice(chunk);
-        let overflow = self.tail.len().saturating_sub(self.cap);
-        if overflow > 0 {
-            self.tail.drain(..overflow);
+        if chunk.len() >= self.cap {
+            self.tail.clear();
+            self.tail
+                .extend_from_slice(&chunk[chunk.len() - self.cap..]);
+        } else {
+            let overflow = (self.tail.len() + chunk.len()).saturating_sub(self.cap);
+            if overflow > 0 {
+                self.tail.drain(..overflow);
+            }
+            self.tail.extend_from_slice(chunk);
         }
     }
 
@@ -1711,7 +1978,9 @@ mod cache_presence_tests {
 }
 
 pub fn extract_response_token_usage(head: &[u8], tail: &[u8]) -> Option<ResponseTokenUsage> {
-    if let Some(usage) = last_balanced_object(tail, b"\"usage\"") {
+    if let Some(usage) = last_balanced_object(tail, b"\"usage\"")
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+    {
         let prompt = object_number(&usage, &["prompt_tokens"]);
         let completion = object_number(&usage, &["completion_tokens"]);
         if prompt.is_some() || completion.is_some() {
@@ -1855,17 +2124,18 @@ pub fn extract_response_token_usage(head: &[u8], tail: &[u8]) -> Option<Response
             });
         }
     }
-    if let Some(usage) = last_balanced_object(tail, b"\"usageMetadata\"") {
+    if let Some(usage) = last_balanced_object(tail, b"\"usageMetadata\"")
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+    {
         let prompt = object_number(&usage, &["promptTokenCount"]);
         let completion = object_number(&usage, &["candidatesTokenCount"]);
         if prompt.is_some() || completion.is_some() {
+            let cached = object_number(&usage, &["cachedContentTokenCount"]);
             return Some(ResponseTokenUsage {
                 input_tokens: prompt.unwrap_or(0),
                 output_tokens: completion.unwrap_or(0),
-                cached_input_tokens: object_number(&usage, &["cachedContentTokenCount"])
-                    .unwrap_or(0),
-                cached_input_tokens_known: object_number(&usage, &["cachedContentTokenCount"])
-                    .is_some(),
+                cached_input_tokens: cached.unwrap_or(0),
+                cached_input_tokens_known: cached.is_some(),
                 cache_write_tokens: 0,
                 cache_write_tokens_known: false,
                 reasoning_tokens: object_number(&usage, &["thoughtsTokenCount"]).unwrap_or(0),
@@ -1963,17 +2233,12 @@ fn balanced_end(bytes: &[u8]) -> Option<usize> {
     None
 }
 
-fn object_number(json: &str, keys: &[&str]) -> Option<u64> {
-    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+fn object_number(value: &serde_json::Value, keys: &[&str]) -> Option<u64> {
     keys.iter().find_map(|key| value.get(key)?.as_u64())
 }
 
-fn nested_object_number(json: &str, object: &str, key: &str) -> Option<u64> {
-    serde_json::from_str::<serde_json::Value>(json)
-        .ok()?
-        .get(object)?
-        .get(key)?
-        .as_u64()
+fn nested_object_number(value: &serde_json::Value, object: &str, key: &str) -> Option<u64> {
+    value.get(object)?.get(key)?.as_u64()
 }
 
 fn last_number_after(haystack: &[u8], key: &[u8]) -> Option<u64> {
@@ -2195,9 +2460,14 @@ impl UsageStateStore {
     }
 
     pub fn save(&self, accounts: &std::collections::BTreeMap<String, AccountUsage>, now_unix: i64) {
-        let document = UsageStateDocument {
+        #[derive(serde::Serialize)]
+        struct Document<'a> {
+            saved_at_unix: i64,
+            accounts: &'a std::collections::BTreeMap<String, AccountUsage>,
+        }
+        let document = Document {
             saved_at_unix: now_unix,
-            accounts: accounts.clone(),
+            accounts,
         };
         let Ok(rendered) = serde_json::to_string_pretty(&document) else {
             return;
@@ -2908,6 +3178,23 @@ mod tests {
         assert_eq!(head[0], b'x');
         assert_eq!(tail.len(), 8192);
         assert_eq!(tail[tail.len() - 1], b'x');
+    }
+
+    #[test]
+    fn capture_bounds_allocation_and_preserves_windows_for_mixed_chunks() {
+        // Given chunks both smaller and larger than the capture window.
+        let chunks = [vec![b'a'; 17], vec![b'b'; 100_000], vec![b'c'; 23]];
+        let expected: Vec<u8> = chunks.iter().flatten().copied().collect();
+        let mut capture = HeadTailCapture::new();
+        // When each chunk is captured.
+        for chunk in &chunks {
+            capture.push(chunk);
+        }
+        // Then the windows match the original bytes without retaining the large chunk.
+        let (head, tail) = capture.parts();
+        assert_eq!(head, &expected[..CAPTURE_WINDOW]);
+        assert_eq!(tail, &expected[expected.len() - CAPTURE_WINDOW..]);
+        assert!(capture.tail.capacity() <= CAPTURE_WINDOW);
     }
 
     #[test]
@@ -3737,6 +4024,7 @@ mod tests {
                 granted_at_unix: Some(1_790_000_000),
                 expires_at_unix: Some(1_792_000_000),
                 status: Some("active".to_string()),
+                label: None,
             }],
             observed_at_unix: Some(1_800_000_000),
             refreshed_at_unix: Some(1_800_000_000),
@@ -3761,6 +4049,7 @@ mod tests {
                         available: Some(true),
                         available_at: None,
                         credits_would_enable: Some(false),
+                        ..Default::default()
                     },
                 );
                 map
@@ -3864,6 +4153,28 @@ mod tests {
         assert!(avail.contains_key("gemini-3-flash"));
         assert!(avail.contains_key("tab_flash_lite_preview"));
         assert!(!avail.contains_key("chat_20706"));
+    }
+
+    #[test]
+    fn disabled_variants_never_become_model_availability() {
+        let raw = r#"{"model_usage":{"gemini-4-argon-high":{"available":true},"gemini-4-carbon-disabled":{"available":true},"gemini-4-hydrogen-disabled":{"available":true}}}"#;
+        let wham: WhamUsage = serde_json::from_str(raw).expect("deserializes");
+
+        let usage = wham.into_account_usage(1_790_954_000);
+        let avail = usage.model_availability.expect("availability present");
+
+        assert!(avail.contains_key("gemini-4-argon-high"));
+        assert!(!avail.contains_key("gemini-4-carbon-disabled"));
+        assert!(!avail.contains_key("gemini-4-hydrogen-disabled"));
+    }
+
+    #[test]
+    fn disabled_suffix_detection_is_narrow() {
+        assert!(is_disabled_variant_id("gemini-4-argon-disabled"));
+        assert!(is_disabled_variant_id("gemini-4-carbon-disabled"));
+        assert!(!is_disabled_variant_id("-disabled"));
+        assert!(!is_disabled_variant_id("gemini-4-argon-high"));
+        assert!(!is_disabled_variant_id("disabled-model"));
     }
     #[test]
     fn parses_live_pro_wham_payload_with_chatpass_and_model_availability() {
@@ -4196,5 +4507,235 @@ mod tests {
         let usage = wham.into_account_usage(1_000);
         assert_eq!(usage.overage_limit_reached, Some(true));
         assert!(usage.is_codex_hard_limit_reached());
+    }
+}
+
+#[cfg(test)]
+mod coding_plan_quota_tests {
+    use super::*;
+
+    #[test]
+    fn monitor_payload_reports_five_hour_usage_and_keeps_tools_second() {
+        let body = serde_json::json!({
+            "code": 200,
+            "data": {
+                "level": "lite",
+                "limits": [
+                    {
+                        "type": "TIME_LIMIT",
+                        "unit": 5,
+                        "number": 1,
+                        "percentage": 1,
+                        "remaining": 99,
+                        "nextResetTime": 1796050452998i64
+                    },
+                    {
+                        "type": "TOKENS_LIMIT",
+                        "unit": 3,
+                        "number": 5,
+                        "percentage": 22,
+                        "nextResetTime": 1793774115449i64
+                    }
+                ]
+            }
+        });
+        let usage = parse_coding_plan_quota(&body, 1_700_000_000);
+        assert_eq!(usage.plan_type.as_deref(), Some("lite"));
+        assert_eq!(usage.observed_at_unix, Some(1_700_000_000));
+        let buckets = &usage.groups[0].buckets;
+        assert_eq!(buckets.len(), 2);
+        assert_eq!(buckets[0].display_name.as_deref(), Some("5h"));
+        assert_eq!(buckets[0].window.as_deref(), Some("5h"));
+        assert_eq!(buckets[0].used_percent, Some(22.0));
+        assert_eq!(buckets[0].reset_at_unix, Some(1_793_774_115));
+        assert_eq!(buckets[1].display_name.as_deref(), Some("Tools"));
+        assert_eq!(buckets[1].used_percent, Some(1.0));
+        assert_eq!(buckets[1].reset_at_unix, Some(1_796_050_452));
+    }
+
+    #[test]
+    fn weekly_credit_window_is_labeled_and_remaining_derives_used_percent() {
+        let body = serde_json::json!({
+            "data": {
+                "limits": [{
+                    "type": "CREDIT_LIMIT",
+                    "unit": 6,
+                    "number": 1,
+                    "remaining": 40,
+                    "nextResetTime": 1_800_000_000
+                }]
+            }
+        });
+        let usage = parse_coding_plan_quota(&body, 10);
+        let bucket = &usage.groups[0].buckets[0];
+        assert_eq!(bucket.display_name.as_deref(), Some("Week"));
+        assert_eq!(bucket.used_percent, Some(60.0));
+        assert_eq!(bucket.reset_at_unix, Some(1_800_000_000));
+    }
+
+    #[test]
+    fn an_unmeasured_monitor_payload_is_not_a_snapshot() {
+        let body = serde_json::json!({"code": 200, "data": {"limits": []}});
+        let usage = parse_coding_plan_quota(&body, 1);
+        assert!(usage.observed_at_unix.is_none());
+        assert!(usage.groups.is_empty());
+    }
+
+    // Captured verbatim from /api/oauth/usage?cedar_ember=1 for a Team seat on
+    // 2026-11-12, so the fixture keeps the exact wire shape being parsed.
+    const LIVE_CEDAR_EMBER: &str = r#"{
+      "cedar_ember": {
+        "eligible": true,
+        "ineligible_reason": null,
+        "grants": [
+          {"id": "full-reset-2611", "label": "One full limit reset (November 2026)",
+           "resets_total": 1, "resets_left": 1,
+           "starts_at": "2026-11-10T21:30:00+00:00",
+           "ends_at": "2026-12-10T22:00:00+00:00",
+           "clears": ["five_hour", "seven_day", "seven_day_overage_included"],
+           "paused": false, "usable_now": true, "gives_back_weekly": false},
+          {"id": "launch-2610-fable", "label": "New model launch: one Fable reset",
+           "resets_total": 1, "resets_left": 1,
+           "starts_at": "2026-11-09T18:00:00+00:00",
+           "ends_at": "2027-03-09T07:59:00+00:00",
+           "clears": ["five_hour", "seven_day_overage_included"],
+           "paused": false, "usable_now": true, "gives_back_weekly": true}
+        ],
+        "next_grant_id": "full-reset-2611",
+        "cooldown_until": null
+      }
+    }"#;
+
+    #[test]
+    fn claude_reset_offer_becomes_banked_credits_with_labels() {
+        let body: serde_json::Value = serde_json::from_str(LIVE_CEDAR_EMBER).expect("parse");
+        let usage = parse_claude_usage_summary(&body, 1_794_441_600);
+        assert_eq!(usage.reset_credits_available, Some(2));
+        let credits = &usage.reset_credits;
+        assert_eq!(credits.len(), 2);
+        assert_eq!(
+            credits[0].expires_at_unix,
+            parse_offset_datetime_unix("2026-12-10T22:00:00+00:00")
+        );
+        assert_eq!(
+            credits[0].label.as_deref(),
+            Some("One full limit reset (November 2026)")
+        );
+        assert_eq!(
+            credits[1].label.as_deref(),
+            Some("New model launch: one Fable reset")
+        );
+    }
+
+    #[test]
+    fn claude_reset_offer_absent_never_becomes_zero() {
+        let body = serde_json::json!({"five_hour": {"utilization": 0.0}});
+        let usage = parse_claude_usage_summary(&body, 1_794_441_600);
+        assert_eq!(usage.reset_credits_available, None);
+        assert!(usage.reset_credits.is_empty());
+    }
+
+    #[test]
+    fn claude_reset_offer_ineligible_is_unknown_not_zero() {
+        let body = serde_json::json!({
+            "cedar_ember": {"eligible": false, "ineligible_reason": "org_not_eligible", "grants": []}
+        });
+        let usage = parse_claude_usage_summary(&body, 1_763_000_000);
+        // Ineligibility means the seat is outside the program, so "0 resets"
+        // would assert a count nobody granted; the count stays unknown.
+        assert_eq!(usage.reset_credits_available, None);
+        assert!(usage.reset_credits.is_empty());
+    }
+
+    #[test]
+    fn claude_reset_credits_drop_spent_paused_and_lapsed_grants() {
+        let body = serde_json::json!({"cedar_ember": {
+            "eligible": true,
+            "grants": [
+                {"id": "spent", "label": "already used", "resets_left": 0},
+                {"id": "paused", "label": "held", "resets_left": 1, "paused": true},
+                {"id": "lapsed", "label": "gone", "resets_left": 1,
+                 "ends_at": "2026-01-01T00:00:00+00:00"},
+                {"id": "live", "label": "still here", "resets_left": 1,
+                 "ends_at": "2027-01-01T00:00:00+00:00"}
+            ]
+        }});
+        // 2026-11-12T00:00:00Z, the day this shape was observed live.
+        let usage = parse_claude_usage_summary(&body, 1_794_441_600);
+        assert_eq!(usage.reset_credits_available, Some(1));
+        assert_eq!(usage.reset_credits.len(), 1);
+        assert_eq!(usage.reset_credits[0].label.as_deref(), Some("still here"));
+    }
+
+    #[test]
+    fn claude_reset_grant_selection_prefers_the_named_next_grant() {
+        let body: serde_json::Value = serde_json::from_str(LIVE_CEDAR_EMBER).expect("parse");
+        let mut status = parse_cedar_ember_status(&body).expect("offer");
+        assert_eq!(
+            crate::quota::select_claude_grant(&status).as_deref(),
+            Some("full-reset-2611")
+        );
+        status.next_grant_id = Some("does-not-exist".to_string());
+        assert_eq!(
+            crate::quota::select_claude_grant(&status).as_deref(),
+            Some("full-reset-2611")
+        );
+    }
+
+    #[test]
+    fn claude_reset_grant_selection_refuses_an_ineligible_offer() {
+        let status = CedarEmberStatus {
+            eligible: Some(false),
+            grants: vec![CedarEmberGrant {
+                id: Some("full-reset-2611".to_string()),
+                resets_left: Some(1),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(crate::quota::select_claude_grant(&status).is_none());
+    }
+
+    // The claim verb answers 200 with a verdict in the body, so the status code
+    // alone cannot distinguish a spent reset from a refused one.
+    #[test]
+    fn claude_claim_verdicts_are_read_from_the_body_not_the_status_code() {
+        use crate::quota::ResetAttemptPolicy;
+        assert_eq!(
+            crate::quota::claude_claim_outcome(
+                reqwest::StatusCode::OK,
+                r#"{"result":"reset","cleared":["five_hour"]}"#
+            ),
+            ResetAttemptPolicy::Success
+        );
+        assert_eq!(
+            crate::quota::claude_claim_outcome(
+                reqwest::StatusCode::OK,
+                r#"{"result":"already_used","resets_left":0}"#
+            ),
+            ResetAttemptPolicy::NoCredit
+        );
+        assert_eq!(
+            crate::quota::claude_claim_outcome(
+                reqwest::StatusCode::OK,
+                r#"{"result":"not_limited","reason":"not_next_grant"}"#
+            ),
+            ResetAttemptPolicy::Upstream
+        );
+        assert_eq!(
+            crate::quota::claude_claim_outcome(reqwest::StatusCode::UNAUTHORIZED, ""),
+            ResetAttemptPolicy::Unauthorized
+        );
+    }
+
+    #[test]
+    fn claude_grant_ids_are_validated_before_the_claim_is_sent() {
+        use crate::quota::claude_grant_id_is_well_formed;
+        assert!(claude_grant_id_is_well_formed("full-reset-2611"));
+        assert!(claude_grant_id_is_well_formed("launch_2610_fable"));
+        assert!(!claude_grant_id_is_well_formed(""));
+        assert!(!claude_grant_id_is_well_formed("Full-Reset"));
+        assert!(!claude_grant_id_is_well_formed("has space"));
+        assert!(!claude_grant_id_is_well_formed(&"a".repeat(41)));
     }
 }

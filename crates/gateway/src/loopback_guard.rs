@@ -458,10 +458,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_client_rejects_initial_non_loopback_ip_with_zero_port_18899_traffic() {
-        let dummy_listener = tokio::net::TcpListener::bind("127.0.0.1:18899")
+    async fn test_client_rejects_initial_non_loopback_ip_without_reaching_the_dummy_port() {
+        // An ephemeral port, not a fixed one: 18840-18899 is the suite-wide
+        // fixture range, so a hardcoded port there collides with any concurrent
+        // reservation (and with unrelated processes on the host).
+        let dummy_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
-            .expect("bind 18899 must succeed");
+            .expect("bind dummy port must succeed");
+        let dummy_port = dummy_listener
+            .local_addr()
+            .expect("dummy listener addr")
+            .port();
 
         let client = reqwest::Client::builder()
             .dns_resolver(Arc::new(QaLoopbackDnsResolver::new()))
@@ -501,11 +508,11 @@ mod tests {
             .expect("set_nonblocking must succeed");
         match std_listener.accept() {
             Ok((_stream, addr)) => {
-                panic!("unexpected connection arrived at port 18899 from {addr}");
+                panic!("unexpected connection arrived at port {dummy_port} from {addr}");
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
             Err(e) => {
-                panic!("unexpected error checking port 18899: {e}");
+                panic!("unexpected error checking port {dummy_port}: {e}");
             }
         }
     }

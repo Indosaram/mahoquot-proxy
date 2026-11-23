@@ -1,4 +1,5 @@
 use serde_json::Value;
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Usage {
@@ -26,6 +27,9 @@ pub enum CodexEvent {
     /// `thinking_redacted`). Preserved as an explicit state event so surfaces
     /// can decide how to represent it instead of silently dropping it.
     ReasoningRedacted,
+    /// Kiro hands back the provider's own opaque redacted-reasoning blob. It
+    /// must round-trip verbatim and never be surfaced as plaintext.
+    KiroRedactedReasoning(String),
     ToolCallBegin {
         output_index: u64,
         call_id: String,
@@ -36,6 +40,7 @@ pub enum CodexEvent {
         delta: String,
     },
     OutputLimitReached,
+    ContentFilterReached,
     Completed {
         usage: Option<Usage>,
     },
@@ -77,6 +82,7 @@ pub struct SseParser {
     after_cr: bool,
     failure: Option<SseLimitError>,
     terminal: bool,
+    arguments_delivered: HashSet<u64>,
 }
 
 impl SseParser {
@@ -131,7 +137,42 @@ impl SseParser {
             return;
         }
         let start = out.len();
+        if let Ok(value) = serde_json::from_slice::<Value>(frame) {
+            let index = value
+                .get("output_index")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let arguments = match value.get("type").and_then(Value::as_str) {
+                Some("response.function_call_arguments.done") => value.get("arguments"),
+                Some("response.output_item.done")
+                    if value.pointer("/item/type").and_then(Value::as_str)
+                        == Some("function_call") =>
+                {
+                    value.pointer("/item/arguments")
+                }
+                _ => None,
+            };
+            if let Some(arguments) = arguments.and_then(Value::as_str) {
+                if !arguments.is_empty() && self.arguments_delivered.insert(index) {
+                    out.push(CodexEvent::ToolArgsDelta {
+                        output_index: index,
+                        delta: arguments.to_string(),
+                    });
+                }
+            }
+        }
         Self::decode(frame, out);
+        for event in &out[start..] {
+            if let CodexEvent::ToolArgsDelta {
+                output_index,
+                delta,
+            } = event
+            {
+                if !delta.is_empty() {
+                    self.arguments_delivered.insert(*output_index);
+                }
+            }
+        }
         self.terminal = out[start..].iter().any(|event| {
             matches!(
                 event,
@@ -235,12 +276,22 @@ impl SseParser {
         };
         if value.get("type").and_then(Value::as_str) == Some("response.incomplete")
             && value.pointer("/response/error").is_none_or(Value::is_null)
-            && value
+            && matches!(
+                value
+                    .pointer("/response/incomplete_details/reason")
+                    .and_then(Value::as_str),
+                Some("max_output_tokens" | "max_tokens" | "content_filter")
+            )
+        {
+            if value
                 .pointer("/response/incomplete_details/reason")
                 .and_then(Value::as_str)
-                == Some("max_output_tokens")
-        {
-            out.push(CodexEvent::OutputLimitReached);
+                == Some("content_filter")
+            {
+                out.push(CodexEvent::ContentFilterReached);
+            } else {
+                out.push(CodexEvent::OutputLimitReached);
+            }
             out.push(CodexEvent::Completed {
                 usage: value.pointer("/response/usage").map(parse_usage),
             });

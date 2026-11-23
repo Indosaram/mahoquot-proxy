@@ -5,7 +5,7 @@ use mahoquot_registry::{
 
 // 1. Antigravity models (14)
 const LEGACY_ANTIGRAVITY_MODELS: [&str; 14] = [
-    "gemini-3.8-flash-high",
+    "gemini-4-neon-high",
     "gemini-3.7-flash-high",
     "gemini-3.6-flash-high",
     "gemini-3.5-flash-low",
@@ -41,17 +41,10 @@ const LEGACY_CLAUDE_MODELS: [&str; 12] = [
 const LEGACY_ZCODE_MODELS: [&str; 5] =
     ["glm-5.3", "glm-5.3-flash", "glm-5.2", "glm-5.1", "glm-4.6"];
 
-// 4. Kiro models (8) - exposed as kiro/{model}
-const LEGACY_KIRO_MODELS: [&str; 8] = [
-    "auto",
-    "claude-sonnet-4.6",
-    "claude-opus-4.6",
-    "claude-haiku-4.5",
-    "claude-sonnet-4-5-20250929",
-    "claude-sonnet-4-5-20250929-thinking",
-    "claude-haiku-4-5-20251001",
-    "claude-haiku-4-5-20251001-thinking",
-];
+// 4. Kiro models (1) - exposed as kiro/{model}, dot-notation runtime ids.
+// Only the model the operator actually routes is declared; kiro is a closed
+// provider, so anything absent here is refused before it reaches the wire.
+const LEGACY_KIRO_MODELS: [&str; 1] = ["claude-opus-5.5"];
 
 // 5. Cursor models (4 in /v1/models + 2 cursor-*)
 const LEGACY_CURSOR_MODELS: [&str; 6] = [
@@ -88,11 +81,13 @@ const LEGACY_VERTEX_MODELS: [&str; 21] = [
     "gemini-3.6-flash",
 ];
 
-// 7. Codex default models (7)
-const LEGACY_CODEX_DEFAULTS: [&str; 7] = [
+// 7. Codex default models (9)
+const LEGACY_CODEX_DEFAULTS: [&str; 9] = [
     "gpt-5.6-sol",
     "gpt-5.6-luna",
     "gpt-5.6-terra",
+    "gpt-6.2-sol",
+    "gpt-6.2-astra",
     "gpt-5.5",
     "gpt-5.4",
     "gpt-5.4-mini",
@@ -178,7 +173,7 @@ fn embedded_catalog_covers_legacy_sources() {
         }
     }
 
-    // 4. Verify all 8 Kiro models (as kiro/{model})
+    // 4. Verify all Kiro runtime models (as kiro/{model})
     let kiro_provider = ProviderId::kiro();
     for raw in LEGACY_KIRO_MODELS {
         let prefixed = format!("kiro/{raw}");
@@ -203,19 +198,17 @@ fn embedded_catalog_covers_legacy_sources() {
         }
     }
 
-    // Verify auto-kiro alias
-    match snapshot.resolve("auto-kiro") {
-        Ok(resolved_kiro) => {
-            if resolved_kiro.canonical_id.as_str() != "kiro/auto" {
-                missing_errors.push(format!(
-                    "auto-kiro alias expected to resolve to 'kiro/auto', got '{}'",
-                    resolved_kiro.canonical_id
-                ));
-            }
-        }
-        Err(e) => {
-            missing_errors.push(format!("auto-kiro alias failed to resolve: {e:?}"));
-        }
+    // Kiro declares no aliases: the retired auto-kiro shim must not rewrite ids.
+    // (resolve() itself still succeeds for unknown ids through open-provider
+    // passthrough, so the alias table is what must stay clean.)
+    let auto_kiro = ModelId::new("auto-kiro").unwrap();
+    match snapshot.resolve_alias(&auto_kiro) {
+        Ok(target) if target == auto_kiro => {}
+        Ok(target) => missing_errors.push(format!(
+            "auto-kiro must not be aliased, but resolves to '{}'",
+            target.as_str()
+        )),
+        Err(e) => missing_errors.push(format!("auto-kiro alias lookup failed: {e:?}")),
     }
 
     // 5. Verify Cursor models
@@ -250,7 +243,7 @@ fn embedded_catalog_covers_legacy_sources() {
         }
     }
 
-    // 7. Verify all 7 Codex defaults
+    // 7. Verify all 9 Codex defaults
     let codex_provider = ProviderId::codex();
     for id in LEGACY_CODEX_DEFAULTS {
         let model_id = ModelId::new(id).unwrap();
@@ -453,16 +446,16 @@ fn test_embedded_catalog_resolves_closed_and_open_models() {
         "claude"
     );
 
-    // Kiro alias model
-    let resolved_kiro = snapshot.resolve("auto-kiro").unwrap();
-    assert_eq!(resolved_kiro.canonical_id.as_str(), "kiro/auto");
+    // Kiro model
+    let resolved_kiro = snapshot.resolve("kiro/claude-opus-5.5").unwrap();
+    assert_eq!(resolved_kiro.canonical_id.as_str(), "kiro/claude-opus-5.5");
     assert_eq!(
         resolved_kiro.eligible_bindings[0].provider_id.as_str(),
         "kiro"
     );
     assert_eq!(
         resolved_kiro.eligible_bindings[0].effective_upstream_id(&resolved_kiro.canonical_id),
-        "auto"
+        "claude-opus-5.5"
     );
 
     // Open Codex model

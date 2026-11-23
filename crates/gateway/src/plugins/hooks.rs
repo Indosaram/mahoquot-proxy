@@ -327,21 +327,22 @@ impl PluginHookRegistry {
         stream: bool,
     ) -> (Vec<u8>, bool) {
         let plugins = self.host.list_plugins();
+        let mut payload_bytes = None;
         for p in plugins {
             if !has_capability(&p, "request_translator") {
                 continue;
             }
-            let payload = json!({
-                "FromFormat": from,
-                "ToFormat": to,
-                "Model": model,
-                "Stream": stream,
-                "Body": body,
+            let payload_bytes = payload_bytes.get_or_insert_with(|| {
+                let payload = json!({
+                    "FromFormat": from,
+                    "ToFormat": to,
+                    "Model": model,
+                    "Stream": stream,
+                    "Body": body,
+                });
+                serde_json::to_vec(&payload).unwrap_or_default()
             });
-            if let Ok(bytes) = p.client.call(
-                METHOD_REQUEST_TRANSLATE,
-                &serde_json::to_vec(&payload).unwrap_or_default(),
-            ) {
+            if let Ok(bytes) = p.client.call(METHOD_REQUEST_TRANSLATE, payload_bytes) {
                 if let Ok(env) = serde_json::from_slice::<Envelope>(&bytes) {
                     if env.ok {
                         if let Some(res) = env.result {
@@ -416,23 +417,24 @@ impl PluginHookRegistry {
         stream: bool,
     ) -> (Vec<u8>, bool) {
         let plugins = self.host.list_plugins();
+        let mut payload_bytes = None;
         for p in plugins {
             if !has_capability(&p, "response_translator") {
                 continue;
             }
-            let payload = json!({
-                "FromFormat": from,
-                "ToFormat": to,
-                "Model": model,
-                "Stream": stream,
-                "OriginalRequest": original_req,
-                "TranslatedRequest": request_raw,
-                "Body": body,
+            let payload_bytes = payload_bytes.get_or_insert_with(|| {
+                let payload = json!({
+                    "FromFormat": from,
+                    "ToFormat": to,
+                    "Model": model,
+                    "Stream": stream,
+                    "OriginalRequest": original_req,
+                    "TranslatedRequest": request_raw,
+                    "Body": body,
+                });
+                serde_json::to_vec(&payload).unwrap_or_default()
             });
-            if let Ok(bytes) = p.client.call(
-                METHOD_RESPONSE_TRANSLATE,
-                &serde_json::to_vec(&payload).unwrap_or_default(),
-            ) {
+            if let Ok(bytes) = p.client.call(METHOD_RESPONSE_TRANSLATE, payload_bytes) {
                 if let Ok(env) = serde_json::from_slice::<Envelope>(&bytes) {
                     if env.ok {
                         if let Some(res) = env.result {
@@ -503,12 +505,14 @@ impl PluginHookRegistry {
         };
 
         let plugins = self.host.list_plugins();
+        let mut req_json = None;
         for p in plugins {
             if !has_capability(&p, "response_interceptor") {
                 continue;
             }
-            let req_json = serde_json::to_vec(&req).unwrap_or_default();
-            if let Ok(bytes) = p.client.call(METHOD_RESPONSE_INTERCEPT_AFTER, &req_json) {
+            let req_json =
+                req_json.get_or_insert_with(|| serde_json::to_vec(&req).unwrap_or_default());
+            if let Ok(bytes) = p.client.call(METHOD_RESPONSE_INTERCEPT_AFTER, req_json) {
                 if let Ok(env) = serde_json::from_slice::<Envelope>(&bytes) {
                     if env.ok {
                         if let Some(res) = env.result {
@@ -555,18 +559,48 @@ impl PluginHookRegistry {
             if !has_capability(&p, "stream_chunk_interceptor") {
                 continue;
             }
-            let mut req = req.clone();
-            if req.chunk_index >= 0 {
-                if p.schema_version >= SCHEMA_VERSION_STREAM_CHUNK_OMIT_REQUEST_BODY {
-                    req.original_request = Vec::new();
-                    req.request_body = Vec::new();
-                }
-                if p.schema_version >= SCHEMA_VERSION_STREAM_CHUNK_OMIT_HISTORY {
-                    req.history_chunks = Vec::new();
-                }
+            #[derive(Serialize)]
+            struct StreamChunkView<'a> {
+                request_id: &'a str,
+                source_format: &'a str,
+                model: &'a str,
+                requested_model: &'a str,
+                request_headers: &'a HashMap<String, Vec<String>>,
+                response_headers: &'a HashMap<String, Vec<String>>,
+                original_request: &'a [u8],
+                request_body: &'a [u8],
+                body: &'a [u8],
+                history_chunks: &'a [Vec<u8>],
+                chunk_index: i64,
+                metadata: &'a HashMap<String, serde_json::Value>,
             }
-
-            let req_json = serde_json::to_vec(&req).unwrap_or_default();
+            let omit_request = req.chunk_index >= 0
+                && p.schema_version >= SCHEMA_VERSION_STREAM_CHUNK_OMIT_REQUEST_BODY;
+            let omit_history = req.chunk_index >= 0
+                && p.schema_version >= SCHEMA_VERSION_STREAM_CHUNK_OMIT_HISTORY;
+            let view = StreamChunkView {
+                request_id: &req.request_id,
+                source_format: &req.source_format,
+                model: &req.model,
+                requested_model: &req.requested_model,
+                request_headers: &req.request_headers,
+                response_headers: &req.response_headers,
+                original_request: if omit_request {
+                    &[]
+                } else {
+                    &req.original_request
+                },
+                request_body: if omit_request { &[] } else { &req.request_body },
+                body: &req.body,
+                history_chunks: if omit_history {
+                    &[]
+                } else {
+                    &req.history_chunks
+                },
+                chunk_index: req.chunk_index,
+                metadata: &req.metadata,
+            };
+            let req_json = serde_json::to_vec(&view).unwrap_or_default();
             if let Ok(bytes) = p
                 .client
                 .call(METHOD_RESPONSE_INTERCEPT_STREAM_CHUNK, &req_json)
@@ -601,17 +635,20 @@ impl PluginHookRegistry {
 
     pub fn complete_request(&self, completion: RequestCompletion) {
         let plugins = self.host.list_plugins();
+        let mut req_json = None;
         for p in plugins {
             if !has_capability(&p, "request_lifecycle_plugin") {
                 continue;
             }
-            let req_json = serde_json::to_vec(&completion).unwrap_or_default();
-            let _ = p.client.call(METHOD_REQUEST_COMPLETE, &req_json);
+            let req_json =
+                req_json.get_or_insert_with(|| serde_json::to_vec(&completion).unwrap_or_default());
+            let _ = p.client.call(METHOD_REQUEST_COMPLETE, req_json);
         }
     }
 
     pub fn observe_websocket_response_event(&self, event: WebSocketResponseEvent) {
         let plugins = self.host.list_plugins();
+        let mut req_json = None;
         for p in plugins {
             if p.schema_version < SCHEMA_VERSION_WEBSOCKET_RESPONSE_OBSERVER {
                 continue;
@@ -619,8 +656,9 @@ impl PluginHookRegistry {
             if !has_capability(&p, "websocket_response_observer") {
                 continue;
             }
-            let req_json = serde_json::to_vec(&event).unwrap_or_default();
-            let _ = p.client.call(METHOD_WEBSOCKET_RESPONSE_EVENT, &req_json);
+            let req_json =
+                req_json.get_or_insert_with(|| serde_json::to_vec(&event).unwrap_or_default());
+            let _ = p.client.call(METHOD_WEBSOCKET_RESPONSE_EVENT, req_json);
         }
     }
 }
@@ -673,21 +711,98 @@ mod review_plugins_tests {
     use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, Mutex};
 
-    struct Recorder(u32, Mutex<Vec<StreamChunkInterceptRequest>>);
+    struct Recorder(u32, Mutex<Vec<Vec<u8>>>);
     impl PluginClient for Recorder {
         fn call(&self, method: &str, request: &[u8]) -> Result<Vec<u8>, PluginError> {
             let value = if method == METHOD_PLUGIN_REGISTER {
                 json!({"schema_version": self.0, "capabilities": {"stream_chunk_interceptor": true}})
             } else {
-                self.1
-                    .lock()
-                    .unwrap()
-                    .push(serde_json::from_slice(request).unwrap());
+                self.1.lock().unwrap().push(request.to_vec());
                 json!({"body": [7]})
             };
             Ok(serde_json::to_vec(&Envelope::success(value)).unwrap())
         }
         fn shutdown(&self) {}
+    }
+
+    struct FanoutRecorder(Mutex<HashMap<String, Vec<Vec<u8>>>>);
+
+    impl PluginClient for FanoutRecorder {
+        fn call(&self, method: &str, request: &[u8]) -> Result<Vec<u8>, PluginError> {
+            let value = if method == METHOD_PLUGIN_REGISTER {
+                json!({"schema_version":6,"capabilities":{
+                    "request_translator":true,"response_translator":true,
+                    "response_interceptor":true,"request_lifecycle_plugin":true,
+                    "websocket_response_observer":true
+                }})
+            } else {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .entry(method.into())
+                    .or_default()
+                    .push(request.to_vec());
+                json!({"body":[7]})
+            };
+            Ok(serde_json::to_vec(&Envelope::success(value)).unwrap())
+        }
+        fn shutdown(&self) {}
+    }
+
+    #[test]
+    fn ulw_gw5_immutable_fanouts_keep_identical_wire_input() {
+        let host = Arc::new(PluginHost::new(Arc::new(|_, _, _| Ok(vec![]))));
+        let clients: Vec<_> = (0..3)
+            .map(|index| {
+                let client = Arc::new(FanoutRecorder(Mutex::new(HashMap::new())));
+                host.register_plugin_client(
+                    &index.to_string(),
+                    std::path::Path::new("fixture"),
+                    "1",
+                    client.clone(),
+                    Arc::new(AtomicUsize::new(0)),
+                )
+                .unwrap();
+                client
+            })
+            .collect();
+        let hooks = PluginHookRegistry::new(host);
+        assert_eq!(
+            hooks.translate_request("a", "b", "m", b"body", true),
+            (b"body".to_vec(), false)
+        );
+        assert_eq!(
+            hooks.translate_response("a", "b", "m", b"original", b"request", b"body", true),
+            (b"body".to_vec(), false)
+        );
+        let response: ResponseInterceptRequest = serde_json::from_value(json!({
+            "body":[1,2],"response_headers":{"x-fixture":["value"]},"metadata":{"fixture":true}
+        }))
+        .unwrap();
+        let response_bytes = serde_json::to_vec(&response).unwrap();
+        assert_eq!(hooks.intercept_response(response).body, [7]);
+        let completion: RequestCompletion =
+            serde_json::from_value(json!({"request_id":"fixture"})).unwrap();
+        let completion_bytes = serde_json::to_vec(&completion).unwrap();
+        hooks.complete_request(completion);
+        let event: WebSocketResponseEvent =
+            serde_json::from_value(json!({"payload":[0,255]})).unwrap();
+        let event_bytes = serde_json::to_vec(&event).unwrap();
+        hooks.observe_websocket_response_event(event);
+        let expected = [
+            (METHOD_REQUEST_TRANSLATE, serde_json::to_vec(&json!({"FromFormat":"a","ToFormat":"b","Model":"m","Stream":true,"Body":b"body"})).unwrap()),
+            (METHOD_RESPONSE_TRANSLATE, serde_json::to_vec(&json!({"FromFormat":"a","ToFormat":"b","Model":"m","Stream":true,"OriginalRequest":b"original","TranslatedRequest":b"request","Body":b"body"})).unwrap()),
+            (METHOD_RESPONSE_INTERCEPT_AFTER, response_bytes),
+            (METHOD_REQUEST_COMPLETE, completion_bytes),
+            (METHOD_WEBSOCKET_RESPONSE_EVENT, event_bytes),
+        ];
+        for client in clients {
+            let calls = client.0.lock().unwrap();
+            assert_eq!(calls.len(), expected.len());
+            for (method, bytes) in &expected {
+                assert_eq!(calls[*method], vec![bytes.clone()]);
+            }
+        }
     }
 
     #[test]
@@ -715,6 +830,7 @@ mod review_plugins_tests {
             let request: StreamChunkInterceptRequest = serde_json::from_value(json!({
                 "original_request": [1], "request_body": [2], "history_chunks": [[3]], "body": [4], "chunk_index": chunk_index
             })).unwrap();
+            let original = request.clone();
             assert_eq!(
                 hooks
                     .intercept_stream_chunk_for_plugins(request, plugins.clone())
@@ -723,7 +839,18 @@ mod review_plugins_tests {
             );
             for client in &clients {
                 let mut calls = client.1.lock().unwrap();
-                let received = calls.pop().unwrap();
+                let received_bytes = calls.pop().unwrap();
+                let mut expected = original.clone();
+                if chunk_index >= 0 && client.0 >= 3 {
+                    expected.original_request.clear();
+                    expected.request_body.clear();
+                }
+                if chunk_index >= 0 && client.0 >= 5 {
+                    expected.history_chunks.clear();
+                }
+                assert_eq!(received_bytes, serde_json::to_vec(&expected).unwrap());
+                let received: StreamChunkInterceptRequest =
+                    serde_json::from_slice(&received_bytes).unwrap();
                 assert_eq!(
                     received.original_request,
                     if chunk_index >= 0 && client.0 >= 3 {

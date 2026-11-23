@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use serde_json::{json, Map, Value};
 
 use super::events::{CodexEvent, Usage};
@@ -215,11 +216,13 @@ impl AnthropicDecoder {
                         "anthropic upstream message ended without text or tool calls"
                     );
                 }
+                let prompt_tokens =
+                    self.input_tokens + self.cache_read_tokens + self.cache_write_tokens;
                 out.push(CodexEvent::Completed {
                     usage: Some(Usage {
-                        prompt_tokens: self.input_tokens,
+                        prompt_tokens,
                         completion_tokens: self.output_tokens,
-                        total_tokens: self.input_tokens + self.output_tokens,
+                        total_tokens: prompt_tokens + self.output_tokens,
                         cached_tokens: self.cache_read_tokens,
                         cached_tokens_known: self.cache_read_tokens_known,
                         reasoning_tokens: 0,
@@ -268,7 +271,6 @@ pub fn anthropic_to_openai(body: &Value) -> Result<Value, String> {
         .ok_or_else(|| "missing messages".to_string())?;
 
     let mut out_messages: Vec<Value> = Vec::new();
-
     if let Some(system) = body.get("system") {
         if let Some(text) = system_to_text(system) {
             if !text.is_empty() {
@@ -279,6 +281,18 @@ pub fn anthropic_to_openai(body: &Value) -> Result<Value, String> {
 
     for msg in messages {
         let role = msg.get("role").and_then(Value::as_str).unwrap_or("user");
+        // Anthropic's cache-preserving per-message effort switch, relayed to
+        // the OpenAI wire as the marker `configuration_update` consumes.
+        if matches!(role, "system" | "developer") {
+            if let Some(effort) = msg.pointer("/output_config/effort").and_then(Value::as_str) {
+                out_messages.push(json!({
+                    "role": "system",
+                    "content": "",
+                    "x_effort_update": effort,
+                }));
+                continue;
+            }
+        }
         let content = msg.get("content");
 
         let mut text_parts: Vec<String> = Vec::new();
@@ -311,6 +325,11 @@ pub fn anthropic_to_openai(body: &Value) -> Result<Value, String> {
                                             source["data"].as_str().unwrap_or("")
                                         )
                                     }
+                                }));
+                            } else if source["type"] == "url" {
+                                image_parts.push(json!({
+                                    "type": "image_url",
+                                    "image_url": {"url": source["url"]}
                                 }));
                             }
                         }
@@ -366,6 +385,11 @@ pub fn anthropic_to_openai(body: &Value) -> Result<Value, String> {
                                                             )
                                                         }
                                                     })
+                                                } else if source["type"] == "url" {
+                                                    json!({
+                                                        "type": "image_url",
+                                                        "image_url": {"url": source["url"]}
+                                                    })
                                                 } else {
                                                     item.clone()
                                                 }
@@ -398,6 +422,7 @@ pub fn anthropic_to_openai(body: &Value) -> Result<Value, String> {
             _ => {}
         }
 
+        out_messages.extend(tool_results);
         if role == "assistant"
             && (!tool_calls.is_empty()
                 || !thinking_parts.is_empty()
@@ -442,16 +467,33 @@ pub fn anthropic_to_openai(body: &Value) -> Result<Value, String> {
             };
             out_messages.push(json!({ "role": role, "content": content }));
         }
-
-        let has_tool_results = !tool_results.is_empty();
-        out_messages.extend(tool_results);
-        let _ = has_tool_results;
     }
 
     let mut out = Map::new();
     out.insert("model".to_string(), json!(model));
     out.insert("messages".to_string(), Value::Array(out_messages));
 
+    if let Some(stop) = body.get("stop_sequences") {
+        out.insert("stop".to_string(), stop.clone());
+    }
+    let thinking_type = body["thinking"]["type"].as_str();
+    let effort = if thinking_type == Some("disabled") {
+        Some("none".to_string())
+    } else if let Some(effort) = body["output_config"]["effort"].as_str() {
+        Some(effort.to_string())
+    } else if let Some(budget) = body["thinking"]["budget_tokens"].as_u64() {
+        Some(
+            super::request::normalize_thinking_level(&budget.to_string())
+                .map_err(|error| error.to_string())?,
+        )
+    } else if matches!(thinking_type, Some("adaptive" | "enabled")) {
+        Some("auto".to_string())
+    } else {
+        None
+    };
+    if let Some(effort) = effort {
+        out.insert("reasoning_effort".to_string(), json!(effort));
+    }
     if let Some(m) = body.get("max_tokens").and_then(Value::as_i64) {
         out.insert("max_tokens".to_string(), json!(m));
     }
@@ -508,6 +550,65 @@ pub fn anthropic_to_openai(body: &Value) -> Result<Value, String> {
     }
 
     Ok(Value::Object(out))
+}
+
+/// Claude models that accept the `mid-conversation-output-config-2026-07-01`
+/// beta: `output_config.effort` on a `role: "system"` message placed partway
+/// through the history. Mirrors the documented support list; everything else
+/// must take the top-level effort (which does invalidate the message cache).
+pub fn supports_mid_conversation_effort(model: &str) -> bool {
+    let model = model.rsplit('/').next().unwrap_or(model);
+    const SUPPORTED: [&str; 6] = [
+        "claude-fable-5-1",
+        "claude-mythos-5-1",
+        "claude-opus-5-5",
+        "claude-opus-5",
+        "claude-sonnet-5-5",
+        "claude-haiku-5-5",
+    ];
+    SUPPORTED.iter().any(|base| {
+        if model == *base {
+            return true;
+        }
+        // A variant suffix (`-high`, `-medium`, …) is the same model; a longer
+        // numeric tail (`-50`) is a different id and must not match.
+        const VARIANTS: [&str; 7] = ["high", "medium", "low", "xhigh", "minimal", "max", "none"];
+        model
+            .strip_prefix(base)
+            .and_then(|rest| rest.strip_prefix('-'))
+            .is_some_and(|tail| VARIANTS.contains(&tail))
+    })
+}
+
+/// Beta that unlocks per-message `output_config.effort`. Without it the
+/// upstream rejects `messages.N.output_config` outright.
+pub const MID_CONVERSATION_EFFORT_BETA: &str = "mid-conversation-output-config-2026-07-01";
+
+/// True when the translated body carries a mid-conversation effort message, so
+/// the caller knows the beta header must ride along.
+pub fn uses_mid_conversation_effort(body: &Value) -> bool {
+    body.get("messages")
+        .and_then(Value::as_array)
+        .is_some_and(|messages| {
+            messages.iter().any(|message| {
+                message.get("role").and_then(Value::as_str) == Some("system")
+                    && message.get("output_config").is_some()
+            })
+        })
+}
+
+/// Same check on the already-encoded upstream body.
+///
+/// Every Anthropic request passes here, so a byte scan rejects the common case
+/// before paying for a full deserialize.
+pub fn uses_mid_conversation_effort_bytes(raw: &[u8]) -> bool {
+    const NEEDLE: &[u8] = b"\"output_config\"";
+    if !raw.windows(NEEDLE.len()).any(|window| window == NEEDLE) {
+        return false;
+    }
+    serde_json::from_slice::<Value>(raw)
+        .map(|body| uses_mid_conversation_effort(&body))
+        .unwrap_or(false)
 }
 
 /// Applies a requested thinking mode (model suffix or reasoning effort) to an
@@ -635,12 +736,35 @@ pub fn openai_to_anthropic_with_capability(
         .ok_or_else(|| "missing messages".to_string())?;
     let mut system = Vec::new();
     let mut out: Vec<Value> = Vec::new();
+    // Beta-gated per-message effort only exists for these models; elsewhere the
+    // switch is folded into the top-level `output_config` instead of emitting a
+    // message the upstream would reject.
+    let per_message_effort = supports_mid_conversation_effort(model);
+    let mut unsupported_effort: Option<String> = None;
     for message in messages {
         let role = message
             .get("role")
             .and_then(Value::as_str)
             .unwrap_or("user");
         if role == "system" || role == "developer" {
+            if let Some(effort) = message.get("x_effort_update").and_then(Value::as_str) {
+                if !per_message_effort {
+                    unsupported_effort = Some(effort.to_string());
+                    continue;
+                }
+                // Cache-preserving effort switch: Anthropic renders a mid-stream
+                // `role: system` message instead of rewriting the top-level
+                // `output_config`, so every earlier block stays inside the
+                // cached prefix. Only emitted when the client itself asked for
+                // it with a `configuration_update` input item.
+                let entry = json!({
+                    "role": "system",
+                    "content": [],
+                    "output_config": {"effort": effort},
+                });
+                out.push(entry);
+                continue;
+            }
             if let Some(text) = message.get("content").and_then(content_text) {
                 let mut block = json!({"type": "text", "text": text});
                 if let Some(cache_control) = message.get("cache_control").filter(|c| c.is_object())
@@ -695,6 +819,24 @@ pub fn openai_to_anthropic_with_capability(
             _ => Vec::new(),
         };
         let mut content = content;
+        if role == "assistant" {
+            if let Some(signature) = message["reasoning_signature"].as_str().filter(|signature| {
+                if message["reasoning_redacted"] == true {
+                    !signature.is_empty()
+                } else {
+                    plausible_claude_signature(signature)
+                }
+            }) {
+                if message["reasoning_redacted"] == true {
+                    content.insert(0, json!({"type":"redacted_thinking","data":signature}));
+                } else if let Some(thinking) = message["reasoning_content"].as_str() {
+                    content.insert(
+                        0,
+                        json!({"type":"thinking","thinking":thinking,"signature":signature}),
+                    );
+                }
+            }
+        }
         if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
             for call in calls {
                 let input = call["function"]["arguments"]
@@ -763,7 +905,7 @@ pub fn openai_to_anthropic_with_capability(
     let mut result = json!({
         "model": model,
         "messages": out,
-        "max_tokens": body.get("max_tokens").and_then(Value::as_u64).unwrap_or(32_768),
+        "max_tokens": body.get("max_tokens").or_else(|| body.get("max_completion_tokens")).and_then(Value::as_u64).unwrap_or(32_768),
         "stream": body.get("stream").and_then(Value::as_bool).unwrap_or(false),
     });
     if !system.is_empty() {
@@ -813,6 +955,11 @@ pub fn openai_to_anthropic_with_capability(
         result["tool_choice"] = choice;
     }
     let thinking_enabled = apply_thinking_mode(raw_model, body, capability, &mut result)?;
+    if let Some(effort) = unsupported_effort {
+        // This model has no per-message switch; the client's latest requested
+        // effort still wins, at the documented cost of the message cache.
+        result["output_config"] = json!({"effort": effort});
+    }
 
     for key in ["temperature", "top_p", "stop_sequences"] {
         if let Some(value) = body.get(key) {
@@ -824,7 +971,46 @@ pub fn openai_to_anthropic_with_capability(
             }
         }
     }
+    match body.get("stop") {
+        Some(Value::String(stop)) => result["stop_sequences"] = json!([stop]),
+        Some(Value::Array(stops)) => result["stop_sequences"] = json!(stops),
+        _ => {}
+    }
+    // Every OpenAI -> Anthropic translation leaves through here, and the
+    // client's own markers are preserved, so the provider limit is enforced at
+    // the translation boundary. A caller that adds path-specific breakpoints
+    // afterwards must enforce it again (see the relay serialization point).
+    enforce_cache_control_limit(&mut result, MAX_CACHE_BREAKPOINTS);
     Ok(result)
+}
+
+// Recognize the opaque Claude protobuf envelope, not arbitrary foreign-provider
+// base64 or fabricated placeholder signatures. Preserve the original bytes.
+fn plausible_claude_signature(signature: &str) -> bool {
+    use base64::Engine as _;
+    if signature.len() < 16 {
+        return false;
+    }
+    let decode = |raw: &[u8]| {
+        base64::engine::general_purpose::STANDARD
+            .decode(raw)
+            .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(raw))
+    };
+    let Ok(mut bytes) = decode(signature.as_bytes()) else {
+        return false;
+    };
+    if matches!(bytes.first(), Some(b'E' | b'C')) {
+        let Ok(inner) = decode(&bytes) else {
+            return false;
+        };
+        bytes = inner;
+    }
+    bytes.first() == Some(&0x12)
+        || bytes.starts_with(&[0x08, 0x04, 0x12])
+        || (bytes.first() == Some(&0x08)
+            && bytes
+                .windows(b"claude-".len())
+                .any(|part| part == b"claude-"))
 }
 
 fn content_text(content: &Value) -> Option<String> {
@@ -951,6 +1137,82 @@ pub fn ensure_claude_code_system_instruction(body: &mut Value) {
     }
 }
 
+/// Anthropic accepts at most four `cache_control` breakpoints per request
+/// and answers a fifth with HTTP 400. Clients that manage their own markers
+/// can exceed that, so excess markers are stripped before the request is
+/// sent: messages first (least stable prefix), then system, then tools.
+pub const MAX_CACHE_BREAKPOINTS: usize = 4;
+
+fn breakpoint_count(body: &Value) -> usize {
+    fn count(blocks: Option<&Vec<Value>>) -> usize {
+        blocks
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .filter(|block| block.get("cache_control").is_some())
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+    let messages = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .map(|messages| {
+            messages
+                .iter()
+                .filter_map(|message| message.get("content").and_then(Value::as_array))
+                .map(|blocks| count(Some(blocks)))
+                .sum::<usize>()
+        })
+        .unwrap_or(0);
+    messages
+        + count(body.get("system").and_then(Value::as_array))
+        + count(body.get("tools").and_then(Value::as_array))
+}
+
+fn strip_breakpoints(blocks: &mut Vec<Value>, excess: &mut usize) {
+    for block in blocks {
+        if *excess == 0 {
+            return;
+        }
+        if block.get("cache_control").is_some() {
+            if let Some(object) = block.as_object_mut() {
+                object.remove("cache_control");
+            }
+            *excess -= 1;
+        }
+    }
+}
+
+/// Enforces [`MAX_CACHE_BREAKPOINTS`], mirroring both references.
+pub fn enforce_cache_control_limit(body: &mut Value, limit: usize) {
+    let total = breakpoint_count(body);
+    if total <= limit {
+        return;
+    }
+    let mut excess = total - limit;
+    if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
+        for message in messages {
+            if excess == 0 {
+                break;
+            }
+            if let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut) {
+                strip_breakpoints(blocks, &mut excess);
+            }
+        }
+    }
+    if excess > 0 {
+        if let Some(system) = body.get_mut("system").and_then(Value::as_array_mut) {
+            strip_breakpoints(system, &mut excess);
+        }
+    }
+    if excess > 0 {
+        if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
+            strip_breakpoints(tools, &mut excess);
+        }
+    }
+}
+
 /// Anthropic only caches a prefix up to an explicit `cache_control`
 /// breakpoint. Translated OpenAI requests carry none, so only the prefix the
 /// relay marks itself (the system prompt) gets cached and the growing
@@ -961,8 +1223,9 @@ pub fn ensure_claude_code_system_instruction(body: &mut Value) {
 /// system it caches itself, but drops a system that arrives as content
 /// blocks (measured 2026-10-12: block-form system cost the same input tokens
 /// as no system at all). A request that already carries a breakpoint is left
-/// as sent.
+/// as sent, after the provider limit is enforced.
 pub fn apply_prompt_cache_breakpoints(body: &mut Value) {
+    enforce_cache_control_limit(body, MAX_CACHE_BREAKPOINTS);
     if body.to_string().contains("\"cache_control\"") {
         return;
     }
@@ -970,7 +1233,14 @@ pub fn apply_prompt_cache_breakpoints(body: &mut Value) {
     let Some(message) = body
         .get_mut("messages")
         .and_then(Value::as_array_mut)
-        .and_then(|messages| messages.last_mut())
+        .and_then(|messages| {
+            // A trailing effort directive is an instruction, not cached content:
+            // the breakpoint belongs on the last real turn before it.
+            messages
+                .iter_mut()
+                .rev()
+                .find(|message| message.get("output_config").is_none())
+        })
     else {
         return;
     };
@@ -1087,6 +1357,7 @@ pub fn anthropic_json_to_openai(body: &Value, model: &str, created: i64) -> Valu
     let completion_tokens = body["usage"]["output_tokens"].as_u64().unwrap_or(0);
     let cache_read = body["usage"]["cache_read_input_tokens"].as_u64();
     let cache_write = body["usage"]["cache_creation_input_tokens"].as_u64();
+    let prompt_tokens = prompt_tokens + cache_read.unwrap_or(0) + cache_write.unwrap_or(0);
 
     let mut usage = json!({
         "prompt_tokens": prompt_tokens,
@@ -1217,10 +1488,7 @@ pub fn messages_payload_full(
         "content": content,
         "stop_reason": stop_reason_for(finish),
         "stop_sequence": Value::Null,
-        "usage": {
-            "input_tokens": usage.map(|u| u.prompt_tokens).unwrap_or(0),
-            "output_tokens": usage.map(|u| u.completion_tokens).unwrap_or(0),
-        }
+        "usage": anthropic_usage(usage)
     })
 }
 
@@ -1277,10 +1545,7 @@ pub fn render_anthropic_stream(
                 "model": model,
                 "stop_reason": Value::Null,
                 "stop_sequence": Value::Null,
-                "usage": {
-                    "input_tokens": final_usage.as_ref().map(|u| u.prompt_tokens).unwrap_or(0),
-                    "output_tokens": final_usage.as_ref().map(|u| u.completion_tokens).unwrap_or(0),
-                }
+                "usage": anthropic_usage(final_usage.as_ref())
             }
         }),
     ));
@@ -1342,6 +1607,24 @@ pub fn render_anthropic_stream(
     (out, usage)
 }
 
+fn anthropic_usage(usage: Option<&Usage>) -> Value {
+    let mut result = json!({"input_tokens": 0, "output_tokens": 0});
+    if let Some(usage) = usage {
+        result["input_tokens"] = json!(usage
+            .prompt_tokens
+            .saturating_sub(usage.cached_tokens)
+            .saturating_sub(usage.cache_write_tokens));
+        result["output_tokens"] = json!(usage.completion_tokens);
+        if usage.cached_tokens_known {
+            result["cache_read_input_tokens"] = json!(usage.cached_tokens);
+        }
+        if usage.cache_write_tokens_known {
+            result["cache_creation_input_tokens"] = json!(usage.cache_write_tokens);
+        }
+    }
+    result
+}
+
 fn sse(event: &str, payload: &Value) -> String {
     format!("event: {event}\ndata: {payload}\n\n")
 }
@@ -1358,6 +1641,7 @@ pub struct AnthropicStreamRenderer {
     closed_tools: std::collections::HashSet<u64>,
     thinking_index: Option<u64>,
     output_limit_reached: bool,
+    content_filter_reached: bool,
 }
 
 impl AnthropicStreamRenderer {
@@ -1374,6 +1658,7 @@ impl AnthropicStreamRenderer {
             closed_tools: std::collections::HashSet::new(),
             thinking_index: None,
             output_limit_reached: false,
+            content_filter_reached: false,
         }
     }
 
@@ -1476,7 +1761,9 @@ impl AnthropicStreamRenderer {
             }
             // Redacted reasoning has no Anthropic wire representation without
             // upstream redacted data; the marker only keeps the state explicit.
-            CodexEvent::ReasoningRedacted => {}
+            // Redacted reasoning stays out of the Claude wire, and the Kiro
+            // opaque blob is replayed only through its own adapter.
+            CodexEvent::ReasoningRedacted | CodexEvent::KiroRedactedReasoning(_) => {}
             CodexEvent::ToolCallBegin {
                 call_id,
                 name,
@@ -1504,11 +1791,14 @@ impl AnthropicStreamRenderer {
                 ));
             }
             CodexEvent::OutputLimitReached => self.output_limit_reached = true,
+            CodexEvent::ContentFilterReached => self.content_filter_reached = true,
             CodexEvent::Completed { usage } => {
                 self.close_thinking(&mut out);
                 self.close_text(&mut out);
                 self.close_open_tools(&mut out);
-                let stop = if self.output_limit_reached {
+                let stop = if self.content_filter_reached {
+                    "refusal"
+                } else if self.output_limit_reached {
                     "max_tokens"
                 } else if self.tool_index > 0 {
                     "tool_use"
@@ -1520,7 +1810,7 @@ impl AnthropicStreamRenderer {
                     // message_start went out before the provider reported usage, so the
                     // final input count is carried here (Anthropic clients merge
                     // message_delta usage into the message).
-                    json!({"type":"message_delta","delta":{"stop_reason":stop,"stop_sequence":Value::Null},"usage":{"input_tokens":usage.as_ref().map(|u|u.prompt_tokens).unwrap_or(0),"output_tokens":usage.as_ref().map(|u|u.completion_tokens).unwrap_or(0)}}),
+                    json!({"type":"message_delta","delta":{"stop_reason":stop,"stop_sequence":Value::Null},"usage":anthropic_usage(usage.as_ref())}),
                 ));
                 out.push(Self::frame("message_stop", json!({"type":"message_stop"})));
                 self.terminated = true;
@@ -1567,6 +1857,307 @@ impl AnthropicStreamRenderer {
     pub fn terminated(&self) -> bool {
         self.terminated
     }
+
+    pub fn tick(&mut self) -> Bytes {
+        if self.terminated {
+            return Bytes::new();
+        }
+        let mut out = Vec::new();
+        self.ensure_started(&mut out);
+        out.push(Bytes::from_static(
+            b"event: ping\ndata: {\"type\":\"ping\"}\n\n",
+        ));
+        out.concat().into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sse_value(frame: &str) -> Value {
+        serde_json::from_str(
+            frame
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn anthropic_cache_usage_is_inclusive_json_and_stream() {
+        let usage = json!({"input_tokens":100,"cache_read_input_tokens":40,"cache_creation_input_tokens":60,"output_tokens":10});
+        let response = json!({"id":"msg_cache","content":[],"usage":usage});
+        let converted = claude_json_to_openai(&response, "fixture", 1);
+        assert_eq!(converted["usage"]["prompt_tokens"], 200);
+        assert_eq!(converted["usage"]["total_tokens"], 210);
+        assert_eq!(
+            converted["usage"]["prompt_tokens_details"]["cached_tokens"],
+            40
+        );
+        assert_eq!(
+            converted["usage"]["prompt_tokens_details"]["cache_write_tokens"],
+            60
+        );
+        let mut decoder = AnthropicDecoder::new();
+        let mut events = Vec::new();
+        for frame in [
+            json!({"type":"message_start","message":{"id":"msg_cache","usage":usage}}),
+            json!({"type":"message_delta","usage":{"output_tokens":10}}),
+            json!({"type":"message_stop"}),
+        ] {
+            decoder.decode(&serde_json::to_vec(&frame).unwrap(), &mut events);
+        }
+        let mut renderer = super::super::render::ChunkRenderer::new("fixture".into(), 1, true);
+        let frames: Vec<_> = events
+            .into_iter()
+            .flat_map(|event| renderer.render(event))
+            .collect();
+        let rendered = frames
+            .iter()
+            .find_map(|frame| {
+                let text = std::str::from_utf8(frame).unwrap();
+                text.lines()
+                    .find_map(|line| line.strip_prefix("data: "))
+                    .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                    .filter(|value| value["usage"].is_object())
+            })
+            .unwrap();
+        assert_eq!(rendered["usage"]["prompt_tokens"], 200);
+        assert_eq!(rendered["usage"]["total_tokens"], 210);
+        assert_eq!(
+            rendered["usage"]["prompt_tokens_details"]["cached_tokens"],
+            40
+        );
+        assert_eq!(
+            rendered["usage"]["prompt_tokens_details"]["cache_write_tokens"],
+            60
+        );
+    }
+
+    #[test]
+    fn anthropic_render_usage_excludes_known_caches() {
+        let usage = Usage {
+            prompt_tokens: 200,
+            completion_tokens: 10,
+            total_tokens: 210,
+            cached_tokens: 40,
+            cached_tokens_known: true,
+            cache_write_tokens: 60,
+            cache_write_tokens_known: true,
+            reasoning_tokens: 0,
+        };
+        let expected = json!({"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":40,"cache_creation_input_tokens":60});
+        let payload = messages_payload_full(
+            "msg",
+            "fixture",
+            "answer",
+            &[],
+            "stop",
+            Some(&usage),
+            None,
+            None,
+        );
+        assert_eq!(payload["usage"], expected);
+        let events = vec![CodexEvent::Completed {
+            usage: Some(usage.clone()),
+        }];
+        let (frames, _) = render_anthropic_stream(&events, "msg", "fixture");
+        assert_eq!(sse_value(&frames[0])["message"]["usage"], expected);
+        let mut renderer = AnthropicStreamRenderer::new("fixture".into(), 1);
+        let frames = renderer.render(events.into_iter().next().unwrap());
+        let terminal = frames
+            .iter()
+            .map(|frame| sse_value(std::str::from_utf8(frame).unwrap()))
+            .find(|value| value["type"] == "message_delta")
+            .unwrap();
+        assert_eq!(terminal["usage"], expected);
+        let zero = Usage {
+            cached_tokens_known: true,
+            cache_write_tokens_known: true,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+            cached_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+        };
+        let unknown = Usage {
+            cached_tokens_known: false,
+            cache_write_tokens_known: false,
+            ..zero.clone()
+        };
+        assert_eq!(anthropic_usage(Some(&zero))["cache_read_input_tokens"], 0);
+        assert_eq!(
+            anthropic_usage(Some(&zero))["cache_creation_input_tokens"],
+            0
+        );
+        assert!(anthropic_usage(Some(&unknown))
+            .get("cache_read_input_tokens")
+            .is_none());
+        assert!(anthropic_usage(Some(&unknown))
+            .get("cache_creation_input_tokens")
+            .is_none());
+        let over = Usage {
+            prompt_tokens: 1,
+            ..usage
+        };
+        assert_eq!(anthropic_usage(Some(&over))["input_tokens"], 0);
+    }
+
+    #[test]
+    fn claude_stop_controls_cross_map() {
+        for stop in [json!("END"), json!(["END", "DONE"])] {
+            let body = json!({"model":"fixture","messages":[],"stop":stop});
+            let converted = openai_to_anthropic(&body).unwrap();
+            let expected = if stop.is_string() {
+                json!([stop])
+            } else {
+                stop
+            };
+            assert_eq!(converted["stop_sequences"], expected);
+            assert_eq!(anthropic_to_openai(&converted).unwrap()["stop"], expected);
+        }
+        let body = json!({"model":"fixture","messages":[],"stop":null,"stop_sequences":["legacy"]});
+        assert_eq!(
+            openai_to_anthropic(&body).unwrap()["stop_sequences"],
+            json!(["legacy"])
+        );
+        assert!(
+            openai_to_anthropic(&json!({"model":"fixture","messages":[],"stop":null}))
+                .unwrap()
+                .get("stop_sequences")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn claude_honors_max_completion_tokens() {
+        let mut body = json!({"model":"fixture","messages":[],"reasoning_effort":"none","max_completion_tokens":64});
+        assert_eq!(openai_to_anthropic(&body).unwrap()["max_tokens"], 64);
+        body["max_tokens"] = json!(32);
+        assert_eq!(openai_to_anthropic(&body).unwrap()["max_tokens"], 32);
+        body.as_object_mut().unwrap().remove("max_tokens");
+        body.as_object_mut()
+            .unwrap()
+            .remove("max_completion_tokens");
+        assert_eq!(openai_to_anthropic(&body).unwrap()["max_tokens"], 32768);
+    }
+
+    #[test]
+    fn anthropic_url_images_survive_chat_translation() {
+        let image =
+            json!({"type":"image","source":{"type":"url","url":"https://example.org/a.png"}});
+        let body = json!({"model":"fixture","messages":[
+            {"role":"user","content":[image,{"type":"text","text":"describe"}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"x","content":[image]}]}
+        ]});
+        let translated = anthropic_to_openai(&body).unwrap();
+        assert_eq!(
+            translated["messages"][0]["content"][0],
+            json!({"type":"text","text":"describe"})
+        );
+        let expected = json!({"type":"image_url","image_url":{"url":"https://example.org/a.png"}});
+        assert_eq!(translated["messages"][0]["content"][1], expected);
+        assert_eq!(translated["messages"][1]["content"][0], expected);
+    }
+
+    #[test]
+    fn anthropic_tool_results_precede_user_followup() {
+        let body = json!({"model":"fixture","messages":[
+            {"role":"assistant","content":[{"type":"tool_use","id":"x","name":"read","input":{}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"x","content":"result"},{"type":"text","text":"continue"}]}
+        ]});
+        let translated = anthropic_to_openai(&body).unwrap();
+        let messages = translated["messages"].as_array().unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message["role"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["assistant", "tool", "user"]
+        );
+        assert_eq!(messages[1]["tool_call_id"], "x");
+        assert_eq!(messages[1]["content"], "result");
+        assert_eq!(messages[2]["content"], "continue");
+    }
+
+    #[test]
+    fn anthropic_thinking_controls_survive_codex_plan() {
+        for (thinking, config, expected) in [
+            (json!({"type":"disabled"}), json!({"effort":"high"}), "none"),
+            (json!({"type":"adaptive"}), json!({"effort":"high"}), "high"),
+            (
+                json!({"type":"enabled","budget_tokens":8192}),
+                json!({}),
+                "medium",
+            ),
+        ] {
+            let body = json!({"model":"gpt-5","messages":[{"role":"user","content":"hi"}],"thinking":thinking,"output_config":config});
+            let translated = anthropic_to_openai(&body).unwrap();
+            let plan =
+                super::super::request::openai_to_codex(&serde_json::to_vec(&translated).unwrap())
+                    .unwrap();
+            let upstream: Value = serde_json::from_slice(&plan.body).unwrap();
+            assert_eq!(upstream["reasoning"]["effort"], expected);
+        }
+        for kind in ["adaptive", "enabled"] {
+            assert_eq!(
+                anthropic_to_openai(
+                    &json!({"model":"fixture","messages":[],"thinking":{"type":kind}})
+                )
+                .unwrap()["reasoning_effort"],
+                "auto"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_replays_signed_assistant_reasoning_before_tools() {
+        // Captured Claude fable-5 CAIS sample from the reference signature corpus.
+        let signature = "CAISqwIKiAEIEBgCKkBHRlRBsNiptQUWfPoOhuQKwi5LnncZVO9bB5jqOs76D7uBtgktML0zqJtNmLHXHHcgD6lk4MQu4QBXzFd1lbC3Mg5jbGF1ZGUtZmFibGUtNTgBQgh0aGlua2luZ1okZDk3NDM5NzUtNGJiMC00OTM2LTllMjgtZDViMGQyMWJkYzQ4EgxCGh+XVFFFeySAjtAaDL/A1LltGu6MMJ+eXSIwsN0oBpDrqLv22UBfkMnTotnIbkvkOyb9xZHgigG6OZVHaI3gThm+maLKmgO5PrFLKlDFYp+YZksy/wKwszJlnLTPzAK+NUlfzagOE1ymtZTXhAYK260XyFYmg/te/C231+Fr/hoX+EJoUBnrn0gD7hqMISOT+TaFEuOXYsN517GfaxgB";
+        let response = json!({"model":"fixture","input":[
+            {"type":"message","role":"assistant","content":[],"reasoning_content":"reason","reasoning_signature":signature},
+            {"type":"function_call","call_id":"x","name":"read","arguments":"{}"}
+        ]});
+        let chat = super::super::responses::responses_to_openai(&response).unwrap();
+        let replay = openai_to_anthropic(&chat).unwrap();
+        assert_eq!(
+            replay["messages"][0]["content"][0],
+            json!({"type":"thinking","thinking":"reason","signature":signature})
+        );
+        let blocks: Vec<_> = replay["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|message| message["content"].as_array().unwrap())
+            .collect();
+        assert_eq!(blocks[0]["type"], "thinking");
+        assert_eq!(blocks[1]["type"], "tool_use");
+        for sig in [
+            Value::Null,
+            json!("gAAAAforeignEncryptedContent"),
+            json!("call_not_a_claude_signature"),
+            json!("unsigned"),
+        ] {
+            let request = json!({"model":"fixture","messages":[{"role":"assistant","content":"","reasoning_content":"reason","reasoning_signature":sig}]});
+            assert!(openai_to_anthropic(&request).unwrap()["messages"]
+                .as_array()
+                .unwrap()
+                .is_empty());
+        }
+        let thinking_only = json!({"model":"fixture","messages":[{"role":"assistant","content":"","reasoning_content":"reason","reasoning_signature":signature}]});
+        assert_eq!(
+            openai_to_anthropic(&thinking_only).unwrap()["messages"][0]["content"][0]["type"],
+            "thinking"
+        );
+        let redacted = json!({"model":"fixture","messages":[{"role":"assistant","content":"","reasoning_redacted":true,"reasoning_signature":"opaque-redacted-data"}]});
+        assert_eq!(
+            openai_to_anthropic(&redacted).unwrap()["messages"][0]["content"][0],
+            json!({"type":"redacted_thinking","data":"opaque-redacted-data"})
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1603,6 +2194,114 @@ mod contract_tests {
                 "new instruction"
             );
         }
+    }
+
+    #[test]
+    fn mid_conversation_effort_emits_a_system_message_for_supported_models() {
+        let body = json!({
+            "model": "claude-opus-5-5",
+            "messages": [
+                {"role": "user", "content": "question"},
+                {"role": "assistant", "content": "answer"},
+                {"role": "system", "content": "", "x_effort_update": "high"},
+                {"role": "user", "content": "follow up"},
+            ],
+        });
+        let out = openai_to_anthropic(&body).unwrap();
+        let messages = out["messages"].as_array().unwrap();
+        // The top-level effort is untouched: the switch rides in-band so the
+        // cached history prefix survives.
+        assert!(out.get("output_config").is_none());
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[2]["role"], "system");
+        assert_eq!(messages[2]["content"], json!([]));
+        assert_eq!(messages[2]["output_config"]["effort"], "high");
+        assert!(uses_mid_conversation_effort(&out));
+    }
+
+    #[test]
+    fn mid_conversation_effort_without_a_supported_model_uses_top_level_effort() {
+        let body = json!({
+            "model": "claude-sonnet-4-5-2",
+            "messages": [
+                {"role": "user", "content": "question"},
+                {"role": "system", "content": "", "x_effort_update": "high"},
+                {"role": "user", "content": "follow up"},
+            ],
+        });
+        let out = openai_to_anthropic(&body).unwrap();
+        assert_eq!(out["output_config"]["effort"], "high");
+        assert!(
+            !uses_mid_conversation_effort(&out),
+            "no beta-gated message may reach an unsupported model"
+        );
+        assert!(out["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|message| message["role"] != "system"));
+    }
+
+    #[test]
+    fn mid_conversation_effort_model_gate_matches_documented_ids() {
+        for model in [
+            "claude-fable-5-1",
+            "claude-mythos-5-1",
+            "claude-opus-5-5",
+            "claude-opus-5",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+            "anthropic/claude-opus-5-5",
+        ] {
+            assert!(supports_mid_conversation_effort(model), "{model}");
+        }
+        for model in [
+            "claude-opus-5-50",
+            "claude-sonnet-4-5-2",
+            "claude-haiku-4-5-2",
+            "gpt-6-astra",
+        ] {
+            assert!(!supports_mid_conversation_effort(model), "{model}");
+        }
+    }
+
+    #[test]
+    fn byte_scan_matches_the_parsed_check() {
+        let with_effort = json!({
+            "messages": [
+                {"role": "user", "content": "q"},
+                {"role": "system", "content": [], "output_config": {"effort": "high"}},
+            ],
+        });
+        assert!(uses_mid_conversation_effort_bytes(
+            with_effort.to_string().as_bytes()
+        ));
+        let without_effort = json!({
+            "messages": [{"role": "user", "content": "q"}],
+            "output_config": {"effort": "high"},
+        });
+        assert!(!uses_mid_conversation_effort_bytes(
+            without_effort.to_string().as_bytes()
+        ));
+        assert!(!uses_mid_conversation_effort_bytes(b"not json"));
+    }
+
+    #[test]
+    fn cache_breakpoint_lands_before_a_trailing_effort_message() {
+        let mut body = json!({
+            "messages": [
+                {"role": "user", "content": "question"},
+                {"role": "assistant", "content": [{"type": "text", "text": "answer"}]},
+                {"role": "system", "content": [], "output_config": {"effort": "high"}},
+            ],
+        });
+        apply_prompt_cache_breakpoints(&mut body);
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(
+            messages[1]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        assert!(messages[2].get("cache_control").is_none());
     }
 
     #[test]
@@ -2244,7 +2943,7 @@ mod contract_tests {
                 _ => None,
             })
             .expect("completed usage");
-        assert_eq!(completed.prompt_tokens, 3);
+        assert_eq!(completed.prompt_tokens, 3 + 12705 + 9);
         assert_eq!(completed.cached_tokens, 12705);
         assert!(completed.cached_tokens_known);
         assert_eq!(completed.cache_write_tokens, 9);
@@ -2274,9 +2973,9 @@ mod contract_tests {
             })
             .expect("completed usage");
 
-        assert_eq!(completed.prompt_tokens, 100);
+        assert_eq!(completed.prompt_tokens, 200);
         assert_eq!(completed.completion_tokens, 25);
-        assert_eq!(completed.total_tokens, 125);
+        assert_eq!(completed.total_tokens, 225);
         assert_eq!(completed.cached_tokens, 40);
         assert_eq!(completed.cache_write_tokens, 60);
 
@@ -2291,6 +2990,7 @@ mod contract_tests {
             }
         });
         let openai = claude_json_to_openai(&response, "claude-3-5-sonnet", 1000);
+        assert_eq!(openai["usage"]["prompt_tokens"], 200);
         assert_eq!(openai["usage"]["cache_creation_input_tokens"], 60);
         assert_eq!(openai["usage"]["cache_read_input_tokens"], 40);
         assert_eq!(
@@ -2592,6 +3292,70 @@ mod openai_to_anthropic_tests {
         assert_eq!(tail.last().unwrap()["type"], "tool_result");
         assert_eq!(tail.last().unwrap()["cache_control"]["type"], "ephemeral");
         assert_eq!(body.to_string().matches("\"cache_control\"").count(), 1);
+    }
+
+    #[test]
+    fn excess_client_breakpoints_are_capped_at_the_provider_limit() {
+        // Anthropic rejects a fifth breakpoint with HTTP 400. Messages are
+        // stripped before system, and system before tools.
+        let block = |text: &str| json!({"type": "text", "text": text, "cache_control": {"type": "ephemeral"}});
+        let mut body = json!({
+            "tools": [block("t1"), block("t2")],
+            "system": [block("s1"), block("s2")],
+            "messages": [
+                {"role": "user", "content": [block("m1"), block("m2")]},
+                {"role": "assistant", "content": [block("m3")]},
+            ],
+        });
+        super::apply_prompt_cache_breakpoints(&mut body);
+
+        // Seven markers against a limit of four: the three message markers
+        // absorb the whole excess, so system and tools survive untouched.
+        assert_eq!(super::breakpoint_count(&body), super::MAX_CACHE_BREAKPOINTS);
+        assert!(body["messages"][0]["content"][0]
+            .get("cache_control")
+            .is_none());
+        assert!(body["messages"][0]["content"][1]
+            .get("cache_control")
+            .is_none());
+        assert!(body["messages"][1]["content"][0]
+            .get("cache_control")
+            .is_none());
+        assert!(body["system"][0].get("cache_control").is_some());
+        assert!(body["system"][1].get("cache_control").is_some());
+        assert!(body["tools"][0].get("cache_control").is_some());
+        assert!(body["tools"][1].get("cache_control").is_some());
+
+        // One message marker, three system markers and two tool markers make
+        // six: the message marker absorbs one and the excess reaches system.
+        let mut body = json!({
+            "tools": [block("t1"), block("t2")],
+            "system": [block("s1"), block("s2"), block("s3")],
+            "messages": [{"role": "user", "content": [block("m1")]}],
+        });
+        super::apply_prompt_cache_breakpoints(&mut body);
+        assert_eq!(super::breakpoint_count(&body), super::MAX_CACHE_BREAKPOINTS);
+        assert!(body["messages"][0]["content"][0]
+            .get("cache_control")
+            .is_none());
+        assert!(body["system"][0].get("cache_control").is_none());
+        assert!(body["system"][1].get("cache_control").is_some());
+        assert!(body["system"][2].get("cache_control").is_some());
+        assert!(body["tools"][0].get("cache_control").is_some());
+        assert!(body["tools"][1].get("cache_control").is_some());
+    }
+
+    #[test]
+    fn breakpoints_within_the_limit_are_untouched() {
+        let block = |text: &str| json!({"type": "text", "text": text, "cache_control": {"type": "ephemeral"}});
+        let sent = json!({
+            "system": [block("s1")],
+            "messages": [{"role": "user", "content": [block("m1"), block("m2")]}],
+            "tools": [block("t1")],
+        });
+        let mut body = sent.clone();
+        super::apply_prompt_cache_breakpoints(&mut body);
+        assert_eq!(body, sent);
     }
 
     #[test]

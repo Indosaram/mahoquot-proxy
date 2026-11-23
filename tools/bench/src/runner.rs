@@ -157,6 +157,8 @@ pub struct ExpectedOutput {
 #[derive(Debug, Default, serde::Serialize)]
 pub struct SemanticGate {
     buffer: Vec<u8>,
+    #[serde(skip)]
+    search_from: usize,
     text: String,
     tool_arguments: String,
     input_tokens: Option<u64>,
@@ -173,190 +175,208 @@ impl SemanticGate {
 
     pub fn feed(&mut self, bytes: &[u8], _elapsed_ms: f64) -> Result<(), String> {
         self.buffer.extend_from_slice(bytes);
-        while let Some(end) = self.buffer.windows(2).position(|window| window == b"\n\n") {
-            let frame: Vec<u8> = self.buffer.drain(..end + 2).collect();
-            let frame = std::str::from_utf8(&frame)
-                .map_err(|error| format!("SSE frame is not UTF-8: {error}"))?;
-            let data = frame
-                .lines()
-                .filter_map(|line| line.strip_prefix("data:"))
-                .map(str::trim)
-                .collect::<Vec<_>>()
-                .join("\n");
-            if data.is_empty() {
-                continue;
-            }
-            if data == "[DONE]" {
-                // OpenAI ends with a finish_reason chunk and then [DONE]; a
-                // second [DONE] is the duplicate.
-                if self.done_marker {
-                    return Err("duplicate SSE terminal marker".into());
-                }
-                self.done_marker = true;
-                self.terminal = true;
-                continue;
-            }
-            let value: serde_json::Value = serde_json::from_str(&data)
-                .map_err(|error| format!("invalid SSE JSON: {error}"))?;
-            if value.get("error").is_some() || value["type"] == "error" {
-                return Err("SSE error event".into());
-            }
-            if value["object"] == "response"
-                || value["type"]
-                    .as_str()
-                    .is_some_and(|kind| kind.starts_with("response."))
+        let mut consumed = 0;
+        let result = (|| {
+            while let Some(end) = self.buffer[self.search_from..]
+                .windows(2)
+                .position(|window| window == b"\n\n")
             {
-                match value["type"].as_str().unwrap_or("") {
-                    "response.output_text.delta" => self
-                        .text
-                        .push_str(value["delta"].as_str().unwrap_or_default()),
-                    "response.function_call_arguments.delta" => self
-                        .tool_arguments
-                        .push_str(value["delta"].as_str().unwrap_or_default()),
-                    "response.completed" => {
-                        if self.terminal {
-                            return Err("duplicate SSE terminal event".into());
-                        }
-                        self.terminal = true;
-                        self.input_tokens = value
-                            .pointer("/response/usage/input_tokens")
-                            .and_then(serde_json::Value::as_u64);
-                        self.output_tokens = value
-                            .pointer("/response/usage/output_tokens")
-                            .and_then(serde_json::Value::as_u64);
-                    }
-                    "response.failed" | "response.incomplete" => {
-                        return Err("SSE terminal response was not completed".into());
-                    }
-                    _ => {}
+                let end = self.search_from + end + 2;
+                let frame = &self.buffer[consumed..end];
+                consumed = end;
+                self.search_from = end;
+                let frame = std::str::from_utf8(frame)
+                    .map_err(|error| format!("SSE frame is not UTF-8: {error}"))?;
+                let data = frame
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data:"))
+                    .map(str::trim)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if data.is_empty() {
+                    continue;
                 }
-            } else if value["type"].as_str().is_some_and(|kind| {
-                kind.starts_with("message_") || kind.starts_with("content_block_")
-            }) {
-                // Anthropic Messages: usage is split across message_start
-                // (input) and message_delta (output); message_stop terminates.
-                match value["type"].as_str().unwrap_or("") {
-                    "message_start" => {
-                        if let Some(input) = value
-                            .pointer("/message/usage/input_tokens")
-                            .and_then(serde_json::Value::as_u64)
-                        {
-                            self.input_tokens = Some(input);
-                        }
+                if data == "[DONE]" {
+                    // OpenAI ends with a finish_reason chunk and then [DONE]; a
+                    // second [DONE] is the duplicate.
+                    if self.done_marker {
+                        return Err("duplicate SSE terminal marker".into());
                     }
-                    "content_block_delta" => {
-                        if let Some(text) = value
-                            .pointer("/delta/text")
-                            .and_then(serde_json::Value::as_str)
-                        {
-                            self.text.push_str(text);
-                        }
-                        if let Some(args) = value
-                            .pointer("/delta/partial_json")
-                            .and_then(serde_json::Value::as_str)
-                        {
-                            self.tool_arguments.push_str(args);
-                        }
-                    }
-                    "message_delta" => {
-                        if let Some(output) = value
-                            .pointer("/usage/output_tokens")
-                            .and_then(serde_json::Value::as_u64)
-                        {
-                            self.output_tokens = Some(output);
-                        }
-                        if let Some(input) = value
-                            .pointer("/usage/input_tokens")
-                            .and_then(serde_json::Value::as_u64)
-                        {
-                            self.input_tokens = Some(input);
-                        }
-                    }
-                    "message_stop" => {
-                        if self.terminal {
-                            return Err("duplicate SSE terminal event".into());
-                        }
-                        self.terminal = true;
-                    }
-                    _ => {}
+                    self.done_marker = true;
+                    self.terminal = true;
+                    continue;
                 }
-            } else if value.get("candidates").is_some() || value.get("usageMetadata").is_some() {
-                // Gemini: finishReason and usageMetadata may arrive in
-                // separate frames; usage after the STOP frame is legitimate.
-                for candidate in value["candidates"].as_array().into_iter().flatten() {
-                    for part in candidate
-                        .pointer("/content/parts")
-                        .and_then(serde_json::Value::as_array)
-                        .into_iter()
-                        .flatten()
-                    {
-                        if part["thought"].as_bool() != Some(true) {
-                            if let Some(text) = part["text"].as_str() {
+                let value: serde_json::Value = serde_json::from_str(&data)
+                    .map_err(|error| format!("invalid SSE JSON: {error}"))?;
+                if value.get("error").is_some() || value["type"] == "error" {
+                    return Err("SSE error event".into());
+                }
+                if value["object"] == "response"
+                    || value["type"]
+                        .as_str()
+                        .is_some_and(|kind| kind.starts_with("response."))
+                {
+                    match value["type"].as_str().unwrap_or("") {
+                        "response.output_text.delta" => self
+                            .text
+                            .push_str(value["delta"].as_str().unwrap_or_default()),
+                        "response.function_call_arguments.delta" => self
+                            .tool_arguments
+                            .push_str(value["delta"].as_str().unwrap_or_default()),
+                        "response.completed" => {
+                            if self.terminal {
+                                return Err("duplicate SSE terminal event".into());
+                            }
+                            self.terminal = true;
+                            self.input_tokens = value
+                                .pointer("/response/usage/input_tokens")
+                                .and_then(serde_json::Value::as_u64);
+                            self.output_tokens = value
+                                .pointer("/response/usage/output_tokens")
+                                .and_then(serde_json::Value::as_u64);
+                        }
+                        "response.failed" | "response.incomplete" => {
+                            return Err("SSE terminal response was not completed".into());
+                        }
+                        _ => {}
+                    }
+                } else if value["type"].as_str().is_some_and(|kind| {
+                    kind.starts_with("message_") || kind.starts_with("content_block_")
+                }) {
+                    // Anthropic Messages: usage is split across message_start
+                    // (input) and message_delta (output); message_stop terminates.
+                    match value["type"].as_str().unwrap_or("") {
+                        "message_start" => {
+                            if let Some(input) = value
+                                .pointer("/message/usage/input_tokens")
+                                .and_then(serde_json::Value::as_u64)
+                            {
+                                self.input_tokens = Some(input);
+                            }
+                        }
+                        "content_block_delta" => {
+                            if let Some(text) = value
+                                .pointer("/delta/text")
+                                .and_then(serde_json::Value::as_str)
+                            {
                                 self.text.push_str(text);
                             }
-                        }
-                    }
-                    if candidate["finishReason"].is_string() {
-                        self.terminal = true;
-                    }
-                }
-                if let Some(usage) = value.get("usageMetadata") {
-                    if let Some(input) = usage["promptTokenCount"].as_u64() {
-                        self.input_tokens = Some(input);
-                    }
-                    if let Some(output) = usage["candidatesTokenCount"].as_u64() {
-                        self.output_tokens = Some(output);
-                    }
-                }
-            } else {
-                // OpenAI chat: a usage-only chunk may follow the
-                // finish_reason chunk; content after the terminal may not.
-                if self.terminal
-                    && value["choices"]
-                        .as_array()
-                        .is_some_and(|choices| !choices.is_empty())
-                {
-                    return Err("SSE data after terminal marker".into());
-                }
-                if let Some(choices) = value["choices"].as_array() {
-                    for choice in choices {
-                        self.text.push_str(
-                            choice
-                                .pointer("/delta/content")
+                            if let Some(args) = value
+                                .pointer("/delta/partial_json")
                                 .and_then(serde_json::Value::as_str)
-                                .unwrap_or_default(),
-                        );
-                        if let Some(calls) = choice
-                            .pointer("/delta/tool_calls")
-                            .and_then(serde_json::Value::as_array)
-                        {
-                            for call in calls {
-                                self.tool_arguments.push_str(
-                                    call.pointer("/function/arguments")
-                                        .and_then(serde_json::Value::as_str)
-                                        .unwrap_or_default(),
-                                );
+                            {
+                                self.tool_arguments.push_str(args);
                             }
                         }
-                        if choice["finish_reason"].is_string() {
+                        "message_delta" => {
+                            if let Some(output) = value
+                                .pointer("/usage/output_tokens")
+                                .and_then(serde_json::Value::as_u64)
+                            {
+                                self.output_tokens = Some(output);
+                            }
+                            if let Some(input) = value
+                                .pointer("/usage/input_tokens")
+                                .and_then(serde_json::Value::as_u64)
+                            {
+                                self.input_tokens = Some(input);
+                            }
+                        }
+                        "message_stop" => {
+                            if self.terminal {
+                                return Err("duplicate SSE terminal event".into());
+                            }
+                            self.terminal = true;
+                        }
+                        _ => {}
+                    }
+                } else if value.get("candidates").is_some() || value.get("usageMetadata").is_some()
+                {
+                    // Gemini: finishReason and usageMetadata may arrive in
+                    // separate frames; usage after the STOP frame is legitimate.
+                    for candidate in value["candidates"].as_array().into_iter().flatten() {
+                        for part in candidate
+                            .pointer("/content/parts")
+                            .and_then(serde_json::Value::as_array)
+                            .into_iter()
+                            .flatten()
+                        {
+                            if part["thought"].as_bool() != Some(true) {
+                                if let Some(text) = part["text"].as_str() {
+                                    self.text.push_str(text);
+                                }
+                            }
+                        }
+                        if candidate["finishReason"].is_string() {
                             self.terminal = true;
                         }
                     }
-                }
-                if let Some(usage) = value.get("usage") {
-                    self.input_tokens = usage["prompt_tokens"]
-                        .as_u64()
-                        .or_else(|| usage["input_tokens"].as_u64());
-                    self.output_tokens = usage["completion_tokens"]
-                        .as_u64()
-                        .or_else(|| usage["output_tokens"].as_u64());
-                    self.cached_tokens = usage
-                        .pointer("/prompt_tokens_details/cached_tokens")
-                        .and_then(serde_json::Value::as_u64);
+                    if let Some(usage) = value.get("usageMetadata") {
+                        if let Some(input) = usage["promptTokenCount"].as_u64() {
+                            self.input_tokens = Some(input);
+                        }
+                        if let Some(output) = usage["candidatesTokenCount"].as_u64() {
+                            self.output_tokens = Some(output);
+                        }
+                    }
+                } else {
+                    // OpenAI chat: a usage-only chunk may follow the
+                    // finish_reason chunk; content after the terminal may not.
+                    if self.terminal
+                        && value["choices"]
+                            .as_array()
+                            .is_some_and(|choices| !choices.is_empty())
+                    {
+                        return Err("SSE data after terminal marker".into());
+                    }
+                    if let Some(choices) = value["choices"].as_array() {
+                        for choice in choices {
+                            self.text.push_str(
+                                choice
+                                    .pointer("/delta/content")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or_default(),
+                            );
+                            if let Some(calls) = choice
+                                .pointer("/delta/tool_calls")
+                                .and_then(serde_json::Value::as_array)
+                            {
+                                for call in calls {
+                                    self.tool_arguments.push_str(
+                                        call.pointer("/function/arguments")
+                                            .and_then(serde_json::Value::as_str)
+                                            .unwrap_or_default(),
+                                    );
+                                }
+                            }
+                            if choice["finish_reason"].is_string() {
+                                self.terminal = true;
+                            }
+                        }
+                    }
+                    if let Some(usage) = value.get("usage") {
+                        self.input_tokens = usage["prompt_tokens"]
+                            .as_u64()
+                            .or_else(|| usage["input_tokens"].as_u64());
+                        self.output_tokens = usage["completion_tokens"]
+                            .as_u64()
+                            .or_else(|| usage["output_tokens"].as_u64());
+                        self.cached_tokens = usage
+                            .pointer("/prompt_tokens_details/cached_tokens")
+                            .and_then(serde_json::Value::as_u64);
+                    }
                 }
             }
-        }
-        Ok(())
+            Ok(())
+        })();
+        // Consume the offending frame on errors too, matching the old drain.
+        self.buffer.drain(..consumed);
+        self.search_from = if result.is_ok() {
+            self.buffer.len().saturating_sub(1)
+        } else {
+            0
+        };
+        result
     }
 
     pub fn finish(&self, expected: &ExpectedOutput) -> Result<(), String> {
@@ -603,6 +623,41 @@ pub async fn run_benchmark(
 #[cfg(test)]
 mod raw_observation_tests {
     use super::*;
+
+    #[test]
+    fn fragmented_frames_preserve_serialized_state_and_errors() {
+        let frames = b"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1}}\n\ndata: [DONE]\n\n";
+        let mut whole = SemanticGate::default();
+        whole.feed(frames, 0.0).unwrap();
+        for split in 0..=frames.len() {
+            let mut fragmented = SemanticGate::default();
+            fragmented.feed(&frames[..split], 0.0).unwrap();
+            fragmented.feed(&frames[split..], 0.0).unwrap();
+            assert_eq!(
+                serde_json::to_vec(&fragmented).unwrap(),
+                serde_json::to_vec(&whole).unwrap()
+            );
+        }
+        let mut fragmented = SemanticGate::default();
+        for byte in frames {
+            fragmented.feed(std::slice::from_ref(byte), 0.0).unwrap();
+        }
+        assert_eq!(
+            serde_json::to_vec(&fragmented).unwrap(),
+            serde_json::to_vec(&whole).unwrap()
+        );
+        assert_eq!(
+            fragmented.feed(b"data: [DONE]\n\ntail", 0.0),
+            Err("duplicate SSE terminal marker".into())
+        );
+        assert_eq!(fragmented.buffer, b"tail");
+        let mut invalid = SemanticGate::default();
+        assert_eq!(
+            invalid.feed(b"data: \xff\n\ntail", 0.0),
+            Err("SSE frame is not UTF-8: invalid utf-8 sequence of 1 bytes from index 6".into())
+        );
+        assert_eq!(invalid.buffer, b"tail");
+    }
 
     #[test]
     fn content_timing_and_failed_evidence_remain_correlated() {

@@ -21,11 +21,11 @@ pub fn default_contribution() -> ProviderContribution {
 }
 
 pub fn supported_models(snapshot: &RegistrySnapshot) -> Vec<String> {
-    contribution(snapshot).supported_model_ids()
+    snapshot.supported_model_ids_for_provider(&provider_id())
 }
 
 pub fn is_vertex_model_in_snapshot(snapshot: &RegistrySnapshot, model: &str) -> bool {
-    contribution(snapshot).supports_model(model)
+    snapshot.provider_supports_model(&provider_id(), model)
 }
 
 pub fn is_vertex_model(model: &str) -> bool {

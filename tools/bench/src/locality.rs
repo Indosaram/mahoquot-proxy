@@ -936,10 +936,10 @@ fn verify_b9(executions: &[WorkloadExecution]) -> Result<(), String> {
         if matching.len() != 1
             || !(200..300).contains(&matching[0].status)
             || matching[0].account.is_empty()
-            || !matching[0]
+            || matching[0]
                 .connection_id
                 .as_deref()
-                .is_some_and(|id| !id.is_empty())
+                .is_none_or(|id| id.is_empty())
         {
             return Err(format!("B9 missing/failed/duplicate execution {id}"));
         }

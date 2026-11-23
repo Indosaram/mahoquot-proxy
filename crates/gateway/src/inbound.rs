@@ -273,8 +273,12 @@ pub async fn require_api_key(
 
     // Downstream handlers read the identity instead of re-deriving it from the
     // header, so scope enforcement and auth share one decision.
-    let key_identifier =
-        extract_presented_key(&req).map(crate::request_history::stable_key_identifier);
+    let key_identifier = match &identity {
+        AuthIdentity::Scoped(key) => Some(key.key_identifier.clone()),
+        AuthIdentity::Master | AuthIdentity::Unrestricted => {
+            extract_presented_key(&req).map(crate::request_history::stable_key_identifier)
+        }
+    };
     req.extensions_mut().insert(ResolvedAuth {
         identity: identity.clone(),
         key_identifier,

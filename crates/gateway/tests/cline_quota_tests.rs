@@ -52,7 +52,7 @@ fn create_cline_account(id: &str, base_url: &str, models: Vec<String>) -> Accoun
 fn test_cline_model_quota_group_isolation_and_antigravity_policy() {
     // 1. Antigravity policy: gemini vs 3p
     assert_eq!(
-        model_quota_group("antigravity", "gemini-3.8-flash-high"),
+        model_quota_group("antigravity", "gemini-4-neon-high"),
         Some("gemini")
     );
     assert_eq!(

@@ -32,9 +32,10 @@ async fn tui_client_reads_gateway_log_records() {
         ..GatewayConfig::default()
     };
     let state = Arc::new(AppState::new(&config).unwrap());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:18887")
-        .await
-        .unwrap();
+    // Port 0: a fixed port collides with other test binaries that cargo runs in
+    // parallel, so a bind failure would report scheduling, not behavior.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
     let (shutdown, stopped) = tokio::sync::oneshot::channel();
     let app = create_app(state.clone());
     let server = tokio::spawn(async move {
@@ -49,7 +50,7 @@ async fn tui_client_reads_gateway_log_records() {
         .unwrap();
     });
     let client = ManagementClient::new(
-        "http://127.0.0.1:18887".into(),
+        format!("http://127.0.0.1:{}", addr.port()),
         "discovery-tui-fixture".into(),
     );
     let empty = client.get_logs().await;

@@ -1,5 +1,5 @@
 {
-  "version": 6,
+  "version": 7,
   "source": "embedded_fallback",
   "models": {
     "claude-3-5-sonnet-20241022": {
@@ -1914,8 +1914,40 @@
         "context_limit": "1048576"
       }
     },
-    "gemini-3.8-flash-high": {
-      "id": "gemini-3.8-flash-high",
+    "gemini-4-neon": {
+      "id": "gemini-4-neon",
+      "owned_by": "google",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "antigravity": {
+          "provider_id": "antigravity",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100,
+          "upstream_model_id": "gemini-4-neon-high"
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1048576"
+      }
+    },
+    "gemini-4-neon-high": {
+      "id": "gemini-4-neon-high",
       "owned_by": "google",
       "capabilities": [
         "chat",
@@ -1944,6 +1976,99 @@
       "metadata": {
         "context_limit": "1048576",
         "thinking.antigravity": "{\"min\":1,\"max\":65535,\"dynamic_allowed\":true,\"levels\":[\"low\",\"medium\",\"high\"]}"
+      }
+    },
+    "gemini-4-neon-medium": {
+      "id": "gemini-4-neon-medium",
+      "owned_by": "google",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "antigravity": {
+          "provider_id": "antigravity",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1048576"
+      }
+    },
+    "gemini-4-neon-low": {
+      "id": "gemini-4-neon-low",
+      "owned_by": "google",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "antigravity": {
+          "provider_id": "antigravity",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1048576"
+      }
+    },
+    "gemini-4-neon-xhigh": {
+      "id": "gemini-4-neon-xhigh",
+      "owned_by": "google",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "antigravity": {
+          "provider_id": "antigravity",
+          "policy": "closed",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "1048576"
       }
     },
     "gemini-pro-agent": {
@@ -2641,6 +2766,68 @@
         "context_limit": "272000"
       }
     },
+    "gpt-6.2-astra": {
+      "id": "gpt-6.2-astra",
+      "owned_by": "openai",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "codex": {
+          "provider_id": "codex",
+          "policy": "open",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "921600"
+      }
+    },
+    "gpt-6.2-sol": {
+      "id": "gpt-6.2-sol",
+      "owned_by": "openai",
+      "capabilities": [
+        "chat",
+        "tools"
+      ],
+      "bindings": {
+        "codex": {
+          "provider_id": "codex",
+          "policy": "open",
+          "source": "embedded_fallback",
+          "capabilities": [
+            "chat",
+            "tools"
+          ],
+          "authority": {
+            "models": true,
+            "capabilities": true,
+            "aliases": true,
+            "prefixes": true,
+            "upstream_id": true
+          },
+          "priority": 100
+        }
+      },
+      "aliases": [],
+      "metadata": {
+        "context_limit": "921600"
+      }
+    },
     "gpt-daybreak-blue-latest": {
       "id": "gpt-daybreak-blue-latest",
       "owned_by": "openai",
@@ -3034,8 +3221,8 @@
         "thinking.kimi": "{\"zero_allowed\":false,\"levels\":[\"low\",\"high\"]}"
       }
     },
-    "kiro/auto": {
-      "id": "kiro/auto",
+    "kiro/claude-opus-5.5": {
+      "id": "kiro/claude-opus-5.5",
       "owned_by": "kiro",
       "capabilities": [
         "chat",
@@ -3058,233 +3245,7 @@
             "upstream_id": true
           },
           "priority": 100,
-          "upstream_model_id": "auto"
-        }
-      },
-      "aliases": [
-        "auto-kiro"
-      ],
-      "metadata": {
-        "context_limit": "200000"
-      }
-    },
-    "kiro/claude-haiku-4-5-20251001": {
-      "id": "kiro/claude-haiku-4-5-20251001",
-      "owned_by": "kiro",
-      "capabilities": [
-        "chat",
-        "tools"
-      ],
-      "bindings": {
-        "kiro": {
-          "provider_id": "kiro",
-          "policy": "closed",
-          "source": "embedded_fallback",
-          "capabilities": [
-            "chat",
-            "tools"
-          ],
-          "authority": {
-            "models": true,
-            "capabilities": true,
-            "aliases": true,
-            "prefixes": true,
-            "upstream_id": true
-          },
-          "priority": 100,
-          "upstream_model_id": "claude-haiku-4-5-20251001"
-        }
-      },
-      "aliases": [],
-      "metadata": {
-        "context_limit": "200000"
-      }
-    },
-    "kiro/claude-haiku-4-5-20251001-thinking": {
-      "id": "kiro/claude-haiku-4-5-20251001-thinking",
-      "owned_by": "kiro",
-      "capabilities": [
-        "chat",
-        "tools"
-      ],
-      "bindings": {
-        "kiro": {
-          "provider_id": "kiro",
-          "policy": "closed",
-          "source": "embedded_fallback",
-          "capabilities": [
-            "chat",
-            "tools"
-          ],
-          "authority": {
-            "models": true,
-            "capabilities": true,
-            "aliases": true,
-            "prefixes": true,
-            "upstream_id": true
-          },
-          "priority": 100,
-          "upstream_model_id": "claude-haiku-4-5-20251001-thinking"
-        }
-      },
-      "aliases": [],
-      "metadata": {
-        "context_limit": "200000"
-      }
-    },
-    "kiro/claude-haiku-4.5": {
-      "id": "kiro/claude-haiku-4.5",
-      "owned_by": "kiro",
-      "capabilities": [
-        "chat",
-        "tools"
-      ],
-      "bindings": {
-        "kiro": {
-          "provider_id": "kiro",
-          "policy": "closed",
-          "source": "embedded_fallback",
-          "capabilities": [
-            "chat",
-            "tools"
-          ],
-          "authority": {
-            "models": true,
-            "capabilities": true,
-            "aliases": true,
-            "prefixes": true,
-            "upstream_id": true
-          },
-          "priority": 100,
-          "upstream_model_id": "claude-haiku-4.5"
-        }
-      },
-      "aliases": [],
-      "metadata": {
-        "context_limit": "200000"
-      }
-    },
-    "kiro/claude-opus-4.6": {
-      "id": "kiro/claude-opus-4.6",
-      "owned_by": "kiro",
-      "capabilities": [
-        "chat",
-        "tools"
-      ],
-      "bindings": {
-        "kiro": {
-          "provider_id": "kiro",
-          "policy": "closed",
-          "source": "embedded_fallback",
-          "capabilities": [
-            "chat",
-            "tools"
-          ],
-          "authority": {
-            "models": true,
-            "capabilities": true,
-            "aliases": true,
-            "prefixes": true,
-            "upstream_id": true
-          },
-          "priority": 100,
-          "upstream_model_id": "claude-opus-4.6"
-        }
-      },
-      "aliases": [],
-      "metadata": {
-        "context_limit": "1000000"
-      }
-    },
-    "kiro/claude-sonnet-4-5-20250929": {
-      "id": "kiro/claude-sonnet-4-5-20250929",
-      "owned_by": "kiro",
-      "capabilities": [
-        "chat",
-        "tools"
-      ],
-      "bindings": {
-        "kiro": {
-          "provider_id": "kiro",
-          "policy": "closed",
-          "source": "embedded_fallback",
-          "capabilities": [
-            "chat",
-            "tools"
-          ],
-          "authority": {
-            "models": true,
-            "capabilities": true,
-            "aliases": true,
-            "prefixes": true,
-            "upstream_id": true
-          },
-          "priority": 100,
-          "upstream_model_id": "claude-sonnet-4-5-20250929"
-        }
-      },
-      "aliases": [],
-      "metadata": {
-        "context_limit": "200000"
-      }
-    },
-    "kiro/claude-sonnet-4-5-20250929-thinking": {
-      "id": "kiro/claude-sonnet-4-5-20250929-thinking",
-      "owned_by": "kiro",
-      "capabilities": [
-        "chat",
-        "tools"
-      ],
-      "bindings": {
-        "kiro": {
-          "provider_id": "kiro",
-          "policy": "closed",
-          "source": "embedded_fallback",
-          "capabilities": [
-            "chat",
-            "tools"
-          ],
-          "authority": {
-            "models": true,
-            "capabilities": true,
-            "aliases": true,
-            "prefixes": true,
-            "upstream_id": true
-          },
-          "priority": 100,
-          "upstream_model_id": "claude-sonnet-4-5-20250929-thinking"
-        }
-      },
-      "aliases": [],
-      "metadata": {
-        "context_limit": "200000"
-      }
-    },
-    "kiro/claude-sonnet-4.6": {
-      "id": "kiro/claude-sonnet-4.6",
-      "owned_by": "kiro",
-      "capabilities": [
-        "chat",
-        "tools"
-      ],
-      "bindings": {
-        "kiro": {
-          "provider_id": "kiro",
-          "policy": "closed",
-          "source": "embedded_fallback",
-          "capabilities": [
-            "chat",
-            "tools"
-          ],
-          "authority": {
-            "models": true,
-            "capabilities": true,
-            "aliases": true,
-            "prefixes": true,
-            "upstream_id": true
-          },
-          "priority": 100,
-          "upstream_model_id": "claude-sonnet-4.6"
+          "upstream_model_id": "claude-opus-5.5"
         }
       },
       "aliases": [],
@@ -3997,11 +3958,6 @@
     "zcode": "closed"
   },
   "aliases": {
-    "auto-kiro": {
-      "alias": "auto-kiro",
-      "target": "kiro/auto",
-      "provider_id": "kiro"
-    },
     "gemini-3.1-pro-high": {
       "alias": "gemini-3.1-pro-high",
       "target": "gemini-pro-agent",

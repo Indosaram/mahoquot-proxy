@@ -191,10 +191,15 @@ impl WorkerRegistry {
                     continue;
                 }
             }
-            if let Some(catalog) = self.catalog(&worker_id) {
-                if catalog.iter().any(|m| m == model) {
-                    return Some(worker_id);
-                }
+            let matches = self
+                .workers
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&worker_id)
+                .and_then(|worker| worker.catalog.as_ref())
+                .is_some_and(|catalog| catalog.iter().any(|m| m == model));
+            if matches {
+                return Some(worker_id);
             }
         }
         None
@@ -210,14 +215,16 @@ impl WorkerRegistry {
             || self.has_connected_model(model)
     }
     pub fn has_connected_model(&self, model: &str) -> bool {
-        for worker_id in self.connected() {
-            if let Some(catalog) = self.catalog(&worker_id) {
-                if catalog.iter().any(|m| m == model) {
-                    return true;
-                }
-            }
-        }
-        false
+        self.workers
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .any(|worker| {
+                worker
+                    .catalog
+                    .as_ref()
+                    .is_some_and(|catalog| catalog.iter().any(|m| m == model))
+            })
     }
     pub async fn request(
         &self,
@@ -575,15 +582,15 @@ pub async fn execute(
     if message.kind == "error" {
         return Err(WorkerError::InvalidResponse);
     }
-    let payload = message.payload.ok_or(WorkerError::InvalidResponse)?;
+    let mut payload = message.payload.ok_or(WorkerError::InvalidResponse)?;
     let status = payload
         .get("status")
         .and_then(Value::as_u64)
         .and_then(|s| u16::try_from(s).ok())
         .and_then(|s| StatusCode::from_u16(s).ok())
         .ok_or(WorkerError::InvalidResponse)?;
-    let body = match payload.get("body") {
-        Some(Value::String(s)) => s.as_bytes().to_vec(),
+    let body = match payload.get_mut("body").map(Value::take) {
+        Some(Value::String(s)) => s.into_bytes(),
         Some(other) => other.to_string().into_bytes(),
         None => Vec::new(),
     };
@@ -629,6 +636,89 @@ mod tests {
             id,
             kind: "http_response".into(),
             payload: Some(json!({"status":200,"body":"owned"})),
+        }
+    }
+
+    #[test]
+    fn ulw_gw5_catalog_membership_keeps_connection_order() {
+        let registry = WorkerRegistry::new();
+        let (first, _rx_first) = mpsc::channel(1);
+        let (second, _rx_second) = mpsc::channel(1);
+        registry.insert("first".into(), first);
+        registry.insert("second".into(), second);
+        let now = Instant::now();
+        {
+            let mut workers = registry.workers.write().unwrap();
+            workers.get_mut("first").unwrap().connected_at = now;
+            workers.get_mut("second").unwrap().connected_at = now + Duration::from_secs(1);
+        }
+        registry.update_catalog("first", &json!({"models":["shared", "first-only"]}));
+        registry.update_catalog("second", &json!({"models":["shared", "second-only"]}));
+        assert_eq!(
+            registry.worker_for_model("shared", None).as_deref(),
+            Some("first")
+        );
+        assert_eq!(
+            registry.worker_for_model("second-only", None).as_deref(),
+            Some("second")
+        );
+        assert!(registry.has_connected_model("shared"));
+        assert!(!registry.has_connected_model("missing"));
+        registry.workers.write().unwrap().remove("first");
+        assert_eq!(
+            registry.worker_for_model("shared", None).as_deref(),
+            Some("second")
+        );
+        assert!(!registry.has_connected_model("first-only"));
+        assert!(registry.is_aistudio_model("first-only"));
+    }
+
+    #[tokio::test]
+    async fn ulw_gw5_owned_relay_bodies_keep_bytes_status_and_headers() {
+        let relay = Arc::new(Relay::new());
+        let (tx, mut rx) = mpsc::channel(1);
+        let generation = relay.registry.insert("worker".into(), tx);
+        for body in [
+            Some(json!("nul\u{0}utf8 \u{e9}\n")),
+            Some(json!({"b":[1,true],"a":null})),
+            Some(Value::Null),
+            None,
+        ] {
+            let expected = match &body {
+                Some(Value::String(text)) => text.as_bytes().to_vec(),
+                Some(value) => value.to_string().into_bytes(),
+                None => Vec::new(),
+            };
+            let r = relay.clone();
+            let task = tokio::spawn(async move {
+                super::execute(&r, "worker", "POST", "/fixture", HeaderMap::new(), vec![]).await
+            });
+            let request = receive(&mut rx).await;
+            let mut payload = json!({"status":201,"headers":{"x-fixture":"kept","x-ignored":42}});
+            if let Some(body) = body {
+                payload["body"] = body;
+            }
+            relay.dispatch(
+                "worker",
+                generation,
+                Message {
+                    id: request.id,
+                    kind: "http_response".into(),
+                    payload: Some(payload),
+                },
+            );
+            let response = timeout(Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CREATED);
+            assert_eq!(response.headers()["x-fixture"], "kept");
+            assert!(!response.headers().contains_key("x-ignored"));
+            let bytes = axum::body::to_bytes(response.into_body(), MAX_FRAME)
+                .await
+                .unwrap();
+            assert_eq!(bytes.as_ref(), expected);
         }
     }
 

@@ -19,6 +19,7 @@ struct KeyList {
     path: &'static str,
     key: &'static str,
     field: KeyField,
+    read: fn(&Settings) -> Value,
 }
 
 #[derive(Clone, Copy)]
@@ -32,41 +33,49 @@ const KEY_LISTS: &[KeyList] = &[
         path: "/api-keys",
         key: "api-keys",
         field: KeyField::Inbound(|s| &mut s.api_keys),
+        read: |s| json!(s.api_keys),
     },
     KeyList {
         path: "/gemini-api-key",
         key: "gemini-api-key",
         field: KeyField::Provider(|s| &mut s.gemini_api_key),
+        read: |s| json!(s.gemini_api_key),
     },
     KeyList {
         path: "/claude-api-key",
         key: "claude-api-key",
         field: KeyField::Provider(|s| &mut s.claude_api_key),
+        read: |s| json!(s.claude_api_key),
     },
     KeyList {
         path: "/codex-api-key",
         key: "codex-api-key",
         field: KeyField::Provider(|s| &mut s.codex_api_key),
+        read: |s| json!(s.codex_api_key),
     },
     KeyList {
         path: "/xai-api-key",
         key: "xai-api-key",
         field: KeyField::Provider(|s| &mut s.xai_api_key),
+        read: |s| json!(s.xai_api_key),
     },
     KeyList {
         path: "/vertex-api-key",
         key: "vertex-api-key",
         field: KeyField::Provider(|s| &mut s.vertex_api_key),
+        read: |s| json!(s.vertex_api_key),
     },
     KeyList {
         path: "/interactions-api-key",
         key: "interactions-api-key",
         field: KeyField::Provider(|s| &mut s.interactions_api_key),
+        read: |s| json!(s.interactions_api_key),
     },
     KeyList {
         path: "/openai-compatibility",
         key: "openai-compatibility",
         field: KeyField::Provider(|s| &mut s.openai_compatibility),
+        read: |s| json!(s.openai_compatibility),
     },
 ];
 
@@ -83,11 +92,8 @@ pub fn key_lists_paths() -> impl Iterator<Item = &'static str> {
 }
 
 async fn read(state: Arc<AppState>, list: &'static KeyList) -> Response {
-    let mut settings = Settings::clone(&state.settings.current());
-    let value = match list.field {
-        KeyField::Inbound(field) => json!(field(&mut settings)),
-        KeyField::Provider(field) => json!(field(&mut settings)),
-    };
+    let settings = state.settings.current();
+    let value = (list.read)(&settings);
     (StatusCode::OK, Json(json!({ list.key: value }))).into_response()
 }
 

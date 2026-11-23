@@ -16,6 +16,7 @@ pub mod media;
 pub mod metrics;
 pub mod models_route;
 pub mod monitor;
+pub mod omo_profile_derive;
 pub mod plan_captcha;
 pub mod pre_expiry_refresh;
 pub mod proxy_policy;
@@ -50,3 +51,8 @@ pub mod plugins;
 
 pub mod aistudio;
 pub mod wsrelay;
+
+pub mod affinity_store;
+pub mod claude_budget;
+pub mod claude_denial;
+pub mod claude_wire;

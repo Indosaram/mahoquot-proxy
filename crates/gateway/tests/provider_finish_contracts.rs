@@ -127,11 +127,21 @@ fn codex_output_limit_is_not_an_upstream_failure() {
 }
 
 #[test]
-fn other_codex_incomplete_reasons_remain_failures() {
+fn content_filter_incomplete_is_a_refusal_not_a_transport_failure() {
+    // A filtered completion is a completed turn with a visible refusal, not a
+    // relay error: the client must see the refusal and its finish reason.
     let mut parser = SseParser::default();
     let mut events = Vec::new();
     parser.push(b"data: {\"type\":\"response.incomplete\",\"response\":{\"incomplete_details\":{\"reason\":\"content_filter\"}}}\n\n", &mut events);
+    assert!(events.contains(&CodexEvent::ContentFilterReached));
+}
+
+#[test]
+fn unknown_codex_incomplete_reasons_remain_failures() {
+    let mut parser = SseParser::default();
+    let mut events = Vec::new();
+    parser.push(b"data: {\"type\":\"response.incomplete\",\"response\":{\"incomplete_details\":{\"reason\":\"something_else\"}}}\n\n", &mut events);
     assert!(
-        matches!(events.as_slice(), [CodexEvent::Failed { message }] if message == "content_filter")
+        matches!(events.as_slice(), [CodexEvent::Failed { message }] if message == "something_else")
     );
 }

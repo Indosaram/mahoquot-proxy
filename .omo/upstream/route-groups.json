@@ -139,6 +139,7 @@
   "GET /antigravity-auth-url",
   "GET /kimi-auth-url",
   "GET /xai-auth-url",
+  "GET /kiro-auth-url",
   "GET /get-auth-status",
   "DELETE /oauth-session"
  ]

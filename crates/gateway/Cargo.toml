@@ -12,6 +12,7 @@ name = "mahoquot-gateway"
 path = "src/main.rs"
 
 [dependencies]
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
 bcrypt = "0.15.1"
 rustls-pemfile.workspace = true
 tokio-rustls.workspace = true
@@ -58,6 +59,8 @@ urlencoding = "2.1"
 libc = "0.2"
 
 [dev-dependencies]
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+rustls-pki-types = "1.15"
 tokio = { workspace = true, features = ["test-util"] }
 tower.workspace = true
 ed25519-dalek.workspace = true

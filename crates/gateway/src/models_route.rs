@@ -27,10 +27,12 @@ pub struct ModelEntry {
     pub owned_by: String,
 }
 
-const DEFAULT_MODELS: [&str; 9] = [
+const DEFAULT_MODELS: [&str; 11] = [
     "gpt-5.6-sol",
     "gpt-5.6-luna",
     "gpt-5.6-terra",
+    "gpt-6.2-sol",
+    "gpt-6.2-astra",
     "gpt-5.5",
     "gpt-5.4",
     "gpt-5.4-mini",
@@ -512,9 +514,9 @@ mod tests {
         // 1. Empty providers -> empty entries
         assert!(model_entries(&[], None).is_empty());
 
-        // 2. Codex only -> DEFAULT_MODELS (9 models) owned by "openai"
+        // 2. Codex only -> DEFAULT_MODELS (11 models) owned by "openai"
         let codex = model_entries(&[ProviderKind::Codex], None);
-        assert_eq!(codex.len(), 9);
+        assert_eq!(codex.len(), 11);
         assert!(codex.iter().all(|e| e.owned_by == "openai"));
         let codex_ids: Vec<&str> = codex.iter().map(|e| e.id.as_str()).collect();
         assert_eq!(
@@ -523,6 +525,8 @@ mod tests {
                 "gpt-5.6-sol",
                 "gpt-5.6-luna",
                 "gpt-5.6-terra",
+                "gpt-6.2-sol",
+                "gpt-6.2-astra",
                 "gpt-5.5",
                 "gpt-5.4",
                 "gpt-5.4-mini",
@@ -579,7 +583,7 @@ mod tests {
             ],
             None,
         );
-        let expected_total = 9
+        let expected_total = DEFAULT_MODELS.len()
             + registry_models_for(ProviderId::antigravity()).len()
             + registry_models_for(ProviderId::claude()).len()
             + registry_models_for(ProviderId::zcode()).len()
@@ -862,7 +866,10 @@ mod tests {
             .contribution_for_provider(&mahoquot_registry::ProviderId::antigravity())
             .model_ids()
             .len();
-        assert!(antigravity_ids > 0, "the catalog must list Antigravity models");
+        assert!(
+            antigravity_ids > 0,
+            "the catalog must list Antigravity models"
+        );
 
         let codex_only = model_entries(&[ProviderKind::Codex], None);
         assert_eq!(codex_only.len(), DEFAULT_MODELS.len());
@@ -871,7 +878,7 @@ mod tests {
         let ag_only = model_entries(&[ProviderKind::Antigravity], None);
         assert_eq!(ag_only.len(), antigravity_ids);
         assert!(ag_only.iter().any(|e| e.id == "gemini-3.7-flash-high"));
-        assert!(ag_only.iter().any(|e| e.id == "gemini-3.8-flash-high"));
+        assert!(ag_only.iter().any(|e| e.id == "gemini-4-neon-high"));
         assert!(ag_only.iter().all(|e| e.owned_by == "google"));
 
         let both = model_entries(&[ProviderKind::Codex, ProviderKind::Antigravity], None);

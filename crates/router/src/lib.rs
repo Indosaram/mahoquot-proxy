@@ -109,25 +109,39 @@ impl Router {
                 // A binding to a member outside the activated pool is stale and
                 // must not be refreshed, so fall through to normal selection.
                 if state.admits(&bound_id) {
-                    if let Some(idx) = members
-                        .iter()
-                        .position(|m| m.id() == bound_id && m.health().is_available(now_unix_ms))
-                    {
+                    if let Some(idx) = members.iter().position(|m| {
+                        m.id() == bound_id
+                            && m.health().is_available(now_unix_ms)
+                            // A sustained upstream-5xx streak keeps health
+                            // `Available` on purpose (a transient 5xx must not
+                            // bench an account), so affinity has to break the
+                            // pin itself or the session replays the failure.
+                            && !m.degraded_streak()
+                    }) {
                         let seq = state.seq.wrapping_add(1);
                         state.seq = seq;
                         state.last_served.insert(bound_id.clone(), seq);
                         state.affinity.insert(key.to_string(), (bound_id, seq));
                         return Some(idx);
                     }
+                    // The bound member is present but unusable: drop the pin so
+                    // the selection below re-binds the session to a live peer.
+                    state.affinity.remove(key);
                 }
             }
         }
 
         match self.strategy() {
             Strategy::FillFirst => {
+                // A degraded member (an unbroken run of upstream 5xx since its
+                // last success) is only chosen when every usable member is
+                // degraded. Health alone cannot express this: a transient 5xx
+                // deliberately leaves the account `Available`.
+                let usable = |m: &Arc<dyn PoolMember>| m.health().is_available(now_unix_ms);
                 let chosen_idx = members
                     .iter()
-                    .position(|m| m.health().is_available(now_unix_ms))?;
+                    .position(|m| usable(m) && !m.degraded_streak())
+                    .or_else(|| members.iter().position(|m| usable(m)))?;
                 let seq = state.seq.wrapping_add(1);
                 state.seq = seq;
                 let chosen_id = members[chosen_idx].id().to_string();
@@ -147,27 +161,37 @@ impl Router {
                 Some(chosen_idx)
             }
             Strategy::StrictRoundRobin => {
-                let mut best: Option<(usize, u64)> = None;
+                // Same preference as FillFirst: keep a degraded member out of
+                // the rotation while any peer is still serving successfully.
+                let chosen_idx = {
+                    let pick = |skip_degraded: bool| -> Option<usize> {
+                        let mut best: Option<(usize, u64)> = None;
 
-                for (idx, member) in members.iter().enumerate() {
-                    if !member.health().is_available(now_unix_ms) {
-                        continue;
-                    }
+                        for (idx, member) in members.iter().enumerate() {
+                            if !member.health().is_available(now_unix_ms) {
+                                continue;
+                            }
+                            if skip_degraded && member.degraded_streak() {
+                                continue;
+                            }
 
-                    let last_seq = state.last_served.get(member.id()).copied().unwrap_or(0);
+                            let last_seq = state.last_served.get(member.id()).copied().unwrap_or(0);
 
-                    match best {
-                        None => {
-                            best = Some((idx, last_seq));
+                            match best {
+                                None => {
+                                    best = Some((idx, last_seq));
+                                }
+                                Some((_, min_seq)) if last_seq < min_seq => {
+                                    best = Some((idx, last_seq));
+                                }
+                                _ => {}
+                            }
                         }
-                        Some((_, min_seq)) if last_seq < min_seq => {
-                            best = Some((idx, last_seq));
-                        }
-                        _ => {}
-                    }
-                }
 
-                let (chosen_idx, _) = best?;
+                        best.map(|(idx, _)| idx)
+                    };
+                    pick(true).or_else(|| pick(false))
+                }?;
                 state.seq = state.seq.wrapping_add(1);
                 let next_seq = state.seq;
                 let chosen_id = members[chosen_idx].id().to_string();
@@ -243,6 +267,7 @@ mod red_tests {
         id: String,
         h: Health,
         reset: Option<i64>,
+        degraded: bool,
     }
     impl M {
         fn new(id: &str, h: Health) -> Arc<dyn PoolMember> {
@@ -250,6 +275,18 @@ mod red_tests {
                 id: id.into(),
                 h,
                 reset: None,
+                degraded: false,
+            })
+        }
+
+        /// An account whose recent attempts all failed with an upstream 5xx:
+        /// health is still `Available` by contract, but the streak is set.
+        fn degraded(id: &str) -> Arc<dyn PoolMember> {
+            Arc::new(M {
+                id: id.into(),
+                h: Health::Available,
+                reset: None,
+                degraded: true,
             })
         }
     }
@@ -263,10 +300,95 @@ mod red_tests {
         fn reset_at_unix(&self) -> Option<i64> {
             self.reset
         }
+        fn degraded_streak(&self) -> bool {
+            self.degraded
+        }
     }
 
     fn pool(ids: &[(&str, Health)]) -> Vec<Arc<dyn PoolMember>> {
         ids.iter().map(|(i, h)| M::new(i, *h)).collect()
+    }
+
+    #[test]
+    fn affinity_breaks_when_bound_member_is_degraded() {
+        // The incident: one conversation's session stayed pinned to an account
+        // that answered 503 on every attempt, replaying the failure hundreds of
+        // times while healthy peers served other traffic. Health stays
+        // `Available` across upstream 5xx by contract, so the streak is what
+        // must release the pin.
+        let r = Router::new(Strategy::FillFirst);
+        let hint = SessionHint {
+            affinity_key: Some("session-1".to_string()),
+        };
+
+        // Both peers healthy: FillFirst pins the session to `alex`.
+        let healthy: Vec<Arc<dyn PoolMember>> = vec![
+            M::new("alex", Health::Available),
+            M::new("jamie", Health::Available),
+        ];
+        let first = r.select(&healthy, &hint).expect("pick");
+        assert_eq!(healthy[first].id(), "alex");
+        assert_eq!(
+            r.bound_affinity_member("session-1").as_deref(),
+            Some("alex")
+        );
+
+        // `alex` then fails every attempt with a 5xx; health is still
+        // `Available`, only the streak distinguishes it.
+        let p: Vec<Arc<dyn PoolMember>> =
+            vec![M::degraded("alex"), M::new("jamie", Health::Available)];
+
+        // The pin must be released and the session must move to the live peer.
+        let next = r.select(&p, &hint).expect("pick");
+        assert_eq!(
+            p[next].id(),
+            "jamie",
+            "affinity must not replay a 5xx streak"
+        );
+        assert_eq!(
+            r.bound_affinity_member("session-1").as_deref(),
+            Some("jamie")
+        );
+    }
+
+    #[test]
+    fn degraded_member_still_serves_when_it_is_the_only_option() {
+        // A streak must not become a bench: with no healthy peer left, the
+        // degraded account is still selected rather than failing the request.
+        let p: Vec<Arc<dyn PoolMember>> = vec![M::degraded("alex")];
+        let r = Router::new(Strategy::FillFirst);
+        let hint = SessionHint {
+            affinity_key: Some("session-3".to_string()),
+        };
+        let i = r
+            .select(&p, &hint)
+            .expect("degraded sole member must serve");
+        assert_eq!(p[i].id(), "alex");
+
+        let rr = Router::new(Strategy::StrictRoundRobin);
+        let i = rr
+            .select(&p, &hint)
+            .expect("degraded sole member must serve under RR too");
+        assert_eq!(p[i].id(), "alex");
+    }
+
+    #[test]
+    fn affinity_sticks_to_a_healthy_bound_member() {
+        // Guard against over-correcting: a healthy pin must still be honoured.
+        let p: Vec<Arc<dyn PoolMember>> = vec![
+            M::new("a", Health::Available),
+            M::new("b", Health::Available),
+        ];
+        let r = Router::new(Strategy::FillFirst);
+        let hint = SessionHint {
+            affinity_key: Some("session-2".to_string()),
+        };
+        let first = r.select(&p, &hint).expect("pick");
+        let id = p[first].id().to_string();
+        for _ in 0..5 {
+            let i = r.select(&p, &hint).expect("pick");
+            assert_eq!(p[i].id(), id, "healthy affinity must hold");
+        }
     }
 
     #[test]
