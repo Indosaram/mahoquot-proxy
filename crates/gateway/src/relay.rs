@@ -2697,6 +2697,22 @@ fn failure_is_limit_exhaustion(body: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
+/// A 400 whose body says the request itself was too large for the upstream
+/// (kiro answers `CONTENT_LENGTH_EXCEEDS_THRESHOLD`).
+///
+/// This is a property of the payload, not of the account that happened to
+/// serve it: every peer would reject the same bytes. It must therefore bypass
+/// account-fault accounting, or the pool slowly attributes one oversized
+/// conversation to whichever account drew it. The body is still forwarded so
+/// the client sees the real reason instead of a bare status code.
+fn failure_is_request_too_large(body: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(body) else {
+        return false;
+    };
+    text.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD")
+        || text.contains("Input content length exceeds threshold")
+}
+
 /// Cline answers 402 `insufficient_credits` when a free-tier account's
 /// overflow is billed against an empty paid Credits balance. Like a daily
 /// cap, the exhaustion is confirmed by upstream and scoped to the account.
@@ -8001,6 +8017,40 @@ pub async fn handle_relay(
             continue;
         }
 
+        if status_code == 400 && failure_is_request_too_large(&failure.body) {
+            // The payload is too large for every peer, so no account is at
+            // fault and no failover can help. Record the outcome (it is real
+            // traffic) but skip the account-error accounting and return the
+            // upstream body verbatim so the client sees why.
+            record_request_outcome(
+                &state,
+                OutcomeRecord {
+                    event_id: &event_id,
+                    occurred_at_ms,
+                    provider: member.provider_name(),
+                    account: Some(member.id()),
+                    model: plan.model.as_deref(),
+                    key_identifier: key_identifier.as_deref(),
+                    session: session.as_deref(),
+                    scoped_entry: scoped_entry.as_deref(),
+                    status: failure.status.as_u16(),
+                    success: false,
+                    elapsed_ms: request_started.elapsed().as_millis() as u64,
+                    bytes_in: plan.original_body.len(),
+                    bytes_out: failure.body.len() as u64,
+                    tokens: None,
+                    fast,
+                    token_usage: None,
+                },
+            )
+            .await;
+            return body_response(
+                failure.status,
+                failure.content_type.as_deref(),
+                failure.body,
+            );
+        }
+
         state
             .metrics
             .exposed_client_errors
@@ -8249,6 +8299,27 @@ mod limit_exhaustion_tests {
         assert!(!failure_is_limit_exhaustion(br#"{"error":"rate limited"}"#));
         assert!(!failure_is_limit_exhaustion(br#"{"error":{"code":1006}}"#));
         assert!(!failure_is_limit_exhaustion(b"not json"));
+    }
+
+    #[test]
+    fn kiro_content_length_threshold_is_a_payload_error() {
+        // Exact body kiro returns for an oversized conversation.
+        let body = br#"{"message":"Input content length exceeds threshold.","reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}"#;
+        assert!(failure_is_request_too_large(body));
+    }
+
+    #[test]
+    fn payload_errors_do_not_match_unrelated_bodies() {
+        assert!(!failure_is_request_too_large(
+            br#"{"error":{"message":"invalid model","type":"invalid_request_error"}}"#
+        ));
+        assert!(!failure_is_request_too_large(
+            br#"{"error":{"code":"insufficient_credits"}}"#
+        ));
+        assert!(!failure_is_request_too_large(b"not json"));
+        assert!(!failure_is_request_too_large(b""));
+        // Not UTF-8: must not panic.
+        assert!(!failure_is_request_too_large(&[0xff, 0xfe, 0x00]));
     }
 
     #[test]
