@@ -285,6 +285,10 @@ pub struct KiroDecoder {
     /// Bytes of a character split across chunk boundaries, awaiting completion.
     pending: Vec<u8>,
     completed: bool,
+    /// Why upstream said the turn ended. Kept separate from `completed`
+    /// because a Kiro turn is not finished when this arrives: the context
+    /// percentage ships in its own later frame.
+    stop_reason: Option<String>,
     usage: Option<Usage>,
     /// Authoritative context occupancy reported by upstream. Kiro never sends
     /// `tokenUsage`, but it does send this, and it is the only real signal of
@@ -417,6 +421,13 @@ impl KiroDecoder {
         out.push(CodexEvent::Failed { message });
     }
 
+    /// Publishes this turn's single `Completed` event.
+    fn complete(&mut self, out: &mut Vec<CodexEvent>) {
+        self.completed = true;
+        let usage = self.take_usage();
+        out.push(CodexEvent::Completed { usage });
+    }
+
     fn decode_json(&mut self, bytes: &[u8], out: &mut Vec<CodexEvent>) {
         // Chunks arrive unaligned to UTF-8 boundaries, so decode from the
         // accumulated bytes: converting each chunk on its own would replace a
@@ -479,8 +490,6 @@ impl KiroDecoder {
                     reasoning_tokens: 0,
                 });
             }
-            // Read before the `stopReason` branch below, because the frame
-            // that ends the turn is also the frame that carries this.
             if let Some(percentage) = value
                 .get("contextUsagePercentage")
                 .and_then(Value::as_f64)
@@ -537,10 +546,19 @@ impl KiroDecoder {
             } else if let Some(signature) = value.get("signature").and_then(Value::as_str) {
                 out.push(CodexEvent::ReasoningSignature(signature.to_string()));
             }
-            if value.get("stopReason").is_some() {
-                self.completed = true;
-                let usage = self.take_usage();
-                out.push(CodexEvent::Completed { usage });
+            if let Some(reason) = value.get("stopReason") {
+                self.stop_reason = Some(reason.as_str().unwrap_or_default().to_string());
+            }
+            // Ending the turn here used to be wrong: live CodeWhisperer sends
+            // `contextUsagePercentage` in a separate `contextUsageEvent` frame
+            // that arrives after the `metadataEvent` carrying `stopReason`, so
+            // terminating on `stopReason` discarded the only usage signal a
+            // Kiro turn ever carries. Only finish once a usage signal is in
+            // hand; otherwise keep draining, and let `finish` close the turn.
+            if self.stop_reason.is_some()
+                && (self.usage.is_some() || self.context_usage_percentage.is_some())
+            {
+                self.complete(out);
                 return;
             }
         }
@@ -558,9 +576,7 @@ impl KiroDecoder {
                 self.fail("Truncated Kiro stream".to_string(), out);
                 return;
             }
-            let usage = self.take_usage();
-            out.push(CodexEvent::Completed { usage });
-            self.completed = true;
+            self.complete(out);
         }
     }
 }
@@ -842,9 +858,55 @@ mod tests {
             &aws_frame("event", br#"{"content":"hello","stopReason":"end_turn"}"#),
             &mut events,
         );
+        // A turn is not closed on `stopReason` alone: the usage frame follows
+        // it, so only EOF proves no usage signal is coming.
+        decoder.finish(&mut events);
         assert!(
             matches!(events.last(), Some(CodexEvent::Completed { usage: None })),
             "a turn with no usage signal must not fabricate one: {events:?}"
+        );
+    }
+
+    #[test]
+    fn kiro_context_usage_after_stop_reason_still_records_usage() {
+        // Production order, captured from live CodeWhisperer: the metadata
+        // frame carries only `stopReason`, and the percentage arrives in its
+        // own `contextUsageEvent` frame afterwards. Terminating on
+        // `stopReason` discarded it, which is why every kiro row recorded zero
+        // tokens.
+        let mut decoder = KiroDecoder::new();
+        let mut events = Vec::new();
+        decoder.decode(
+            &aws_frame("event", br#"{"content":"abcdefgh"}"#),
+            &mut events,
+        );
+        decoder.decode(
+            &aws_frame("event", br#"{"stopReason":"end_turn"}"#),
+            &mut events,
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, CodexEvent::Completed { .. })),
+            "stopReason must not close the turn before the usage frame arrives: {events:?}"
+        );
+        decoder.decode(
+            &aws_frame("event", br#"{"contextUsagePercentage":42.0}"#),
+            &mut events,
+        );
+        let Some(CodexEvent::Completed { usage: Some(usage) }) = events.last() else {
+            panic!("the trailing usage frame must close the turn: {events:?}")
+        };
+        assert_eq!(usage.total_tokens, 280_001);
+        assert_eq!(usage.completion_tokens, 2);
+        decoder.finish(&mut events);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, CodexEvent::Completed { .. }))
+                .count(),
+            1,
+            "exactly one Completed event: {events:?}"
         );
     }
 
@@ -860,7 +922,11 @@ mod tests {
             ),
             &mut events,
         );
-        assert!(matches!(&events[0], CodexEvent::Completed { usage: None }));
+        decoder.finish(&mut events);
+        assert!(matches!(
+            events.last(),
+            Some(CodexEvent::Completed { usage: None })
+        ));
     }
 
     fn aws_frame(message_type: &str, payload: &[u8]) -> Vec<u8> {
