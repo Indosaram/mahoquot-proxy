@@ -175,7 +175,49 @@ fn merge_profile(
     true
 }
 
+/// Project the routable registry into the stored omo profile.
+///
+/// Runs on the same 300s tick as the Cline catalog so a catalog change reaches
+/// every machine without a manual PUT. An empty registry is treated as
+/// "temporarily unavailable", never as "delete everything": wiping the profile
+/// would empty four machines' model lists at once.
+pub async fn derive_into_settings(state: &AppState) {
+    let snapshot = state.catalog.current_snapshot();
+    if snapshot.models().is_empty() {
+        tracing::info!("empty registry, skip omo profile derivation");
+        return;
+    }
+    let settings = Arc::clone(&state.settings);
+    let outcome = tokio::task::spawn_blocking(move || {
+        settings.try_mutate(|settings| {
+            let existing = settings.omo_profile.clone().unwrap_or_default();
+            match crate::omo_profile_derive::derive_profile(&snapshot, &existing) {
+                Some(next) => {
+                    settings.omo_profile = Some(next);
+                    Ok(())
+                }
+                // Refused edit: the stored profile already matches the registry.
+                None => Err(()),
+            }
+        })
+    })
+    .await;
+    match outcome {
+        Ok(Ok(Ok(_))) => tracing::info!("omo profile derived from registry"),
+        Ok(Ok(Err(error))) => {
+            tracing::warn!(%error, "derived omo profile rejected by settings validation")
+        }
+        Ok(Err(())) => {}
+        Err(error) => tracing::warn!(%error, "omo profile derivation task failed"),
+    }
+}
+
 pub async fn refresh(state: Arc<AppState>, base: &str) -> anyhow::Result<()> {
+    // Registry derivation runs on the same 300s tick: the client catalog is a
+    // projection of what the gateway can route, so it must be recomputed even
+    // when no cline account exists.
+    derive_into_settings(&state).await;
+
     let members: Vec<_> = state
         .pool
         .load()

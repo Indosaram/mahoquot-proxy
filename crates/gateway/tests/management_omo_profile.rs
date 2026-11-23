@@ -22,6 +22,7 @@ const URI: &str = "/v0/management/omo-profile";
 
 struct Fixture {
     app: Router,
+    state: Arc<AppState>,
     dir: PathBuf,
     config_path: PathBuf,
 }
@@ -53,7 +54,8 @@ fn fixture(label: &str) -> Fixture {
     };
     let state = Arc::new(AppState::new(&config).expect("gateway state"));
     Fixture {
-        app: create_app(state),
+        app: create_app(Arc::clone(&state)),
+        state,
         dir,
         config_path,
     }
@@ -367,4 +369,88 @@ async fn the_profile_and_unrelated_keys_survive_a_reload_from_disk() {
         .contains_key("omo-profile-unmodelled-probe"));
     // and the modelled passthrough key is still carried through
     assert!(reloaded.current().tls.extra.contains_key("enable"));
+}
+
+fn stored_profile(fixture: &Fixture) -> mahoquot_gateway::management::settings::OmoProfile {
+    fixture
+        .state
+        .settings
+        .current()
+        .omo_profile
+        .clone()
+        .expect("derivation must store a profile")
+}
+
+fn derived_model_ids(profile: &mahoquot_gateway::management::settings::OmoProfile) -> Vec<String> {
+    profile
+        .models
+        .iter()
+        .filter_map(|model| model.get("id")?.as_str().map(str::to_string))
+        .collect()
+}
+
+/// A tick with no catalog change must not bump the revision: every machine
+/// polls by ETag, so a churning revision would rewrite four model files a
+/// minute for nothing.
+#[tokio::test]
+async fn a_repeated_tick_keeps_the_revision_stable() {
+    let fixture = fixture("tick-idempotent");
+    mahoquot_gateway::cline_catalog::derive_into_settings(&fixture.state).await;
+    let first = stored_profile(&fixture);
+    assert!(
+        !first.models.is_empty(),
+        "embedded catalog must yield models"
+    );
+
+    mahoquot_gateway::cline_catalog::derive_into_settings(&fixture.state).await;
+    let second = stored_profile(&fixture);
+
+    assert_eq!(second.revision, first.revision);
+    assert_eq!(second.models, first.models);
+    assert_eq!(second.remove, first.remove);
+}
+
+/// A model that disappears from the stored profile is restored by the next
+/// tick, which is what makes the gateway catalog authoritative rather than a
+/// one-shot seed.
+#[tokio::test]
+async fn a_tick_restores_a_model_missing_from_the_stored_profile() {
+    let fixture = fixture("tick-restores");
+    mahoquot_gateway::cline_catalog::derive_into_settings(&fixture.state).await;
+    let first = stored_profile(&fixture);
+    let dropped = derived_model_ids(&first)
+        .into_iter()
+        .next()
+        .expect("at least one derived model");
+
+    fixture
+        .state
+        .settings
+        .try_mutate(|settings| {
+            let profile = settings.omo_profile.as_mut().expect("profile present");
+            profile
+                .models
+                .retain(|model| model.get("id").and_then(Value::as_str) != Some(dropped.as_str()));
+            Ok::<(), ()>(())
+        })
+        .expect("edit accepted")
+        .expect("settings persisted");
+
+    mahoquot_gateway::cline_catalog::derive_into_settings(&fixture.state).await;
+    let second = stored_profile(&fixture);
+
+    assert!(derived_model_ids(&second).contains(&dropped));
+    assert_eq!(second.revision, first.revision + 1);
+}
+
+/// Derivation must never empty the profile while the registry still routes
+/// models; an empty result would blank every machine's list at once.
+#[tokio::test]
+async fn a_tick_never_leaves_an_empty_model_list() {
+    let fixture = fixture("tick-never-empty");
+    mahoquot_gateway::cline_catalog::derive_into_settings(&fixture.state).await;
+    mahoquot_gateway::cline_catalog::derive_into_settings(&fixture.state).await;
+    mahoquot_gateway::cline_catalog::derive_into_settings(&fixture.state).await;
+
+    assert!(!stored_profile(&fixture).models.is_empty());
 }
