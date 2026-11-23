@@ -735,6 +735,9 @@ async fn record_turn(
         total_tokens,
         latency_ms,
         fast: false,
+        // The websocket relay only records usage it actually parsed off the
+        // wire, so a row here always carries reported numbers.
+        tokens_reported: true,
     });
     state.telemetry.record_with_account(
         occurred_at_ms / 1000,

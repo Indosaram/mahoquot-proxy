@@ -783,6 +783,7 @@ async fn record_request_outcome(state: &AppState, record: OutcomeRecord<'_>) {
     // injector rewrote is not by itself proof that the request left fast.
     let fast = record.fast && record.provider == "codex";
     let token_usage = record.token_usage.unwrap_or_default();
+    let tokens_reported = record.token_usage.is_some();
     let total_tokens = token_usage.total_tokens();
     if total_tokens > 0 {
         if let Some(entry) = record.scoped_entry {
@@ -813,6 +814,7 @@ async fn record_request_outcome(state: &AppState, record: OutcomeRecord<'_>) {
         total_tokens: token_usage.total_tokens(),
         latency_ms: record.elapsed_ms,
         fast,
+        tokens_reported,
     });
     state.telemetry.record_with_account(
         timestamp,

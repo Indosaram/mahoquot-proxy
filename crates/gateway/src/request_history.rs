@@ -166,6 +166,13 @@ pub struct UsageEvent {
     /// tier. Additive: rows written before the column existed read back false.
     #[serde(default)]
     pub fast: bool,
+    /// Whether upstream reported any token usage for this request. `false`
+    /// means the zeroes in the token columns are "not reported", not "none".
+    /// Kiro is the standing example: it never sends `tokenUsage`, so before
+    /// this flag existed its rows were indistinguishable from a request that
+    /// genuinely consumed nothing.
+    #[serde(default)]
+    pub tokens_reported: bool,
     pub reasoning_tokens: u64,
     pub total_tokens: u64,
     pub latency_ms: u64,
@@ -270,6 +277,10 @@ pub struct HistoryEventRow {
     /// tier. Additive: rows written before the column existed read back false.
     #[serde(default)]
     pub fast: bool,
+    /// Whether upstream reported any token usage for this request. `false`
+    /// means the zeroes in the token columns are "not reported", not "none".
+    #[serde(default)]
+    pub tokens_reported: bool,
     pub reasoning_tokens: u64,
     pub total_tokens: u64,
     pub latency_ms: u64,
@@ -1069,6 +1080,13 @@ pub fn init_schema(conn: &Connection) {
         [],
     )
     .ok();
+    // Rows written before this column existed read back as `false`, which is
+    // the honest answer: we did not record whether upstream reported usage.
+    conn.execute(
+        "ALTER TABLE usage_events ADD COLUMN tokens_reported INTEGER NOT NULL DEFAULT 0;",
+        [],
+    )
+    .ok();
 }
 
 /// Add the columns added after their table's own migration ran.
@@ -1364,9 +1382,10 @@ fn insert_event(connection: &Connection, event: &UsageEvent) -> Result<bool, His
             status_code, succeeded, input_tokens, output_tokens, cached_input_tokens,
             reasoning_tokens, total_tokens, latency_ms, created_at_ms,
             estimated_cost_usd, price_version, cache_write_tokens,
-            cached_input_tokens_known, cache_write_tokens_known, session_identifier, fast
+            cached_input_tokens_known, cache_write_tokens_known, session_identifier, fast,
+            tokens_reported
          ) VALUES (
-            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23
          )",
         params![
             event.event_id,
@@ -1391,6 +1410,7 @@ fn insert_event(connection: &Connection, event: &UsageEvent) -> Result<bool, His
             event.cache_write_tokens_known,
             event.session_identifier,
             i64::from(event.fast),
+            i64::from(event.tokens_reported),
         ],
     )?;
     Ok(changed == 1)
@@ -1415,7 +1435,8 @@ const EVENT_SELECT: &str =
          e.key_identifier, e.status_code, e.succeeded, e.input_tokens, e.output_tokens, \
          e.cached_input_tokens, e.reasoning_tokens, e.total_tokens, e.latency_ms, \
          e.estimated_cost_usd, e.price_version, e.cache_write_tokens, \
-         e.cached_input_tokens_known, e.cache_write_tokens_known, e.session_identifier, e.fast \
+         e.cached_input_tokens_known, e.cache_write_tokens_known, e.session_identifier, e.fast, \
+         e.tokens_reported \
          FROM usage_events e";
 
 fn read_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryEventRow> {
@@ -1442,6 +1463,7 @@ fn read_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryEventRow> 
         cache_write_tokens_known: row.get(19)?,
         session_identifier: row.get(20)?,
         fast: row.get::<_, i64>(21)? != 0,
+        tokens_reported: row.get::<_, i64>(22)? != 0,
     })
 }
 
@@ -2236,6 +2258,7 @@ pub mod tests {
             total_tokens: fixture.input_tokens + fixture.output_tokens,
             latency_ms: 125,
             fast: false,
+            tokens_reported: true,
         }
     }
 
@@ -2944,6 +2967,90 @@ mod extended_tests {
     }
 
     #[test]
+    fn unreported_tokens_are_distinguishable_from_a_genuine_zero() {
+        // Kiro never sends tokenUsage, so its rows are all zeroes. Without this
+        // flag a kiro row and a real zero-token request are the same row, and
+        // "usage is wrong" cannot be answered from the database at all.
+        let path = TestPath::new("tokens-reported");
+        let history = ready(&path.0);
+        history
+            .insert(&UsageEvent {
+                tokens_reported: false,
+                ..event(EventFixture {
+                    event_id: "kiro-unreported",
+                    occurred_at_ms: 1_000,
+                    account: "kiro-account",
+                    provider: "kiro",
+                    model: "kiro/claude-opus-5.5",
+                    key: "k",
+                    status_code: 200,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cached_input_tokens: 0,
+                })
+            })
+            .unwrap();
+        history
+            .insert(&UsageEvent {
+                tokens_reported: true,
+                ..event(EventFixture {
+                    event_id: "genuine-zero",
+                    occurred_at_ms: 2_000,
+                    account: "other",
+                    provider: "other",
+                    model: "other/model",
+                    key: "k",
+                    status_code: 200,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cached_input_tokens: 0,
+                })
+            })
+            .unwrap();
+
+        let result = history.export(&HistoryQuery::default()).unwrap();
+        let mut by_id: Vec<_> = result
+            .iter()
+            .map(|row| (row.event_id.clone(), row.tokens_reported, row.total_tokens))
+            .collect();
+        by_id.sort();
+        assert_eq!(
+            by_id,
+            vec![
+                ("genuine-zero".to_string(), true, 0),
+                ("kiro-unreported".to_string(), false, 0),
+            ],
+            "both rows carry zero tokens; only the flag separates them"
+        );
+    }
+
+    #[test]
+    fn unreported_flag_survives_serialization_as_false_not_missing() {
+        // A surface reading the JSON must see an explicit false, because the
+        // field's absence would be indistinguishable from an old row.
+        let event = UsageEvent {
+            tokens_reported: false,
+            ..event(EventFixture {
+                event_id: "e",
+                occurred_at_ms: 1,
+                account: "a",
+                provider: "p",
+                model: "m",
+                key: "k",
+                status_code: 200,
+                input_tokens: 0,
+                output_tokens: 0,
+                cached_input_tokens: 0,
+            })
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(
+            json.contains("\"tokens_reported\":false"),
+            "unreported usage must serialize explicitly: {json}"
+        );
+    }
+
+    #[test]
     fn history_totals_and_event_serde_cache_write_tokens() {
         let totals = HistoryTotals {
             cache_write_tokens: 42,
@@ -2979,6 +3086,7 @@ mod extended_tests {
             total_tokens: 150,
             latency_ms: 200,
             fast: false,
+            tokens_reported: true,
         };
         let event_json = serde_json::to_string(&event).unwrap();
         assert!(event_json.contains("\"cache-write-tokens\":30"));
@@ -3008,6 +3116,7 @@ mod extended_tests {
             estimated_cost_usd: 0.001,
             price_version: None,
             fast: false,
+            tokens_reported: true,
         };
         let row_json = serde_json::to_string(&row).unwrap();
         assert!(row_json.contains("\"cache-write-tokens\":30"));
