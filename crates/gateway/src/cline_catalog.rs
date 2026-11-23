@@ -213,11 +213,6 @@ pub async fn derive_into_settings(state: &AppState) {
 }
 
 pub async fn refresh(state: Arc<AppState>, base: &str) -> anyhow::Result<()> {
-    // Registry derivation runs on the same 300s tick: the client catalog is a
-    // projection of what the gateway can route, so it must be recomputed even
-    // when no cline account exists.
-    derive_into_settings(&state).await;
-
     let members: Vec<_> = state
         .pool
         .load()
@@ -331,6 +326,11 @@ pub fn spawn(state: Arc<AppState>) -> ClineCatalogHandle {
                 _ = signal.notified() => break,
                 _ = timer.tick() => {}
             }
+            // Registry derivation is a separate projection from the Cline
+            // catalog: it must run even when no cline account exists, but it
+            // must not ride inside `refresh`, whose contract is to touch only
+            // cline-owned entries and leave every other curated model alone.
+            derive_into_settings(&state).await;
             if let Err(error) = refresh(Arc::clone(&state), API).await {
                 tracing::warn!(%error, "Cline free catalog refresh failed; retaining last successful catalog");
             }

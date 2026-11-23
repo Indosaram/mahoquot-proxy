@@ -217,27 +217,21 @@ async fn task_10_http_qa_scenario() {
 
     // 4. Provider blackout rejection via /oauth-excluded-models
     let excluded_uri = "http://127.0.0.1:18871/v0/management/oauth-excluded-models";
-    let all_ag_models = vec![
-        "gemini-4-neon-high",
-        "gemini-3.7-flash-high",
-        "gemini-3.6-flash-high",
-        "gemini-3.5-flash-low",
-        "gemini-3.5-flash-extra-low",
-        "gemini-3.1-flash-lite",
-        "gemini-3.1-flash-image",
-        "gemini-3.1-pro-low",
-        "gemini-3-flash",
-        "gemini-3-flash-agent",
-        "gemini-pro-agent",
-        "claude-sonnet-4-6",
-        "claude-opus-4-6-thinking",
-        "gpt-oss-120b-medium",
-        "gemini-next-flash-high",
-        "gemini-4-argon",
-        "gemini-4-argon-high",
-        "gemini-4-argon-medium",
-        "gemini-4-argon-low",
-    ];
+    // Every routable Antigravity model, derived from the embedded catalog. A
+    // hand-maintained list goes stale whenever the catalog grows, and then the
+    // "complete blackout" this scenario claims to test is only a partial one.
+    let mut all_ag_models: Vec<String> = mahoquot_registry::embedded_registry_snapshot()
+        .expect("embedded catalog loads")
+        .models()
+        .values()
+        .filter(|descriptor| descriptor.bindings.contains_key(&ProviderId::antigravity()))
+        .map(|descriptor| descriptor.id.as_str().to_string())
+        .collect();
+    // The catalog is only the fallback set: this scenario also routes the
+    // locally defined custom model to Antigravity, so it must be excluded too.
+    all_ag_models.push(custom_id.as_str().to_string());
+    all_ag_models.sort();
+    all_ag_models.dedup();
     let blackout_payload = json!({
         "antigravity": all_ag_models
     });

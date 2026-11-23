@@ -232,33 +232,26 @@ fn test_complete_provider_blackout_rejection() {
     let (store, path) = temp_store("provider-blackout");
     let initial_yaml = std::fs::read_to_string(&path).expect("initial file exists");
 
-    // All 14 fallback-routable models for Antigravity in the active catalog
-    let all_ag_models = vec![
-        "gemini-4-neon-high",
-        "gemini-3.7-flash-high",
-        "gemini-3.6-flash-high",
-        "gemini-3.5-flash-low",
-        "gemini-3.5-flash-extra-low",
-        "gemini-3.1-flash-lite",
-        "gemini-3.1-flash-image",
-        "gemini-3.1-pro-low",
-        "gemini-3-flash",
-        "gemini-3-flash-agent",
-        "gemini-pro-agent",
-        "claude-sonnet-4-6",
-        "claude-opus-4-6-thinking",
-        "gpt-oss-120b-medium",
-        "gemini-4-argon",
-        "gemini-4-argon-high",
-        "gemini-4-argon-medium",
-        "gemini-4-argon-low",
-    ];
+    // Every model the active catalog can route to Antigravity. Derived from the
+    // registry rather than hand-listed: a hardcoded copy silently stopped being
+    // a full set when the catalog grew, and the blackout guard stopped firing.
+    let all_ag_models: Vec<String> = store
+        .active_snapshot()
+        .models()
+        .values()
+        .filter(|descriptor| descriptor.bindings.contains_key(&ProviderId::antigravity()))
+        .map(|descriptor| descriptor.id.as_str().to_string())
+        .collect();
+    assert!(
+        !all_ag_models.is_empty(),
+        "antigravity must have routable models"
+    );
 
     // Attempting to exclude 100% of Antigravity models without an explicit override
     let blackout_result = store.mutate(|s| {
         s.oauth_excluded_models.insert(
             "antigravity".to_string(),
-            all_ag_models.iter().map(|s| s.to_string()).collect(),
+            all_ag_models.iter().cloned().collect(),
         );
     });
 
@@ -274,11 +267,14 @@ fn test_complete_provider_blackout_rejection() {
     let current_yaml = std::fs::read_to_string(&path).expect("file readable");
     assert_eq!(current_yaml, initial_yaml);
 
-    // Partial exclusion (e.g. 13 of 14 models excluded, 1 model remains) is permitted
+    // Partial exclusion (all but one routable model) is permitted
     let partial_result = store.mutate(|s| {
         s.oauth_excluded_models.insert(
             "antigravity".to_string(),
-            all_ag_models[..13].iter().map(|s| s.to_string()).collect(),
+            all_ag_models[..all_ag_models.len() - 1]
+                .iter()
+                .cloned()
+                .collect(),
         );
     });
     assert!(partial_result.is_ok(), "partial exclusion must succeed");
@@ -289,7 +285,7 @@ fn test_complete_provider_blackout_rejection() {
             .get("antigravity")
             .unwrap()
             .len(),
-        13
+        all_ag_models.len() - 1
     );
 
     // With explicit override: user specifies `allowed-blackouts` containing `antigravity`
@@ -300,7 +296,7 @@ fn test_complete_provider_blackout_rejection() {
         });
         s.oauth_excluded_models.insert(
             "antigravity".to_string(),
-            all_ag_models.iter().map(|s| s.to_string()).collect(),
+            all_ag_models.iter().cloned().collect(),
         );
     });
     assert!(
@@ -314,7 +310,7 @@ fn test_complete_provider_blackout_rejection() {
             .get("antigravity")
             .unwrap()
             .len(),
-        18
+        all_ag_models.len()
     );
 }
 

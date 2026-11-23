@@ -37,7 +37,10 @@ fn runtime_maintenance_prunes_expired_records_at_exact_clock_trigger() {
         &dir.join("history.sqlite"),
         HistoryConfig {
             retention: Some(Duration::from_secs(7 * 24 * 60 * 60)),
-            max_size_bytes: Some(100_000),
+            // Generous on purpose: this fixture tests retention, and a cap near
+            // the schema's own footprint would evict the fresh rows too, in
+            // 50-row chunks, before retention could be observed.
+            max_size_bytes: Some(10 * 1024 * 1024),
             prune_chunk_size: 50,
             ..HistoryConfig::default()
         },
@@ -72,6 +75,7 @@ fn runtime_maintenance_prunes_expired_records_at_exact_clock_trigger() {
                 total_tokens: 2,
                 latency_ms: 1,
                 fast: false,
+                tokens_reported: true,
             })
             .unwrap();
     }
@@ -132,6 +136,7 @@ fn runtime_maintenance_enforces_configured_size_cap_without_retention() {
                 total_tokens: 2,
                 latency_ms: 1,
                 fast: false,
+                tokens_reported: true,
             })
             .unwrap();
     }
@@ -405,6 +410,7 @@ async fn full_channel_is_nonblocking() {
             total_tokens: 2,
             latency_ms: 1,
             fast: false,
+            tokens_reported: true,
         });
         if !accepted {
             dropped += 1;
@@ -506,6 +512,7 @@ async fn cancelled_clear_preserves_rows() {
         total_tokens: 2,
         latency_ms: 1,
         fast: false,
+        tokens_reported: true,
     });
     fixture.state.history.flush().expect("flush clear sentinel");
 
@@ -559,6 +566,7 @@ async fn confirmed_filtered_clear_deletes_only_the_selected_scope() {
             total_tokens: 2,
             latency_ms: 1,
             fast: false,
+            tokens_reported: true,
         });
     }
     fixture.state.history.flush().expect("flush clear fixtures");
@@ -662,6 +670,7 @@ fn enqueue_event(
         total_tokens: 120 + index * 2,
         latency_ms: 50 + index,
         fast: false,
+        tokens_reported: true,
     });
 }
 
@@ -1105,6 +1114,7 @@ async fn one_invalid_event_does_not_discard_the_valid_events_in_its_batch() {
         total_tokens: 2,
         latency_ms: 1,
         fast: false,
+        tokens_reported: true,
     };
 
     fixture
@@ -1167,6 +1177,7 @@ async fn export_is_bounded_instead_of_returning_every_row() {
             total_tokens: 2,
             latency_ms: 1,
             fast: false,
+            tokens_reported: true,
         });
         if index % 200 == 0 {
             fixture.state.history.flush().expect("flush ingest worker");
@@ -1225,6 +1236,7 @@ async fn session_identifier_round_trips_through_store_and_management_wire() {
         total_tokens: 2,
         latency_ms: 1,
         fast: false,
+        tokens_reported: true,
     };
     assert!(fixture.state.history.enqueue(labeled.clone()));
     let mut unlabeled = labeled.clone();

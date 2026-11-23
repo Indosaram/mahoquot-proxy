@@ -82,6 +82,7 @@ async fn manual_api_driver() {
             cache_write_tokens: 0,
             cache_write_tokens_known: false,
             fast: false,
+            tokens_reported: true,
             reasoning_tokens: index % 2,
             total_tokens: 15 + index * 2,
             latency_ms: 100 + index,

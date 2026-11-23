@@ -141,7 +141,7 @@ impl Router {
                 let chosen_idx = members
                     .iter()
                     .position(|m| usable(m) && !m.degraded_streak())
-                    .or_else(|| members.iter().position(|m| usable(m)))?;
+                    .or_else(|| members.iter().position(usable))?;
                 let seq = state.seq.wrapping_add(1);
                 state.seq = seq;
                 let chosen_id = members[chosen_idx].id().to_string();

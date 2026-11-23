@@ -314,7 +314,7 @@ impl KiroDecoder {
     /// remains, which mirrors how kiro-lb derives `prompt_tokens`.
     fn derived_usage(&self) -> Option<Usage> {
         let percentage = self.context_usage_percentage?;
-        if !(percentage > 0.0) || !percentage.is_finite() {
+        if !(percentage.is_finite() && percentage > 0.0) {
             return None;
         }
         let capped = percentage.min(100.0);
