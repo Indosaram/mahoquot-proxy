@@ -1,5 +1,5 @@
 {
-  "version": 7,
+  "version": 8,
   "source": "embedded_fallback",
   "models": {
     "claude-3-5-sonnet-20241022": {
@@ -220,7 +220,8 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "1000000"
+        "context_limit": "1000000",
+        "max_output_tokens": "128000"
       }
     },
     "claude-opus-4-5": {
@@ -378,7 +379,8 @@
       "aliases": [],
       "metadata": {
         "context_limit": "250000",
-        "thinking.antigravity": "{\"min\":1024,\"max\":64000,\"zero_allowed\":true,\"dynamic_allowed\":true}"
+        "thinking.antigravity": "{\"min\":1024,\"max\":64000,\"zero_allowed\":true,\"dynamic_allowed\":true}",
+        "max_output_tokens": "64000"
       }
     },
     "claude-opus-4-7": {
@@ -506,7 +508,8 @@
       "aliases": [],
       "metadata": {
         "context_limit": "1000000",
-        "thinking.claude": "{\"zero_allowed\":true,\"dynamic_allowed\":true,\"levels\":[\"low\",\"medium\",\"high\",\"xhigh\",\"max\"]}"
+        "thinking.claude": "{\"zero_allowed\":true,\"dynamic_allowed\":true,\"levels\":[\"low\",\"medium\",\"high\",\"xhigh\",\"max\"]}",
+        "max_output_tokens": "128000"
       }
     },
     "claude-sonnet-4-5": {
@@ -714,7 +717,8 @@
       "aliases": [],
       "metadata": {
         "context_limit": "1000000",
-        "thinking.claude": "{\"zero_allowed\":true,\"dynamic_allowed\":true,\"levels\":[\"low\",\"medium\",\"high\",\"xhigh\",\"max\"]}"
+        "thinking.claude": "{\"zero_allowed\":true,\"dynamic_allowed\":true,\"levels\":[\"low\",\"medium\",\"high\",\"xhigh\",\"max\"]}",
+        "max_output_tokens": "128000"
       }
     },
     "cline-free/gemini-3.8-flash": {
@@ -1416,7 +1420,8 @@
       "metadata": {
         "context_limit": "1048576",
         "thinking.antigravity": "{\"min\":128,\"max\":32768,\"dynamic_allowed\":true,\"levels\":[\"minimal\",\"low\",\"medium\",\"high\"]}",
-        "thinking.vertex": "{\"min\":128,\"max\":32768,\"dynamic_allowed\":true,\"levels\":[\"minimal\",\"low\",\"medium\",\"high\"]}"
+        "thinking.vertex": "{\"min\":128,\"max\":32768,\"dynamic_allowed\":true,\"levels\":[\"minimal\",\"low\",\"medium\",\"high\"]}",
+        "max_output_tokens": "65536"
       }
     },
     "gemini-3-flash-agent": {
@@ -1447,7 +1452,8 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "1048576"
+        "context_limit": "1048576",
+        "max_output_tokens": "65536"
       }
     },
     "gemini-3-flash-preview": {
@@ -1544,7 +1550,8 @@
       "aliases": [],
       "metadata": {
         "context_limit": "1048576",
-        "thinking.antigravity": "{\"min\":128,\"max\":32768,\"dynamic_allowed\":true,\"levels\":[\"minimal\",\"high\"]}"
+        "thinking.antigravity": "{\"min\":128,\"max\":32768,\"dynamic_allowed\":true,\"levels\":[\"minimal\",\"high\"]}",
+        "max_output_tokens": "65536"
       }
     },
     "gemini-3.1-flash-lite": {
@@ -1594,7 +1601,8 @@
       "metadata": {
         "context_limit": "1048576",
         "thinking.antigravity": "{\"min\":1,\"max\":65535,\"zero_allowed\":true,\"dynamic_allowed\":true,\"levels\":[\"minimal\",\"low\",\"medium\",\"high\"]}",
-        "thinking.vertex": "{\"min\":128,\"max\":32768,\"dynamic_allowed\":true,\"levels\":[\"minimal\",\"low\",\"medium\",\"high\"]}"
+        "thinking.vertex": "{\"min\":128,\"max\":32768,\"dynamic_allowed\":true,\"levels\":[\"minimal\",\"low\",\"medium\",\"high\"]}",
+        "max_output_tokens": "65536"
       }
     },
     "gemini-3.1-pro-low": {
@@ -1626,7 +1634,8 @@
       "aliases": [],
       "metadata": {
         "context_limit": "1048576",
-        "thinking.antigravity": "{\"min\":1,\"max\":65535,\"dynamic_allowed\":true,\"levels\":[\"low\",\"medium\",\"high\"]}"
+        "thinking.antigravity": "{\"min\":1,\"max\":65535,\"dynamic_allowed\":true,\"levels\":[\"low\",\"medium\",\"high\"]}",
+        "max_output_tokens": "65536"
       }
     },
     "gemini-3.1-pro-preview": {
@@ -1721,7 +1730,8 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "1048576"
+        "context_limit": "1048576",
+        "max_output_tokens": "65536"
       }
     },
     "gemini-3.5-flash-low": {
@@ -1752,7 +1762,8 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "1048576"
+        "context_limit": "1048576",
+        "max_output_tokens": "65536"
       }
     },
     "gemini-3.6-flash": {
@@ -1816,7 +1827,8 @@
       "aliases": [],
       "metadata": {
         "context_limit": "1048576",
-        "thinking.antigravity": "{\"min\":1,\"max\":65535,\"dynamic_allowed\":true,\"levels\":[\"minimal\",\"low\",\"medium\",\"high\"]}"
+        "thinking.antigravity": "{\"min\":1,\"max\":65535,\"dynamic_allowed\":true,\"levels\":[\"minimal\",\"low\",\"medium\",\"high\"]}",
+        "max_output_tokens": "65536"
       }
     },
     "gemini-3.7-flash": {
@@ -1880,7 +1892,8 @@
       "aliases": [],
       "metadata": {
         "context_limit": "1048576",
-        "thinking.antigravity": "{\"min\":1,\"max\":65535,\"dynamic_allowed\":true,\"levels\":[\"low\",\"medium\",\"high\"]}"
+        "thinking.antigravity": "{\"min\":1,\"max\":65535,\"dynamic_allowed\":true,\"levels\":[\"low\",\"medium\",\"high\"]}",
+        "max_output_tokens": "32768"
       }
     },
     "gemini-3.7-flash-thinking": {
@@ -1943,7 +1956,8 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "1048576"
+        "context_limit": "1048576",
+        "max_output_tokens": "65536"
       }
     },
     "gemini-4-neon-high": {
@@ -1975,7 +1989,8 @@
       "aliases": [],
       "metadata": {
         "context_limit": "1048576",
-        "thinking.antigravity": "{\"min\":1,\"max\":65535,\"dynamic_allowed\":true,\"levels\":[\"low\",\"medium\",\"high\"]}"
+        "thinking.antigravity": "{\"min\":1,\"max\":65535,\"dynamic_allowed\":true,\"levels\":[\"low\",\"medium\",\"high\"]}",
+        "max_output_tokens": "65536"
       }
     },
     "gemini-4-neon-medium": {
@@ -2006,7 +2021,8 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "1048576"
+        "context_limit": "1048576",
+        "max_output_tokens": "65536"
       }
     },
     "gemini-4-neon-low": {
@@ -2037,7 +2053,8 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "1048576"
+        "context_limit": "1048576",
+        "max_output_tokens": "65536"
       }
     },
     "gemini-4-neon-xhigh": {
@@ -2068,7 +2085,8 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "1048576"
+        "context_limit": "1048576",
+        "max_output_tokens": "65536"
       }
     },
     "gemini-pro-agent": {
@@ -2100,7 +2118,8 @@
       "aliases": [],
       "metadata": {
         "context_limit": "1048576",
-        "thinking.antigravity": "{\"min\":1,\"max\":65535,\"dynamic_allowed\":true,\"levels\":[\"low\",\"medium\",\"high\"]}"
+        "thinking.antigravity": "{\"min\":1,\"max\":65535,\"dynamic_allowed\":true,\"levels\":[\"low\",\"medium\",\"high\"]}",
+        "max_output_tokens": "65536"
       }
     },
     "glm-4.6": {
@@ -2385,7 +2404,8 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "1047576"
+        "context_limit": "1047576",
+        "max_output_tokens": "32768"
       }
     },
     "gpt-4o": {
@@ -2433,7 +2453,8 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "128000"
+        "context_limit": "128000",
+        "max_output_tokens": "32768"
       }
     },
     "gpt-5.3-codex": {
@@ -2763,7 +2784,8 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "272000"
+        "context_limit": "272000",
+        "max_output_tokens": "32768"
       }
     },
     "gpt-6.2-astra": {
@@ -2794,7 +2816,8 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "921600"
+        "context_limit": "921600",
+        "max_output_tokens": "32768"
       }
     },
     "gpt-6.2-sol": {
@@ -2825,7 +2848,8 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "921600"
+        "context_limit": "921600",
+        "max_output_tokens": "32768"
       }
     },
     "gpt-daybreak-blue-latest": {
@@ -2857,7 +2881,8 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "373000"
+        "context_limit": "373000",
+        "max_output_tokens": "64000"
       }
     },
     "gpt-image-1.5": {
@@ -2886,7 +2911,8 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "128000"
+        "context_limit": "128000",
+        "max_output_tokens": "32768"
       }
     },
     "gpt-image-2": {
@@ -2915,7 +2941,8 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "128000"
+        "context_limit": "128000",
+        "max_output_tokens": "32768"
       }
     },
     "gpt-oss-120b-medium": {
@@ -2947,7 +2974,8 @@
       "aliases": [],
       "metadata": {
         "context_limit": "131072",
-        "thinking.antigravity": "null"
+        "thinking.antigravity": "null",
+        "max_output_tokens": "32768"
       }
     },
     "grok-4.5": {
@@ -3250,7 +3278,8 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "1000000"
+        "context_limit": "1000000",
+        "max_output_tokens": "128000"
       }
     },
     "mimo-v2-omni": {
@@ -3843,7 +3872,8 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "1048576"
+        "context_limit": "1048576",
+        "max_output_tokens": "65536"
       }
     },
     "gemini-4-argon-high": {
@@ -3874,7 +3904,8 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "1048576"
+        "context_limit": "1048576",
+        "max_output_tokens": "65536"
       }
     },
     "gemini-4-argon-medium": {
@@ -3905,7 +3936,8 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "1048576"
+        "context_limit": "1048576",
+        "max_output_tokens": "65536"
       }
     },
     "gemini-4-argon-low": {
@@ -3936,7 +3968,8 @@
       },
       "aliases": [],
       "metadata": {
-        "context_limit": "1048576"
+        "context_limit": "1048576",
+        "max_output_tokens": "65536"
       }
     }
   },

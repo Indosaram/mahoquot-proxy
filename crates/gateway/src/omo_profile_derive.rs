@@ -10,9 +10,12 @@ use crate::management::settings::OmoProfile;
 
 /// Return a new revision only when the canonical model contents change.
 ///
-/// The registry has no output-token-limit metadata contract, so `maxTokens` is
-/// null (unknown), not a guessed limit or a provider's thinking budget. Reading
-/// the clock for `updated_at` is the only external dependency; nothing is saved.
+/// `maxTokens` comes from the catalog's optional `max_output_tokens` metadata.
+/// It is null (unknown) when the catalog omits it or the value does not parse;
+/// the client then falls back to its own default. A guess would be worse than
+/// null: a limit below the provider's real ceiling truncates every long answer.
+/// Reading the clock for `updated_at` is the only external dependency; nothing
+/// is saved.
 pub fn derive_profile(registry: &Registry, existing: &OmoProfile) -> Option<OmoProfile> {
     if registry.models().is_empty() {
         return None;
@@ -50,11 +53,15 @@ pub fn derive_profile(registry: &Registry, existing: &OmoProfile) -> Option<OmoP
         // Presence, not parseability, is the inclusion contract. Keep unknown
         // numeric metadata null rather than silently excluding the model.
         let context = descriptor.metadata["context_limit"].parse::<u64>().ok();
+        let output = descriptor
+            .metadata
+            .get("max_output_tokens")
+            .and_then(|limit| limit.parse::<u64>().ok());
         let model = json!({
             "id": id.as_str(),
             "name": descriptor.display_name.as_deref().unwrap_or(id.as_str()),
             "contextWindow": context,
-            "maxTokens": null,
+            "maxTokens": output,
             "input": input,
             "reasoning": reasoning,
         });
@@ -401,6 +408,36 @@ mod tests {
             json!(result.models[0]),
             json!({"id": "vision", "name": "Vision", "contextWindow": 200000, "maxTokens": null, "input": ["text", "image"], "reasoning": true})
         );
+    }
+
+    #[test]
+    fn output_limit_metadata_becomes_max_tokens() {
+        // A catalog-supplied ceiling must reach the client verbatim: the client
+        // otherwise applies its own default and truncates long answers there.
+        let mut descriptor = model("neon", true, true);
+        descriptor
+            .metadata
+            .insert("max_output_tokens".into(), "65536".into());
+        let result = derive_profile(&registry(vec![descriptor]), &OmoProfile::default()).unwrap();
+        assert_eq!(result.models[0]["maxTokens"], json!(65536));
+        assert_eq!(result.models[0]["contextWindow"], json!(200000));
+    }
+
+    #[test]
+    fn absent_or_unparsable_output_limit_stays_null() {
+        let mut unparsable = model("a", true, true);
+        unparsable
+            .metadata
+            .insert("max_output_tokens".into(), "unknown".into());
+        let mut empty = model("b", true, true);
+        empty
+            .metadata
+            .insert("max_output_tokens".into(), String::new());
+        let result =
+            derive_profile(&registry(vec![unparsable, empty]), &OmoProfile::default()).unwrap();
+        for model in result.models {
+            assert_eq!(model["maxTokens"], Value::Null);
+        }
     }
 
     #[test]

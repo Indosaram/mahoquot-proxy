@@ -90,13 +90,24 @@ fi
 echo "  PASS: Tampered payload rejected as expected (canonicalization mismatch)"
 
 # Adversarial 2: Tampered payload semantic content
+# The catalog version is read from the signed payload; hardcoding it silently
+# skipped the mutation on every catalog release past v1 and let the tampered
+# file verify unchanged.
 TAMPERED_PAYLOAD2="$TMP_DIR/tampered-payload2.json"
+CATALOG_VERSION=$(python3 -c '
+import json,sys
+print(json.load(open(sys.argv[1]))["version"])
+' "$OUT_PAYLOAD")
 python3 -c '
-data = open("'"$OUT_PAYLOAD"'", "rb").read()
-# Mutate version from 1 to 9
-data2 = data.replace(b"\"version\":1", b"\"version\":9")
-open("'"$TAMPERED_PAYLOAD2"'", "wb").write(data2)
-'
+import sys
+path, version = sys.argv[1], int(sys.argv[2])
+raw = open(path, "rb").read()
+old = b"\"version\":" + str(version).encode()
+new = b"\"version\":" + str(version + 1).encode()
+assert raw.count(old) == 1, f"expected one {old!r} in {path}"
+open(sys.argv[3], "wb").write(raw.replace(old, new))
+' "$OUT_PAYLOAD" "$CATALOG_VERSION" "$TAMPERED_PAYLOAD2"
+
 if cargo run -q -p mahoquot-model-catalog -- verify \
   --input "$TAMPERED_PAYLOAD2" \
   --signature "$OUT_SIGNATURE" >/dev/null 2>&1; then
@@ -127,7 +138,7 @@ echo "  PASS: Tampered signature rejected as expected"
 if cargo run -q -p mahoquot-model-catalog -- verify \
   --input "$OUT_PAYLOAD" \
   --signature "$OUT_SIGNATURE" \
-  --active-version 2 >/dev/null 2>&1; then
+  --active-version "$CATALOG_VERSION" >/dev/null 2>&1; then
   echo "ERROR: verification succeeded on downgraded version!" >&2
   exit 1
 fi

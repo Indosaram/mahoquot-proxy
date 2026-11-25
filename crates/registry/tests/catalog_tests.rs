@@ -466,3 +466,29 @@ fn test_embedded_catalog_resolves_closed_and_open_models() {
         .iter()
         .any(|b| b.provider_id.as_str() == "codex"));
 }
+
+/// The omo profile derives each client's `maxTokens` from this metadata, and a
+/// missing value leaves the client on its own 16384 default. The Gemini 4
+/// family answers far past that, so every member must publish its ceiling.
+#[test]
+fn embedded_catalog_publishes_gemini_4_output_limits() {
+    let snapshot = embedded_registry_snapshot().expect("embedded catalog must parse");
+    let mut missing = Vec::new();
+    for (id, desc) in snapshot.models() {
+        if !id.as_str().starts_with("gemini-4-") {
+            continue;
+        }
+        match desc.metadata.get("max_output_tokens") {
+            Some(limit) => assert_eq!(
+                limit.parse::<u64>().expect("output limit must be numeric"),
+                65536,
+                "gemini-4 output limit for {id}"
+            ),
+            None => missing.push(id.as_str().to_owned()),
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "gemini-4 models missing max_output_tokens: {missing:?}"
+    );
+}

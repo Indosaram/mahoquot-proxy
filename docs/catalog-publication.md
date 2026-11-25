@@ -115,6 +115,20 @@ Schemas are versioned and stored under `crates/registry/schema/` and `docs/schem
    - Duplicate bindings with conflicting properties without proper precedence are rejected.
    - Catalogs with zero fallback-routable bindings are rejected.
 
+### Model Metadata Keys
+The `metadata` map is an open string-to-string map; the gateway reads these keys:
+
+| Key | Meaning | Consumer |
+|-----|---------|----------|
+| `context_limit` | Prompt context window in tokens. Presence is also the gate for a model to enter the derived omo profile. | `omo_profile_derive` (`contextWindow`), `/v1/models` |
+| `max_output_tokens` | How many output tokens the model can emit in one response. Omit it when the ceiling is unknown. | `omo_profile_derive` (`maxTokens`) |
+| `thinking.<provider>` | JSON object describing that provider's thinking budget (`min`, `max`, `levels`, ...). | `omo_profile_derive` (`reasoning`) |
+
+A model without `max_output_tokens` derives `maxTokens: null`, which leaves the client on its
+own default (16 384 in current Senpi builds). That is the correct fallback for an unknown
+ceiling, but it silently truncates long answers for a model that can emit more, so a catalog
+entry for a high-output model must publish this key.
+
 ---
 
 ## 6. Key Custody, Rotation, and Revocation
