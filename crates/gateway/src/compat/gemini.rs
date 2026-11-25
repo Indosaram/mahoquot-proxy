@@ -1440,9 +1440,21 @@ fn strip_gemini_schema(value: &mut Value) -> Result<(), String> {
         if let Some(one) = map.remove("oneOf") {
             map.entry("anyOf").or_insert(one);
         }
+        ensure_gemini_array_items(map);
         super::tool_schema::visit_schema_children(map, &mut strip_gemini_schema)?;
     }
     Ok(())
+}
+
+/// Gemini's `GenerateContentRequest` requires `items` on every `type: "array"`
+/// schema node and rejects the whole request with a 400 before the stream opens
+/// otherwise ("...properties[args].items: missing field"). An empty schema is
+/// the unconstrained element type Gemini accepts, so publish that instead of
+/// dropping the property.
+fn ensure_gemini_array_items(map: &mut Map<String, Value>) {
+    if map.get("type").and_then(Value::as_str) == Some("array") && !map.contains_key("items") {
+        map.insert("items".to_string(), json!({}));
+    }
 }
 
 // Unlike the legacy Gemini JSON walk, visit only schema positions: a tool may
@@ -1470,6 +1482,7 @@ fn sanitize_claude_schema_for_gemini(value: &mut Value) -> Result<(), String> {
     if let Some(one) = map.remove("oneOf") {
         map.entry("anyOf").or_insert(one);
     }
+    ensure_gemini_array_items(map);
     super::tool_schema::visit_schema_children(map, &mut sanitize_claude_schema_for_gemini)
 }
 
@@ -2252,6 +2265,58 @@ mod tests {
             &request["tools"][0]["functionDeclarations"][0]["parameters"]["properties"]["value"];
         assert!(value.get("oneOf").is_none());
         assert_eq!(value["anyOf"].as_array().expect("anyOf").len(), 2);
+    }
+
+    #[test]
+    fn tool_parameters_gain_items_for_every_array_node() {
+        // Live 400 shape (2026-11-24): a `chain[].args` array published without
+        // `items` made Gemini reject the whole request before the stream opened.
+        let body = json!({
+            "model": "gemini-3.7-flash-high",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "computer",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "chain": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "args": {
+                                            "type": "array",
+                                            "description": "positional helper arguments"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }]
+        });
+
+        let request = openai_to_gemini(&body).expect("translate");
+        let params = &request["tools"][0]["functionDeclarations"][0]["parameters"];
+        assert_eq!(
+            params["properties"]["chain"]["items"]["properties"]["args"]["items"],
+            json!({})
+        );
+
+        let antigravity = json!({
+            "model": "claude-opus-5-5",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "tools": body["tools"].clone()
+        });
+        let request = openai_to_antigravity(&antigravity, "p").expect("translate");
+        let params = &request["request"]["tools"][0]["functionDeclarations"][0]["parameters"];
+        assert_eq!(
+            params["properties"]["chain"]["items"]["properties"]["args"]["items"],
+            json!({})
+        );
     }
 
     #[test]
