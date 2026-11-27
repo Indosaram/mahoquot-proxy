@@ -1440,10 +1440,38 @@ fn strip_gemini_schema(value: &mut Value) -> Result<(), String> {
         if let Some(one) = map.remove("oneOf") {
             map.entry("anyOf").or_insert(one);
         }
+        collapse_gemini_union_type(map);
         ensure_gemini_array_items(map);
         super::tool_schema::visit_schema_children(map, &mut strip_gemini_schema)?;
     }
     Ok(())
+}
+
+/// Gemini's `Schema.type` is a scalar enum, so a JSON-Schema union such as
+/// `"type": ["string", "null"]` is rejected request-wide with a 400
+/// ("Unknown name \"type\" ... Proto field is not repeating, cannot start list").
+/// MCP servers publish those unions for every optional field, so collapse them
+/// to the single non-null branch. `null` only widens a field that the caller may
+/// omit; the non-null branch still accepts every value the caller sends, and a
+/// purely-null union drops `type` to leave the node unconstrained.
+fn collapse_gemini_union_type(map: &mut Map<String, Value>) {
+    let Some(types) = map.get("type").and_then(Value::as_array) else {
+        return;
+    };
+    // A genuine multi-type union has no Gemini equivalent; the first branch is
+    // what the sibling translators keep as well.
+    match types
+        .iter()
+        .filter_map(Value::as_str)
+        .find(|t| *t != "null")
+    {
+        Some(single) => {
+            map.insert("type".to_string(), Value::String(single.to_string()));
+        }
+        None => {
+            map.remove("type");
+        }
+    }
 }
 
 /// Gemini's `GenerateContentRequest` requires `items` on every `type: "array"`
@@ -1482,6 +1510,7 @@ fn sanitize_claude_schema_for_gemini(value: &mut Value) -> Result<(), String> {
     if let Some(one) = map.remove("oneOf") {
         map.entry("anyOf").or_insert(one);
     }
+    collapse_gemini_union_type(map);
     ensure_gemini_array_items(map);
     super::tool_schema::visit_schema_children(map, &mut sanitize_claude_schema_for_gemini)
 }
@@ -2317,6 +2346,56 @@ mod tests {
             params["properties"]["chain"]["items"]["properties"]["args"]["items"],
             json!({})
         );
+    }
+
+    #[test]
+    fn tool_parameters_collapse_union_types_for_every_schema_node() {
+        // Live 400 shape (2026-11-26): MCP servers publish optional fields as
+        // `"type": ["string", "null"]`. Gemini's `Schema.type` is a scalar
+        // enum, so the whole request was rejected before the stream opened.
+        let body = json!({
+            "model": "gemini-4-neon-xhigh",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "save_issue",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "assignee": { "type": ["string", "null"] },
+                            "estimate": { "type": ["null", "integer"] },
+                            "anyValue": { "type": ["string", "integer"] },
+                            "nothing": { "type": ["null"] },
+                            "tags": {
+                                "type": ["array", "null"],
+                                "items": { "type": ["string", "null"] }
+                            }
+                        }
+                    }
+                }
+            }]
+        });
+
+        let request = openai_to_gemini(&body).expect("translate");
+        let props = &request["tools"][0]["functionDeclarations"][0]["parameters"]["properties"];
+        assert_eq!(props["assignee"]["type"], json!("string"));
+        assert_eq!(props["estimate"]["type"], json!("integer"));
+        assert_eq!(props["anyValue"]["type"], json!("string"));
+        assert!(props["nothing"].get("type").is_none());
+        assert_eq!(props["tags"]["type"], json!("array"));
+        assert_eq!(props["tags"]["items"]["type"], json!("string"));
+
+        let antigravity = json!({
+            "model": "claude-opus-5-5",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "tools": body["tools"].clone()
+        });
+        let request = openai_to_antigravity(&antigravity, "p").expect("translate");
+        let props =
+            &request["request"]["tools"][0]["functionDeclarations"][0]["parameters"]["properties"];
+        assert_eq!(props["assignee"]["type"], json!("string"));
+        assert!(props["nothing"].get("type").is_none());
     }
 
     #[test]
