@@ -841,7 +841,7 @@ impl ProviderAccount {
                 None => a.access_token.clone(),
             },
             Self::Cursor(a) => a.access_token.clone(),
-            Self::Kiro(a) => a.access_token.clone(),
+            Self::Kiro(a) => a.effective_access_token().to_string(),
             Self::Zcode(a) => a.access_token.clone(),
             Self::Vertex(a) => a.access_token.clone(),
             Self::OpenCode(a) => a.api_key.clone(),
@@ -901,7 +901,7 @@ impl ProviderAccount {
                 }
             }
             Self::Cursor(a) => expired_at_is_past(&a.expired, now_unix),
-            Self::Kiro(a) => expired_at_is_past(&a.expired, now_unix),
+            Self::Kiro(a) => !a.is_static_token() && expired_at_is_past(&a.expired, now_unix),
             // A provisioned {id}.{secret} key carries no expiry and cannot be
             // refreshed, so an absent timestamp means "never expires" here
             // rather than the "expired" default the OAuth providers take.
@@ -974,33 +974,44 @@ impl ProviderAccount {
                 ("x-cursor-client-type".to_string(), "cli".to_string()),
                 ("te".to_string(), "trailers".to_string()),
             ],
-            Self::Kiro(a) => vec![
-                (
-                    "authorization".to_string(),
-                    format!("Bearer {}", a.access_token),
-                ),
-                (
-                    "content-type".to_string(),
-                    "application/x-amz-json-1.0".to_string(),
-                ),
-                (
-                    "x-amz-target".to_string(),
-                    "AmazonCodeWhispererStreamingService.GenerateAssistantResponse".to_string(),
-                ),
-                (
-                    "x-amzn-codewhisperer-optout".to_string(),
-                    "true".to_string(),
-                ),
-                ("x-amzn-kiro-agent-mode".to_string(), "vibe".to_string()),
-                (
-                    "amz-sdk-request".to_string(),
-                    "attempt=1; max=3".to_string(),
-                ),
-                (
-                    "user-agent".to_string(),
-                    "aws-sdk-js/1.0.27 KiroIDE-0.7.45-mahoquot".to_string(),
-                ),
-            ],
+            Self::Kiro(a) => {
+                let mut headers = vec![
+                    (
+                        "authorization".to_string(),
+                        format!("Bearer {}", a.effective_access_token()),
+                    ),
+                    (
+                        "content-type".to_string(),
+                        "application/x-amz-json-1.0".to_string(),
+                    ),
+                    (
+                        "x-amz-target".to_string(),
+                        "AmazonCodeWhispererStreamingService.GenerateAssistantResponse".to_string(),
+                    ),
+                    (
+                        "x-amzn-codewhisperer-optout".to_string(),
+                        "true".to_string(),
+                    ),
+                    ("x-amzn-kiro-agent-mode".to_string(), "vibe".to_string()),
+                    ("x-amzn-kiro-attempt".to_string(), "1;max=3".to_string()),
+                    (
+                        "amz-sdk-request".to_string(),
+                        "attempt=1; max=3".to_string(),
+                    ),
+                    (
+                        "user-agent".to_string(),
+                        mahoquot_providers::kiro_cli_user_agent(),
+                    ),
+                    (
+                        "x-amz-user-agent".to_string(),
+                        mahoquot_providers::kiro_cli_amz_user_agent(),
+                    ),
+                ];
+                if let Some(token_type) = mahoquot_providers::kiro_token_type_header(a.auth_mode) {
+                    headers.push(("tokentype".to_string(), token_type.to_string()));
+                }
+                headers
+            }
             // Identity and attribution mirror the official client's LLM calls
             // exactly (opencodex PR #4437): UA with the AI SDK suffix, X-ZCode-Agent
             // last, fresh per-request trace ids, x-zcode-session-type: main, and NO
@@ -1164,6 +1175,19 @@ impl ProviderAccount {
                         &a.client_id,
                         &a.client_secret,
                     )
+                }
+                mahoquot_providers::KiroAuthMode::ExternalIdp if !a.client_id.is_empty() => {
+                    mahoquot_providers::build_kiro_idc_refresh_request(
+                        &a.refresh_token,
+                        a.effective_region(),
+                        &a.client_id,
+                        &a.client_secret,
+                    )
+                }
+                mahoquot_providers::KiroAuthMode::ExternalIdp
+                | mahoquot_providers::KiroAuthMode::ApiKey
+                | mahoquot_providers::KiroAuthMode::MachineToken => {
+                    mahoquot_providers::build_refresh_request("")
                 }
             },
             Self::Generic(a) if a.provider == "cline" => {
@@ -1338,7 +1362,16 @@ pub struct AccountMember {
     /// may still be valid, so inference continues until it actually expires;
     /// only the grant replay is suppressed. Cleared by any successful rotation.
     pub grant_rejected: Arc<std::sync::atomic::AtomicBool>,
+    pub kiro_responses_flag: Arc<RwLock<KiroResponsesFlagState>>,
     pub claude_device_id: String,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct KiroResponsesFlagState {
+    pub known: bool,
+    pub use_responses: bool,
+    pub until_unix_ms: i64,
+    pub last_recheck_ms: i64,
 }
 
 impl PoolMember for AccountMember {
@@ -1420,6 +1453,7 @@ impl AccountMember {
             devin_catalog: arc_swap::ArcSwapOption::empty(),
             devin_discovery_seq: Arc::new(AtomicU64::new(0)),
             grant_rejected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            kiro_responses_flag: Arc::new(RwLock::new(KiroResponsesFlagState::default())),
             claude_device_id,
         }
     }
@@ -1859,6 +1893,7 @@ impl AccountMember {
             devin_catalog: arc_swap::ArcSwapOption::new(new_catalog),
             devin_discovery_seq: Arc::clone(&self.devin_discovery_seq),
             grant_rejected: Arc::clone(&self.grant_rejected),
+            kiro_responses_flag: Arc::clone(&self.kiro_responses_flag),
             claude_device_id: self.claude_device_id.clone(),
         }
     }
@@ -2009,6 +2044,19 @@ impl AccountMember {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         match &*guard {
             ProviderAccount::Kiro(account) => Some(account.effective_region().to_string()),
+            _ => None,
+        }
+    }
+
+    pub fn kiro_token_type(&self) -> Option<&'static str> {
+        let guard = self
+            .inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match &*guard {
+            ProviderAccount::Kiro(account) => {
+                mahoquot_providers::kiro_token_type_header(account.auth_mode)
+            }
             _ => None,
         }
     }
@@ -2244,6 +2292,136 @@ impl AccountMember {
         *slot = (*slot).max(until_unix_ms);
     }
 
+    pub fn set_model_bench_kind(&self, model: &str, kind: BenchKind) {
+        self.bench_kinds
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(model_bench_key(model), kind);
+    }
+
+    pub fn model_reset_at_unix(&self, model: &str) -> Option<i64> {
+        let guard = self
+            .group_cooldowns
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard
+            .get(&model_bench_key(model))
+            .map(|until_ms| until_ms / 1000)
+    }
+
+    pub fn bench_reset_at_unix(&self, model: &str) -> Option<i64> {
+        match (
+            self.group_reset_at_unix(model),
+            self.model_reset_at_unix(model),
+        ) {
+            (Some(group), Some(single)) => Some(group.max(single)),
+            (group, single) => group.or(single),
+        }
+    }
+
+    pub fn kiro_responses_flag_cached(&self, now_ms: i64) -> Option<bool> {
+        let guard = self
+            .kiro_responses_flag
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (guard.until_unix_ms > now_ms).then_some(guard.use_responses)
+    }
+
+    pub fn kiro_responses_flag_fallback(&self) -> bool {
+        let guard = self
+            .kiro_responses_flag
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.known && guard.use_responses
+    }
+
+    pub fn record_kiro_responses_flag(&self, use_responses: bool, now_ms: i64) {
+        let mut guard = self
+            .kiro_responses_flag
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.known = true;
+        guard.use_responses = use_responses;
+        guard.until_unix_ms = now_ms.saturating_add(15 * 60 * 1000);
+        guard.last_recheck_ms = now_ms;
+    }
+
+    pub fn record_kiro_responses_flag_failure(&self, now_ms: i64) {
+        let mut guard = self
+            .kiro_responses_flag
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.until_unix_ms = now_ms.saturating_add(60 * 1000);
+        guard.last_recheck_ms = now_ms;
+    }
+
+    pub fn can_recheck_kiro_responses_flag(&self, now_ms: i64) -> bool {
+        let guard = self
+            .kiro_responses_flag
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        now_ms.saturating_sub(guard.last_recheck_ms) >= 30 * 1000
+    }
+
+    pub fn build_kiro_responses_headers(&self, attempt: usize) -> Vec<(String, String)> {
+        let mut headers = vec![
+            (
+                "authorization".to_string(),
+                format!("Bearer {}", self.access_token()),
+            ),
+            ("content-type".to_string(), "application/json".to_string()),
+            ("accept".to_string(), "text/event-stream".to_string()),
+            (
+                "user-agent".to_string(),
+                mahoquot_providers::kiro_cli_user_agent(),
+            ),
+            (
+                "x-amzn-kiro-origin".to_string(),
+                mahoquot_providers::KIRO_CLI_ORIGIN.to_string(),
+            ),
+            (
+                "x-amzn-codewhisperer-optout".to_string(),
+                "true".to_string(),
+            ),
+            (
+                "x-amzn-kiro-attempt".to_string(),
+                format!("{};max=3", attempt.max(1)),
+            ),
+        ];
+        if let Some(profile_arn) = self
+            .kiro_profile_arn()
+            .filter(|value| !value.trim().is_empty())
+        {
+            headers.push(("x-amzn-kiro-profile".to_string(), profile_arn));
+        }
+        if let Some(token_type) = self.kiro_token_type() {
+            headers.push(("tokentype".to_string(), token_type.to_string()));
+        }
+        headers
+    }
+
+    pub fn build_kiro_control_plane_headers(&self) -> Vec<(String, String)> {
+        let mut headers = vec![
+            (
+                "authorization".to_string(),
+                format!("Bearer {}", self.access_token()),
+            ),
+            ("accept".to_string(), "application/json".to_string()),
+            (
+                "user-agent".to_string(),
+                mahoquot_providers::kiro_cli_user_agent(),
+            ),
+            (
+                "x-amz-user-agent".to_string(),
+                mahoquot_providers::kiro_cli_amz_user_agent(),
+            ),
+        ];
+        if let Some(token_type) = self.kiro_token_type() {
+            headers.push(("tokentype".to_string(), token_type.to_string()));
+        }
+        headers
+    }
+
     /// The benched-group reset (unix secs) for `model`, when this account's
     /// provider meters it in a currently-benched group. Mirrors
     /// `group_available`'s group resolution so exhaustion ETAs and routability
@@ -2321,6 +2499,16 @@ impl AccountMember {
             .bench_kinds
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let model_key = model_bench_key(model);
+        let model_active = self
+            .group_cooldowns
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&model_key)
+            .is_some_and(|deadline| *deadline > now_unix_ms);
+        if model_active {
+            return kinds.get(&model_key).copied();
+        }
         if let Some(group) = self.quota_group_for(model) {
             let group_active = self
                 .group_cooldowns
@@ -4590,6 +4778,7 @@ pub fn load_account_members(auth_dir: &Path) -> anyhow::Result<Vec<Arc<AccountMe
             devin_catalog: arc_swap::ArcSwapOption::empty(),
             devin_discovery_seq: Arc::new(AtomicU64::new(0)),
             grant_rejected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            kiro_responses_flag: Arc::new(RwLock::new(KiroResponsesFlagState::default())),
         }));
     }
 

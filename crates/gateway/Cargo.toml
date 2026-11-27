@@ -64,4 +64,5 @@ rustls-pki-types = "1.15"
 tokio = { workspace = true, features = ["test-util"] }
 tower.workspace = true
 ed25519-dalek.workspace = true
+zstd = "0.14"
 

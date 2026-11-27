@@ -1792,6 +1792,7 @@ dependencies = [
  "uuid",
  "webrtc",
  "xxhash-rust",
+ "zstd",
 ]
 
 [[package]]
@@ -1816,6 +1817,7 @@ dependencies = [
  "axum",
  "base64",
  "chrono",
+ "futures",
  "jsonwebtoken",
  "mahoquot-registry",
  "mahoquot-types",
@@ -1826,6 +1828,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "zstd",
 ]
 
 [[package]]

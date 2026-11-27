@@ -43,7 +43,6 @@ const CLAUDE_CLI_USER_AGENT: &str = crate::claude_wire::USER_AGENT_CLI;
 /// Program id the CLI sends when spending a reset grant.
 const CLAUDE_RESET_PROGRAM: &str = "cedar_ember";
 const CURSOR_USAGE_URL: &str = "https://api2.cursor.sh/auth/usage-summary";
-const KIRO_USAGE_URL: &str = "https://q.us-east-1.amazonaws.com/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST";
 /// ClinePass subscription quota. The account's own API key is the bearer
 /// credential; there is no local login file to read and no OAuth to refresh.
 const CLINEPASS_USAGE_URL: &str = "https://api.cline.bot/api/v1/users/me/plan/usage-limits";
@@ -357,11 +356,15 @@ async fn refresh_account_usage_inner(
             refresh_json_usage(member, &client, &url, parse_cursor_usage_summary).await
         }
         ProviderKind::Kiro => {
-            let url = member
-                .upstream_override
-                .as_deref()
-                .map(|base| format!("{}/getUsageLimits", base.trim_end_matches('/')))
-                .unwrap_or_else(|| KIRO_USAGE_URL.to_string());
+            let region = member
+                .kiro_region()
+                .unwrap_or_else(|| mahoquot_providers::KIRO_DEFAULT_REGION.to_string());
+            let profile_arn = member.kiro_profile_arn();
+            let url = mahoquot_providers::kiro_usage_url(
+                member.upstream_override.as_deref(),
+                &region,
+                profile_arn.as_deref(),
+            );
             let client = state.try_client_for_member(member).map_err(|error| {
                 QuotaError::Upstream(format!("proxy client construction failed: {error}"))
             })?;
@@ -694,7 +697,12 @@ async fn refresh_json_usage(
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or(0);
     let mut request = client.get(url);
-    for (name, value) in member.build_upstream_headers() {
+    let headers = if member.kind() == ProviderKind::Kiro {
+        member.build_kiro_control_plane_headers()
+    } else {
+        member.build_upstream_headers()
+    };
+    for (name, value) in headers {
         request = request.header(name, value);
     }
     let response = request

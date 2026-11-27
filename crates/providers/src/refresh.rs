@@ -104,10 +104,7 @@ pub fn build_kiro_social_refresh_request(refresh_token: &str, region: &str) -> R
         url: crate::kiro::kiro_refresh_url(crate::kiro::KiroAuthMode::Social, region),
         form_fields: Vec::new(),
         json_body: Some(serde_json::json!({"refreshToken": refresh_token})),
-        headers: vec![(
-            "user-agent".to_string(),
-            "KiroIDE-0.7.45-mahoquot".to_string(),
-        )],
+        headers: vec![("user-agent".to_string(), crate::kiro::kiro_cli_user_agent())],
     }
 }
 

@@ -71,7 +71,7 @@ pub fn openai_to_kiro_with_profile(
             }
             history.push(json!({ "assistantResponseMessage": assistant }));
         } else {
-            let mut user = json!({"content": content, "modelId": model, "origin": "AI_EDITOR",
+            let mut user = json!({"content": content, "modelId": model, "origin": mahoquot_providers::KIRO_CLI_ORIGIN,
                 "images": images_content(message.get("content").unwrap_or(&Value::Null)),
                 "userInputMessageContext": {"toolResults": []}});
             if role == "tool" {
@@ -150,7 +150,7 @@ pub fn openai_to_kiro_with_profile(
     {
         history.pop().unwrap()["userInputMessage"].take()
     } else {
-        json!({"content": "", "modelId": model, "origin": "AI_EDITOR", "userInputMessageContext": {}})
+        json!({"content": "", "modelId": model, "origin": mahoquot_providers::KIRO_CLI_ORIGIN, "userInputMessageContext": {}})
     };
     let current = user_input["content"]
         .as_str()
@@ -185,6 +185,204 @@ pub fn openai_to_kiro_with_profile(
             "history": history,
         }
     });
+    if let Some(profile_arn) = profile_arn.filter(|value| !value.is_empty()) {
+        payload["profileArn"] = Value::String(profile_arn.to_string());
+    }
+    Ok(payload)
+}
+
+pub fn openai_to_kiro_responses_with_profile(
+    body: &Value,
+    profile_arn: Option<&str>,
+) -> Result<Value, String> {
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "missing model".to_string())?;
+    let model = model.strip_prefix("kiro/").unwrap_or(model);
+    let messages = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "missing messages".to_string())?;
+
+    let mut system = Vec::new();
+    let mut input = Vec::new();
+    for message in messages {
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("user");
+        let content = text_content(message.get("content").unwrap_or(&Value::Null));
+        if role == "system" || role == "developer" {
+            if !content.is_empty() {
+                system.push(content);
+            }
+            continue;
+        }
+        if role == "assistant" {
+            if let Some(reasoning) = message
+                .get("kiroRedactedReasoning")
+                .or_else(|| message.get("kiro_redacted_reasoning"))
+                .and_then(Value::as_str)
+                .filter(|v| !v.is_empty())
+            {
+                let encrypted = encode_kiro_redacted_reasoning_envelope(reasoning);
+                input.push(json!({
+                    "type": "reasoning",
+                    "summary": [],
+                    "encrypted_content": encrypted,
+                }));
+            } else if let Some(text) = message
+                .get("reasoning_content")
+                .or_else(|| message.get("thinking"))
+                .and_then(Value::as_str)
+                .filter(|v| !v.is_empty())
+            {
+                let signature = message
+                    .get("reasoning_signature")
+                    .or_else(|| message.get("signature"))
+                    .and_then(Value::as_str)
+                    .filter(|v| !v.is_empty());
+                let encrypted = encode_kiro_text_reasoning_envelope(text, signature);
+                input.push(json!({
+                    "type": "reasoning",
+                    "summary": [],
+                    "encrypted_content": encrypted,
+                }));
+            }
+            if !content.is_empty() {
+                input.push(json!({
+                    "role": "assistant",
+                    "content": content,
+                }));
+            }
+            if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
+                for call in calls {
+                    let arguments = match &call["function"]["arguments"] {
+                        Value::String(raw) => raw.clone(),
+                        Value::Null => "{}".to_string(),
+                        other => other.to_string(),
+                    };
+                    input.push(json!({
+                        "type": "function_call",
+                        "call_id": normalize_tool_id(call["id"].as_str().unwrap_or_default()),
+                        "name": call["function"]["name"],
+                        "arguments": arguments,
+                    }));
+                }
+            }
+        } else if role == "tool" {
+            let id = message
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "Kiro tool result missing tool_call_id".to_string())?;
+            let output = if content.trim().is_empty() {
+                "Tool completed without textual output".to_string()
+            } else {
+                content
+            };
+            input.push(json!({
+                "type": "function_call_output",
+                "call_id": normalize_tool_id(id),
+                "output": output,
+            }));
+        } else {
+            let imgs = images_content(message.get("content").unwrap_or(&Value::Null));
+            if !imgs.is_empty() {
+                let mut parts = Vec::new();
+                if !content.is_empty() {
+                    parts.push(json!({"type": "input_text", "text": content}));
+                }
+                for img in imgs {
+                    let fmt = img["format"].as_str().unwrap_or("png");
+                    let bytes = img["source"]["bytes"].as_str().unwrap_or_default();
+                    parts.push(json!({
+                        "type": "input_image",
+                        "image_url": format!("data:image/{fmt};base64,{bytes}"),
+                    }));
+                }
+                if !parts.is_empty() {
+                    input.push(json!({"role": "user", "content": parts}));
+                }
+            } else if !content.is_empty() {
+                input.push(json!({"role": "user", "content": content}));
+            }
+        }
+    }
+    if input.is_empty() {
+        return Err("messages contain no user turn".to_string());
+    }
+
+    let mut payload = json!({
+        "model": model,
+        "input": input,
+        "stream": true,
+        "origin": mahoquot_providers::KIRO_CLI_ORIGIN,
+        "metadata": {
+            "kiro:agent_mode": "vibe",
+            "kiro:conversation_id": format!("{:016x}", rand::random::<u64>()),
+        },
+    });
+    if !system.is_empty() {
+        payload["instructions"] = Value::String(system.join("
+
+"));
+    }
+    if let Some(tools) = body.get("tools").and_then(Value::as_array) {
+        let converted: Vec<Value> = tools
+            .iter()
+            .filter_map(|tool| tool.get("function"))
+            .filter_map(|function| {
+                let name = function.get("name")?.as_str()?;
+                if name.is_empty() {
+                    return None;
+                }
+                let mut schema = function
+                    .get("parameters")
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                sanitize_schema(&mut schema);
+                Some(json!({
+                    "type": "function",
+                    "name": name,
+                    "description": function.get("description").and_then(Value::as_str).unwrap_or(""),
+                    "parameters": schema,
+                }))
+            })
+            .collect();
+        if !converted.is_empty() {
+            payload["tools"] = Value::Array(converted);
+        }
+    }
+    let mut reasoning_obj = Map::new();
+    if let Some(kind) = body
+        .pointer("/reasoning/type")
+        .or_else(|| body.pointer("/thinking/type"))
+        .and_then(Value::as_str)
+        .filter(|v| !v.is_empty())
+    {
+        reasoning_obj.insert("type".to_string(), Value::String(kind.to_string()));
+    }
+    if let Some(effort) = body
+        .get("reasoning_effort")
+        .or_else(|| body.pointer("/reasoning/effort"))
+        .or_else(|| body.pointer("/output_config/effort"))
+        .and_then(Value::as_str)
+        .filter(|e| !e.is_empty())
+    {
+        reasoning_obj.insert("effort".to_string(), Value::String(effort.to_string()));
+    }
+    if let Some(summary) = body
+        .pointer("/reasoning/summary")
+        .or_else(|| body.pointer("/thinking/display"))
+        .and_then(Value::as_str)
+        .filter(|v| !v.is_empty())
+    {
+        reasoning_obj.insert("summary".to_string(), Value::String(summary.to_string()));
+    }
+    if !reasoning_obj.is_empty() {
+        payload["reasoning"] = Value::Object(reasoning_obj);
+    }
     if let Some(profile_arn) = profile_arn.filter(|value| !value.is_empty()) {
         payload["profileArn"] = Value::String(profile_arn.to_string());
     }
@@ -579,6 +777,334 @@ impl KiroDecoder {
             self.complete(out);
         }
     }
+}
+
+#[derive(Default)]
+pub struct KiroResponsesDecoder {
+    completed: bool,
+    next_tool_index: u64,
+    tool_indices: std::collections::HashMap<String, u64>,
+    argued_tools: std::collections::HashSet<u64>,
+    last_tool_index: Option<u64>,
+    refusal_streamed: bool,
+    output_chars: u64,
+}
+
+impl KiroResponsesDecoder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn derive_usage(&self, response: Option<&Value>) -> Option<Usage> {
+        let usage = response?.get("usage")?;
+        let input_tokens = usage.get("input_tokens").and_then(Value::as_u64);
+        let output_tokens = usage.get("output_tokens").and_then(Value::as_u64);
+        let total_tokens = usage.get("total_tokens").and_then(Value::as_u64);
+        if input_tokens.unwrap_or(0) > 0 || output_tokens.unwrap_or(0) > 0 {
+            let prompt = input_tokens.unwrap_or(0);
+            let completion = output_tokens.unwrap_or(0);
+            let cached = usage
+                .pointer("/input_tokens_details/cached_tokens")
+                .and_then(Value::as_u64);
+            let reasoning = usage
+                .pointer("/output_tokens_details/reasoning_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            return Some(Usage {
+                prompt_tokens: prompt,
+                completion_tokens: completion,
+                total_tokens: total_tokens.unwrap_or_else(|| prompt.saturating_add(completion)),
+                cached_tokens: cached.unwrap_or(0),
+                cached_tokens_known: cached.is_some(),
+                reasoning_tokens: reasoning,
+                cache_write_tokens: 0,
+                cache_write_tokens_known: false,
+            });
+        }
+        let percentage = usage
+            .get("kiro:context_usage_percentage")
+            .and_then(Value::as_f64)
+            .filter(|pct| pct.is_finite() && *pct > 0.0)?;
+        let total = ((percentage / 100.0) * KIRO_CONTEXT_WINDOW_TOKENS as f64).round() as u64;
+        if total == 0 {
+            return None;
+        }
+        let completion = if self.output_chars == 0 {
+            0
+        } else {
+            self.output_chars.div_ceil(KIRO_CHARS_PER_TOKEN).min(total)
+        };
+        Some(Usage {
+            prompt_tokens: total.saturating_sub(completion),
+            completion_tokens: completion,
+            total_tokens: total,
+            cached_tokens: 0,
+            cached_tokens_known: false,
+            reasoning_tokens: 0,
+            cache_write_tokens: 0,
+            cache_write_tokens_known: false,
+        })
+    }
+
+    pub fn decode_frame(&mut self, frame: &[u8], out: &mut Vec<CodexEvent>) {
+        if self.completed {
+            return;
+        }
+        let Ok(raw) = std::str::from_utf8(frame) else {
+            return;
+        };
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed == "[DONE]" {
+            return;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+            return;
+        };
+        let event_type = value.get("type").and_then(Value::as_str).unwrap_or_default();
+        match event_type {
+            "kiro:keep_alive" => {}
+            "response.created" => {
+                if let Some(id) = value.pointer("/response/id").and_then(Value::as_str) {
+                    out.push(CodexEvent::Created {
+                        response_id: id.to_string(),
+                    });
+                }
+            }
+            "response.output_text.delta" => {
+                if let Some(delta) = value.get("delta").and_then(Value::as_str) {
+                    if !delta.is_empty() {
+                        self.output_chars = self
+                            .output_chars
+                            .saturating_add(delta.chars().count() as u64);
+                        out.push(CodexEvent::TextDelta(delta.to_string()));
+                    }
+                }
+            }
+            "response.reasoning_text.delta" | "response.reasoning.delta" => {
+                if let Some(delta) = value.get("delta").and_then(Value::as_str) {
+                    if !delta.is_empty() {
+                        self.output_chars = self
+                            .output_chars
+                            .saturating_add(delta.chars().count() as u64);
+                        out.push(CodexEvent::ReasoningDelta(delta.to_string()));
+                    }
+                }
+            }
+            "response.refusal.delta" => {
+                if let Some(delta) = value.get("delta").and_then(Value::as_str) {
+                    if !delta.is_empty() {
+                        self.refusal_streamed = true;
+                        self.output_chars = self
+                            .output_chars
+                            .saturating_add(delta.chars().count() as u64);
+                        out.push(CodexEvent::TextDelta(delta.to_string()));
+                    }
+                }
+            }
+            "response.refusal.done" => {
+                if !self.refusal_streamed {
+                    if let Some(refusal) = value.get("refusal").and_then(Value::as_str) {
+                        if !refusal.is_empty() {
+                            self.output_chars = self
+                                .output_chars
+                                .saturating_add(refusal.chars().count() as u64);
+                            out.push(CodexEvent::TextDelta(refusal.to_string()));
+                        }
+                    }
+                }
+            }
+            "response.output_item.added" => {
+                let Some(item) = value.get("item") else {
+                    return;
+                };
+                if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                    let call_id = item
+                        .get("call_id")
+                        .or_else(|| item.get("id"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let name = item
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let output_index = self.next_tool_index;
+                    self.next_tool_index += 1;
+                    if let Some(item_id) = item.get("id").and_then(Value::as_str) {
+                        self.tool_indices.insert(item_id.to_string(), output_index);
+                    }
+                    if !call_id.is_empty() {
+                        self.tool_indices.insert(call_id.clone(), output_index);
+                    }
+                    self.last_tool_index = Some(output_index);
+                    out.push(CodexEvent::ToolCallBegin {
+                        output_index,
+                        call_id,
+                        name,
+                    });
+                    if let Some(args) = item
+                        .get("arguments")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                    {
+                        self.argued_tools.insert(output_index);
+                        out.push(CodexEvent::ToolArgsDelta {
+                            output_index,
+                            delta: args.to_string(),
+                        });
+                    }
+                }
+            }
+            "response.function_call_arguments.delta" => {
+                let output_index = value
+                    .get("item_id")
+                    .or_else(|| value.get("call_id"))
+                    .and_then(Value::as_str)
+                    .and_then(|id| self.tool_indices.get(id).copied())
+                    .or(self.last_tool_index);
+                if let (Some(output_index), Some(delta)) = (
+                    output_index,
+                    value.get("delta").and_then(Value::as_str),
+                ) {
+                    if !delta.is_empty() {
+                        self.argued_tools.insert(output_index);
+                        out.push(CodexEvent::ToolArgsDelta {
+                            output_index,
+                            delta: delta.to_string(),
+                        });
+                    }
+                }
+            }
+            "response.output_item.done" => {
+                let Some(item) = value.get("item") else {
+                    return;
+                };
+                match item.get("type").and_then(Value::as_str) {
+                    Some("reasoning") => {
+                        if let Some(encrypted) = item
+                            .get("encrypted_content")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                        {
+                            if let Some(event) = decode_kiro_reasoning_envelope(encrypted) {
+                                out.push(event);
+                            }
+                        }
+                    }
+                    Some("function_call") => {
+                        let output_index = item
+                            .get("id")
+                            .or_else(|| item.get("call_id"))
+                            .and_then(Value::as_str)
+                            .and_then(|id| self.tool_indices.get(id).copied())
+                            .or(self.last_tool_index);
+                        if let Some(output_index) = output_index {
+                            if !self.argued_tools.contains(&output_index) {
+                                if let Some(args) = item
+                                    .get("arguments")
+                                    .and_then(Value::as_str)
+                                    .filter(|s| !s.is_empty())
+                                {
+                                    self.argued_tools.insert(output_index);
+                                    out.push(CodexEvent::ToolArgsDelta {
+                                        output_index,
+                                        delta: args.to_string(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            "response.completed" | "response.incomplete" => {
+                let response = value.get("response");
+                let incomplete = event_type == "response.incomplete"
+                    || response
+                        .and_then(|r| r.get("status"))
+                        .and_then(Value::as_str)
+                        == Some("incomplete");
+                if incomplete {
+                    match response
+                        .and_then(|r| r.pointer("/incomplete_details/reason"))
+                        .and_then(Value::as_str)
+                    {
+                        Some("max_output_tokens") => out.push(CodexEvent::OutputLimitReached),
+                        Some("content_filter") => out.push(CodexEvent::ContentFilterReached),
+                        _ => {}
+                    }
+                }
+                self.completed = true;
+                out.push(CodexEvent::Completed {
+                    usage: self.derive_usage(response),
+                });
+            }
+            "error" | "response.failed" => {
+                let err_obj = if event_type == "error" {
+                    value.get("error").unwrap_or(&value)
+                } else {
+                    value.pointer("/response/error").unwrap_or(&value)
+                };
+                let message = kiro_error_message(err_obj)
+                    .unwrap_or_else(|| "Kiro CreateResponse stream error".to_string());
+                self.completed = true;
+                out.push(CodexEvent::Failed { message });
+            }
+            _ => {}
+        }
+    }
+
+    pub fn finish(&mut self, out: &mut Vec<CodexEvent>) {
+        if !self.completed {
+            self.completed = true;
+            out.push(CodexEvent::Completed { usage: None });
+        }
+    }
+}
+
+fn encode_kiro_redacted_reasoning_envelope(raw: &str) -> String {
+    if let Ok(parsed) = serde_json::from_str::<Value>(raw) {
+        if parsed.get("redactedContent").and_then(Value::as_str).is_some()
+            || parsed.pointer("/reasoningText/text").and_then(Value::as_str).is_some()
+        {
+            return raw.to_string();
+        }
+    }
+    json!({"redactedContent": raw}).to_string()
+}
+
+fn encode_kiro_text_reasoning_envelope(text: &str, signature: Option<&str>) -> String {
+    let mut inner = Map::new();
+    inner.insert("text".to_string(), Value::String(text.to_string()));
+    if let Some(sig) = signature {
+        inner.insert("signature".to_string(), Value::String(sig.to_string()));
+    }
+    json!({"reasoningText": Value::Object(inner)}).to_string()
+}
+
+fn decode_kiro_reasoning_envelope(raw: &str) -> Option<CodexEvent> {
+    let parsed = serde_json::from_str::<Value>(raw).ok()?;
+    if let Some(redacted) = parsed
+        .get("redactedContent")
+        .and_then(Value::as_str)
+        .filter(|v| !v.is_empty())
+    {
+        return Some(CodexEvent::KiroRedactedReasoning(redacted.to_string()));
+    }
+    if parsed
+        .pointer("/reasoningText/text")
+        .and_then(Value::as_str)
+        .is_some()
+    {
+        if let Some(sig) = parsed
+            .pointer("/reasoningText/signature")
+            .and_then(Value::as_str)
+        {
+            return Some(CodexEvent::ReasoningSignature(sig.to_string()));
+        }
+    }
+    None
 }
 
 fn kiro_error_message(value: &Value) -> Option<String> {

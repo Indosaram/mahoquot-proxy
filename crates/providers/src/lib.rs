@@ -55,9 +55,17 @@ pub use devin::{
 };
 #[allow(deprecated)]
 pub use kiro::{
-    is_kiro_model, kiro_generate_url, kiro_refresh_url, list_kiro_auth_files, KiroAccount,
-    KiroAuthMode, KIRO_API_HOST_TEMPLATE, KIRO_DEFAULT_REGION, KIRO_GENERATE_PATH,
-    KIRO_IDC_REFRESH_TEMPLATE, KIRO_SOCIAL_REFRESH_TEMPLATE,
+    current_kiro_cli_version, current_kiro_kas_version, fetch_kas_version_from_tar_zst_url,
+    is_kiro_model, is_newer_kiro_version, kiro_cli_amz_user_agent, kiro_cli_user_agent,
+    kiro_feature_config_url, kiro_generate_url, kiro_refresh_url, kiro_responses_url,
+    kiro_token_type_header, kiro_usage_url, list_kiro_auth_files, refresh_kiro_cli_version,
+    refresh_kiro_cli_version_from_url, resolve_kas_package_url, update_kiro_cli_version,
+    update_kiro_kas_version, KiroAccount, KiroAuthMode, KIRO_API_HOST_TEMPLATE,
+    KIRO_CLI_DEFAULT_VERSION, KIRO_CLI_MANIFEST_URL, KIRO_CLI_ORIGIN, KIRO_DEFAULT_REGION,
+    KIRO_FEATURE_CONFIG_PATH, KIRO_FEATURE_CONFIG_SALT, KIRO_GENERATE_PATH,
+    KIRO_IDC_REFRESH_TEMPLATE, KIRO_KAS_DEFAULT_VERSION, KIRO_KAS_VERSION,
+    KIRO_MANAGEMENT_HOST_TEMPLATE, KIRO_RESPONSES_PATH, KIRO_SOCIAL_REFRESH_TEMPLATE,
+    KIRO_USAGE_LIMITS_PATH,
 };
 pub use mimo::{
     execute_mimo_bootstrap, is_mimo_endpoint, MIMO_BOOTSTRAP_URL, MIMO_CHAT_URL, MIMO_SOURCE,

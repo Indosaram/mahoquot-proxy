@@ -972,7 +972,20 @@ pub fn parse_cursor_usage_summary(body: &serde_json::Value, now_unix: i64) -> Ac
     }
 }
 
+fn parse_unix_timestamp(value: &serde_json::Value) -> Option<i64> {
+    value.as_i64().or_else(|| {
+        value
+            .as_f64()
+            .filter(|seconds| seconds.is_finite() && *seconds >= 0.0 && *seconds <= i64::MAX as f64)
+            .map(|seconds| seconds.trunc() as i64)
+    })
+}
+
 pub fn parse_kiro_usage_summary(body: &serde_json::Value, now_unix: i64) -> AccountUsage {
+    let fallback_reset = body
+        .get("nextDateReset")
+        .or_else(|| body.get("next_date_reset"))
+        .and_then(parse_unix_timestamp);
     let buckets = body
         .get("usageBreakdownList")
         .or_else(|| body.get("usage_breakdown_list"))
@@ -998,7 +1011,10 @@ pub fn parse_kiro_usage_summary(body: &serde_json::Value, now_unix: i64) -> Acco
                     .and_then(|v| v.as_str())
                     .unwrap_or("Usage"),
                 percent,
-                item.get("nextDateReset").and_then(|v| v.as_i64()),
+                item.get("nextDateReset")
+                    .or_else(|| item.get("next_date_reset"))
+                    .and_then(parse_unix_timestamp)
+                    .or(fallback_reset),
                 now_unix,
             )
         })

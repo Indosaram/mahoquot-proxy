@@ -366,20 +366,21 @@ pub async fn fetch_account_email(
     profile_arn: &str,
 ) -> Option<String> {
     let region = region_from_profile_arn(profile_arn)?;
-    let url = format!("https://management.{region}.kiro.dev/getUsageLimits");
+    let url = format!(
+        "https://management.{region}.kiro.dev{}",
+        crate::kiro::KIRO_USAGE_LIMITS_PATH
+    );
     let response = client
         .get(url)
         .query(&[
-            ("origin", "AI_EDITOR"),
+            ("origin", crate::kiro::KIRO_CLI_ORIGIN),
             ("profileArn", profile_arn),
             ("resourceType", "AGENTIC_REQUEST"),
             ("isEmailRequired", "true"),
         ])
-        .header("user-agent", "aws-sdk-js/1.0.0 KiroIDE-1.1.70-mahoquot")
-        .header(
-            "x-amz-user-agent",
-            "aws-sdk-js/1.0.0 KiroIDE-1.1.70-mahoquot",
-        )
+        .header("user-agent", crate::kiro::kiro_cli_user_agent())
+        .header("x-amz-user-agent", crate::kiro::kiro_cli_amz_user_agent())
+        .header("tokentype", "SSO_OIDC")
         .bearer_auth(access_token)
         .send()
         .await

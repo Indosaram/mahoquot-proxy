@@ -725,6 +725,25 @@ async fn main() -> anyhow::Result<()> {
     // access token turns the first post-expiry attempt into a terminal failure.
     let pre_expiry_refresh =
         mahoquot_gateway::pre_expiry_refresh::spawn_from_env(Arc::clone(&state));
+    let kiro_version_refresher = tokio::spawn({
+        let client = reqwest::Client::new();
+        async move {
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(24 * 60 * 60));
+            loop {
+                interval.tick().await;
+                match mahoquot_providers::refresh_kiro_cli_version(&client).await {
+                    Ok(true) => info!(
+                        version = %mahoquot_providers::current_kiro_cli_version(),
+                        kas = %mahoquot_providers::current_kiro_kas_version(),
+                        "updated Kiro CLI/KAS version from stable manifest"
+                    ),
+                    Ok(false) => {}
+                    Err(error) => warn!(%error, "kiro cli version refresh failed"),
+                }
+            }
+        }
+    });
     mahoquot_gateway::egress_supervisor::spawn_egress_supervisor(
         state.clone(),
         std::time::Duration::from_secs(10),
@@ -746,6 +765,7 @@ async fn main() -> anyhow::Result<()> {
     catalog_refresh.shutdown().await;
     cline_catalog.shutdown().await;
     pre_expiry_refresh.shutdown().await;
+    kiro_version_refresher.abort();
     claude_budget_refresher.abort();
     claude_affinity_shutdown.notify_one();
     if tokio::time::timeout(

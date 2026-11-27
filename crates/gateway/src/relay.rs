@@ -1843,18 +1843,31 @@ fn resolve_target(
         if member.kind() == crate::account::ProviderKind::Kiro {
             let openai = openai_body_with_model(plan, upstream_model)
                 .ok_or_else(|| "Kiro requires an OpenAI-shaped request".to_string())?;
+            let region = member
+                .kiro_region()
+                .unwrap_or_else(|| mahoquot_providers::KIRO_DEFAULT_REGION.to_string());
+            let profile_arn = member.kiro_profile_arn();
+            if member.kiro_responses_flag_fallback() {
+                return Ok(UpstreamTarget {
+                    url: mahoquot_providers::kiro_responses_url(upstream, &region),
+                    body: Bytes::from(
+                        serde_json::to_vec(&compat::kiro::openai_to_kiro_responses_with_profile(
+                            &openai,
+                            profile_arn.as_deref(),
+                        )?)
+                        .map_err(|e| e.to_string())?,
+                    ),
+                    protocol: compat::Protocol::KiroResponses,
+                    headers: Some(member.build_kiro_responses_headers(1)),
+                    replay: None,
+                });
+            }
             return Ok(UpstreamTarget {
-                url: mahoquot_providers::kiro_generate_url(
-                    upstream,
-                    member
-                        .kiro_region()
-                        .as_deref()
-                        .unwrap_or(mahoquot_providers::KIRO_DEFAULT_REGION),
-                ),
+                url: mahoquot_providers::kiro_generate_url(upstream, &region),
                 body: Bytes::from(
                     serde_json::to_vec(&compat::kiro::openai_to_kiro_with_profile(
                         &openai,
-                        member.kiro_profile_arn().as_deref(),
+                        profile_arn.as_deref(),
                     )?)
                     .map_err(|e| e.to_string())?,
                 ),
@@ -2199,6 +2212,9 @@ async fn send_upstream(
     let member_sets_content_type = member_headers
         .iter()
         .any(|(name, _)| name.eq_ignore_ascii_case("content-type"));
+    let member_sets_accept = member_headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("accept"));
     for (name, val) in member_headers {
         req_builder = req_builder.header(name, val);
     }
@@ -2208,7 +2224,7 @@ async fn send_upstream(
             accept.unwrap_or(compat::devin::STREAM_CONTENT_TYPE),
         );
     } else {
-        if let Some(accept) = accept.filter(|_| !claude_direct) {
+        if let Some(accept) = accept.filter(|_| !claude_direct && !member_sets_accept) {
             req_builder = req_builder.header(header::ACCEPT, accept);
         }
         // reqwest appends. x.ai's edge answers 415 when content-type is
@@ -2585,9 +2601,17 @@ pub fn cooldown_deadline_from_headers(headers: &reqwest::header::HeaderMap, now_
     // source), so the account returns exactly when its window frees instead of
     // sitting out a fixed 5-minute default.
     let retry_after_secs = headers
-        .get(reqwest::header::RETRY_AFTER)
+        .get("x-amzn-kiro-ratelimit-retry-after")
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| parse_retry_after(v.trim(), now_ms))
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|ms| ms.is_finite() && *ms > 0.0)
+        .map(|ms| (ms.ceil() as i64).saturating_add(999) / 1000)
+        .or_else(|| {
+            headers
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| parse_retry_after(v.trim(), now_ms))
+        })
         .or_else(|| {
             headers
                 .iter()
@@ -2681,8 +2705,183 @@ pub(crate) fn resolve_cline_deadline(
 /// zcode plan's quota biz error (1005). Exhaustion is an expected state the
 /// cooldown deadline already surfaces, so it must not be recorded as an
 /// account error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KiroPaymentClassification {
+    QuotaExhausted(crate::account::BenchKind),
+    SeatUnavailable,
+    ConversationLimit,
+    Unclassified,
+}
+
+fn kiro_feature_wire_key(name: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(mahoquot_providers::KIRO_FEATURE_CONFIG_SALT.as_bytes());
+    hasher.update(name.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+async fn fetch_kiro_responses_flag(state: &AppState, member: &AccountMember, now_ms: i64) -> bool {
+    let region = member
+        .kiro_region()
+        .unwrap_or_else(|| mahoquot_providers::KIRO_DEFAULT_REGION.to_string());
+    let url = mahoquot_providers::kiro_feature_config_url(member.upstream_override.as_deref(), &region);
+    let Ok(client) = state.try_client_for_member(member) else {
+        member.record_kiro_responses_flag_failure(now_ms);
+        return member.kiro_responses_flag_fallback();
+    };
+    let mut req = client
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(5))
+        .bearer_auth(member.access_token())
+        .header("accept", "application/json")
+        .header("user-agent", mahoquot_providers::kiro_cli_user_agent());
+    if let Some(arn) = member
+        .kiro_profile_arn()
+        .filter(|value| !value.trim().is_empty())
+    {
+        req = req.header("x-amzn-kiro-profile-arn", arn);
+    }
+    if let Some(token_type) = member.kiro_token_type() {
+        req = req.header("tokentype", token_type);
+    }
+    let Ok(resp) = req.send().await else {
+        member.record_kiro_responses_flag_failure(now_ms);
+        return member.kiro_responses_flag_fallback();
+    };
+    if !resp.status().is_success() {
+        member.record_kiro_responses_flag_failure(now_ms);
+        return member.kiro_responses_flag_fallback();
+    }
+    let Ok(body) = resp.json::<serde_json::Value>().await else {
+        member.record_kiro_responses_flag_failure(now_ms);
+        return member.kiro_responses_flag_fallback();
+    };
+    let key = kiro_feature_wire_key("create_response_api");
+    let use_responses = body
+        .get("configuration")
+        .and_then(|cfg| cfg.get(&key))
+        .and_then(serde_json::Value::as_str)
+        == Some("create_response");
+    member.record_kiro_responses_flag(use_responses, now_ms);
+    use_responses
+}
+
+async fn ensure_kiro_responses_flag(state: &AppState, member: &AccountMember) -> bool {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or(0);
+    if let Some(cached) = member.kiro_responses_flag_cached(now_ms) {
+        return cached;
+    }
+    fetch_kiro_responses_flag(state, member, now_ms).await
+}
+
+static LAST_KIRO_VERSION_GATE_RECHECK_SECS: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(0);
+
+fn maybe_refresh_kiro_version_on_gate(body: &[u8]) {
+    let Ok(text) = std::str::from_utf8(body) else {
+        return;
+    };
+    if !text.contains("FEATURE_NOT_SUPPORTED") {
+        return;
+    }
+    let now = now_unix_secs();
+    let prev = LAST_KIRO_VERSION_GATE_RECHECK_SECS.load(Ordering::Relaxed);
+    if now.saturating_sub(prev) < 600 {
+        return;
+    }
+    if LAST_KIRO_VERSION_GATE_RECHECK_SECS
+        .compare_exchange(prev, now, Ordering::SeqCst, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    tokio::spawn(async move {
+        let client = reqwest::Client::new();
+        let _ = mahoquot_providers::refresh_kiro_cli_version(&client).await;
+    });
+}
+
+fn extract_kiro_error_reason(body: &[u8]) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let raw = parsed
+        .pointer("/cause/reason")
+        .or_else(|| parsed.get("reason"))
+        .or_else(|| parsed.pointer("/error/code"))
+        .and_then(serde_json::Value::as_str)?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let stripped = trimmed
+        .strip_prefix("kiro:")
+        .or_else(|| trimmed.strip_prefix("KIRO:"))
+        .unwrap_or(trimmed);
+    Some(stripped.to_ascii_uppercase())
+}
+
+fn extract_kiro_error_type(body: &[u8]) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let raw = parsed
+        .pointer("/error/type")
+        .or_else(|| parsed.get("__type"))
+        .or_else(|| parsed.pointer("/cause/name"))
+        .or_else(|| parsed.get("name"))
+        .and_then(serde_json::Value::as_str)?;
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_ascii_lowercase())
+}
+
+pub fn classify_kiro_payment_error(body: &[u8]) -> KiroPaymentClassification {
+    match extract_kiro_error_reason(body).as_deref() {
+        Some(
+            "HOURLY_REQUEST_COUNT"
+            | "DAILY_REQUEST_COUNT"
+            | "WEEKLY_REQUEST_COUNT"
+            | "MONTHLY_REQUEST_COUNT"
+            | "USAGE_LIMIT_REACHED",
+        ) => KiroPaymentClassification::QuotaExhausted(crate::account::BenchKind::QuotaExhausted),
+        Some(
+            "OVERAGE_REQUEST_LIMIT_EXCEEDED"
+            | "CREDIT_BALANCE_EXHAUSTED"
+            | "INSUFFICIENT_QUOTA",
+        ) => KiroPaymentClassification::QuotaExhausted(crate::account::BenchKind::OutOfCredit),
+        Some("SEAT_UNAVAILABLE") => KiroPaymentClassification::SeatUnavailable,
+        Some("CONVERSATION_LIMIT_EXCEEDED") => KiroPaymentClassification::ConversationLimit,
+        Some(_) => KiroPaymentClassification::Unclassified,
+        None => {
+            if extract_kiro_error_type(body).as_deref() == Some("insufficient_quota") {
+                KiroPaymentClassification::QuotaExhausted(crate::account::BenchKind::OutOfCredit)
+            } else {
+                KiroPaymentClassification::Unclassified
+            }
+        }
+    }
+}
+
+fn kiro_body_retry_after_secs(body: &[u8]) -> Option<i64> {
+    let parsed: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let ms = parsed
+        .get("retryAfterMilliseconds")
+        .or_else(|| parsed.pointer("/error/retryAfterMilliseconds"))
+        .and_then(serde_json::Value::as_f64)?;
+    if !ms.is_finite() || ms <= 0.0 {
+        return None;
+    }
+    Some(((ms.ceil() as i64).saturating_add(999) / 1000).clamp(1, MAX_COOLDOWN_SECS))
+}
+
 fn failure_is_limit_exhaustion(body: &[u8]) -> bool {
     if parse_cline_cap_error(body).is_some() || failure_is_insufficient_credits(body) {
+        return true;
+    }
+    if matches!(
+        classify_kiro_payment_error(body),
+        KiroPaymentClassification::QuotaExhausted(_)
+    ) {
         return true;
     }
     serde_json::from_slice::<serde_json::Value>(body)
@@ -2840,6 +3039,10 @@ async fn record_cooldown(
     // Retry-After is upstream-controlled: clamp so a hostile or broken value
     // cannot overflow into a past (or panicking) cooldown deadline. Read the
     // headers before the body extraction consumes the response.
+    let has_explicit_retry_header = resp.headers().contains_key(reqwest::header::RETRY_AFTER)
+        || resp
+            .headers()
+            .contains_key("x-amzn-kiro-ratelimit-retry-after");
     let header_until_unix_ms = cooldown_deadline_from_headers(resp.headers(), now_ms);
     // Claude reports a model/overage-scoped rejection with the shared 5h/7d
     // windows still allowed: only the requested model is benched, the account
@@ -2886,6 +3089,11 @@ async fn record_cooldown(
         } else {
             (model.map(ToString::to_string), header_until_unix_ms)
         }
+    } else if member.kind() == crate::account::ProviderKind::Kiro && !has_explicit_retry_header {
+        let until = kiro_body_retry_after_secs(&failure.body)
+            .map(|secs| cooldown_deadline_ms(now_ms, secs))
+            .unwrap_or(header_until_unix_ms);
+        (model.map(ToString::to_string), until)
     } else {
         (model.map(ToString::to_string), header_until_unix_ms)
     };
@@ -2943,6 +3151,25 @@ fn bench_exhausted_quota(
     }
     member.set_health(Health::Cooldown { until_unix_ms });
     member.set_account_bench_kind(kind);
+}
+
+fn bench_exhausted_quota_for_model(
+    member: &AccountMember,
+    model: Option<&str>,
+    until_unix_ms: i64,
+    kind: crate::account::BenchKind,
+) {
+    let Some(model) = model else {
+        member.set_health(Health::Cooldown { until_unix_ms });
+        member.set_account_bench_kind(kind);
+        return;
+    };
+    if member.set_group_cooldown(model, until_unix_ms) {
+        member.set_group_bench_kind(model, kind);
+    } else {
+        member.set_model_cooldown(model, until_unix_ms);
+        member.set_model_bench_kind(model, kind);
+    }
 }
 
 /// Bench a cline cap under **both** model names it can be routed by.
@@ -3446,6 +3673,7 @@ fn earliest_exhaustion_reset_unix_secs(
         }
         for reset in [
             canonical_model.and_then(|model| member.group_reset_at_unix(model)),
+            canonical_model.and_then(|model| member.model_reset_at_unix(model)),
             member.reset_at_unix(),
         ]
         .into_iter()
@@ -3496,7 +3724,7 @@ fn benched_pool_cause(
             continue;
         }
         let group_benched = member
-            .group_reset_at_unix(model)
+            .bench_reset_at_unix(model)
             .is_some_and(|reset| reset > now);
         let account_benched = matches!(
             member.health(),
@@ -3977,10 +4205,6 @@ fn json_error(status: StatusCode, message: &str) -> Response {
 }
 
 fn is_account_scoped_model_rejection(status_code: u16, body: &[u8]) -> bool {
-    if status_code == 402 {
-        return true;
-    }
-    // Model rejections also arrive as 403s on entitlement-gated shards.
     if status_code != 400 && status_code != 403 {
         return false;
     }
@@ -6965,6 +7189,7 @@ pub async fn handle_relay(
     // Each round excludes attempted accounts and the round ceiling bounds
     // repetition. Cooldown waiting never changes the network timeout policy.
     let mut failover_budget = 0usize;
+    let mut unclassified_kiro_payment = false;
     loop {
         if (retry_limit == 0 && failover_budget >= max_attempts)
             || permission_denied_accounts.len() >= max_attempts
@@ -7080,7 +7305,7 @@ pub async fn handle_relay(
                             Some(
                                 account_deadline.max(
                                     member
-                                        .group_reset_at_unix(select_model.unwrap_or_default())
+                                        .bench_reset_at_unix(select_model.unwrap_or_default())
                                         .map(|unix_secs| unix_secs.saturating_mul(1000))
                                         .unwrap_or(now_ms),
                                 ),
@@ -7194,6 +7419,9 @@ pub async fn handle_relay(
                 StatusCode::BAD_REQUEST,
                 "target translation does not support document inputs",
             );
+        }
+        if member.kind() == crate::account::ProviderKind::Kiro {
+            let _ = ensure_kiro_responses_flag(&state, &member).await;
         }
         let target = match resolve_target(
             &pool,
@@ -7408,7 +7636,7 @@ pub async fn handle_relay(
         if status_code == 401 && state.auth_refresh_enabled && !refreshed_this_account {
             match state.refresh_member(&member, Some(&member_at)).await {
                 Ok(_) => {
-                    if is_claude_direct_wire {
+                    if is_claude_direct_wire || target.protocol == compat::Protocol::KiroResponses {
                         if let Some(ref mut headers) = target_headers {
                             if let Some(auth) = headers
                                 .iter_mut()
@@ -7801,12 +8029,64 @@ pub async fn handle_relay(
         }
 
         if status_code == 429 {
+            if member.kind() == crate::account::ProviderKind::Kiro
+                && target.protocol == compat::Protocol::Kiro
+            {
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
+                    .unwrap_or(0);
+                let has_explicit_retry_header = resp
+                    .headers()
+                    .contains_key(reqwest::header::RETRY_AFTER)
+                    || resp
+                        .headers()
+                        .contains_key("x-amzn-kiro-ratelimit-retry-after");
+                let header_until_unix_ms = cooldown_deadline_from_headers(resp.headers(), now_ms);
+                let failure = extract_failure(resp, status_code).await;
+                if extract_kiro_error_reason(&failure.body).as_deref()
+                    == Some("USER_REQUEST_RATE_EXCEEDED")
+                    && member.can_recheck_kiro_responses_flag(now_ms)
+                    && fetch_kiro_responses_flag(&state, &member, now_ms).await
+                {
+                    attempted.retain(|idx| *idx != chosen_idx);
+                    pinned_idx = Some(chosen_idx);
+                    round_attempts = round_attempts.saturating_sub(1);
+                    last_failure = Some(failure);
+                    continue;
+                }
+                let bench_kind = if failure_is_limit_exhaustion(&failure.body) {
+                    crate::account::BenchKind::QuotaExhausted
+                } else {
+                    crate::account::BenchKind::RateLimited
+                };
+                let until_unix_ms = if has_explicit_retry_header {
+                    header_until_unix_ms
+                } else {
+                    kiro_body_retry_after_secs(&failure.body)
+                        .map(|secs| cooldown_deadline_ms(now_ms, secs))
+                        .unwrap_or(header_until_unix_ms)
+                };
+                bench_exhausted_quota_for_model(
+                    &member,
+                    select_model.or(plan.model.as_deref()),
+                    until_unix_ms,
+                    bench_kind,
+                );
+                member.record_fail();
+                state.metrics.failed_over.fetch_add(1, Ordering::Relaxed);
+                state.monitor.clear_error(member.id());
+                if !failure_is_limit_exhaustion(&failure.body) {
+                    failover_budget += 1;
+                    round_retryable = true;
+                } else {
+                    round_attempts = round_attempts.saturating_sub(1);
+                }
+                last_failure = Some(failure);
+                continue;
+            }
             let failure =
                 record_cooldown(resp, &member, status_code, plan.model.as_deref(), &state).await;
-            // A limit-exhaustion 429 durably benches this account (hours, per
-            // the upstream reset), so it cannot repeat here: keep walking the
-            // pool without spending the failover budget. Any other 429 stays
-            // budgeted — it may be a shared limiter that every account hits.
             if !failure_is_limit_exhaustion(&failure.body) {
                 failover_budget += 1;
                 round_retryable = true;
@@ -7819,11 +8099,6 @@ pub async fn handle_relay(
 
         if status_code == 402 {
             let failure = extract_failure(resp, status_code).await;
-            // Cline bills a free-tier account's overflow to paid Credits; a
-            // $0 balance answers 402 insufficient_credits on a model the
-            // account has otherwise exhausted. That is account-scoped, but it
-            // is a balance rather than a timer: bench briefly and keep walking
-            // the pool without spending the failover budget.
             if failure_is_insufficient_credits(&failure.body)
                 && plan.model.is_some()
                 && member.provider_name() == "cline"
@@ -7857,6 +8132,50 @@ pub async fn handle_relay(
                 label_credit_bench(&member, &cap_model, plan.model.as_deref(), reset_at * 1000);
                 last_failure = Some(failure);
                 continue;
+            }
+            if member.kind() == crate::account::ProviderKind::Kiro {
+                match classify_kiro_payment_error(&failure.body) {
+                    KiroPaymentClassification::QuotaExhausted(kind) => {
+                        let bench_now_ms = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
+                            .unwrap_or(0);
+                        let until_unix_ms = bench_now_ms
+                            .saturating_add(CLINE_CREDIT_BACKOFF_SECS.saturating_mul(1000));
+                        round_attempts = round_attempts.saturating_sub(1);
+                        bench_exhausted_quota_for_model(
+                            &member,
+                            select_model.or(plan.model.as_deref()),
+                            until_unix_ms,
+                            kind,
+                        );
+                        last_failure = Some(failure);
+                        continue;
+                    }
+                    KiroPaymentClassification::SeatUnavailable => {
+                        let bench_now_ms = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
+                            .unwrap_or(0);
+                        let until_unix_ms = bench_now_ms
+                            .saturating_add(CLINE_CREDIT_BACKOFF_SECS.saturating_mul(1000));
+                        round_attempts = round_attempts.saturating_sub(1);
+                        bench_exhausted_quota_for_model(
+                            &member,
+                            select_model.or(plan.model.as_deref()),
+                            until_unix_ms,
+                            crate::account::BenchKind::QuotaExhausted,
+                        );
+                        last_failure = Some(failure);
+                        continue;
+                    }
+                    KiroPaymentClassification::ConversationLimit
+                    | KiroPaymentClassification::Unclassified => {
+                        unclassified_kiro_payment = true;
+                        last_failure = Some(failure);
+                        break;
+                    }
+                }
             }
             last_failure = Some(failure);
             failover_budget += 1;
@@ -7974,6 +8293,9 @@ pub async fn handle_relay(
         }
 
         if status_code == 403 {
+            if member.kind() == crate::account::ProviderKind::Kiro {
+                maybe_refresh_kiro_version_on_gate(&failure.body);
+            }
             member.record_fail();
             if member.kind() == crate::account::ProviderKind::Claude {
                 tracing::warn!(account = member.id(), model = ?plan.model, "upstream HTTP permission denied; excluding account for this request");
@@ -8097,7 +8419,20 @@ pub async fn handle_relay(
         .unwrap_or((None, None));
 
     let response = match last_failure {
-        Some(final_fail) if failure_is_limit_exhaustion(&final_fail.body) => {
+        Some(final_fail) if unclassified_kiro_payment => body_response(
+            final_fail.status,
+            final_fail.content_type.as_deref(),
+            final_fail.body,
+        ),
+        Some(final_fail)
+            if failure_is_limit_exhaustion(&final_fail.body)
+                || (final_fail.status == StatusCode::PAYMENT_REQUIRED
+                    && matches!(
+                        classify_kiro_payment_error(&final_fail.body),
+                        KiroPaymentClassification::QuotaExhausted(_)
+                            | KiroPaymentClassification::SeatUnavailable
+                    )) =>
+        {
             // Every eligible account was tried and durably benched on the
             // same model cap. Hand the client a deterministic 503 with the
             // earliest known reset instead of the last upstream 429 body, so

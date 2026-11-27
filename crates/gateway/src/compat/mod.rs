@@ -836,6 +836,7 @@ pub enum Protocol {
     Antigravity,
     Anthropic,
     Kiro,
+    KiroResponses,
     CommandCode,
     Cursor,
     Devin,
@@ -851,6 +852,7 @@ impl Protocol {
             Self::Antigravity => "antigravity",
             Self::Anthropic => "anthropic",
             Self::Kiro => "kiro",
+            Self::KiroResponses => "kiro-responses",
             Self::CommandCode => "command-code",
             Self::Cursor => "cursor",
             Self::Devin => "devin",
@@ -874,6 +876,7 @@ struct ProtocolParser {
     gemini: Option<gemini::GeminiDecoder>,
     anthropic: Option<claude::AnthropicDecoder>,
     kiro: Option<kiro::KiroDecoder>,
+    kiro_responses: Option<kiro::KiroResponsesDecoder>,
     command_code: Option<command_code::CommandCodeDecoder>,
     cursor: Option<cursor::CursorDecoder>,
     devin: Option<devin::DevinDecoder>,
@@ -935,6 +938,7 @@ impl ProtocolParser {
                 }),
                 Protocol::Anthropic => None,
                 Protocol::Kiro => None,
+                Protocol::KiroResponses => None,
                 Protocol::CommandCode => None,
                 Protocol::Cursor => None,
                 Protocol::Devin => None,
@@ -942,6 +946,8 @@ impl ProtocolParser {
             },
             anthropic: (protocol == Protocol::Anthropic).then(claude::AnthropicDecoder::new),
             kiro: (protocol == Protocol::Kiro).then(kiro::KiroDecoder::new),
+            kiro_responses: (protocol == Protocol::KiroResponses)
+                .then(kiro::KiroResponsesDecoder::new),
             command_code: (protocol == Protocol::CommandCode)
                 .then(command_code::CommandCodeDecoder::new),
             cursor: (protocol == Protocol::Cursor).then(|| match cursor_reply {
@@ -964,6 +970,15 @@ impl ProtocolParser {
         }
         if let Some(decoder) = self.kiro.as_mut() {
             decoder.decode(chunk, events);
+            return;
+        }
+        if let Some(decoder) = self.kiro_responses.as_mut() {
+            let mut frames = Vec::new();
+            let result = self.sse.push_raw_data(chunk, &mut frames);
+            for frame in frames {
+                decoder.decode_frame(&frame, events);
+            }
+            push_limit_failure(result, events);
             return;
         }
         if let Some(decoder) = self.devin.as_mut() {
@@ -1011,6 +1026,16 @@ impl ProtocolParser {
             return;
         }
         if let Some(decoder) = self.kiro.as_mut() {
+            decoder.finish(events);
+            return;
+        }
+        if let Some(decoder) = self.kiro_responses.as_mut() {
+            let mut frames = Vec::new();
+            let result = self.sse.finish_raw_data(&mut frames);
+            for frame in frames {
+                decoder.decode_frame(&frame, events);
+            }
+            push_limit_failure(result, events);
             decoder.finish(events);
             return;
         }
