@@ -1299,6 +1299,8 @@ fn model_bench_key(model: &str) -> String {
 pub enum BenchKind {
     /// Upstream named a plan cap (daily or weekly window) that has to run out.
     QuotaExhausted,
+    /// Upstream named a monthly request or credit plan cap.
+    MonthlyQuotaExhausted,
     /// A transient rate limit the account recovers from on its own.
     RateLimited,
     /// The account's credit balance ran out; waiting will not help.
@@ -2297,6 +2299,23 @@ impl AccountMember {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(model_bench_key(model), kind);
+    }
+
+    pub fn clear_model_cooldowns(&self) {
+        let prefix = " model:";
+        self.group_cooldowns
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|key, _| !key.starts_with(prefix));
+        self.bench_kinds
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|key, _| !key.starts_with(prefix));
+    }
+
+    pub fn usage_exhausted_reset_at_unix(&self, now_unix: i64) -> Option<i64> {
+        self.usage_snapshot_at(now_unix)
+            .exhausted_reset_at_unix(now_unix)
     }
 
     pub fn model_reset_at_unix(&self, model: &str) -> Option<i64> {

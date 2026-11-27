@@ -222,14 +222,27 @@ impl TarPackageJsonScanner {
     }
 }
 
+struct InnerCandidate {
+    dec: zstd::stream::raw::Decoder<'static>,
+    probe_buf: Vec<u8>,
+}
+
 struct KiroKasStreamExtractor {
     outer_dec: zstd::stream::raw::Decoder<'static>,
     inner_dec: Option<zstd::stream::raw::Decoder<'static>>,
+    candidates: Vec<InnerCandidate>,
     inner_tar: TarPackageJsonScanner,
-    outer_tail: Vec<u8>,
+    magic_tail: Vec<u8>,
     outer_out: Vec<u8>,
     inner_out: Vec<u8>,
     found_version: Option<String>,
+}
+
+fn probe_looks_like_tar(buf: &[u8]) -> bool {
+    buf.len() >= 265
+        && (&buf[257..262] == b"ustar"
+            || buf.starts_with(b"././@PaxHeader")
+            || buf.starts_with(b"node_modules/"))
 }
 
 impl KiroKasStreamExtractor {
@@ -238,8 +251,9 @@ impl KiroKasStreamExtractor {
         Ok(Self {
             outer_dec,
             inner_dec: None,
+            candidates: Vec::new(),
             inner_tar: TarPackageJsonScanner::default(),
-            outer_tail: Vec::new(),
+            magic_tail: Vec::new(),
             outer_out: vec![0u8; 64 * 1024],
             inner_out: vec![0u8; 64 * 1024],
             found_version: None,
@@ -271,15 +285,68 @@ impl KiroKasStreamExtractor {
         Ok(self.found_version.clone())
     }
 
+    fn feed_candidate(
+        cand: &mut InnerCandidate,
+        mut input: &[u8],
+        scratch: &mut [u8],
+    ) -> Result<Option<usize>, ()> {
+        use zstd::stream::raw::Operation;
+        let total = input.len();
+        while !input.is_empty() {
+            let status = cand.dec.run_on_buffers(input, scratch).map_err(|_| ())?;
+            input = &input[status.bytes_read..];
+            if status.bytes_written > 0 {
+                cand.probe_buf.extend_from_slice(&scratch[..status.bytes_written]);
+                if cand.probe_buf.len() >= 265 {
+                    if probe_looks_like_tar(&cand.probe_buf) {
+                        return Ok(Some(total - input.len()));
+                    } else {
+                        return Err(());
+                    }
+                }
+            }
+            if status.bytes_read == 0 && status.bytes_written == 0 {
+                break;
+            }
+        }
+        Ok(None)
+    }
+
     fn feed_outer_decompressed(&mut self, data: &[u8]) -> Option<String> {
-        if let Some(version) = self.feed_inner(data) {
-            return Some(version);
-        }
         if self.inner_dec.is_some() {
-            return None;
+            return self.feed_inner(data);
         }
-        let mut combined = Vec::with_capacity(self.outer_tail.len() + data.len());
-        combined.extend_from_slice(&self.outer_tail);
+
+        // Advance existing unconfirmed candidates across chunk boundaries so a
+        // zstd block split across 64 KiB chunks is never dropped.
+        let mut next_candidates = Vec::with_capacity(self.candidates.len());
+        let mut confirmed: Option<(InnerCandidate, usize)> = None;
+        for mut cand in std::mem::take(&mut self.candidates) {
+            match Self::feed_candidate(&mut cand, data, &mut self.inner_out) {
+                Ok(Some(consumed)) => {
+                    confirmed = Some((cand, consumed));
+                    break;
+                }
+                Ok(None) => next_candidates.push(cand),
+                Err(()) => {}
+            }
+        }
+        if let Some((cand, consumed)) = confirmed {
+            self.candidates.clear();
+            self.magic_tail.clear();
+            self.inner_tar = TarPackageJsonScanner::default();
+            if let Some(version) = self.inner_tar.feed(&cand.probe_buf) {
+                return Some(version);
+            }
+            self.inner_dec = Some(cand.dec);
+            return self.feed_inner(&data[consumed..]);
+        }
+        self.candidates = next_candidates;
+
+        // Scan for any new ZSTD_MAGIC starting in the 3-byte overlap + current chunk.
+        let tail_len = self.magic_tail.len();
+        let mut combined = Vec::with_capacity(tail_len + data.len());
+        combined.extend_from_slice(&self.magic_tail);
         combined.extend_from_slice(data);
 
         let mut search_from = 0usize;
@@ -291,33 +358,35 @@ impl KiroKasStreamExtractor {
                 break;
             };
             let pos = search_from + rel;
-            if let Ok(mut candidate) = zstd::stream::raw::Decoder::new() {
-                use zstd::stream::raw::Operation;
-                let slice = &combined[pos..];
-                let mut probe = vec![0u8; 16 * 1024];
-                if let Ok(status) = candidate.run_on_buffers(slice, &mut probe) {
-                    let probe_out = &probe[..status.bytes_written];
-                    let looks_like_tar = probe_out.len() >= 265
-                        && (&probe_out[257..262] == b"ustar"
-                            || probe_out.starts_with(b"././@PaxHeader")
-                            || probe_out.starts_with(b"node_modules/"));
-                    if looks_like_tar {
+            search_from = pos + 1;
+            if let Ok(dec) = zstd::stream::raw::Decoder::new() {
+                let mut cand = InnerCandidate {
+                    dec,
+                    probe_buf: Vec::new(),
+                };
+                match Self::feed_candidate(&mut cand, &combined[pos..], &mut self.inner_out) {
+                    Ok(Some(consumed)) => {
+                        self.candidates.clear();
+                        self.magic_tail.clear();
                         self.inner_tar = TarPackageJsonScanner::default();
-                        if let Some(version) = self.inner_tar.feed(probe_out) {
+                        if let Some(version) = self.inner_tar.feed(&cand.probe_buf) {
                             return Some(version);
                         }
-                        self.inner_dec = Some(candidate);
-                        let rest = &slice[status.bytes_read..];
-                        self.outer_tail.clear();
-                        return self.feed_inner(rest);
+                        self.inner_dec = Some(cand.dec);
+                        return self.feed_inner(&combined[pos + consumed..]);
                     }
+                    Ok(None) => {
+                        if self.candidates.len() < 8 {
+                            self.candidates.push(cand);
+                        }
+                    }
+                    Err(()) => {}
                 }
             }
-            search_from = pos + 1;
         }
 
-        let keep = combined.len().min(4096);
-        self.outer_tail = combined[combined.len() - keep..].to_vec();
+        let keep = combined.len().min(3);
+        self.magic_tail = combined[combined.len() - keep..].to_vec();
         None
     }
 

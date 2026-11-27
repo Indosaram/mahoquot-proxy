@@ -186,6 +186,32 @@ fn matches_codex_model(
 }
 
 impl AccountUsage {
+    pub fn exhausted_reset_at_unix(&self, now_unix: i64) -> Option<i64> {
+        self.groups
+            .iter()
+            .flat_map(|group| group.buckets.iter())
+            .filter(|bucket| bucket.used_percent.is_some_and(|pct| pct >= 99.5))
+            .filter_map(|bucket| bucket.reset_at_unix)
+            .filter(|reset| *reset > now_unix)
+            .min()
+    }
+
+    pub fn has_available_kiro_credits(&self) -> bool {
+        let mut saw_bucket = false;
+        for group in &self.groups {
+            for bucket in &group.buckets {
+                if let Some(pct) = bucket.used_percent {
+                    saw_bucket = true;
+                    if pct < 99.5 {
+                        return true;
+                    }
+                }
+            }
+        }
+        let _ = saw_bucket;
+        false
+    }
+
     /// Authoritative spend-limit or overage limit denial.
     ///
     /// When this is true, upstream or spend control has explicitly determined

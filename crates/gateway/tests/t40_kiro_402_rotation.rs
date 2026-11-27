@@ -352,7 +352,7 @@ fn now_ms() -> i64 {
 fn kiro_v3_payment_classifier_distinguishes_every_documented_reason() {
     assert_eq!(
         classify_kiro_payment_error(br#"{"reason":"MONTHLY_REQUEST_COUNT"}"#),
-        KiroPaymentClassification::QuotaExhausted(BenchKind::QuotaExhausted)
+        KiroPaymentClassification::QuotaExhausted(BenchKind::MonthlyQuotaExhausted)
     );
     assert_eq!(
         classify_kiro_payment_error(
@@ -628,8 +628,8 @@ async fn unknown_or_conversation_402_preserves_error_without_benching_or_rotatio
 #[tokio::test]
 async fn confirmed_402_reasons_bench_model_only_and_rotate_to_funded_account() {
     for (reply, expected_kind) in [
-        (Reply::MonthlyLimit, BenchKind::QuotaExhausted),
-        (Reply::CauseNestedMonthlyLimit, BenchKind::QuotaExhausted),
+        (Reply::MonthlyLimit, BenchKind::MonthlyQuotaExhausted),
+        (Reply::CauseNestedMonthlyLimit, BenchKind::MonthlyQuotaExhausted),
         (Reply::OverageLimit, BenchKind::OutOfCredit),
         (Reply::CreditBalanceExhausted, BenchKind::OutOfCredit),
         (Reply::SeatUnavailable, BenchKind::QuotaExhausted),
@@ -689,4 +689,348 @@ async fn every_kiro_account_confirmed_out_of_plan_answers_retryable_503() {
     mock_a.abort();
     mock_b.abort();
     std::fs::remove_dir_all(auth_dir).ok();
+}
+
+#[tokio::test]
+async fn kiro_v3_monthly_402_uses_real_reset_renders_monthly_eta_and_clears_on_recovery() {
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let (upstream_a, mock_a) = spawn_mock("a", Reply::MonthlyLimit, order.clone()).await;
+    let (gateway, auth_dir, state, gateway_task) = start_gateway(&[("kiro-a", &upstream_a)]).await;
+
+    let now_unix = now_ms() / 1000;
+    let reset_unix = now_unix + 3 * 86_400 + 4 * 3600;
+    let a = state.find_member("kiro-a").expect("account a");
+    a.set_usage(parse_kiro_usage_summary(
+        &serde_json::json!({
+            "nextDateReset": reset_unix as f64,
+            "usageBreakdownList": [{
+                "displayName": "Credit",
+                "currentUsage": 10000,
+                "usageLimit": 10000,
+                "nextDateReset": reset_unix as f64
+            }]
+        }),
+        now_unix,
+    ));
+
+    let (status, headers, body) = ask(&gateway).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body: {body}");
+    let retry_after = headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .expect("Retry-After header");
+    assert!(retry_after > 3 * 86_400, "retry_after={retry_after}");
+    assert!(
+        body.contains("monthly-exhausted") && body.contains("3d "),
+        "expected monthly-exhausted with real multi-day ETA: {body}"
+    );
+    assert!(!a.group_available(MODEL, now_ms()));
+
+    // When quota recovers, clearing model cooldowns immediately restores routing.
+    a.clear_model_cooldowns();
+    assert!(a.group_available(MODEL, now_ms()));
+
+    gateway_task.abort();
+    mock_a.abort();
+    std::fs::remove_dir_all(auth_dir).ok();
+}
+
+#[tokio::test]
+async fn kiro_v3_responses_413_returns_verbatim_without_account_fault_or_rotation() {
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let key = create_response_feature_key();
+    let order_a = order.clone();
+    let app_a = Router::new()
+        .route(
+            "/featureConfiguration",
+            get({
+                let key = key.clone();
+                move || {
+                    let key = key.clone();
+                    async move {
+                        (
+                            StatusCode::OK,
+                            [("content-type", "application/json")],
+                            serde_json::json!({"configuration": {key: "create_response"}})
+                                .to_string(),
+                        )
+                    }
+                }
+            }),
+        )
+        .fallback(post(move || {
+            let order_a = order_a.clone();
+            async move {
+                order_a.lock().unwrap().push("a".to_string());
+                (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    [("content-type", "application/json")],
+                    r#"{"error":{"type":"invalid_request","code":"context_length_exceeded","message":"Input exceeds context window"}}"#,
+                )
+            }
+        }));
+    let listener_a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_a = format!("http://{}", listener_a.local_addr().unwrap());
+    let mock_a = tokio::spawn(async move { axum::serve(listener_a, app_a).await.unwrap() });
+
+    let (upstream_b, mock_b) = spawn_mock("b", Reply::EventStream, order.clone()).await;
+    let (gateway, auth_dir, state, gateway_task) =
+        start_gateway(&[("kiro-a", &upstream_a), ("kiro-b", &upstream_b)]).await;
+
+    let (status, _, body) = ask(&gateway).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "body: {body}");
+    assert!(body.contains("context_length_exceeded"), "body: {body}");
+    assert_eq!(*order.lock().unwrap(), vec!["a".to_string()]);
+    let a = state.find_member("kiro-a").unwrap();
+    assert!(matches!(a.health(), Health::Available));
+    assert_eq!(a.fail_count.load(Ordering::Relaxed), 0);
+
+    gateway_task.abort();
+    mock_a.abort();
+    mock_b.abort();
+    std::fs::remove_dir_all(auth_dir).ok();
+}
+
+#[tokio::test]
+async fn kiro_v3_responses_429_and_sse_preamble_402_bench_model_only_and_rotate() {
+    let key = create_response_feature_key();
+
+    // Case 1: HTTP 429 on /v1/responses must bench model-only (not account-wide Health::Cooldown)
+    {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let order_a = order.clone();
+        let app_a = Router::new()
+            .route(
+                "/featureConfiguration",
+                get({
+                    let key = key.clone();
+                    move || {
+                        let key = key.clone();
+                        async move {
+                            (
+                                StatusCode::OK,
+                                [("content-type", "application/json")],
+                                serde_json::json!({"configuration": {key: "create_response"}})
+                                    .to_string(),
+                            )
+                        }
+                    }
+                }),
+            )
+            .fallback(post(move || {
+                let order_a = order_a.clone();
+                async move {
+                    order_a.lock().unwrap().push("a".to_string());
+                    (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        [
+                            ("content-type", "application/json"),
+                            ("x-amzn-kiro-ratelimit-retry-after", "60000"),
+                        ],
+                        r#"{"error":{"type":"too_many_requests","code":"rate_limit_exceeded","message":"Slow down"}}"#,
+                    )
+                }
+            }));
+        let listener_a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_a = format!("http://{}", listener_a.local_addr().unwrap());
+        let mock_a = tokio::spawn(async move { axum::serve(listener_a, app_a).await.unwrap() });
+        let (upstream_b, mock_b) = spawn_mock("b", Reply::EventStream, order.clone()).await;
+        let (gateway, auth_dir, state, gateway_task) =
+            start_gateway(&[("kiro-a", &upstream_a), ("kiro-b", &upstream_b)]).await;
+
+        let (status, _, body) = ask(&gateway).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert!(body.contains("kiro-rotated"), "body: {body}");
+        assert_eq!(*order.lock().unwrap(), vec!["a".to_string(), "b".to_string()]);
+        let a = state.find_member("kiro-a").unwrap();
+        assert!(
+            matches!(a.health(), Health::Available),
+            "KiroResponses 429 must stay model-scoped, got {:?}",
+            a.health()
+        );
+        assert!(!a.group_available(MODEL, now_ms()));
+        assert!(a.group_available("kiro/some-other-model", now_ms()));
+
+        gateway_task.abort();
+        mock_a.abort();
+        mock_b.abort();
+        std::fs::remove_dir_all(auth_dir).ok();
+    }
+
+    // Case 2: HTTP 200 SSE preamble carrying response.failed(credit_balance_exhausted) rotates to B
+    {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let order_a = order.clone();
+        let app_a = Router::new()
+            .route(
+                "/featureConfiguration",
+                get({
+                    let key = key.clone();
+                    move || {
+                        let key = key.clone();
+                        async move {
+                            (
+                                StatusCode::OK,
+                                [("content-type", "application/json")],
+                                serde_json::json!({"configuration": {key: "create_response"}})
+                                    .to_string(),
+                            )
+                        }
+                    }
+                }),
+            )
+            .fallback(post(move || {
+                let order_a = order_a.clone();
+                async move {
+                    order_a.lock().unwrap().push("a".to_string());
+                    let sse = [
+                        r#"data: {"type":"response.created","response":{"id":"resp_fail_1"}}"#,
+                        r#"data: {"type":"response.failed","response":{"error":{"type":"insufficient_quota","code":"credit_balance_exhausted","message":"No credits"}}}"#,
+                    ]
+                    .join("\n\n")
+                        + "\n\n";
+                    (
+                        StatusCode::OK,
+                        [("content-type", "text/event-stream")],
+                        sse,
+                    )
+                }
+            }));
+        let listener_a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_a = format!("http://{}", listener_a.local_addr().unwrap());
+        let mock_a = tokio::spawn(async move { axum::serve(listener_a, app_a).await.unwrap() });
+        let (upstream_b, mock_b) = spawn_mock("b", Reply::EventStream, order.clone()).await;
+        let (gateway, auth_dir, state, gateway_task) =
+            start_gateway(&[("kiro-a", &upstream_a), ("kiro-b", &upstream_b)]).await;
+
+        let (status, _, body) = ask(&gateway).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert!(body.contains("kiro-rotated"), "body: {body}");
+        assert_eq!(*order.lock().unwrap(), vec!["a".to_string(), "b".to_string()]);
+        let a = state.find_member("kiro-a").unwrap();
+        assert_eq!(
+            a.bench_kind_for_model(MODEL, now_ms()),
+            Some(BenchKind::OutOfCredit)
+        );
+
+        gateway_task.abort();
+        mock_a.abort();
+        mock_b.abort();
+        std::fs::remove_dir_all(auth_dir).ok();
+    }
+}
+
+#[tokio::test]
+async fn kiro_v3_responses_supports_input_file_and_stable_session_conversation_id() {
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let (upstream, mock) =
+        spawn_mock_with_flag("v3", Reply::CreateResponseSse, order.clone(), captured.clone(), true)
+            .await;
+    let (gateway, auth_dir, _state, gateway_task) = start_gateway(&[("kiro-v3", &upstream)]).await;
+
+    let client = reqwest::Client::new();
+    for _ in 0..2 {
+        let resp = client
+            .post(format!("{gateway}/v1/chat/completions"))
+            .bearer_auth(API_KEY)
+            .header("x-session-id", "sess-stable-42")
+            .json(&serde_json::json!({
+                "model": MODEL,
+                "stream": true,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "summarize"},
+                        {"type": "file", "file": {"filename": "spec.pdf", "file_data": "data:application/pdf;base64,JVBERi0x"}}
+                    ]
+                }]
+            }))
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = resp.text().await.unwrap();
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+    }
+
+    let reqs = captured.lock().unwrap();
+    let posts: Vec<&CapturedReq> = reqs.iter().filter(|r| r.path == "/v1/responses").collect();
+    assert_eq!(posts.len(), 2);
+    let conv_0 = posts[0].body["metadata"]["kiro:conversation_id"].as_str().unwrap();
+    let conv_1 = posts[1].body["metadata"]["kiro:conversation_id"].as_str().unwrap();
+    assert_eq!(conv_0, conv_1, "session affinity must yield stable conversation_id");
+    let parts = posts[0].body["input"][0]["content"].as_array().unwrap();
+    assert!(parts.iter().any(|p| p["type"] == "input_file" && p["filename"] == "spec.pdf"));
+
+    gateway_task.abort();
+    mock.abort();
+    std::fs::remove_dir_all(auth_dir).ok();
+}
+
+#[tokio::test]
+async fn kiro_v3_kas_extractor_handles_split_chunks_across_64k_boundaries() {
+    // Pad ELF with 90 KiB + fake ZSTD magic noise so the real inner zstd frame
+    // straddles multiple 64 KiB outer-decompression chunks.
+    let mut inner_tar = build_ustar_entry("node_modules/filler/pad.bin", &vec![b'x'; 200_000]);
+    inner_tar.extend_from_slice(&build_ustar_entry(
+        "node_modules/@kiro/agent/package.json",
+        br#"{"name":"@kiro/agent","version":"0.68.4-hotfix.3"}"#,
+    ));
+    inner_tar.extend_from_slice(&[0u8; 1024]);
+    let inner_zst = zstd::bulk::compress(&inner_tar, 1).expect("compress inner");
+
+    let mut fake_elf = vec![0x7f, b'E', b'L', b'F'];
+    fake_elf.resize(65_500, 0x90);
+    // False ZSTD magic right before a 64 KiB boundary
+    fake_elf.extend_from_slice(&[0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x01, 0x02, 0x03]);
+    fake_elf.resize(131_068, 0x55);
+    // Real inner zstd frame starting 4 bytes before a 64 KiB boundary
+    fake_elf.extend_from_slice(&inner_zst);
+    let mut outer_tar = build_ustar_entry("kirocli/bin/kiro-cli", &fake_elf);
+    outer_tar.extend_from_slice(&[0u8; 1024]);
+    let outer_zst = Arc::new(zstd::bulk::compress(&outer_tar, 1).expect("compress outer"));
+
+    let app = Router::new().route(
+        "/pkg.tar.zst",
+        get(move || {
+            let bytes = Arc::clone(&outer_zst);
+            async move {
+                // Stream in tiny 512-byte chunks to stress every chunk boundary.
+                let chunks: Vec<Result<Bytes, std::io::Error>> = bytes
+                    .chunks(512)
+                    .map(|c| Ok(Bytes::copy_from_slice(c)))
+                    .collect();
+                (StatusCode::OK, axum::body::Body::from_stream(futures::stream::iter(chunks)))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let client = reqwest::Client::new();
+    let found = mahoquot_providers::fetch_kas_version_from_tar_zst_url(
+        &client,
+        &format!("http://{addr}/pkg.tar.zst"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(found.as_deref(), Some("0.68.4-hotfix.3"));
+
+    task.abort();
+}
+
+#[tokio::test]
+#[ignore]
+async fn live_official_kiro_tar_zst_extracts_kas_version() {
+    let client = reqwest::Client::new();
+    let found = mahoquot_providers::fetch_kas_version_from_tar_zst_url(
+        &client,
+        "https://prod.download.cli.kiro.dev/stable/3.6.2/kirocli-aarch64-linux.tar.zst",
+    )
+    .await
+    .unwrap();
+    assert_eq!(found.as_deref(), Some("0.66.127-hotfix.1"));
 }

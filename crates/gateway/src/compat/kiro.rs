@@ -6,9 +6,28 @@ pub fn openai_to_kiro(body: &Value) -> Result<Value, String> {
     openai_to_kiro_with_profile(body, None)
 }
 
+fn stable_kiro_conversation_id(session_id: Option<&str>) -> String {
+    match session_id.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(sid) => uuid::Uuid::new_v5(
+            &uuid::Uuid::NAMESPACE_OID,
+            format!("kiro-conv:{sid}").as_bytes(),
+        )
+        .to_string(),
+        None => uuid::Uuid::new_v4().to_string(),
+    }
+}
+
 pub fn openai_to_kiro_with_profile(
     body: &Value,
     profile_arn: Option<&str>,
+) -> Result<Value, String> {
+    openai_to_kiro_with_profile_and_session(body, profile_arn, None)
+}
+
+pub fn openai_to_kiro_with_profile_and_session(
+    body: &Value,
+    profile_arn: Option<&str>,
+    session_id: Option<&str>,
 ) -> Result<Value, String> {
     let model = body
         .get("model")
@@ -178,7 +197,7 @@ pub fn openai_to_kiro_with_profile(
     let mut payload = json!({
         "conversationState": {
             "chatTriggerType": "MANUAL",
-            "conversationId": format!("{:016x}", rand::random::<u64>()),
+            "conversationId": stable_kiro_conversation_id(session_id),
             "currentMessage": {
                 "userInputMessage": user_input
             },
@@ -194,6 +213,14 @@ pub fn openai_to_kiro_with_profile(
 pub fn openai_to_kiro_responses_with_profile(
     body: &Value,
     profile_arn: Option<&str>,
+) -> Result<Value, String> {
+    openai_to_kiro_responses_with_profile_and_session(body, profile_arn, None)
+}
+
+pub fn openai_to_kiro_responses_with_profile_and_session(
+    body: &Value,
+    profile_arn: Option<&str>,
+    session_id: Option<&str>,
 ) -> Result<Value, String> {
     let model = body
         .get("model")
@@ -287,8 +314,10 @@ pub fn openai_to_kiro_responses_with_profile(
                 "output": output,
             }));
         } else {
-            let imgs = images_content(message.get("content").unwrap_or(&Value::Null));
-            if !imgs.is_empty() {
+            let raw_content = message.get("content").unwrap_or(&Value::Null);
+            let imgs = images_content(raw_content);
+            let docs = documents_content(raw_content);
+            if !imgs.is_empty() || !docs.is_empty() {
                 let mut parts = Vec::new();
                 if !content.is_empty() {
                     parts.push(json!({"type": "input_text", "text": content}));
@@ -301,6 +330,7 @@ pub fn openai_to_kiro_responses_with_profile(
                         "image_url": format!("data:image/{fmt};base64,{bytes}"),
                     }));
                 }
+                parts.extend(docs);
                 if !parts.is_empty() {
                     input.push(json!({"role": "user", "content": parts}));
                 }
@@ -320,7 +350,7 @@ pub fn openai_to_kiro_responses_with_profile(
         "origin": mahoquot_providers::KIRO_CLI_ORIGIN,
         "metadata": {
             "kiro:agent_mode": "vibe",
-            "kiro:conversation_id": format!("{:016x}", rand::random::<u64>()),
+            "kiro:conversation_id": stable_kiro_conversation_id(session_id),
         },
     });
     if !system.is_empty() {
@@ -403,6 +433,152 @@ fn text_content(value: &Value) -> String {
             .join(""),
         _ => String::new(),
     }
+}
+
+fn documents_content(value: &Value) -> Vec<Value> {
+    let Value::Array(blocks) = value else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for block in blocks {
+        let Some(kind) = block.get("type").and_then(Value::as_str) else {
+            continue;
+        };
+        match kind {
+            "input_file" => {
+                if let Some(file_data) = block.get("file_data").and_then(Value::as_str) {
+                    if !file_data.is_empty() {
+                        let filename = block
+                            .get("filename")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or("document");
+                        out.push(json!({
+                            "type": "input_file",
+                            "filename": filename,
+                            "file_data": file_data,
+                        }));
+                    }
+                }
+            }
+            "file" => {
+                let file = block.get("file").unwrap_or(block);
+                if let Some(file_data) = file.get("file_data").and_then(Value::as_str) {
+                    if !file_data.is_empty() {
+                        let filename = file
+                            .get("filename")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or("document");
+                        out.push(json!({
+                            "type": "input_file",
+                            "filename": filename,
+                            "file_data": file_data,
+                        }));
+                    }
+                }
+            }
+            "document" => {
+                if let Some(source) = block.get("source") {
+                    let media = source
+                        .get("media_type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("application/pdf");
+                    let filename = block
+                        .get("title")
+                        .or_else(|| block.get("filename"))
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("document");
+                    let data_uri = match source.get("type").and_then(Value::as_str) {
+                        Some("base64") => source
+                            .get("data")
+                            .and_then(Value::as_str)
+                            .map(|b64| format!("data:{media};base64,{b64}")),
+                        Some("text") => source.get("data").and_then(Value::as_str).map(|txt| {
+                            use base64::Engine as _;
+                            let b64 = base64::engine::general_purpose::STANDARD.encode(txt.as_bytes());
+                            format!("data:{media};base64,{b64}")
+                        }),
+                        _ => None,
+                    };
+                    if let Some(file_data) = data_uri {
+                        out.push(json!({
+                            "type": "input_file",
+                            "filename": filename,
+                            "file_data": file_data,
+                        }));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+pub fn infer_kiro_responses_stream_error_status(err_type: Option<&str>, code: Option<&str>) -> u16 {
+    let lower_type = err_type.unwrap_or_default().to_ascii_lowercase();
+    let raw_code = code.unwrap_or_default();
+    let norm_code = raw_code
+        .strip_prefix("kiro:")
+        .or_else(|| raw_code.strip_prefix("KIRO:"))
+        .unwrap_or(raw_code)
+        .to_ascii_uppercase();
+    if raw_code == "context_length_exceeded" || norm_code == "CONTENT_LENGTH_EXCEEDS_THRESHOLD" {
+        return 413;
+    }
+    if raw_code == "model_not_found" || lower_type == "not_found" {
+        return 404;
+    }
+    if lower_type == "too_many_requests"
+        || raw_code == "rate_limit_exceeded"
+        || matches!(
+            norm_code.as_str(),
+            "USER_REQUEST_RATE_EXCEEDED"
+                | "SERVICE_REQUEST_RATE_EXCEEDED"
+                | "CREDIT_CONSUMPTION_RATE_EXCEEDED"
+                | "INSUFFICIENT_MODEL_CAPACITY"
+                | "HOURLY_REQUEST_COUNT"
+                | "DAILY_REQUEST_COUNT"
+                | "WEEKLY_REQUEST_COUNT"
+        )
+    {
+        return 429;
+    }
+    if lower_type == "insufficient_quota"
+        || raw_code == "credit_balance_exhausted"
+        || matches!(
+            norm_code.as_str(),
+            "MONTHLY_REQUEST_COUNT"
+                | "OVERAGE_REQUEST_LIMIT_EXCEEDED"
+                | "CONVERSATION_LIMIT_EXCEEDED"
+                | "SEAT_UNAVAILABLE"
+                | "USAGE_LIMIT_REACHED"
+        )
+    {
+        return 402;
+    }
+    if raw_code == "access_denied"
+        || raw_code == "kiro:model_requires_user_opt_in"
+        || matches!(
+            norm_code.as_str(),
+            "TEMPORARILY_SUSPENDED" | "FEATURE_NOT_SUPPORTED" | "NEW_USER_ACCESS_PAUSED"
+        )
+    {
+        return 403;
+    }
+    if lower_type == "invalid_request"
+        || raw_code.starts_with("invalid_")
+        || raw_code.starts_with("unsupported_")
+        || raw_code.starts_with("missing_")
+    {
+        return 400;
+    }
+    if raw_code == "server_is_overloaded" || norm_code == "MODEL_TEMPORARILY_UNAVAILABLE" {
+        return 503;
+    }
+    500
 }
 
 fn images_content(value: &Value) -> Vec<Value> {

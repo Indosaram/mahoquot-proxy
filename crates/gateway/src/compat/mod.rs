@@ -282,6 +282,116 @@ fn empty_message_reason(text: &str) -> String {
 /// either as `Err` before any byte is committed lets the relay fail over to the
 /// next account instead of serving an error or an empty 200. On deadline or cap
 /// the buffered bytes are released unchanged.
+enum KiroResponsesPreamble {
+    Pending,
+    Served,
+    Failed { status: u16, raw_json: String },
+}
+
+fn classify_kiro_responses_preamble(buf: &[u8]) -> KiroResponsesPreamble {
+    let text = String::from_utf8_lossy(buf).replace("
+", "
+");
+    let mut frames: Vec<&str> = text.split("
+
+").collect();
+    frames.pop();
+    for frame in frames {
+        let data: String = frame
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(str::trim_start)
+            .collect();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&data) else {
+            continue;
+        };
+        let event_type = value.get("type").and_then(Value::as_str).unwrap_or_default();
+        match event_type {
+            "kiro:keep_alive" | "response.created" | "response.in_progress" => continue,
+            "error" | "response.failed" => {
+                let err_obj = if event_type == "error" {
+                    value.get("error").unwrap_or(&value)
+                } else {
+                    value.pointer("/response/error").unwrap_or(&value)
+                };
+                let mut err_type = err_obj.get("type").and_then(Value::as_str);
+                let mut err_code = err_obj
+                    .get("code")
+                    .or_else(|| err_obj.get("reason"))
+                    .and_then(Value::as_str);
+                if err_type == Some("error") {
+                    err_type = None;
+                }
+                if err_type.is_none()
+                    && matches!(
+                        err_code,
+                        Some(
+                            "invalid_request"
+                                | "not_found"
+                                | "too_many_requests"
+                                | "insufficient_quota"
+                                | "server_error"
+                                | "model_error"
+                        )
+                    )
+                {
+                    err_type = err_code;
+                    err_code = None;
+                }
+                let status = kiro::infer_kiro_responses_stream_error_status(err_type, err_code);
+                let raw_json = serde_json::json!({ "error": err_obj }).to_string();
+                return KiroResponsesPreamble::Failed { status, raw_json };
+            }
+            _ => return KiroResponsesPreamble::Served,
+        }
+    }
+    KiroResponsesPreamble::Pending
+}
+
+pub async fn open_kiro_responses_stream(
+    resp: reqwest::Response,
+    deadline: std::time::Duration,
+) -> Result<(Bytes, UpstreamStream), String> {
+    let (first, mut stream) = open_stream(resp, Protocol::KiroResponses).await?;
+    let until = tokio::time::Instant::now() + deadline;
+    let mut buf = bytes::BytesMut::from(&first[..]);
+    loop {
+        match classify_kiro_responses_preamble(&buf) {
+            KiroResponsesPreamble::Failed { status, raw_json } => {
+                return Err(format!("kiro_http_error:{status}:{raw_json}"));
+            }
+            KiroResponsesPreamble::Served => return Ok((buf.freeze(), stream)),
+            KiroResponsesPreamble::Pending if buf.len() >= ANTHROPIC_PREAMBLE_CAP => {
+                return Ok((buf.freeze(), stream))
+            }
+            KiroResponsesPreamble::Pending => {}
+        }
+        match tokio::time::timeout_at(until, stream.next()).await {
+            Ok(Some(Ok(chunk))) => buf.extend_from_slice(&chunk),
+            Ok(Some(Err(err))) => return Err(err.to_string()),
+            Ok(None) => {
+                buf.extend_from_slice(b"
+
+");
+                return match classify_kiro_responses_preamble(&buf) {
+                    KiroResponsesPreamble::Failed { status, raw_json } => {
+                        Err(format!("kiro_http_error:{status}:{raw_json}"))
+                    }
+                    KiroResponsesPreamble::Pending => Err(
+                        "unavailable: upstream Kiro CreateResponse stream ended without output"
+                            .to_string(),
+                    ),
+                    KiroResponsesPreamble::Served => Ok((buf.freeze(), stream)),
+                };
+            }
+            Err(_) => return Ok((buf.freeze(), stream)),
+        }
+    }
+}
+
 pub async fn open_anthropic_stream(
     resp: reqwest::Response,
     deadline: std::time::Duration,

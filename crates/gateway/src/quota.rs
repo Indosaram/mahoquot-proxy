@@ -732,7 +732,12 @@ async fn refresh_json_usage(
     usage.refreshed_at_unix = Some(now_unix);
     usage.refresh_status = Some("ok".to_string());
     usage.last_refresh_error = None;
+    let kiro_recovered =
+        member.kind() == ProviderKind::Kiro && usage.has_available_kiro_credits();
     member.set_usage(usage);
+    if kiro_recovered {
+        member.clear_model_cooldowns();
+    }
     Ok(())
 }
 
