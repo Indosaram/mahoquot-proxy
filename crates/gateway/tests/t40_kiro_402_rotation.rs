@@ -1023,6 +1023,182 @@ async fn kiro_v3_kas_extractor_handles_split_chunks_across_64k_boundaries() {
 }
 
 #[tokio::test]
+async fn kiro_v3_anthropic_and_responses_inbound_preserve_documents_reasoning_and_sse_done_events() {
+    let key = create_response_feature_key();
+    let captured = Arc::new(Mutex::new(Vec::<CapturedReq>::new()));
+    let cap_clone = captured.clone();
+    let app = Router::new()
+        .route(
+            "/featureConfiguration",
+            get({
+                let key = key.clone();
+                move || {
+                    let key = key.clone();
+                    async move {
+                        (
+                            StatusCode::OK,
+                            [("content-type", "application/json")],
+                            serde_json::json!({"configuration": {key: "create_response"}})
+                                .to_string(),
+                        )
+                    }
+                }
+            }),
+        )
+        .fallback(post(move |uri: Uri, headers: HeaderMap, body: Bytes| {
+            let cap_clone = cap_clone.clone();
+            async move {
+                let parsed = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+                cap_clone.lock().unwrap().push(CapturedReq {
+                    path: uri.path().to_string(),
+                    headers,
+                    body: parsed,
+                });
+                // Emit done-only text + reasoning summary delta + arguments.done to test edge events.
+                let sse = [
+                    r#"data: {"type":"response.created","response":{"id":"resp_edge_1"}}"#,
+                    r#"data: {"type":"response.reasoning_summary_text.delta","delta":"sum-think"}"#,
+                    r#"data: {"type":"response.output_text.done","text":"done-only-answer"}"#,
+                    r#"data: {"type":"response.output_item.added","item":{"type":"function_call","id":"fc_1","call_id":"call_edge_1","name":"lookup"}}"#,
+                    r#"data: {"type":"response.function_call_arguments.done","item_id":"fc_1","arguments":"{"q":"ok"}"}"#,
+                    r#"data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":120,"output_tokens":30}}}"#,
+                ]
+                .join("\n\n")
+                    + "\n\n";
+                (
+                    StatusCode::OK,
+                    [("content-type", "text/event-stream")],
+                    sse,
+                )
+            }
+        }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    let mock = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let (gateway, auth_dir, _state, gateway_task) = start_gateway(&[("kiro-v3", &upstream)]).await;
+
+    let client = reqwest::Client::new();
+
+    // 1. Anthropic /v1/messages with document + redacted_thinking + adaptive thinking
+    let resp1 = client
+        .post(format!("{gateway}/v1/messages"))
+        .bearer_auth(API_KEY)
+        .header("anthropic-version", "2023-06-01")
+        .json(&serde_json::json!({
+            "model": MODEL,
+            "max_tokens": 128,
+            "stream": true,
+            "thinking": {"type": "adaptive"},
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "read this pdf"},
+                        {
+                            "type": "document",
+                            "title": "guide.pdf",
+                            "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0x"}
+                        }
+                    ]
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "redacted_thinking", "data": "opaque-blob"},
+                        {"type": "text", "text": "checked"}
+                    ]
+                },
+                {"role": "user", "content": "next"}
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status1 = resp1.status();
+    let body1 = resp1.text().await.unwrap();
+    assert_eq!(status1, StatusCode::OK, "anthropic body: {body1}");
+    assert!(body1.contains("done-only-answer"), "done-only text lost: {body1}");
+    assert!(body1.contains("sum-think"), "reasoning summary delta lost: {body1}");
+    assert!(body1.contains("lookup"), "tool call lost: {body1}");
+
+    // 2. OpenAI Responses /v1/responses with input_file + Kiro reasoning envelope + flat tool
+    let resp2 = client
+        .post(format!("{gateway}/v1/responses"))
+        .bearer_auth(API_KEY)
+        .json(&serde_json::json!({
+            "model": MODEL,
+            "stream": true,
+            "reasoning": {"effort": "high", "summary": "concise"},
+            "tools": [{"type": "function", "name": "lookup", "description": "find", "parameters": {"type": "object"}}],
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "check doc"},
+                        {"type": "input_file", "filename": "report.pdf", "file_data": "data:application/pdf;base64,JVBERi0x"}
+                    ]
+                },
+                {
+                    "type": "reasoning",
+                    "encrypted_content": r#"{"redactedContent":"resp-blob"}"#
+                },
+                {"type": "message", "role": "user", "content": "continue"}
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status2 = resp2.status();
+    let body2 = resp2.text().await.unwrap();
+    assert_eq!(status2, StatusCode::OK, "responses body: {body2}");
+    assert!(body2.contains("done-only-answer"), "responses done-only text lost: {body2}");
+
+    let reqs = captured.lock().unwrap();
+    let posts: Vec<&CapturedReq> = reqs.iter().filter(|r| r.path == "/v1/responses").collect();
+    assert_eq!(posts.len(), 2);
+
+    // Verify /v1/messages translation
+    let p1 = &posts[0].body;
+    let user0_parts = p1["input"][0]["content"].as_array().expect("user0 multipart");
+    assert!(user0_parts.iter().any(|part| {
+        part["type"] == "input_file"
+            && part["filename"] == "guide.pdf"
+            && part["file_data"] == "data:application/pdf;base64,JVBERi0x"
+    }));
+    assert!(p1["input"].as_array().unwrap().iter().any(|item| {
+        item["type"] == "reasoning"
+            && item["encrypted_content"]
+                .as_str()
+                .is_some_and(|s| s.contains("opaque-blob"))
+    }));
+    assert_eq!(p1["reasoning"]["type"], "adaptive");
+    assert!(p1["reasoning"].get("effort").is_none(), "invalid effort 'auto' must not be sent: {p1}");
+
+    // Verify /v1/responses translation
+    let p2 = &posts[1].body;
+    let r_user0 = p2["input"][0]["content"].as_array().expect("responses user0 multipart");
+    assert!(r_user0.iter().any(|part| {
+        part["type"] == "input_file"
+            && part["filename"] == "report.pdf"
+            && part["file_data"] == "data:application/pdf;base64,JVBERi0x"
+    }));
+    assert!(p2["input"].as_array().unwrap().iter().any(|item| {
+        item["type"] == "reasoning"
+            && item["encrypted_content"]
+                .as_str()
+                .is_some_and(|s| s.contains("resp-blob"))
+    }));
+    assert_eq!(p2["reasoning"]["effort"], "high");
+    assert_eq!(p2["reasoning"]["summary"], "concise");
+    assert_eq!(p2["tools"][0]["name"], "lookup");
+
+    gateway_task.abort();
+    mock.abort();
+    std::fs::remove_dir_all(auth_dir).ok();
+}
+
+#[tokio::test]
 #[ignore]
 async fn live_official_kiro_tar_zst_extracts_kas_version() {
     let client = reqwest::Client::new();

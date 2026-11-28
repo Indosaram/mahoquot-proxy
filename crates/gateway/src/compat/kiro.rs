@@ -259,6 +259,24 @@ pub fn openai_to_kiro_responses_with_profile_and_session(
                     "summary": [],
                     "encrypted_content": encrypted,
                 }));
+            } else if message
+                .get("reasoning_redacted")
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                if let Some(sig) = message
+                    .get("reasoning_signature")
+                    .or_else(|| message.get("signature"))
+                    .and_then(Value::as_str)
+                    .filter(|v| !v.is_empty())
+                {
+                    let encrypted = encode_kiro_redacted_reasoning_envelope(sig);
+                    input.push(json!({
+                        "type": "reasoning",
+                        "summary": [],
+                        "encrypted_content": encrypted,
+                    }));
+                }
             } else if let Some(text) = message
                 .get("reasoning_content")
                 .or_else(|| message.get("thinking"))
@@ -361,14 +379,15 @@ pub fn openai_to_kiro_responses_with_profile_and_session(
     if let Some(tools) = body.get("tools").and_then(Value::as_array) {
         let converted: Vec<Value> = tools
             .iter()
-            .filter_map(|tool| tool.get("function"))
-            .filter_map(|function| {
+            .filter_map(|tool| {
+                let function = tool.get("function").unwrap_or(tool);
                 let name = function.get("name")?.as_str()?;
                 if name.is_empty() {
                     return None;
                 }
                 let mut schema = function
                     .get("parameters")
+                    .or_else(|| function.get("input_schema"))
                     .cloned()
                     .unwrap_or_else(|| json!({}));
                 sanitize_schema(&mut schema);
@@ -393,14 +412,20 @@ pub fn openai_to_kiro_responses_with_profile_and_session(
     {
         reasoning_obj.insert("type".to_string(), Value::String(kind.to_string()));
     }
-    if let Some(effort) = body
+    if let Some(raw_effort) = body
         .get("reasoning_effort")
         .or_else(|| body.pointer("/reasoning/effort"))
         .or_else(|| body.pointer("/output_config/effort"))
         .and_then(Value::as_str)
+        .map(str::trim)
         .filter(|e| !e.is_empty())
     {
-        reasoning_obj.insert("effort".to_string(), Value::String(effort.to_string()));
+        let lower = raw_effort.to_ascii_lowercase();
+        if matches!(lower.as_str(), "none" | "low" | "medium" | "high" | "xhigh") {
+            reasoning_obj.insert("effort".to_string(), Value::String(lower));
+        } else if lower == "auto" && !reasoning_obj.contains_key("type") {
+            reasoning_obj.insert("type".to_string(), Value::String("adaptive".to_string()));
+        }
     }
     if let Some(summary) = body
         .pointer("/reasoning/summary")
@@ -962,6 +987,8 @@ pub struct KiroResponsesDecoder {
     tool_indices: std::collections::HashMap<String, u64>,
     argued_tools: std::collections::HashSet<u64>,
     last_tool_index: Option<u64>,
+    text_streamed: bool,
+    reasoning_streamed: bool,
     refusal_streamed: bool,
     output_chars: u64,
 }
@@ -1049,6 +1076,7 @@ impl KiroResponsesDecoder {
             "response.output_text.delta" => {
                 if let Some(delta) = value.get("delta").and_then(Value::as_str) {
                     if !delta.is_empty() {
+                        self.text_streamed = true;
                         self.output_chars = self
                             .output_chars
                             .saturating_add(delta.chars().count() as u64);
@@ -1056,13 +1084,42 @@ impl KiroResponsesDecoder {
                     }
                 }
             }
-            "response.reasoning_text.delta" | "response.reasoning.delta" => {
+            "response.output_text.done" => {
+                if !self.text_streamed {
+                    if let Some(text) = value.get("text").and_then(Value::as_str) {
+                        if !text.is_empty() {
+                            self.text_streamed = true;
+                            self.output_chars = self
+                                .output_chars
+                                .saturating_add(text.chars().count() as u64);
+                            out.push(CodexEvent::TextDelta(text.to_string()));
+                        }
+                    }
+                }
+            }
+            "response.reasoning_text.delta"
+            | "response.reasoning_summary_text.delta"
+            | "response.reasoning.delta" => {
                 if let Some(delta) = value.get("delta").and_then(Value::as_str) {
                     if !delta.is_empty() {
+                        self.reasoning_streamed = true;
                         self.output_chars = self
                             .output_chars
                             .saturating_add(delta.chars().count() as u64);
                         out.push(CodexEvent::ReasoningDelta(delta.to_string()));
+                    }
+                }
+            }
+            "response.reasoning_text.done" | "response.reasoning_summary_text.done" => {
+                if !self.reasoning_streamed {
+                    if let Some(text) = value.get("text").and_then(Value::as_str) {
+                        if !text.is_empty() {
+                            self.reasoning_streamed = true;
+                            self.output_chars = self
+                                .output_chars
+                                .saturating_add(text.chars().count() as u64);
+                            out.push(CodexEvent::ReasoningDelta(text.to_string()));
+                        }
                     }
                 }
             }
@@ -1152,12 +1209,52 @@ impl KiroResponsesDecoder {
                     }
                 }
             }
+            "response.function_call_arguments.done" => {
+                let output_index = value
+                    .get("item_id")
+                    .or_else(|| value.get("call_id"))
+                    .and_then(Value::as_str)
+                    .and_then(|id| self.tool_indices.get(id).copied())
+                    .or(self.last_tool_index);
+                if let Some(output_index) = output_index {
+                    if !self.argued_tools.contains(&output_index) {
+                        if let Some(args) = value
+                            .get("arguments")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                        {
+                            self.argued_tools.insert(output_index);
+                            out.push(CodexEvent::ToolArgsDelta {
+                                output_index,
+                                delta: args.to_string(),
+                            });
+                        }
+                    }
+                }
+            }
             "response.output_item.done" => {
                 let Some(item) = value.get("item") else {
                     return;
                 };
                 match item.get("type").and_then(Value::as_str) {
                     Some("reasoning") => {
+                        if !self.reasoning_streamed {
+                            if let Some(summary) = item.get("summary").and_then(Value::as_array) {
+                                for entry in summary {
+                                    if let Some(text) = entry
+                                        .get("text")
+                                        .and_then(Value::as_str)
+                                        .filter(|s| !s.is_empty())
+                                    {
+                                        self.reasoning_streamed = true;
+                                        self.output_chars = self
+                                            .output_chars
+                                            .saturating_add(text.chars().count() as u64);
+                                        out.push(CodexEvent::ReasoningDelta(text.to_string()));
+                                    }
+                                }
+                            }
+                        }
                         if let Some(encrypted) = item
                             .get("encrypted_content")
                             .and_then(Value::as_str)

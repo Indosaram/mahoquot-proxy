@@ -333,6 +333,9 @@ pub fn anthropic_to_openai(body: &Value) -> Result<Value, String> {
                                 }));
                             }
                         }
+                        Some("document") => {
+                            image_parts.push(block.clone());
+                        }
                         Some("thinking") => {
                             if let Some(th) = block.get("thinking").and_then(Value::as_str) {
                                 thinking_parts.push(th.to_string());

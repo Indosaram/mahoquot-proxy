@@ -431,9 +431,20 @@ pub fn responses_to_openai(req: &Value) -> Result<Value, ResponsesError> {
                         }));
                     }
                     Some("reasoning") => {
-                        if let Some(blob) =
-                            item.get("kiroRedactedReasoning").and_then(Value::as_str)
-                        {
+                        let kiro_blob = item
+                            .get("kiroRedactedReasoning")
+                            .and_then(Value::as_str)
+                            .or_else(|| {
+                                item.get("encrypted_content")
+                                    .and_then(Value::as_str)
+                                    .filter(|raw| {
+                                        serde_json::from_str::<Value>(raw).ok().is_some_and(|v| {
+                                            v.get("redactedContent").is_some()
+                                                || v.get("reasoningText").is_some()
+                                        })
+                                    })
+                            });
+                        if let Some(blob) = kiro_blob {
                             messages.push(json!({
                                 "role": "assistant",
                                 "content": "",
@@ -711,6 +722,9 @@ pub fn responses_to_openai(req: &Value) -> Result<Value, ResponsesError> {
                                                 "type": "image_url",
                                                 "image_url": {"url": url}
                                             }));
+                                        }
+                                        Some("input_file") | Some("file") | Some("document") => {
+                                            image_parts.push(part.clone());
                                         }
                                         Some("reasoning") | Some("thinking") => {
                                             if let Some(r) = part
